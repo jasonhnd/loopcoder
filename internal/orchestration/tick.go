@@ -26,6 +26,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
+	"github.com/jasonhnd/loopcoder/internal/waitstate"
 	"github.com/jasonhnd/loopcoder/internal/worker"
 )
 
@@ -89,6 +90,9 @@ type TickOptions struct {
 	CircuitBreaker         config.GuardrailCircuitBreaker
 	Progress               progress.Recorder
 	AdditionalRiskRedLines []RiskRedLine
+	WaitForChecks          bool
+	WaitPolicy             waitstate.Policy
+	WaitClock              waitstate.Clock
 	ProcessAlive           ProcessAliveFunc
 	Clock                  func() time.Time
 	Stderr                 io.Writer
@@ -192,6 +196,7 @@ type TickRiskGateResult struct {
 	ChangedFiles       []string                  `json:"changed_files"`
 	Checks             []gh.Check                `json:"checks"`
 	RedLines           []RiskRedLine             `json:"red_lines"`
+	Wait               *waitstate.Report         `json:"wait,omitempty"`
 	Error              string                    `json:"error,omitempty"`
 	ConfiguredEvidence []config.EvidenceArtifact `json:"configured_evidence,omitempty"`
 }
@@ -951,6 +956,17 @@ func runTickRiskGateAndPreProdMerge(ctx context.Context, opts TickOptions, tickR
 		PRNumber:           prNumber,
 		RequiredChecks:     opts.RequiredChecks,
 		AdditionalRedLines: opts.AdditionalRiskRedLines,
+		WaitForChecks:      opts.WaitForChecks,
+		WaitPolicy:         opts.WaitPolicy,
+		WaitClock:          opts.WaitClock,
+		WaitReceipt: func(ctx context.Context, receipt waitstate.Receipt) error {
+			at, parseErr := time.Parse(time.RFC3339Nano, receipt.OccurredAt)
+			if parseErr != nil {
+				at = opts.Clock().UTC()
+			}
+			emitCIProgress(ctx, opts.Progress, at, opts.RunID, item.Issue, item.PR, "risk-gate", riskGateRecordID, progress.KnownWaitingCI, progress.KnownWaitingCI, "waiting for PR checks", false)
+			return nil
+		},
 	})
 	gateResult := TickRiskGateResult{
 		Issue:          item.Issue,
@@ -961,6 +977,7 @@ func runTickRiskGateAndPreProdMerge(ctx context.Context, opts TickOptions, tickR
 		ChangedFiles:   append([]string(nil), decision.ChangedFiles...),
 		Checks:         append([]gh.Check(nil), decision.Checks...),
 		RedLines:       append([]RiskRedLine(nil), decision.RedLines...),
+		Wait:           decision.Wait,
 	}
 	if err != nil {
 		gateResult.Status = RiskGateStatusNeedsHuman

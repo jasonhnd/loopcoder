@@ -3,6 +3,7 @@ package orchestration
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"path"
@@ -14,6 +15,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/progress"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
+	"github.com/jasonhnd/loopcoder/internal/waitstate"
 )
 
 const (
@@ -42,6 +44,10 @@ type RiskGateReader interface {
 	PRDiffNameOnly(ctx context.Context, number int) ([]string, error)
 }
 
+type RiskGateHeadReader interface {
+	ViewPR(ctx context.Context, number int) (gh.PullRequest, error)
+}
+
 type PreProdWriter interface {
 	MergeToPreProd(ctx context.Context, prNumber int, preProdBranch string) (gh.PreProdMergeResult, error)
 	RevertOnPreProd(ctx context.Context, prNumber int, preProdBranch, mergeSHA string) (gh.PreProdRevertResult, error)
@@ -62,15 +68,20 @@ type RiskGateOptions struct {
 	PRNumber           int
 	RequiredChecks     []string
 	AdditionalRedLines []RiskRedLine
+	WaitForChecks      bool
+	WaitPolicy         waitstate.Policy
+	WaitClock          waitstate.Clock
+	WaitReceipt        waitstate.ReceiptFunc
 }
 
 type RiskGateDecision struct {
-	PRNumber       int           `json:"pr_number"`
-	Status         string        `json:"status"`
-	RequiredChecks []string      `json:"required_checks"`
-	ChangedFiles   []string      `json:"changed_files"`
-	Checks         []gh.Check    `json:"checks"`
-	RedLines       []RiskRedLine `json:"red_lines"`
+	PRNumber       int               `json:"pr_number"`
+	Status         string            `json:"status"`
+	RequiredChecks []string          `json:"required_checks"`
+	ChangedFiles   []string          `json:"changed_files"`
+	Checks         []gh.Check        `json:"checks"`
+	RedLines       []RiskRedLine     `json:"red_lines"`
+	Wait           *waitstate.Report `json:"wait,omitempty"`
 }
 
 type RiskRedLine struct {
@@ -88,9 +99,60 @@ func EvaluateRiskGate(ctx context.Context, opts RiskGateOptions) (RiskGateDecisi
 	}
 
 	requiredChecks := normalizeRequiredChecks(opts.RequiredChecks)
+	var prBeforeWait gh.PullRequest
+	var identityBeforeWaitErr error
+	if opts.WaitForChecks && len(requiredChecks) > 0 {
+		headReader, ok := opts.Reader.(RiskGateHeadReader)
+		if !ok {
+			identityBeforeWaitErr = fmt.Errorf("risk gate reader does not support PR identity reads")
+		} else {
+			pr, err := headReader.ViewPR(ctx, opts.PRNumber)
+			prBeforeWait = pr
+			identityBeforeWaitErr = err
+			if err == nil && (strings.TrimSpace(pr.HeadRefOID) == "" || strings.TrimSpace(pr.BaseRefName) == "" || strings.TrimSpace(pr.BaseRefOID) == "") {
+				identityBeforeWaitErr = fmt.Errorf("pull request head SHA, base branch, and base SHA are required")
+			}
+		}
+	}
 	changedFiles, filesErr := opts.Reader.PRDiffNameOnly(ctx, opts.PRNumber)
 	diff, diffErr := opts.Reader.PRDiff(ctx, opts.PRNumber)
 	checks, checksErr := opts.Reader.PRChecks(ctx, opts.PRNumber)
+	var waitReport *waitstate.Report
+	if opts.WaitForChecks && len(requiredChecks) > 0 && requiredChecksPending(requiredChecks, checks, checksErr) {
+		if identityBeforeWaitErr != nil {
+			checksErr = fmt.Errorf("capture PR identity before check wait: %w", identityBeforeWaitErr)
+		} else {
+			report, waitErr := waitstate.WatchGitHubCI(ctx, waitstate.Options{
+				WaitID:  fmt.Sprintf("pr-%d-required-checks", opts.PRNumber),
+				Policy:  opts.WaitPolicy,
+				Clock:   opts.WaitClock,
+				Receipt: opts.WaitReceipt,
+				Probe: func(ctx context.Context) (waitstate.Observation, error) {
+					observed, err := opts.Reader.PRChecks(ctx, opts.PRNumber)
+					checks = append([]gh.Check(nil), observed...)
+					checksErr = err
+					return requiredChecksObservation(requiredChecks, observed, err)
+				},
+			})
+			waitReport = &report
+			if waitErr != nil {
+				checksErr = waitErr
+			} else {
+				headReader := opts.Reader.(RiskGateHeadReader)
+				pr, err := headReader.ViewPR(ctx, opts.PRNumber)
+				switch {
+				case err != nil:
+					checksErr = fmt.Errorf("revalidate PR identity after check wait: %w", err)
+				case strings.TrimSpace(pr.HeadRefOID) == "" || strings.TrimSpace(pr.BaseRefName) == "" || strings.TrimSpace(pr.BaseRefOID) == "":
+					checksErr = fmt.Errorf("revalidate PR identity after check wait: head SHA, base branch, and base SHA are required")
+				case strings.TrimSpace(pr.HeadRefOID) != strings.TrimSpace(prBeforeWait.HeadRefOID):
+					checksErr = fmt.Errorf("PR head changed during check wait from %s to %s; rerun risk evaluation", prBeforeWait.HeadRefOID, pr.HeadRefOID)
+				case strings.TrimSpace(pr.BaseRefName) != strings.TrimSpace(prBeforeWait.BaseRefName) || strings.TrimSpace(pr.BaseRefOID) != strings.TrimSpace(prBeforeWait.BaseRefOID):
+					checksErr = fmt.Errorf("PR base changed during check wait from %s@%s to %s@%s; rerun risk evaluation", prBeforeWait.BaseRefName, prBeforeWait.BaseRefOID, pr.BaseRefName, pr.BaseRefOID)
+				}
+			}
+		}
+	}
 
 	decision := RiskGateDecision{
 		PRNumber:       opts.PRNumber,
@@ -99,6 +161,7 @@ func EvaluateRiskGate(ctx context.Context, opts RiskGateOptions) (RiskGateDecisi
 		ChangedFiles:   normalizeChangedFiles(changedFiles),
 		Checks:         append([]gh.Check(nil), checks...),
 		RedLines:       []RiskRedLine{},
+		Wait:           waitReport,
 	}
 
 	if filesErr != nil {
@@ -128,6 +191,71 @@ func EvaluateRiskGate(ctx context.Context, opts RiskGateOptions) (RiskGateDecisi
 		decision.Status = RiskGateStatusNeedsHuman
 	}
 	return decision, nil
+}
+
+func requiredChecksPending(required []string, checks []gh.Check, err error) bool {
+	if err != nil {
+		return true
+	}
+	byName := make(map[string]gh.Check, len(checks))
+	for _, check := range checks {
+		byName[strings.TrimSpace(check.Name)] = check
+	}
+	for _, name := range required {
+		check, ok := byName[name]
+		if !ok || (!checkPassed(check) && !checkFailed(check)) {
+			return true
+		}
+	}
+	return false
+}
+
+func requiredChecksObservation(required []string, checks []gh.Check, err error) (waitstate.Observation, error) {
+	if err != nil {
+		return waitstate.Observation{}, err
+	}
+	byName := make(map[string]gh.Check, len(checks))
+	for _, check := range checks {
+		byName[strings.TrimSpace(check.Name)] = check
+	}
+	parts := make([]string, 0, len(required))
+	refs := make([]waitstate.Reference, 0, len(required))
+	pending := false
+	failed := false
+	for _, name := range required {
+		check, ok := byName[name]
+		status := "missing"
+		if ok {
+			status = checkStatus(check)
+			if checkPassed(check) {
+				status = "pass"
+			} else if checkFailed(check) {
+				failed = true
+			} else {
+				pending = true
+			}
+		} else {
+			pending = true
+		}
+		parts = append(parts, name+":"+status)
+		refs = append(refs, waitstate.Reference{Kind: "github-check", ID: name})
+	}
+	sort.Strings(parts)
+	eventID := checkObservationID(parts)
+	switch {
+	case failed:
+		return waitstate.Observation{EventID: eventID, State: waitstate.StateTerminal, Code: "required-check-failed", References: refs, Consequential: true, Terminal: true}, nil
+	case pending:
+		return waitstate.Observation{EventID: eventID, State: waitstate.StateWaiting, Code: "required-checks-pending", References: refs}, nil
+	default:
+		return waitstate.Observation{EventID: eventID, State: waitstate.StateReady, Code: "required-checks-passed", References: refs, Consequential: true}, nil
+	}
+}
+
+func checkObservationID(parts []string) string {
+	// The state packet needs only a stable delta reference, not the raw check
+	// payload or logs.
+	return fmt.Sprintf("checks-%x", sha256.Sum256([]byte(strings.Join(parts, "\x00"))))[:39]
 }
 
 func ciProgressCorrelation(runID string, issue int, pr, phase, recordID string) string {
@@ -356,11 +484,11 @@ func checkFailed(check gh.Check) bool {
 	bucket := strings.ToLower(strings.TrimSpace(check.Bucket))
 	state := strings.ToLower(strings.TrimSpace(check.State))
 	switch bucket {
-	case "fail", "failed", "cancel", "cancelled", "error", "timed_out":
+	case "fail", "failed", "cancel", "cancelled", "error", "timed_out", "skip", "skipped", "skipping":
 		return true
 	}
 	switch state {
-	case "failure", "failed", "error", "cancelled", "timed_out", "action_required":
+	case "failure", "failed", "error", "cancelled", "timed_out", "action_required", "skip", "skipped", "skipping":
 		return true
 	}
 	return false

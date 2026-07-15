@@ -2888,6 +2888,7 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		AdditionalRiskRedLines: orchestration.DomainRedLines(
 			cfg.Domain.RedLines,
 		),
+		WaitForChecks:   true,
 		Thresholds:      cfg.Resilience.Worker,
 		Budget:          cfg.Guardrails.Budget,
 		CircuitBreaker:  cfg.Guardrails.CircuitBreaker,
@@ -3259,6 +3260,7 @@ func tickOptionsFromConfig(repoPath string, stderr io.Writer, deps Deps, cfg con
 		VerifierTimeout:    loopreview.DefaultVerifierTimeout,
 		ThrottleLimit:      lcdefaults.DispatchWaveThrottleLimit,
 		RequiredChecks:     cfg.CI.Checks,
+		WaitForChecks:      true,
 		ConfiguredEvidence: cfg.Evidence.Artifacts(),
 		AdditionalRiskRedLines: orchestration.DomainRedLines(
 			cfg.Domain.RedLines,

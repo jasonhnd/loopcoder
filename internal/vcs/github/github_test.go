@@ -153,6 +153,41 @@ func TestExecRunnerCapturesOutputAndNonZeroExit(t *testing.T) {
 	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 7 {
 		t.Fatalf("error = %v, want wrapped exec.ExitError exit 7", err)
 	}
+
+	output, err = (ExecRunner{}).Run(context.Background(), dir, os.Args[0], "-test.run=TestGitHubExecHelper", "--", "stdout-exit", `[{"name":"verify","bucket":"pending"}]`, "8")
+	if err == nil {
+		t.Fatal("Run error = nil, want status exit error")
+	}
+	if !strings.Contains(string(output), `"bucket":"pending"`) {
+		t.Fatalf("output = %q, want JSON preserved on non-zero status exit", output)
+	}
+}
+
+func TestPRChecksParsesStatusJSONFromNonZeroExit(t *testing.T) {
+	wantErr := errors.New("exit status 8")
+	runner := &fakeRunner{
+		err:       wantErr,
+		errOutput: []byte(`[{"name":"verify","state":"IN_PROGRESS","bucket":"pending"}]`),
+	}
+	client := NewWithRunner("repo", runner)
+
+	checks, err := client.PRChecks(context.Background(), 967)
+	if err != nil {
+		t.Fatalf("PRChecks: %v", err)
+	}
+	if len(checks) != 1 || checks[0].Name != "verify" || checks[0].Bucket != "pending" {
+		t.Fatalf("checks = %#v, want pending verify payload", checks)
+	}
+}
+
+func TestPRChecksPreservesNonJSONCommandError(t *testing.T) {
+	wantErr := errors.New("authentication failed")
+	client := NewWithRunner("repo", &fakeRunner{err: wantErr, errOutput: []byte("not json")})
+
+	_, err := client.PRChecks(context.Background(), 967)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("PRChecks error = %v, want %v", err, wantErr)
+	}
 }
 
 func TestExecRunnerTimesOut(t *testing.T) {
@@ -208,6 +243,9 @@ func runExecHelper() {
 		fmt.Fprintln(os.Stdout, args[0])
 	case "stderr-exit":
 		fmt.Fprintln(os.Stderr, args[0])
+		os.Exit(parseHelperInt(args[1]))
+	case "stdout-exit":
+		fmt.Fprintln(os.Stdout, args[0])
 		os.Exit(parseHelperInt(args[1]))
 	case "sleep":
 		time.Sleep(parseHelperDuration(args[0]))
@@ -980,16 +1018,17 @@ func TestCreatePRPropagatesRunnerError(t *testing.T) {
 }
 
 type fakeRunner struct {
-	calls   [][]string
-	outputs map[string][]byte
-	err     error
+	calls     [][]string
+	outputs   map[string][]byte
+	err       error
+	errOutput []byte
 }
 
 func (f *fakeRunner) Run(_ context.Context, dir, name string, args ...string) ([]byte, error) {
 	call := append([]string{dir, name}, args...)
 	f.calls = append(f.calls, call)
 	if f.err != nil {
-		return nil, f.err
+		return append([]byte(nil), f.errOutput...), f.err
 	}
 	key := dir + "\x00" + name
 	for _, arg := range args {
