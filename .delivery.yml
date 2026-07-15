@@ -65,6 +65,14 @@ ci:
 #       - app/**
 #       - "**/*.css"
 #       - "**/*.tsx"
+# orchestration:
+#   cost_budget:
+#     Optional conservative per-run caps; defaults shown below.
+#     max_model_calls: 8
+#     max_tokens: 500000
+#     Release integration fails closed when coordination tokens exceed this
+#     percentage of useful Worker + Verifier tokens.
+#     max_overhead_percent: 10
 report:
   channel: chat
 audit:

@@ -32,6 +32,7 @@ type Config struct {
 	CI                CI                `yaml:"ci"`
 	Models            Models            `yaml:"models"`
 	Verification      Verification      `yaml:"verification"`
+	Orchestration     Orchestration     `yaml:"orchestration"`
 	Resilience        Resilience        `yaml:"resilience"`
 	Guardrails        Guardrails        `yaml:"guardrails"`
 	Environment       Environment       `yaml:"environment"`
@@ -118,6 +119,16 @@ type Verification struct {
 type Browser struct {
 	Enabled string   `yaml:"enabled"`
 	Globs   []string `yaml:"globs"`
+}
+
+type Orchestration struct {
+	CostBudget OrchestrationCostBudget `yaml:"cost_budget"`
+}
+
+type OrchestrationCostBudget struct {
+	MaxModelCalls      int   `yaml:"max_model_calls"`
+	MaxTokens          int64 `yaml:"max_tokens"`
+	MaxOverheadPercent int   `yaml:"max_overhead_percent"`
 }
 
 type Resilience struct {
@@ -437,6 +448,13 @@ func Default() Config {
 				Enabled: lcdefaults.VerificationBrowserMode,
 			},
 		},
+		Orchestration: Orchestration{
+			CostBudget: OrchestrationCostBudget{
+				MaxModelCalls:      8,
+				MaxTokens:          500_000,
+				MaxOverheadPercent: 10,
+			},
+		},
 		Resilience: Resilience{
 			Worker: ResilienceWorker{
 				HeartbeatIntervalSeconds: lcdefaults.WorkerHeartbeatIntervalSeconds,
@@ -483,6 +501,9 @@ func validateParsedConfig(cfg Config) error {
 		return err
 	}
 	if err := validateGuardrailBudget(cfg.Guardrails.Budget); err != nil {
+		return err
+	}
+	if err := validateOrchestrationCostBudget(cfg.Orchestration.CostBudget); err != nil {
 		return err
 	}
 	if err := validateGuardrailCircuitBreaker(cfg.Guardrails.CircuitBreaker); err != nil {
@@ -589,6 +610,19 @@ func validateGuardrailBudget(b GuardrailBudget) error {
 	}
 	if b.MaxTotalCostUSD != nil && *b.MaxTotalCostUSD <= 0 {
 		return fmt.Errorf("invalid delivery config: guardrails.budget.max_total_cost_usd must be greater than zero")
+	}
+	return nil
+}
+
+func validateOrchestrationCostBudget(b OrchestrationCostBudget) error {
+	if b.MaxModelCalls <= 0 {
+		return fmt.Errorf("invalid delivery config: orchestration.cost_budget.max_model_calls must be greater than zero")
+	}
+	if b.MaxTokens <= 0 {
+		return fmt.Errorf("invalid delivery config: orchestration.cost_budget.max_tokens must be greater than zero")
+	}
+	if b.MaxOverheadPercent <= 0 || b.MaxOverheadPercent > 100 {
+		return fmt.Errorf("invalid delivery config: orchestration.cost_budget.max_overhead_percent must be between 1 and 100")
 	}
 	return nil
 }

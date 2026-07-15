@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
@@ -60,52 +61,56 @@ const (
 )
 
 type Options struct {
-	RepoPath         string
-	IssueNumber      int
-	IssueTitle       string
-	IssueBody        string
-	RunID            string
-	BaseBranch       string
-	MaxAttempts      int
-	BackoffSeconds   []int
-	Provider         string
-	Model            string
-	Effort           string
-	ConfigFromBase   bool
-	UpgradedModel    string
-	UpgradedEffort   string
-	FailureContext   string
-	SkipAdoptPR      bool
-	VerifierProvider string
-	VerifierModel    string
-	VerifierEffort   string
-	VerifierTimeout  time.Duration
-	Budget           config.GuardrailBudget
-	CircuitBreaker   config.GuardrailCircuitBreaker
-	Progress         progress.Recorder
-	Now              time.Time
-	Stderr           io.Writer
+	RepoPath           string
+	IssueNumber        int
+	IssueTitle         string
+	IssueBody          string
+	RunID              string
+	BaseBranch         string
+	MaxAttempts        int
+	BackoffSeconds     []int
+	Provider           string
+	Model              string
+	Effort             string
+	ConfigFromBase     bool
+	UpgradedModel      string
+	UpgradedEffort     string
+	FailureContext     string
+	SkipAdoptPR        bool
+	VerifierProvider   string
+	VerifierModel      string
+	VerifierEffort     string
+	VerifierTimeout    time.Duration
+	Budget             config.GuardrailBudget
+	CircuitBreaker     config.GuardrailCircuitBreaker
+	Progress           progress.Recorder
+	Now                time.Time
+	Stderr             io.Writer
+	BeforeProviderCall func(kind string) error
+	AfterProviderCall  func(kind string, invoked bool, report *reporter.Report)
 }
 
 type DispatchOptions struct {
-	RepoPath        string
-	IssueNumber     int
-	IssueTitle      string
-	IssueBody       string
-	BaseBranch      string
-	Branch          string
-	RunID           string
-	Attempt         int
-	RecoveryContext string
-	Provider        string
-	Model           string
-	Effort          string
-	ConfigFromBase  bool
-	Stderr          io.Writer
+	RepoPath           string
+	IssueNumber        int
+	IssueTitle         string
+	IssueBody          string
+	BaseBranch         string
+	Branch             string
+	RunID              string
+	Attempt            int
+	RecoveryContext    string
+	Provider           string
+	Model              string
+	Effort             string
+	ConfigFromBase     bool
+	Stderr             io.Writer
+	BeforeProviderCall func() error
 }
 
 type DispatchResult struct {
 	OK              bool             `json:"ok"`
+	ProviderInvoked bool             `json:"provider_invoked,omitempty"`
 	Issue           int              `json:"issue"`
 	Branch          string           `json:"branch"`
 	RunID           string           `json:"run_id"`
@@ -438,7 +443,20 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			Effort:          effort,
 			ConfigFromBase:  opts.ConfigFromBase,
 			Stderr:          opts.Stderr,
+			BeforeProviderCall: func() error {
+				if opts.BeforeProviderCall == nil {
+					return nil
+				}
+				return opts.BeforeProviderCall("worker")
+			},
 		})
+		if opts.AfterProviderCall != nil {
+			opts.AfterProviderCall("worker", dispatchResult.ProviderInvoked, dispatchResult.Report)
+		}
+		if agent.IsProviderCallRefused(dispatchErr) {
+			report.WriteString("BLOCKED: orchestration cost budget: " + dispatchErr.Error() + "\n")
+			return Result{Action: ActionBlocked, Report: report.String(), RecoveryAttempts: recoveryAttempts}, nil
+		}
 		lastDispatchResult = &dispatchResult
 		record.DispatchResult = &dispatchResult
 		record.PR = dispatchResult.PR
@@ -533,7 +551,16 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			ConfigFromBase: opts.ConfigFromBase,
 			Timeout:        opts.VerifierTimeout,
 			Stderr:         opts.Stderr,
+			BeforeProviderCall: func() error {
+				if opts.BeforeProviderCall == nil {
+					return nil
+				}
+				return opts.BeforeProviderCall("verifier")
+			},
 		})
+		if opts.AfterProviderCall != nil {
+			opts.AfterProviderCall("verifier", reviewResult.ProviderInvoked, reviewResult.Verdict.Report)
+		}
 		lastReviewResult = &reviewResult
 		record.Review = &reviewResult.Verdict
 		if reviewErr != nil {

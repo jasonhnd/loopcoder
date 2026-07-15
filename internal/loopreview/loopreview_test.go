@@ -1943,6 +1943,7 @@ func TestRunInvokesReadOnlyVerifierAndReturnsPass(t *testing.T) {
 		summary: `{"verdict":"pass","findings":[],"evidence":"diff satisfies issue and spec","spec_conformance":"pass"}`,
 	}
 	fakeLock := &loopreviewFakeLock{}
+	providerReservations := 0
 
 	result, err := Run(context.Background(), Options{
 		RepoPath:   repo,
@@ -1951,6 +1952,10 @@ func TestRunInvokesReadOnlyVerifierAndReturnsPass(t *testing.T) {
 		Model:      "claude-opus",
 		Effort:     "max",
 		BaseBranch: "main",
+		BeforeProviderCall: func() error {
+			providerReservations++
+			return nil
+		},
 	}, Deps{
 		Git: fakeGit,
 		GitHub: func(path string) GitHubClient {
@@ -1987,6 +1992,9 @@ func TestRunInvokesReadOnlyVerifierAndReturnsPass(t *testing.T) {
 	}
 	if result.Verdict.Report == nil {
 		t.Fatal("verdict missing report")
+	}
+	if providerReservations != 1 {
+		t.Fatalf("provider reservations = %d, want one before verifier launch", providerReservations)
 	}
 	sourceRef := prHeadLocalRef(152)
 	if fakeGit.fetchBase != "main" || fakeGit.fetchPRRef != 152 || fakeGit.fetchPRRefDest != sourceRef || fakeGit.addRev != sourceRef {
@@ -2666,6 +2674,9 @@ func TestRunVerifierTimeoutReturnsNeedsHuman(t *testing.T) {
 	if result.Verdict.Report != nil {
 		t.Fatalf("hung verifier result had report: %#v", result.Verdict.Report)
 	}
+	if !result.ProviderInvoked {
+		t.Fatal("hung verifier did not report its provider invocation")
+	}
 	if fakeAgent.calls != 1 {
 		t.Fatalf("agent calls = %d, want 1", fakeAgent.calls)
 	}
@@ -3017,6 +3028,11 @@ type loopreviewFakeAgent struct {
 func (f *loopreviewFakeAgent) Run(ctx context.Context, invocation agent.Invocation) (agent.Result, error) {
 	f.calls++
 	f.invocation = invocation
+	if invocation.OnProviderStart != nil {
+		if err := invocation.OnProviderStart(agent.ProviderProcess{PID: os.Getpid()}); err != nil {
+			return agent.Result{ExitCode: -1}, err
+		}
+	}
 	if err := os.WriteFile(invocation.LogPath, []byte("verifier log\n"), 0o644); err != nil {
 		return agent.Result{ExitCode: -1}, err
 	}

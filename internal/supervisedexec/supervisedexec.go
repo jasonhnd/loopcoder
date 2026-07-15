@@ -85,6 +85,9 @@ type Options struct {
 	Role  string
 	// OnStart is called after the provider process starts and is adopted into
 	// its kill-group, before Run reports any running state to callers.
+	// OnLaunch is called immediately after cmd.Start succeeds. Unlike OnStart,
+	// it does not depend on a successful process-identity snapshot.
+	OnLaunch func(pid int)
 	OnStart  func(StartedProcess) error
 	Guardian GuardianOptions
 }
@@ -164,6 +167,9 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 	_ = group.adopt(cmd)
 	managedPID := cmd.Process.Pid
 	registerProc(cmd, opts.RunID, opts.Role, group)
+	if opts.OnLaunch != nil {
+		opts.OnLaunch(managedPID)
+	}
 	defer func() {
 		deregisterProc(managedPID)
 		group.close()

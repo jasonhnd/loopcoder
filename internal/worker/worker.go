@@ -57,10 +57,15 @@ type Options struct {
 	ConfigFromBase  bool
 	KeepWorktree    bool
 	Stderr          io.Writer
+	// BeforeProviderCall runs after provider-free adoption/reconciliation and
+	// immediately before the provider runner. Callers use it to durably reserve
+	// a budget slot; returning an error prevents the provider launch.
+	BeforeProviderCall func() error
 }
 
 type Result struct {
 	OK              bool                       `json:"ok"`
+	ProviderInvoked bool                       `json:"provider_invoked,omitempty"`
 	Issue           int                        `json:"issue"`
 	Branch          string                     `json:"branch"`
 	RunID           string                     `json:"run_id"`
@@ -194,6 +199,8 @@ type dispatchContext struct {
 	progressRecorder  *progressRecorder
 	activePhase       string
 	dispatchSucceeded bool
+	providerInvoked   bool
+	providerRefused   bool
 	preserveArtifacts bool
 	preserveReason    string
 	cleanupStatus     string
@@ -205,6 +212,9 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 	if err != nil {
 		return Result{}, err
 	}
+	defer func() {
+		result.ProviderInvoked = dispatch.providerInvoked
+	}()
 	if adopted, ok, err := adoptExistingBranchPRPreflight(ctx, dispatch); err != nil {
 		fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: preflight branch PR lookup failed; continuing provider execution: %v\n", err)
 	} else if ok {
@@ -224,6 +234,14 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 	invocation, err := buildInvocation(ctx, dispatch)
 	if err != nil {
 		return Result{}, err
+	}
+	if dispatch.opts.BeforeProviderCall != nil {
+		if err := dispatch.opts.BeforeProviderCall(); err != nil {
+			dispatch.providerRefused = true
+			dispatch.dispatchSucceeded = true
+			dispatch.cleanupStatus = state.StatusSkipped
+			return Result{}, fmt.Errorf("before provider call: %w", agent.ProviderCallRefusedError{Err: err})
+		}
 	}
 	agentResult, agentErr := runAgent(ctx, dispatch, invocation)
 	if agentResult.Hung {
@@ -449,7 +467,11 @@ func buildInvocation(ctx context.Context, dispatch *dispatchContext) (agent.Invo
 		ProviderKey:     dispatch.opts.ProviderKey,
 		Role:            "worker",
 		MCPServers:      mcpServers,
+		OnProviderLaunch: func(int) {
+			dispatch.providerInvoked = true
+		},
 		OnProviderStart: func(started agent.ProviderProcess) error {
+			dispatch.providerInvoked = true
 			if err := persistProviderExecutionAuthority(ctx, dispatch, started); err != nil {
 				return err
 			}
@@ -778,6 +800,14 @@ func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
 		return
 	}
 	defer closeWorkerOwnershipStore(dispatch)
+	defer func() {
+		if !dispatch.providerRefused || strings.TrimSpace(dispatch.attemptPath) == "" {
+			return
+		}
+		if err := os.Remove(dispatch.attemptPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: remove provider-refused attempt %s: %v\n", dispatch.attemptPath, err)
+		}
+	}()
 	if dispatch.progressRecorder != nil {
 		defer dispatch.progressRecorder.Stop()
 	}

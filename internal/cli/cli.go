@@ -32,6 +32,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/models"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
+	"github.com/jasonhnd/loopcoder/internal/orchestrationcost"
 	"github.com/jasonhnd/loopcoder/internal/perception"
 	"github.com/jasonhnd/loopcoder/internal/platform"
 	"github.com/jasonhnd/loopcoder/internal/process"
@@ -2891,6 +2892,7 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		WaitForChecks:   true,
 		Thresholds:      cfg.Resilience.Worker,
 		Budget:          cfg.Guardrails.Budget,
+		CostPolicy:      orchestrationCostPolicy(cfg.Orchestration.CostBudget),
 		CircuitBreaker:  cfg.Guardrails.CircuitBreaker,
 		Progress:        progressRecorder,
 		ProcessAlive:    deps.ProcessAlive,
@@ -3267,6 +3269,7 @@ func tickOptionsFromConfig(repoPath string, stderr io.Writer, deps Deps, cfg con
 		),
 		Thresholds:      cfg.Resilience.Worker,
 		Budget:          cfg.Guardrails.Budget,
+		CostPolicy:      orchestrationCostPolicy(cfg.Orchestration.CostBudget),
 		CircuitBreaker:  cfg.Guardrails.CircuitBreaker,
 		ProcessAlive:    deps.ProcessAlive,
 		Clock:           deps.Now,
@@ -3279,6 +3282,14 @@ func tickOptionsFromConfig(repoPath string, stderr io.Writer, deps Deps, cfg con
 		PreProdWriter:   deps.NewPreProdWriter(repoPath),
 		StatePush:       deps.StatePush,
 	}, true
+}
+
+func orchestrationCostPolicy(budget config.OrchestrationCostBudget) orchestrationcost.Policy {
+	return orchestrationcost.Policy{
+		MaxModelCalls:      budget.MaxModelCalls,
+		MaxTokens:          budget.MaxTokens,
+		MaxOverheadPercent: budget.MaxOverheadPercent,
+	}
 }
 
 func renderTriggerPrettyReports(w io.Writer, report orchestration.TriggerReport, mode reporter.PrettyMode) error {
@@ -6170,35 +6181,37 @@ func recoverWithDispatch(dispatch func(ctx context.Context, opts worker.Options)
 		recoverDeps := recovery.DefaultDeps()
 		recoverDeps.Dispatch = func(ctx context.Context, dispatchOpts recovery.DispatchOptions) (recovery.DispatchResult, error) {
 			result, err := dispatch(ctx, worker.Options{
-				RepoPath:        dispatchOpts.RepoPath,
-				IssueNumber:     dispatchOpts.IssueNumber,
-				IssueTitle:      dispatchOpts.IssueTitle,
-				IssueBody:       dispatchOpts.IssueBody,
-				BaseBranch:      dispatchOpts.BaseBranch,
-				Branch:          dispatchOpts.Branch,
-				RunID:           dispatchOpts.RunID,
-				Attempt:         dispatchOpts.Attempt,
-				RecoveryContext: dispatchOpts.RecoveryContext,
-				Provider:        dispatchOpts.Provider,
-				Model:           dispatchOpts.Model,
-				Effort:          dispatchOpts.Effort,
-				ConfigFromBase:  dispatchOpts.ConfigFromBase,
-				Stderr:          dispatchOpts.Stderr,
+				RepoPath:           dispatchOpts.RepoPath,
+				IssueNumber:        dispatchOpts.IssueNumber,
+				IssueTitle:         dispatchOpts.IssueTitle,
+				IssueBody:          dispatchOpts.IssueBody,
+				BaseBranch:         dispatchOpts.BaseBranch,
+				Branch:             dispatchOpts.Branch,
+				RunID:              dispatchOpts.RunID,
+				Attempt:            dispatchOpts.Attempt,
+				RecoveryContext:    dispatchOpts.RecoveryContext,
+				Provider:           dispatchOpts.Provider,
+				Model:              dispatchOpts.Model,
+				Effort:             dispatchOpts.Effort,
+				ConfigFromBase:     dispatchOpts.ConfigFromBase,
+				Stderr:             dispatchOpts.Stderr,
+				BeforeProviderCall: dispatchOpts.BeforeProviderCall,
 			})
 			return recovery.DispatchResult{
-				OK:          result.OK,
-				Issue:       result.Issue,
-				Branch:      result.Branch,
-				RunID:       result.RunID,
-				PR:          result.PR,
-				Summary:     result.Summary,
-				AttemptPath: result.AttemptPath,
-				Status:      result.Status,
-				ExitCode:    result.ExitCode,
-				LogBytes:    result.LogBytes,
-				Reason:      result.Reason,
-				NextAction:  result.NextAction,
-				Report:      result.Report,
+				OK:              result.OK,
+				ProviderInvoked: result.ProviderInvoked,
+				Issue:           result.Issue,
+				Branch:          result.Branch,
+				RunID:           result.RunID,
+				PR:              result.PR,
+				Summary:         result.Summary,
+				AttemptPath:     result.AttemptPath,
+				Status:          result.Status,
+				ExitCode:        result.ExitCode,
+				LogBytes:        result.LogBytes,
+				Reason:          result.Reason,
+				NextAction:      result.NextAction,
+				Report:          result.Report,
 			}, err
 		}
 		recoverDeps.Review = review

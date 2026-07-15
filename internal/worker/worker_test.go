@@ -141,6 +141,9 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 	if !result.OK || result.Issue != 101 || result.Branch != "loop/issue-101" || result.RunID != "run-test" {
 		t.Fatalf("result has wrong identity fields: %#v", result)
 	}
+	if !result.ProviderInvoked {
+		t.Fatal("successful dispatch did not report the provider invocation")
+	}
 	if result.PR != "https://github.com/owner/repo/pull/101" {
 		t.Fatalf("PR = %q", result.PR)
 	}
@@ -278,6 +281,59 @@ func TestDispatchSuccessWritesStateAndReturnsParityJSONFields(t *testing.T) {
 	}
 	if strings.Contains(fakeAgent.invocation.Prompt, "Repo-local skills") {
 		t.Fatalf("agent prompt unexpectedly included repo skills:\n%s", fakeAgent.invocation.Prompt)
+	}
+}
+
+func TestDispatchProviderRefusalLeavesNoFailedAttemptOrProviderCall(t *testing.T) {
+	repo := t.TempDir()
+	scratchRoot := t.TempDir()
+	fakeGit := &workerFakeGit{}
+	fakeAgent := &workerFakeAgent{resultSet: true, result: validWorkerAgentResult("unexpected", 0)}
+
+	result, err := Dispatch(context.Background(), Options{
+		RepoPath:    repo,
+		IssueNumber: 102,
+		IssueTitle:  "Budget refusal",
+		RunID:       "run-refused",
+		Provider:    "codex",
+		BeforeProviderCall: func() error {
+			return errors.New("model-call-budget exhausted")
+		},
+	}, Deps{
+		Git: fakeGit,
+		GitHub: func(string) GitHubClient {
+			return &workerFakeGitHub{}
+		},
+		AgentLookup: func(string) (agent.Runner, error) {
+			return fakeAgent, nil
+		},
+		AcquireLock: func(string, time.Duration) (Lock, error) {
+			return &workerFakeLock{}, nil
+		},
+		Now: fixedNow,
+		PID: func() int {
+			return 4322
+		},
+		MkdirTemp: func(dir, pattern string) (string, error) {
+			return os.MkdirTemp(scratchRoot, pattern)
+		},
+		RemoveAll: os.RemoveAll,
+	})
+	if !agent.IsProviderCallRefused(err) {
+		t.Fatalf("Dispatch error = %v, want provider refusal", err)
+	}
+	if result.ProviderInvoked || fakeAgent.runCalls != 0 {
+		t.Fatalf("result=%#v provider calls=%d, want no provider", result, fakeAgent.runCalls)
+	}
+	attempts, loadErr := state.LoadAttempts(repo, "run-refused")
+	if loadErr != nil {
+		t.Fatalf("LoadAttempts: %v", loadErr)
+	}
+	if len(attempts) != 0 {
+		t.Fatalf("provider refusal left durable worker attempts: %#v", attempts)
+	}
+	if fakeGit.removeCalls != 1 || fakeGit.branchDeleteCalls != 1 {
+		t.Fatalf("cleanup calls worktree=%d branch=%d, want 1/1", fakeGit.removeCalls, fakeGit.branchDeleteCalls)
 	}
 }
 
@@ -2375,6 +2431,7 @@ func TestDispatchFinalizationRetryAdoptsExistingPRWithoutProviderRerun(t *testin
 		},
 		RemoveAll: os.RemoveAll,
 	}
+	providerReservations := 0
 	opts := Options{
 		RepoPath:    repo,
 		IssueNumber: 965,
@@ -2383,6 +2440,10 @@ func TestDispatchFinalizationRetryAdoptsExistingPRWithoutProviderRerun(t *testin
 		Branch:      "loop/issue-965",
 		Provider:    "codex",
 		Stderr:      &warnings,
+		BeforeProviderCall: func() error {
+			providerReservations++
+			return nil
+		},
 	}
 
 	first, err := Dispatch(context.Background(), opts, deps)
@@ -2392,8 +2453,11 @@ func TestDispatchFinalizationRetryAdoptsExistingPRWithoutProviderRerun(t *testin
 	if first.Report == nil || first.Outcome != string(OutcomeDeliveryFailed) || first.ProviderOutcome != string(OutcomeProviderCompleted) {
 		t.Fatalf("first result = %#v, want preserved report and delivery_failed/provider_completed", first)
 	}
-	if fakeAgent.runCalls != 1 || fakeGitHub.createPRCalls != 1 {
-		t.Fatalf("first calls provider=%d createPR=%d, want 1/1", fakeAgent.runCalls, fakeGitHub.createPRCalls)
+	if !first.ProviderInvoked {
+		t.Fatal("first dispatch did not report the provider invocation")
+	}
+	if fakeAgent.runCalls != 1 || fakeGitHub.createPRCalls != 1 || providerReservations != 1 {
+		t.Fatalf("first calls provider=%d createPR=%d reservations=%d, want 1/1/1", fakeAgent.runCalls, fakeGitHub.createPRCalls, providerReservations)
 	}
 
 	fakeGitHub.createErr = nil
@@ -2405,11 +2469,17 @@ func TestDispatchFinalizationRetryAdoptsExistingPRWithoutProviderRerun(t *testin
 	if !second.OK || second.Outcome != string(OutcomePRAdopted) || second.PR != "https://github.com/owner/repo/pull/965" {
 		t.Fatalf("second result = %#v, want adopted PR success", second)
 	}
+	if second.ProviderInvoked {
+		t.Fatal("finalization-only adoption reported a second provider invocation")
+	}
 	if fakeAgent.runCalls != 1 {
 		t.Fatalf("provider executions = %d, want exactly one across finalization retry", fakeAgent.runCalls)
 	}
 	if fakeGitHub.createPRCalls != 1 {
 		t.Fatalf("CreatePR calls = %d, want no second create", fakeGitHub.createPRCalls)
+	}
+	if providerReservations != 1 {
+		t.Fatalf("provider reservations = %d, want adoption to remain provider-free", providerReservations)
 	}
 }
 
@@ -3306,6 +3376,11 @@ type workerFakeAgent struct {
 func (f *workerFakeAgent) Run(_ context.Context, invocation agent.Invocation) (agent.Result, error) {
 	f.runCalls++
 	f.invocation = invocation
+	if invocation.OnProviderStart != nil {
+		if err := invocation.OnProviderStart(agent.ProviderProcess{PID: os.Getpid()}); err != nil {
+			return agent.Result{ExitCode: -1}, err
+		}
+	}
 	if err := os.WriteFile(invocation.LogPath, []byte(f.log), 0o644); err != nil {
 		return agent.Result{ExitCode: -1}, err
 	}
@@ -3321,6 +3396,11 @@ func (f *workerFakeAgent) Run(_ context.Context, invocation agent.Invocation) (a
 type workerContextErrAgent struct{}
 
 func (workerContextErrAgent) Run(ctx context.Context, invocation agent.Invocation) (agent.Result, error) {
+	if invocation.OnProviderStart != nil {
+		if err := invocation.OnProviderStart(agent.ProviderProcess{PID: os.Getpid()}); err != nil {
+			return agent.Result{ExitCode: -1}, err
+		}
+	}
 	_ = os.WriteFile(invocation.LogPath, []byte("parent context stopped\n"), 0o644)
 	if ctx.Err() != nil {
 		return agent.Result{ExitCode: -1}, ctx.Err()
