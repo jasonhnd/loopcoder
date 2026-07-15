@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -62,6 +63,51 @@ func TestDarwinGuardianRetainedAuthorityKillsAfterSupervisorEOFLoaderContention(
 		t.Fatalf("authority loader calls = %d, want cached kill without EOF reload", got)
 	}
 	assertGuardianDiagnostic(t, cfg.DiagnosticPath, "killed")
+}
+
+func TestDarwinGuardianReadySignalTimeoutCoversAuthorityRetentionWindow(t *testing.T) {
+	if guardianReadySignalTimeout <= guardianAuthorityLoadTimeout {
+		t.Fatalf("guardian ready signal timeout = %s, must exceed authority load timeout %s", guardianReadySignalTimeout, guardianAuthorityLoadTimeout)
+	}
+}
+
+func TestDarwinGuardianReadySignalWaitsPastPreviousFiveSecondBoundary(t *testing.T) {
+	readyRead, readyWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("readiness pipe: %v", err)
+	}
+	defer readyRead.Close()
+	defer readyWrite.Close()
+
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start placeholder guardian process: %v", err)
+	}
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	}()
+
+	writeDone := make(chan error, 1)
+	go func() {
+		time.Sleep(5500 * time.Millisecond)
+		_, err := readyWrite.Write([]byte{'1'})
+		writeDone <- err
+	}()
+
+	if err := waitGuardianReadySignal(cmd, readyRead); err != nil {
+		t.Fatalf("guardian readiness after previous 5s boundary: %v", err)
+	}
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("write readiness token: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("readiness writer did not finish")
+	}
 }
 
 func TestDarwinGuardianReadinessWaitsForAuthorityRetention(t *testing.T) {

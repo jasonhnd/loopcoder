@@ -25,6 +25,7 @@ const (
 	guardianReadyFD   = uintptr(4)
 
 	guardianAuthorityLoadTimeout = 8 * time.Second
+	guardianReadySignalTimeout   = guardianAuthorityLoadTimeout + time.Second
 )
 
 type darwinGuardianHandle struct {
@@ -281,7 +282,7 @@ func waitGuardianReadySignal(cmd *exec.Cmd, readyRead *os.File) error {
 			_ = cmd.Wait()
 		}
 		return err
-	case <-time.After(5 * time.Second):
+	case <-time.After(guardianReadySignalTimeout):
 		_ = readyRead.Close()
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
