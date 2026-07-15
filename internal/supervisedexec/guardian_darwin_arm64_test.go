@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -174,13 +175,22 @@ func TestDarwinGuardianSupervisorEOFFailsClosedWhenCurrentAuthorityUnreadable(t 
 	assertGuardianDiagnostic(t, cfg.DiagnosticPath, "skip")
 }
 
-func TestDarwinGuardianReadySignalTimeoutCoversAuthorityRetentionWindow(t *testing.T) {
-	if guardianReadySignalTimeout <= guardianAuthorityLoadTimeout {
-		t.Fatalf("guardian ready signal timeout = %s, must exceed authority load timeout %s", guardianReadySignalTimeout, guardianAuthorityLoadTimeout)
+func TestDarwinGuardianStartupDeadlinesStayBelowTwoSeconds(t *testing.T) {
+	if guardianStartupAuthorityLoadTimeout >= 2*time.Second {
+		t.Fatalf("guardian startup authority timeout = %s, must stay below 2s", guardianStartupAuthorityLoadTimeout)
+	}
+	if guardianReadySignalTimeout >= 2*time.Second {
+		t.Fatalf("guardian ready signal timeout = %s, must stay below 2s", guardianReadySignalTimeout)
+	}
+	if guardianReadySignalTimeout <= guardianStartupAuthorityLoadTimeout {
+		t.Fatalf("guardian ready signal timeout = %s, must exceed startup authority timeout %s", guardianReadySignalTimeout, guardianStartupAuthorityLoadTimeout)
+	}
+	if guardianAuthorityLoadTimeout <= guardianReadySignalTimeout {
+		t.Fatalf("guardian EOF authority timeout = %s, must exceed startup readiness timeout %s", guardianAuthorityLoadTimeout, guardianReadySignalTimeout)
 	}
 }
 
-func TestDarwinGuardianReadySignalWaitsPastPreviousFiveSecondBoundary(t *testing.T) {
+func TestDarwinGuardianLateReadinessFailsWithinStartupDeadline(t *testing.T) {
 	readyRead, readyWrite, err := os.Pipe()
 	if err != nil {
 		t.Fatalf("readiness pipe: %v", err)
@@ -201,22 +211,80 @@ func TestDarwinGuardianReadySignalWaitsPastPreviousFiveSecondBoundary(t *testing
 
 	writeDone := make(chan error, 1)
 	go func() {
-		time.Sleep(5500 * time.Millisecond)
+		time.Sleep(guardianReadySignalTimeout + 100*time.Millisecond)
 		_, err := readyWrite.Write([]byte{'1'})
 		writeDone <- err
 	}()
 
-	if err := waitGuardianReadySignal(cmd, readyRead); err != nil {
-		t.Fatalf("guardian readiness after previous 5s boundary: %v", err)
+	start := time.Now()
+	err = waitGuardianReadySignal(cmd, readyRead)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("guardian readiness succeeded after startup deadline")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("guardian readiness error = %v, want timeout", err)
+	}
+	if elapsed >= 2*time.Second {
+		t.Fatalf("guardian readiness blocked for %s, want under 2s", elapsed)
 	}
 	select {
 	case err := <-writeDone:
-		if err != nil {
-			t.Fatalf("write readiness token: %v", err)
+		if err == nil {
+			t.Fatal("late readiness token write unexpectedly succeeded")
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("readiness writer did not finish")
 	}
+}
+
+func TestDarwinGuardianStartupAuthorityLoadFailsWithinTwoSeconds(t *testing.T) {
+	cfg := guardianConfig{
+		SchemaVersion:  guardianSchema,
+		DiagnosticPath: filepath.Join(t.TempDir(), "guardian.jsonl"),
+	}
+	readFile, writeFile, readyRead, readyWrite := guardianTestPipes(t)
+	defer readFile.Close()
+	defer writeFile.Close()
+	defer readyRead.Close()
+
+	var killed atomic.Bool
+	done := make(chan int, 1)
+	go func() {
+		done <- runGuardianProcessWithFiles(cfg, readFile, readyWrite, func(ctx context.Context, _ guardianConfig) (storage.ProviderExecutionAuthority, error) {
+			<-ctx.Done()
+			return storage.ProviderExecutionAuthority{}, ctx.Err()
+		}, func(int) error {
+			killed.Store(true)
+			return nil
+		})
+	}()
+
+	start := time.Now()
+	select {
+	case err := <-readGuardianReadyToken(readyRead):
+		elapsed := time.Since(start)
+		if err == nil {
+			t.Fatal("guardian signaled readiness after startup authority load failure")
+		}
+		if elapsed >= 2*time.Second {
+			t.Fatalf("guardian startup readiness failure took %s, want under 2s", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("guardian startup readiness failure timed out")
+	}
+	select {
+	case code := <-done:
+		if code != 2 {
+			t.Fatalf("guardian exit code = %d, want 2", code)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("guardian did not finish after startup authority load failure")
+	}
+	if killed.Load() {
+		t.Fatal("guardian killed provider before startup authority retention")
+	}
+	assertGuardianDiagnostic(t, cfg.DiagnosticPath, "startup-failed")
 }
 
 func TestDarwinGuardianReadinessWaitsForAuthorityRetention(t *testing.T) {

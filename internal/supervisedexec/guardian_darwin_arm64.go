@@ -24,8 +24,9 @@ const (
 	guardianReadFD    = uintptr(3)
 	guardianReadyFD   = uintptr(4)
 
-	guardianAuthorityLoadTimeout = 8 * time.Second
-	guardianReadySignalTimeout   = guardianAuthorityLoadTimeout + time.Second
+	guardianStartupAuthorityLoadTimeout = 1 * time.Second
+	guardianAuthorityLoadTimeout        = 8 * time.Second
+	guardianReadySignalTimeout          = 1500 * time.Millisecond
 )
 
 type darwinGuardianHandle struct {
@@ -193,7 +194,7 @@ func runGuardianProcess() int {
 func runGuardianProcessWithFiles(cfg guardianConfig, readFile, readyFile *os.File, load guardianAuthorityLoader, kill guardianGroupKiller) int {
 	defer readyFile.Close()
 	authorityCache := newGuardianAuthorityCache()
-	loadCtx, cancelLoad := context.WithTimeout(context.Background(), guardianAuthorityLoadTimeout)
+	loadCtx, cancelLoad := context.WithTimeout(context.Background(), guardianStartupAuthorityLoadTimeout)
 	_, loadErr := retryGuardianAuthorityLoad(loadCtx, cfg, load, authorityCache)
 	cancelLoad()
 	if loadErr != nil {
