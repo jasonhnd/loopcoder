@@ -21,6 +21,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/mcp"
 	"github.com/jasonhnd/loopcoder/internal/pathid"
 	"github.com/jasonhnd/loopcoder/internal/progress"
+	"github.com/jasonhnd/loopcoder/internal/providerreconcile"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/runtimepath"
@@ -59,23 +60,24 @@ type Options struct {
 }
 
 type Result struct {
-	OK              bool             `json:"ok"`
-	Issue           int              `json:"issue"`
-	Branch          string           `json:"branch"`
-	RunID           string           `json:"run_id"`
-	PR              string           `json:"pr"`
-	Summary         string           `json:"summary"`
-	AttemptPath     string           `json:"attempt_path"`
-	Status          string           `json:"status"`
-	Outcome         string           `json:"outcome,omitempty"`
-	ProviderOutcome string           `json:"provider_outcome,omitempty"`
-	DeliveryOutcome string           `json:"delivery_outcome,omitempty"`
-	Evidence        []string         `json:"evidence,omitempty"`
-	ExitCode        int              `json:"exit_code"`
-	LogBytes        int64            `json:"log_bytes"`
-	Reason          string           `json:"reason,omitempty"`
-	NextAction      string           `json:"next_action,omitempty"`
-	Report          *reporter.Report `json:"report,omitempty"`
+	OK              bool                       `json:"ok"`
+	Issue           int                        `json:"issue"`
+	Branch          string                     `json:"branch"`
+	RunID           string                     `json:"run_id"`
+	PR              string                     `json:"pr"`
+	Summary         string                     `json:"summary"`
+	AttemptPath     string                     `json:"attempt_path"`
+	Status          string                     `json:"status"`
+	Outcome         string                     `json:"outcome,omitempty"`
+	ProviderOutcome string                     `json:"provider_outcome,omitempty"`
+	DeliveryOutcome string                     `json:"delivery_outcome,omitempty"`
+	Evidence        []string                   `json:"evidence,omitempty"`
+	ExitCode        int                        `json:"exit_code"`
+	LogBytes        int64                      `json:"log_bytes"`
+	Reason          string                     `json:"reason,omitempty"`
+	NextAction      string                     `json:"next_action,omitempty"`
+	Reconciliation  *providerreconcile.Receipt `json:"provider_reconciliation,omitempty"`
+	Report          *reporter.Report           `json:"report,omitempty"`
 }
 
 type Outcome string
@@ -206,6 +208,9 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 		fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: preflight branch PR lookup failed; continuing provider execution: %v\n", err)
 	} else if ok {
 		return adopted, nil
+	}
+	if decision := reconcileBeforeProviderLaunch(ctx, dispatch); decision.BlockRedispatch {
+		return providerReconciliationResult(dispatch, decision), nil
 	}
 	if err := prepareWorktree(ctx, dispatch); err != nil {
 		writeRecovery(ctx, dispatch, err)
@@ -967,6 +972,49 @@ func providerFailureResult(dispatch *dispatchContext, agentResult agent.Result, 
 		LogBytes:        fileSize(dispatch.logPath),
 		Reason:          "outcome=provider_failed evidence=" + reason,
 		NextAction:      "inspect the provider log and retry provider execution if appropriate",
+	}
+}
+
+func reconcileBeforeProviderLaunch(ctx context.Context, dispatch *dispatchContext) providerreconcile.Receipt {
+	attempts, err := state.LoadAttempts(dispatch.repoPath, dispatch.opts.RunID)
+	if err != nil {
+		now := dispatch.deps.Now()
+		return providerreconcile.Receipt{
+			SchemaVersion:   providerreconcile.SchemaVersion,
+			Issue:           dispatch.opts.IssueNumber,
+			RunID:           dispatch.opts.RunID,
+			Outcome:         providerreconcile.OutcomeAmbiguous,
+			Action:          providerreconcile.ActionNeedsHuman,
+			NeedsHuman:      true,
+			BlockRedispatch: true,
+			Reason:          "load attempts before provider reconciliation: " + err.Error(),
+			NextAction:      "request human review before launching another provider",
+			DecidedAt:       state.FormatTimestamp(now),
+			Evidence:        []string{"repo=" + dispatch.repoPath},
+		}
+	}
+	return providerreconcile.Check(ctx, providerreconcile.Options{
+		RepoPath: dispatch.repoPath,
+		RunID:    dispatch.opts.RunID,
+		Issue:    dispatch.opts.IssueNumber,
+		Attempts: attempts,
+		Now:      dispatch.deps.Now(),
+	})
+}
+
+func providerReconciliationResult(dispatch *dispatchContext, decision providerreconcile.Receipt) Result {
+	return Result{
+		OK:             false,
+		Issue:          dispatch.opts.IssueNumber,
+		Branch:         dispatch.opts.Branch,
+		RunID:          dispatch.opts.RunID,
+		Status:         state.StatusNeedsHuman,
+		Outcome:        string(OutcomeNeedsHuman),
+		Evidence:       append([]string{decision.JSONLine()}, decision.Evidence...),
+		ExitCode:       0,
+		Reason:         decision.Summary(),
+		NextAction:     decision.NextAction,
+		Reconciliation: &decision,
 	}
 }
 
