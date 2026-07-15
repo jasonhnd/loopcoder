@@ -109,17 +109,6 @@ func (cache *guardianAuthorityCache) cached() (storage.ProviderExecutionAuthorit
 	return cache.authority, cache.ok
 }
 
-func (cache *guardianAuthorityCache) load(ctx context.Context, cfg guardianConfig, load guardianAuthorityLoader) (storage.ProviderExecutionAuthority, error) {
-	if authority, ok := cache.cached(); ok {
-		return authority, nil
-	}
-	authority, err := retryGuardianAuthorityLoad(ctx, cfg, load, cache)
-	if err == nil {
-		return authority, nil
-	}
-	return storage.ProviderExecutionAuthority{}, err
-}
-
 func normalizeGuardianOptions(opts GuardianOptions) GuardianOptions {
 	opts.StorePath = strings.TrimSpace(opts.StorePath)
 	opts.DiagnosticPath = strings.TrimSpace(opts.DiagnosticPath)

@@ -17,7 +17,113 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
-func TestDarwinGuardianRetainedAuthorityKillsAfterSupervisorEOFLoaderContention(t *testing.T) {
+func TestDarwinGuardianSupervisorEOFRejectsAuthorityMutationAfterReadiness(t *testing.T) {
+	cmd, authority := startGuardianAuthorityProcess(t)
+	defer cmd.Wait()
+	defer terminateProcessGroup(cmd.Process.Pid)
+
+	cfg := guardianConfigForAuthority(t, authority)
+	readFile, writeFile, readyRead, readyWrite := guardianTestPipes(t)
+	defer readFile.Close()
+	defer writeFile.Close()
+	defer readyRead.Close()
+
+	var loadCalls atomic.Int32
+	loader := func(context.Context, guardianConfig) (storage.ProviderExecutionAuthority, error) {
+		if loadCalls.Add(1) == 1 {
+			return authority, nil
+		}
+		mutated := authority
+		mutated.OwnerID = "worker:run-guardian:job-guardian:recovery"
+		mutated.ClaimGeneration++
+		return mutated, nil
+	}
+	var killedPGID atomic.Int64
+	done := make(chan int, 1)
+	go func() {
+		done <- runGuardianProcessWithFiles(cfg, readFile, readyWrite, loader, func(pgid int) error {
+			killedPGID.Store(int64(pgid))
+			return nil
+		})
+	}()
+
+	waitGuardianReadyToken(t, readyRead)
+	if err := writeFile.Close(); err != nil {
+		t.Fatalf("close supervisor liveness pipe: %v", err)
+	}
+	select {
+	case code := <-done:
+		if code != 1 {
+			t.Fatalf("guardian exit code = %d, want 1", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("guardian did not finish after supervisor EOF")
+	}
+	if got := killedPGID.Load(); got != 0 {
+		t.Fatalf("killed PGID = %d, want no kill", got)
+	}
+	if got := loadCalls.Load(); got < 2 {
+		t.Fatalf("authority loader calls = %d, want fresh EOF reload", got)
+	}
+	if !process.Alive(authority.ProviderPID) {
+		t.Fatalf("provider pid %d was killed after authority mutation", authority.ProviderPID)
+	}
+	assertGuardianDiagnostic(t, cfg.DiagnosticPath, "skip")
+}
+
+func TestDarwinGuardianSupervisorEOFRetriesCurrentAuthorityBeforeKill(t *testing.T) {
+	cmd, authority := startGuardianAuthorityProcess(t)
+	defer cmd.Wait()
+	defer terminateProcessGroup(cmd.Process.Pid)
+
+	cfg := guardianConfigForAuthority(t, authority)
+	readFile, writeFile, readyRead, readyWrite := guardianTestPipes(t)
+	defer readFile.Close()
+	defer writeFile.Close()
+	defer readyRead.Close()
+
+	var loadCalls atomic.Int32
+	loader := func(context.Context, guardianConfig) (storage.ProviderExecutionAuthority, error) {
+		switch loadCalls.Add(1) {
+		case 1:
+			return authority, nil
+		case 2, 3:
+			return storage.ProviderExecutionAuthority{}, fmt.Errorf("configure sqlite: %w", context.DeadlineExceeded)
+		default:
+			return authority, nil
+		}
+	}
+	var killedPGID atomic.Int64
+	done := make(chan int, 1)
+	go func() {
+		done <- runGuardianProcessWithFiles(cfg, readFile, readyWrite, loader, func(pgid int) error {
+			killedPGID.Store(int64(pgid))
+			return nil
+		})
+	}()
+
+	waitGuardianReadyToken(t, readyRead)
+	if err := writeFile.Close(); err != nil {
+		t.Fatalf("close supervisor liveness pipe: %v", err)
+	}
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("guardian exit code = %d, want 0", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("guardian did not finish after supervisor EOF")
+	}
+	if got := killedPGID.Load(); got != int64(authority.ProviderPGID) {
+		t.Fatalf("killed PGID = %d, want %d", got, authority.ProviderPGID)
+	}
+	if got := loadCalls.Load(); got < 4 {
+		t.Fatalf("authority loader calls = %d, want transient EOF retries before kill", got)
+	}
+	assertGuardianDiagnostic(t, cfg.DiagnosticPath, "killed")
+}
+
+func TestDarwinGuardianSupervisorEOFFailsClosedWhenCurrentAuthorityUnreadable(t *testing.T) {
 	cmd, authority := startGuardianAuthorityProcess(t)
 	defer cmd.Wait()
 	defer terminateProcessGroup(cmd.Process.Pid)
@@ -50,19 +156,22 @@ func TestDarwinGuardianRetainedAuthorityKillsAfterSupervisorEOFLoaderContention(
 	}
 	select {
 	case code := <-done:
-		if code != 0 {
-			t.Fatalf("guardian exit code = %d, want 0", code)
+		if code != 1 {
+			t.Fatalf("guardian exit code = %d, want 1", code)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(guardianAuthorityLoadTimeout + 2*time.Second):
 		t.Fatal("guardian did not finish after supervisor EOF")
 	}
-	if got := killedPGID.Load(); got != int64(authority.ProviderPGID) {
-		t.Fatalf("killed PGID = %d, want %d", got, authority.ProviderPGID)
+	if got := killedPGID.Load(); got != 0 {
+		t.Fatalf("killed PGID = %d, want no kill", got)
 	}
-	if got := loadCalls.Load(); got != 1 {
-		t.Fatalf("authority loader calls = %d, want cached kill without EOF reload", got)
+	if got := loadCalls.Load(); got < 2 {
+		t.Fatalf("authority loader calls = %d, want bounded EOF reload attempts", got)
 	}
-	assertGuardianDiagnostic(t, cfg.DiagnosticPath, "killed")
+	if !process.Alive(authority.ProviderPID) {
+		t.Fatalf("provider pid %d was killed when authority was unreadable", authority.ProviderPID)
+	}
+	assertGuardianDiagnostic(t, cfg.DiagnosticPath, "skip")
 }
 
 func TestDarwinGuardianReadySignalTimeoutCoversAuthorityRetentionWindow(t *testing.T) {

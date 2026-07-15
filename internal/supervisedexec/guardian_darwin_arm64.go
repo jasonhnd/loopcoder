@@ -234,7 +234,7 @@ func runGuardianProcessWithFiles(cfg guardianConfig, readFile, readyFile *os.Fil
 		ctx, cancel := context.WithTimeout(context.Background(), guardianAuthorityLoadTimeout)
 		defer cancel()
 		event := guardianVerifyAndKill(ctx, cfg, func(ctx context.Context, cfg guardianConfig) (storage.ProviderExecutionAuthority, error) {
-			return authorityCache.load(ctx, cfg, load)
+			return retryGuardianAuthorityLoad(ctx, cfg, load, nil)
 		}, kill)
 		writeGuardianEvent(cfg.DiagnosticPath, event)
 		if event.Event == "killed" {
