@@ -228,8 +228,8 @@ func TestDarwinGuardianReapsProviderAfterSupervisorSIGKILL(t *testing.T) {
 			if raceBuildEnabled {
 				reapWithin = 10 * time.Second
 			}
-			waitNotAlive(t, ready.ProviderPID, reapWithin, "provider")
-			waitNotAlive(t, ready.GuardianPID, reapWithin, "guardian")
+			waitNotExecuting(t, ready.ProviderPID, reapWithin, "provider", diagPath)
+			waitNotExecuting(t, ready.GuardianPID, reapWithin, "guardian", diagPath)
 			assertGuardianDiagnostic(t, diagPath, "killed")
 		})
 	}
