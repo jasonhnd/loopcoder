@@ -35,6 +35,10 @@ func KillTree(pid int) error {
 	return err
 }
 
+func KillGroup(pgid int) error {
+	return KillTree(pgid)
+}
+
 func Alive(pid int) bool {
 	if pid <= 0 {
 		return false

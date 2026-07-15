@@ -260,6 +260,10 @@ func unsupportedPlatformNoSideEffectDeps(t *testing.T) Deps {
 			fail("KillProcessTree")
 			return errors.New("unexpected KillProcessTree")
 		},
+		KillProcessGroup: func(int) error {
+			fail("KillProcessGroup")
+			return errors.New("unexpected KillProcessGroup")
+		},
 		ProcessAuthority: func(int, time.Time) (string, error) {
 			fail("ProcessAuthority")
 			return "", errors.New("unexpected ProcessAuthority")
@@ -2353,7 +2357,7 @@ func TestStatusRendersLocalRunState(t *testing.T) {
 	for _, want := range []string{
 		"RUN STATUS",
 		"RunId: run-test (requested run)",
-		"| #101 | job-101-1 | not reported | codex | gpt-5.5 | parsed | high | write | 42s | 120 | 34 | 154 | true | codex_exited | succeeded |",
+		"| #101 | job-101-1 | not reported | codex | gpt-5.5 | parsed | high | write | 42s | 120 | 34 | 154 | true | not reported | not reported | not reported | not reported | not reported | not reported | not reported | codex_exited | succeeded |",
 		"status is read-only and local-only",
 	} {
 		if !strings.Contains(output, want) {

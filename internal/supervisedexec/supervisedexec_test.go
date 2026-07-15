@@ -2,6 +2,7 @@ package supervisedexec
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -89,6 +91,138 @@ func TestRunDarwinArm64ProviderAuthorityIdentifiesProviderProcessGroup(t *testin
 	}
 	if err := process.VerifySnapshot(identity); err == nil {
 		t.Fatalf("VerifySnapshot succeeded after sleep exited; fixture should not treat exited/PID-reused process as proof")
+	}
+}
+
+func TestGuardianVerifyAndKillRequiresCurrentAuthority(t *testing.T) {
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("macOS arm64 guardian authority fixture")
+	}
+	cmd, authority := startGuardianAuthorityProcess(t)
+	defer terminateProcessGroup(cmd.Process.Pid)
+	defer cmd.Wait()
+
+	cfg := guardianConfig{
+		SchemaVersion:   guardianSchema,
+		ProjectID:       authority.ProjectID,
+		RunID:           authority.RunID,
+		AttemptID:       authority.AttemptID,
+		OwnerID:         authority.OwnerID,
+		ClaimGeneration: authority.ClaimGeneration,
+	}
+	tests := []struct {
+		name       string
+		mutate     func(storage.ProviderExecutionAuthority) storage.ProviderExecutionAuthority
+		wantEvent  string
+		wantKilled bool
+	}{
+		{
+			name:       "current live authority kills process group",
+			wantEvent:  "killed",
+			wantKilled: true,
+		},
+		{
+			name: "completed authority is not killed",
+			mutate: func(a storage.ProviderExecutionAuthority) storage.ProviderExecutionAuthority {
+				a.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
+				a.TerminalState = "succeeded"
+				return a
+			},
+			wantEvent: "skip",
+		},
+		{
+			name: "authority generation change is not killed",
+			mutate: func(a storage.ProviderExecutionAuthority) storage.ProviderExecutionAuthority {
+				a.ClaimGeneration++
+				return a
+			},
+			wantEvent: "skip",
+		},
+		{
+			name: "pid reuse birth mismatch is not killed",
+			mutate: func(a storage.ProviderExecutionAuthority) storage.ProviderExecutionAuthority {
+				a.ProcessBirthIdentity = "different process birth identity"
+				return a
+			},
+			wantEvent: "skip",
+		},
+		{
+			name: "ambiguous identity is not killed",
+			mutate: func(a storage.ProviderExecutionAuthority) storage.ProviderExecutionAuthority {
+				a.IdentityAmbiguous = true
+				a.AmbiguityReason = "process-birth-identity-unavailable"
+				return a
+			},
+			wantEvent: "skip",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			candidate := authority
+			if tt.mutate != nil {
+				candidate = tt.mutate(candidate)
+			}
+			var killedPGID int
+			event := guardianVerifyAndKill(context.Background(), cfg, func(context.Context, guardianConfig) (storage.ProviderExecutionAuthority, error) {
+				return candidate, nil
+			}, func(pgid int) error {
+				killedPGID = pgid
+				return nil
+			})
+			if event.Event != tt.wantEvent {
+				t.Fatalf("event = %#v, want %q", event, tt.wantEvent)
+			}
+			if (killedPGID != 0) != tt.wantKilled {
+				t.Fatalf("killedPGID = %d, want killed=%v event=%#v", killedPGID, tt.wantKilled, event)
+			}
+			if tt.wantKilled && killedPGID != authority.ProviderPGID {
+				t.Fatalf("killed pgid = %d, want %d", killedPGID, authority.ProviderPGID)
+			}
+		})
+	}
+}
+
+func TestDarwinGuardianReapsProviderAfterSupervisorSIGKILL(t *testing.T) {
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("macOS arm64 guardian crash fixture")
+	}
+	const attempts = 100
+	for i := 0; i < attempts; i++ {
+		t.Run(fmt.Sprintf("attempt-%03d", i), func(t *testing.T) {
+			root := t.TempDir()
+			storePath := filepath.Join(root, "home", "data", "loopcoder.db")
+			diagPath := filepath.Join(root, "home", "logs", fmt.Sprintf("guardian-%03d.jsonl", i))
+			readyPath := filepath.Join(root, "ready.json")
+			ctx := context.Background()
+			store, err := storage.Open(ctx, storage.Options{Path: storePath})
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			seedGuardianProject(t, ctx, store, "proj-guardian", root)
+			if err := store.Close(); err != nil {
+				t.Fatalf("Close seed store: %v", err)
+			}
+
+			parent := helperCommand(t, "guardian-supervisor", storePath, diagPath, readyPath, strconv.Itoa(i))
+			if err := parent.Start(); err != nil {
+				t.Fatalf("start supervisor helper: %v", err)
+			}
+			ready := waitGuardianReady(t, readyPath)
+			if ready.ProviderPID <= 0 || ready.GuardianPID <= 0 {
+				t.Fatalf("ready = %#v, want provider and guardian pids", ready)
+			}
+			if !process.Alive(ready.ProviderPID) {
+				t.Fatalf("provider pid %d is not alive before crash", ready.ProviderPID)
+			}
+			if err := parent.Process.Kill(); err != nil {
+				t.Fatalf("kill supervisor: %v", err)
+			}
+			_ = parent.Wait()
+			waitNotAlive(t, ready.ProviderPID, 2*time.Second, "provider")
+			waitNotAlive(t, ready.GuardianPID, 2*time.Second, "guardian")
+			assertGuardianDiagnostic(t, diagPath, "killed")
+		})
 	}
 }
 
@@ -919,10 +1053,88 @@ func TestHelperProcess(t *testing.T) {
 		}
 		fmt.Println(args[0])
 		os.Exit(0)
+	case "guardian-supervisor":
+		runGuardianSupervisorHelper(args)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
 		os.Exit(2)
 	}
+}
+
+type guardianReadyRecord struct {
+	ProviderPID  int `json:"provider_pid"`
+	ProviderPGID int `json:"provider_pgid"`
+	GuardianPID  int `json:"guardian_pid"`
+}
+
+func runGuardianSupervisorHelper(args []string) {
+	if len(args) != 4 {
+		fmt.Fprintf(os.Stderr, "guardian-supervisor got %d args\n", len(args))
+		os.Exit(2)
+	}
+	storePath, diagPath, readyPath, suffix := args[0], args[1], args[2], args[3]
+	ctx := context.Background()
+	store, err := storage.Open(ctx, storage.Options{Path: storePath})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
+		os.Exit(2)
+	}
+	defer store.Close()
+	runID := "run-guardian-crash-" + suffix
+	attemptID := "job-guardian-crash-" + suffix
+	ownerID := "worker:" + runID + ":" + attemptID + ":1"
+	var started StartedProcess
+	cmd := helperCommandForProcess("sleep", "30s")
+	_, err = Run(ctx, cmd, Options{
+		HardCap: 35 * time.Second,
+		RunID:   runID,
+		Role:    "worker",
+		OnStart: func(process StartedProcess) error {
+			started = process
+			_, err := storage.PersistProviderExecutionAuthority(ctx, store, storage.ProviderExecutionAuthority{
+				ProjectID:            "proj-guardian",
+				RunID:                runID,
+				AttemptID:            attemptID,
+				ProviderPID:          process.PID,
+				ProviderPGID:         process.PGID,
+				ProcessBirthIdentity: process.ProcessBirthIdentity,
+				ExecutableIdentity:   process.ExecutableIdentity,
+				OwnerID:              ownerID,
+				ClaimGeneration:      1,
+				WorktreePath:         filepath.Dir(readyPath),
+				LogPath:              filepath.Join(filepath.Dir(readyPath), "provider.log"),
+				IdentityAmbiguous:    process.IdentityAmbiguous,
+				AmbiguityReason:      process.IdentityAmbiguityNote,
+			}, time.Now())
+			return err
+		},
+		Guardian: GuardianOptions{
+			Enabled:         true,
+			StorePath:       storePath,
+			DiagnosticPath:  diagPath,
+			ProjectID:       "proj-guardian",
+			RunID:           runID,
+			AttemptID:       attemptID,
+			OwnerID:         ownerID,
+			ClaimGeneration: 1,
+			OnStart: func(guardian GuardianProcess) error {
+				data, err := json.Marshal(guardianReadyRecord{
+					ProviderPID:  started.PID,
+					ProviderPGID: started.PGID,
+					GuardianPID:  guardian.PID,
+				})
+				if err != nil {
+					return err
+				}
+				return os.WriteFile(readyPath, data, 0o600)
+			},
+		},
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "guardian supervisor run: %v\n", err)
+		os.Exit(2)
+	}
+	os.Exit(0)
 }
 
 func helperCommand(t *testing.T, args ...string) *exec.Cmd {
@@ -1058,4 +1270,105 @@ func updateWorktreeActivity(worktreePath string, index int) {
 		fmt.Fprintf(os.Stderr, "chtimes activity: %v\n", err)
 		os.Exit(2)
 	}
+}
+
+func startGuardianAuthorityProcess(t *testing.T) (*exec.Cmd, storage.ProviderExecutionAuthority) {
+	t.Helper()
+	cmd := exec.Command("/bin/sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start authority process: %v", err)
+	}
+	identity, err := process.Snapshot(cmd.Process.Pid, time.Now())
+	if err != nil {
+		terminateProcessGroup(cmd.Process.Pid)
+		t.Fatalf("snapshot authority process: %v", err)
+	}
+	return cmd, storage.ProviderExecutionAuthority{
+		ProjectID:            "proj-guardian",
+		RunID:                "run-guardian",
+		AttemptID:            "job-guardian",
+		ProviderPID:          identity.PID,
+		ProviderPGID:         identity.PGID,
+		ProcessBirthIdentity: identity.ProcessBirthIdentity,
+		ExecutableIdentity:   identity.ExecutableIdentity,
+		OwnerID:              "worker:run-guardian:job-guardian:1",
+		ClaimGeneration:      1,
+		WorktreePath:         t.TempDir(),
+		LogPath:              filepath.Join(t.TempDir(), "provider.log"),
+		IdentityAmbiguous:    identity.Ambiguous,
+		AmbiguityReason:      identity.AmbiguityReason,
+	}
+}
+
+func terminateProcessGroup(pid int) {
+	if pid <= 0 {
+		return
+	}
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
+}
+
+func seedGuardianProject(t *testing.T, ctx context.Context, store storage.Store, projectID, projectPath string) {
+	t.Helper()
+	err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		_, err := tx.Exec(ctx, `INSERT INTO projects(
+				id, local_path, created_at, updated_at, local_path_canonical, git_root, identity_source
+			) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			projectID, projectPath, now, now, projectPath, projectPath, "test")
+		return err
+	})
+	if err != nil {
+		t.Fatalf("seed guardian project: %v", err)
+	}
+}
+
+func waitGuardianReady(t *testing.T, path string) guardianReadyRecord {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			var ready guardianReadyRecord
+			if err := json.Unmarshal(data, &ready); err != nil {
+				t.Fatalf("decode ready record: %v\n%s", err, string(data))
+			}
+			return ready
+		}
+		lastErr = err
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("ready record %s not written: %v", path, lastErr)
+	return guardianReadyRecord{}
+}
+
+func waitNotAlive(t *testing.T, pid int, timeout time.Duration, label string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !process.Alive(pid) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("%s pid %d still alive after %s", label, pid, timeout)
+}
+
+func assertGuardianDiagnostic(t *testing.T, path, wantEvent string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read guardian diagnostic: %v", err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var event guardianEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("decode guardian diagnostic line %q: %v", line, err)
+		}
+		if event.Event == wantEvent {
+			return
+		}
+	}
+	t.Fatalf("guardian diagnostic missing event %q:\n%s", wantEvent, string(data))
 }

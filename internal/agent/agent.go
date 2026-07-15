@@ -10,6 +10,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
 type Invocation struct {
@@ -25,6 +26,7 @@ type Invocation struct {
 	StallTimeout    time.Duration
 	LivenessMode    string
 	LivenessCommand string
+	Guardian        supervisedexec.GuardianOptions
 	// RunID and Role tag the spawned provider process as loopcoder-managed and
 	// place it in a per-run kill-group (spec 0390, Decision 11).
 	RunID string

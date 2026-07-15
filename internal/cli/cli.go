@@ -105,6 +105,7 @@ type Deps struct {
 	LeaseRelease                func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
 	StartDetachedDispatch       func(ctx context.Context, args []string, logPath string) (int, error)
 	KillProcessTree             func(pid int) error
+	KillProcessGroup            func(pgid int) error
 	ProcessAuthority            func(pid int, observedAt time.Time) (string, error)
 	VerifyProcessAuthority      func(pid int, authority string) error
 	DetachedSupervisorCadence   time.Duration
@@ -276,6 +277,7 @@ func DefaultDeps() Deps {
 		},
 		StartDetachedDispatch:  startDetachedDispatchProcess,
 		KillProcessTree:        process.KillTree,
+		KillProcessGroup:       process.KillGroup,
 		ProcessAuthority:       process.Authority,
 		VerifyProcessAuthority: process.VerifyAuthority,
 	}

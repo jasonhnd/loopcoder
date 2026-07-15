@@ -438,6 +438,7 @@ func buildInvocation(ctx context.Context, dispatch *dispatchContext) (agent.Invo
 		StallTimeout:    config.DurationSeconds(resilience.Worker.StallTimeoutSeconds, WorkerStallTimeout),
 		LivenessMode:    domainPolicy.AgentLivenessMode(),
 		LivenessCommand: domainPolicy.LivenessCommand,
+		Guardian:        providerGuardianOptions(dispatch),
 		RunID:           dispatch.opts.RunID,
 		ProviderKey:     dispatch.opts.ProviderKey,
 		Role:            "worker",
@@ -452,6 +453,22 @@ func buildInvocation(ctx context.Context, dispatch *dispatchContext) (agent.Invo
 			return nil
 		},
 	}, nil
+}
+
+func providerGuardianOptions(dispatch *dispatchContext) supervisedexec.GuardianOptions {
+	if dispatch == nil || dispatch.ownershipLease == nil || dispatch.runtimeRoots.DatabasePath == "" || dispatch.runtimeRoots.ProjectID == "" {
+		return supervisedexec.GuardianOptions{}
+	}
+	return supervisedexec.GuardianOptions{
+		Enabled:         true,
+		StorePath:       dispatch.runtimeRoots.DatabasePath,
+		DiagnosticPath:  filepath.Join(dispatch.runtimeRoots.LogsRoot, dispatch.opts.RunID, dispatch.jobID+"-guardian.jsonl"),
+		ProjectID:       dispatch.runtimeRoots.ProjectID,
+		RunID:           dispatch.opts.RunID,
+		AttemptID:       dispatch.jobID,
+		OwnerID:         dispatch.ownershipLease.OwnerID,
+		ClaimGeneration: dispatch.ownershipLease.ClaimGeneration,
+	}
 }
 
 func runAgent(ctx context.Context, dispatch *dispatchContext, invocation agent.Invocation) (agent.Result, error) {
