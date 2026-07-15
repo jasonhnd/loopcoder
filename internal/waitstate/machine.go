@@ -225,6 +225,12 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 			}
 		}
 	}
+	// A completed observation is authoritative across restart. In particular, a
+	// host that reconnects after the original deadline must not replace a
+	// checkpointed success or failure with a newly synthesized timeout.
+	if reason := completedSnapshotStopReason(snapshot); reason != "" {
+		return finish(reason, nil)
+	}
 
 	startedAt, _ := time.Parse(time.RFC3339Nano, snapshot.StartedAt)
 	deadline := startedAt.Add(policy.Timeout)
@@ -521,7 +527,7 @@ func nextDelay(policy Policy, waitID string, attempt int, retryAfter time.Durati
 	percent := int(h.Sum32()%uint32(span)) - policy.JitterPercent
 	jittered := delay + time.Duration(int64(delay)*int64(percent)/100)
 	if jittered < policy.MinPollInterval {
-		return policy.MinPollInterval
+		jittered = policy.MinPollInterval
 	}
 	if jittered > policy.MaxPollInterval {
 		jittered = policy.MaxPollInterval
@@ -530,6 +536,19 @@ func nextDelay(policy Policy, waitID string, attempt int, retryAfter time.Durati
 		return retryAfter
 	}
 	return jittered
+}
+
+func completedSnapshotStopReason(snapshot Snapshot) string {
+	if snapshot.LastState != StateReady && snapshot.LastState != StateTerminal {
+		return ""
+	}
+	if snapshot.LastCode == "wait-timeout" {
+		return StopTimeout
+	}
+	if snapshot.PendingWake != nil && snapshot.PendingWake.Reason == StopTimeout {
+		return StopTimeout
+	}
+	return StopTransition
 }
 
 func normalizeObservation(obs Observation) Observation {

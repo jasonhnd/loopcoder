@@ -142,6 +142,41 @@ func TestDuplicateTransitionProducesAtMostOneWakeDecisionAcrossRestart(t *testin
 	}
 }
 
+func TestCompletedSnapshotSurvivesRestartAfterDeadline(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 16, 2, 30, 0, 0, time.UTC)}
+	first, err := Run(context.Background(), Options{
+		Kind: KindDetachedWorker, WaitID: "worker-completed", Clock: clock, Policy: fastPolicy(),
+		Probe: func(context.Context) (Observation, error) {
+			return Observation{EventID: "worker-succeeded", State: StateTerminal, Code: "worker-succeeded", Consequential: true, Terminal: true}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	if first.Snapshot.PendingWake == nil {
+		t.Fatal("first Run did not preserve the disconnected-host wake")
+	}
+	wantDecision := first.Snapshot.LastDecisionKey
+	clock.now = clock.now.Add(2 * time.Minute)
+	probes := 0
+	second, err := Run(context.Background(), Options{
+		Kind: KindDetachedWorker, WaitID: "worker-completed", Clock: clock, Policy: fastPolicy(), Initial: first.Snapshot,
+		Probe: func(context.Context) (Observation, error) {
+			probes++
+			return Observation{}, errors.New("completed snapshot must not be probed")
+		},
+	})
+	if err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if probes != 0 || second.StopReason != StopTransition || second.Snapshot.LastCode != "worker-succeeded" {
+		t.Fatalf("second report = %#v, probes=%d", second, probes)
+	}
+	if second.Snapshot.LastDecisionKey != wantDecision || second.Snapshot.PendingWake == nil {
+		t.Fatalf("terminal decision was replaced across restart: %#v", second.Snapshot)
+	}
+}
+
 func TestWakeDecisionIsCheckpointedBeforeDelivery(t *testing.T) {
 	clock := &fakeClock{now: time.Date(2026, 7, 16, 5, 0, 0, 0, time.UTC)}
 	checkpointed := false
@@ -274,6 +309,17 @@ func TestRetryAfterIsProbeLowerBoundWhileReceiptsContinue(t *testing.T) {
 	}
 	if probes != 2 || receipts != 3 || clock.now.Sub(start) != 10*time.Minute {
 		t.Fatalf("probes=%d receipts=%d elapsed=%s, want 2/3/10m", probes, receipts, clock.now.Sub(start))
+	}
+}
+
+func TestRetryAfterRemainsLowerBoundUnderNegativeJitter(t *testing.T) {
+	policy := DefaultPolicy()
+	retryAfter := 10 * time.Minute
+	for i := 0; i < 1000; i++ {
+		waitID := fmt.Sprintf("jitter-wait-%d", i)
+		if delay := nextDelay(policy, waitID, 0, retryAfter); delay < retryAfter {
+			t.Fatalf("nextDelay(%q) = %s, want >= Retry-After %s", waitID, delay, retryAfter)
+		}
 	}
 }
 
