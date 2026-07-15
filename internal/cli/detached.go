@@ -18,7 +18,9 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/detachedrun"
 	"github.com/jasonhnd/loopcoder/internal/process"
 	"github.com/jasonhnd/loopcoder/internal/progress"
+	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/runtimepath"
+	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/worker"
 )
@@ -36,6 +38,7 @@ type detachedLaunchRecord struct {
 	PID            int    `json:"pid,omitempty"`
 	StatusCommand  string `json:"status_command"`
 	AttachCommand  string `json:"attach_command"`
+	CancelCommand  string `json:"cancel_command"`
 }
 
 func runDetachedDispatch(opts worker.Options, format string, stdout, stderr io.Writer, deps Deps) int {
@@ -113,8 +116,9 @@ func runDetachedDispatch(opts worker.Options, format string, stdout, stderr io.W
 		PID:            spawned.ProcessPID,
 		StatusCommand:  detachedFenceCommand("loopcoder status --receipts", spawned),
 		AttachCommand:  detachedFenceCommand("loopcoder attach", spawned),
+		CancelCommand:  detachedFenceCommand("loopcoder cancel", spawned),
 	}
-	if format == "json" {
+	if format == "json" || format == "jsonl" {
 		if err := writeJSONLine(stdout, record); err != nil {
 			fmt.Fprintf(stderr, "dispatch: write detached output: %v\n", err)
 			return 1
@@ -125,7 +129,107 @@ func runDetachedDispatch(opts worker.Options, format string, stdout, stderr io.W
 	fmt.Fprintf(stdout, "supervisor: %s generation %d pid %d\n", record.Owner, record.Generation, record.PID)
 	fmt.Fprintf(stdout, "status: %s\n", record.StatusCommand)
 	fmt.Fprintf(stdout, "attach: %s\n", record.AttachCommand)
+	fmt.Fprintf(stdout, "cancel: %s\n", record.CancelCommand)
 	return 0
+}
+
+func runDetachedCommand(repoPath, runID, command, format string, commandArgs []string, stdout, stderr io.Writer, deps Deps) int {
+	ctx := context.Background()
+	now := normalizedDepsNow(deps)().UTC()
+	store, roots, err := openDetachedStore(ctx, repoPath, deps)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s: %v\n", command, err)
+		return 1
+	}
+	defer store.Close()
+
+	if strings.TrimSpace(runID) == "" {
+		runID = state.RunIDForWave(now)
+	}
+	owner := detachedOwner(runID, now)
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:           roots.ProjectID,
+		RunID:               runID,
+		Owner:               owner,
+		LeaseExpiresAt:      now.Add(detachedLeaseDuration(worker.Options{})),
+		DeliverySinks:       []string{"progress_receipts", "progress_delivery_outbox", "local_relay_ledger"},
+		CancellationChannel: "detached-run:" + runID,
+		WorkerLease: map[string]any{
+			"authority": "agent_ownership_locks",
+			"scope":     command,
+		},
+		RecoveryEvidence: []detachedrun.Evidence{{
+			Kind:       "durable-claim",
+			ID:         runID,
+			Summary:    "detached supervisor claim persisted before launch success",
+			Confidence: "exact",
+		}},
+		Payload: map[string]any{
+			"command": command,
+			"args":    append([]string(nil), commandArgs...),
+		},
+		Now: now,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "%s: claim detached supervisor: %v\n", command, err)
+		return 1
+	}
+
+	logPath := filepath.Join(roots.LogsRoot, runID, "detached-supervisor.log")
+	args := detachedSuperviseArgs(repoPath, claim.Fence(), command, commandArgs)
+	spawned, err := launchDetachedCommandSupervisorProcess(ctx, store, command, args, claim.Fence(), logPath, stderr, deps)
+	if err != nil {
+		return 1
+	}
+	record := detachedLaunchRecord{
+		SchemaVersion:  "loopcoder.detached_launch.v1",
+		Detached:       true,
+		RunID:          spawned.RunID,
+		ProjectID:      spawned.ProjectID,
+		Owner:          spawned.Owner,
+		Generation:     spawned.Generation,
+		LeaseExpiresAt: spawned.LeaseExpiresAt,
+		LaunchPhase:    spawned.LaunchPhase,
+		Status:         spawned.Status,
+		PID:            spawned.ProcessPID,
+		StatusCommand:  detachedFenceCommand("loopcoder status --receipts", spawned),
+		AttachCommand:  detachedFenceCommand("loopcoder attach", spawned),
+		CancelCommand:  detachedFenceCommand("loopcoder cancel", spawned),
+	}
+	if format == "json" || format == "jsonl" {
+		if err := writeJSONLine(stdout, record); err != nil {
+			fmt.Fprintf(stderr, "%s: write detached output: %v\n", command, err)
+			return 1
+		}
+		return 0
+	}
+	fmt.Fprintf(stdout, "detached run: %s\n", record.RunID)
+	fmt.Fprintf(stdout, "supervisor: %s generation %d pid %d\n", record.Owner, record.Generation, record.PID)
+	fmt.Fprintf(stdout, "status: %s\n", record.StatusCommand)
+	fmt.Fprintf(stdout, "attach: %s\n", record.AttachCommand)
+	fmt.Fprintf(stdout, "cancel: %s\n", record.CancelCommand)
+	return 0
+}
+
+func persistDetachedReadySetInput(repoPath, runID string, readySet report.ReadySetReport, deps Deps) (string, error) {
+	roots, err := runtimepath.Resolve(context.Background(), repoPath)
+	if err != nil {
+		return "", err
+	}
+	inputDir := filepath.Join(roots.LogsRoot, strings.TrimSpace(runID))
+	if err := os.MkdirAll(inputDir, 0o700); err != nil {
+		return "", err
+	}
+	path := filepath.Join(inputDir, "ready-set.json")
+	data, err := json.Marshal(readySet)
+	if err != nil {
+		return "", err
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func runDispatchSupervisor(opts worker.Options, fence detachedrun.Fence, deps Deps) int {
@@ -569,6 +673,149 @@ func launchDetachedSupervisor(ctx context.Context, store storage.Store, opts wor
 	return spawned, nil
 }
 
+func launchDetachedCommandSupervisorProcess(ctx context.Context, store storage.Store, command string, args []string, fence detachedrun.Fence, logPath string, stderr io.Writer, deps Deps) (detachedrun.Record, error) {
+	start := deps.StartDetachedDispatch
+	if start == nil {
+		start = startDetachedDispatchProcess
+	}
+	pid, err := start(ctx, args, logPath)
+	if err != nil {
+		_, _ = detachedrun.Complete(ctx, store, fence, detachedrun.StatusFailed, "", "spawn-failed", err.Error(), normalizedDepsNow(deps)().UTC())
+		fmt.Fprintf(stderr, "%s: start detached supervisor: %v\n", command, err)
+		return detachedrun.Record{}, err
+	}
+	authorityFunc := deps.ProcessAuthority
+	if authorityFunc == nil {
+		authorityFunc = process.Authority
+	}
+	observedAt := normalizedDepsNow(deps)().UTC()
+	authority, authorityErr := authorityFunc(pid, observedAt)
+	if authorityErr != nil {
+		kill := deps.KillProcessTree
+		if kill == nil {
+			kill = process.KillTree
+		}
+		if killErr := kill(pid); killErr != nil {
+			_, _ = detachedrun.Complete(ctx, store, fence, detachedrun.StatusNeedsHuman, "", "spawn-authority-ambiguous", killErr.Error(), observedAt)
+		} else {
+			_, _ = detachedrun.Complete(ctx, store, fence, detachedrun.StatusNeedsHuman, "", "spawn-authority-unverified", authorityErr.Error(), observedAt)
+		}
+		fmt.Fprintf(stderr, "%s: verify detached spawn authority: %v\n", command, authorityErr)
+		return detachedrun.Record{}, authorityErr
+	}
+	spawned, err := detachedrun.MarkSpawned(ctx, store, fence, pid, authority, observedAt)
+	if err != nil {
+		kill := deps.KillProcessTree
+		if kill == nil {
+			kill = process.KillTree
+		}
+		if killErr := kill(pid); killErr != nil {
+			_, _ = detachedrun.Complete(ctx, store, fence, detachedrun.StatusNeedsHuman, "", "spawn-marker-ambiguous", killErr.Error(), normalizedDepsNow(deps)().UTC())
+		} else {
+			_, _ = detachedrun.Complete(ctx, store, fence, detachedrun.StatusNeedsHuman, "", "spawn-marker-failed", err.Error(), normalizedDepsNow(deps)().UTC())
+		}
+		fmt.Fprintf(stderr, "%s: persist detached spawn: %v\n", command, err)
+		return detachedrun.Record{}, err
+	}
+	return spawned, nil
+}
+
+func runDetachedCommandSupervisor(args []string, stdout, stderr io.Writer, deps Deps) int {
+	fs := flag.NewFlagSet("supervise", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var repoPath string
+	var runID string
+	var supervisorOwner string
+	var supervisorGeneration int64
+	fs.StringVar(&repoPath, "repo", "", "repository path")
+	fs.StringVar(&runID, "run", "", "run id")
+	fs.StringVar(&supervisorOwner, "supervisor-owner", "", "detached supervisor owner")
+	fs.Int64Var(&supervisorGeneration, "supervisor-generation", 0, "detached supervisor generation")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	commandArgs := fs.Args()
+	if len(commandArgs) == 0 {
+		fmt.Fprintln(stderr, "supervise: command is required")
+		return 2
+	}
+	command := commandArgs[0]
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "supervise: %v\n", err)
+		return 2
+	}
+	fence, _, ok := detachedCommandFence("supervise", runID, supervisorOwner, supervisorGeneration, "", stderr)
+	if !ok {
+		return 2
+	}
+	ctx := context.Background()
+	now := normalizedDepsNow(deps)
+	store, _, err := openDetachedStore(ctx, resolvedRepo, deps)
+	if err != nil {
+		fmt.Fprintf(stderr, "supervise: %v\n", err)
+		return 1
+	}
+	defer store.Close()
+	if _, err := detachedrun.MarkWorkerStarted(ctx, store, fence, now().UTC()); err != nil {
+		fmt.Fprintf(stderr, "supervise: mark started: %v\n", err)
+		return 1
+	}
+	record, err := detachedrun.Get(ctx, store, fence.RunID)
+	if err != nil {
+		fmt.Fprintf(stderr, "supervise: read started record: %v\n", err)
+		return 1
+	}
+	if _, err := persistDetachedReceipt(ctx, store, record, "detached-worker-started", detachedrun.StatusRunning, false, now().UTC()); err != nil {
+		_, _ = detachedrun.Complete(ctx, store, fence, detachedrun.StatusNeedsHuman, "", "worker-started-receipt-failed", err.Error(), now().UTC())
+		fmt.Fprintf(stderr, "supervise: persist started receipt: %v\n", err)
+		return 1
+	}
+	superviseCtx, cancelSupervise := context.WithCancel(ctx)
+	cadence, err := startDetachedSupervisorCadence(superviseCtx, store, worker.Options{RepoPath: resolvedRepo, RunID: fence.RunID}, fence, deps, cancelSupervise)
+	if err != nil {
+		cancelSupervise()
+		_, _ = detachedrun.Complete(ctx, store, fence, detachedrun.StatusNeedsHuman, "", "cadence-start-failed", err.Error(), now().UTC())
+		fmt.Fprintf(stderr, "supervise: start cadence: %v\n", err)
+		return 1
+	}
+	exitCode := RunWithDeps(commandArgs, stdout, stderr, Deps{})
+	cancelSupervise()
+	cadenceErr := cadence.Stop()
+	terminalStatus := detachedrun.StatusSucceeded
+	errorCode := ""
+	errorMessage := ""
+	if exitCode != 0 {
+		terminalStatus = detachedrun.StatusFailed
+		errorCode = "command-failed"
+		errorMessage = fmt.Sprintf("%s exited with code %d", command, exitCode)
+	}
+	if cadenceErr != nil {
+		terminalStatus = detachedrun.StatusNeedsHuman
+		errorCode = "supervisor-cadence-failed"
+		errorMessage = cadenceErr.Error()
+	}
+	latest, getErr := detachedrun.Get(ctx, store, fence.RunID)
+	if getErr != nil {
+		fmt.Fprintf(stderr, "supervise: read terminal record: %v\n", getErr)
+		return 1
+	}
+	terminalReceiptID, receiptErr := persistDetachedReceipt(ctx, store, latest, "detached-terminal", terminalStatus, true, now().UTC())
+	if receiptErr != nil {
+		terminalStatus = detachedrun.StatusNeedsHuman
+		errorCode = "terminal-receipt-failed"
+		errorMessage = receiptErr.Error()
+	}
+	if _, err := detachedrun.Complete(ctx, store, fence, terminalStatus, terminalReceiptID, errorCode, errorMessage, now().UTC()); err != nil {
+		fmt.Fprintf(stderr, "supervise: complete: %v\n", err)
+		return 1
+	}
+	if exitCode != 0 || cadenceErr != nil || receiptErr != nil {
+		return 1
+	}
+	return 0
+}
+
 type detachedSupervisorCadence struct {
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -701,6 +948,20 @@ func detachedFenceCommand(prefix string, record detachedrun.Record) string {
 		shellQuote(record.RunID),
 		shellQuote(record.Owner),
 		record.Generation)
+}
+
+func detachedSuperviseArgs(repoPath string, fence detachedrun.Fence, command string, commandArgs []string) []string {
+	args := []string{
+		"supervise",
+		"--repo", repoPath,
+		"--run", fence.RunID,
+		"--supervisor-owner", fence.Owner,
+		"--supervisor-generation", fmt.Sprint(fence.Generation),
+		"--",
+		command,
+	}
+	args = append(args, commandArgs...)
+	return args
 }
 
 func detachedDispatchArgs(opts worker.Options, fence detachedrun.Fence, issueBodyFile string) []string {

@@ -25,6 +25,7 @@ import (
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/detachedrun"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
+	"github.com/jasonhnd/loopcoder/internal/hostprofile"
 	"github.com/jasonhnd/loopcoder/internal/inspect"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	localmigrate "github.com/jasonhnd/loopcoder/internal/migrate"
@@ -409,6 +410,10 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return renderUnsupportedPlatform(err, args, stdout, stderr)
 	}
 
+	if args[0] == "supervise" {
+		return runDetachedCommandSupervisor(args[1:], stdout, stderr, deps)
+	}
+
 	command, ok := findCommand(args[0])
 	if !ok {
 		fmt.Fprintf(stderr, "unknown command %q\n\n", args[0])
@@ -689,6 +694,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --config-from-base          read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintln(w, "  --keep-worktree             preserve the scratch worktree and logs")
 		fmt.Fprintln(w, "  --detach                    launch a bounded detached supervisor and return a run record")
+		fmt.Fprintln(w, "  --foreground                run in the foreground instead of detached supervision")
 		fmt.Fprintln(w, "  --format string             output format: text, json, or jsonl (default \"text\")")
 		fmt.Fprintln(w, "  --verbose                   include raw canonical records in text output")
 		fmt.Fprintln(w, "  --pretty                    force emoji pretty report on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
@@ -808,6 +814,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --strict                         reject invalid model/depth selections instead of warning")
 		fmt.Fprintf(w, "  --throttle-limit int             maximum concurrent dispatches (default %d)\n", lcdefaults.DispatchWaveThrottleLimit)
 		fmt.Fprintln(w, "  --config-from-base               read .delivery.yml from base branch when absent from working tree")
+		fmt.Fprintln(w, "  --detach                         launch a bounded detached supervisor and return a run record")
+		fmt.Fprintln(w, "  --foreground                     run in the foreground instead of detached supervision")
 		fmt.Fprintln(w, "  --format string                  output format: text, json, or jsonl (default \"json\")")
 		fmt.Fprintln(w, "  --pretty                         force emoji pretty reports on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty                      suppress pretty reports on stderr (LOOPCODER_NO_PRETTY)")
@@ -937,6 +945,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --strict                   reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base         read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintf(w, "  --throttle-limit int       maximum concurrent dispatches (default %d)\n", lcdefaults.DispatchWaveThrottleLimit)
+		fmt.Fprintln(w, "  --detach                   launch a bounded detached supervisor and return a run record")
+		fmt.Fprintln(w, "  --foreground               run in the foreground instead of detached supervision")
 		fmt.Fprintln(w, "  --format string            output format: text, json, or jsonl (default \"text\")")
 		fmt.Fprintln(w, "  --verbose                  include raw wave report details in text output")
 		fmt.Fprintln(w, "  --pretty                   force emoji pretty reports on stdout (LOOPCODER_PRETTY; default is stdout, plain on non-TTY)")
@@ -2639,6 +2649,10 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var prettyAlias bool
 	var noPretty bool
 	var noPrettyAlias bool
+	var detach bool
+	var detachAlias bool
+	var foreground bool
+	var foregroundAlias bool
 	outputFormat := "json"
 	var outputFormatAlias string
 
@@ -2674,6 +2688,10 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable reports on stderr")
 	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable reports on stderr")
 	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable reports on stderr")
+	fs.BoolVar(&detach, "detach", false, "launch detached supervisor")
+	fs.BoolVar(&detachAlias, "Detach", false, "launch detached supervisor")
+	fs.BoolVar(&foreground, "foreground", false, "run in the foreground instead of detached supervision")
+	fs.BoolVar(&foregroundAlias, "Foreground", false, "run in the foreground instead of detached supervision")
 	fs.StringVar(&outputFormat, "format", "json", "output format")
 	fs.StringVar(&outputFormatAlias, "Format", "", "output format")
 
@@ -2722,6 +2740,8 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	strict = strict || strictAlias
 	pretty = pretty || prettyAlias
 	noPretty = noPretty || noPrettyAlias
+	detach = detach || detachAlias
+	foreground = foreground || foregroundAlias
 	if outputFormatAlias != "" {
 		outputFormat = outputFormatAlias
 	}
@@ -2747,6 +2767,10 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if verifierTimeout <= 0 {
 		fmt.Fprintln(stderr, "tick: --verifier-timeout must be positive")
+		return 2
+	}
+	if detach && foreground {
+		fmt.Fprintln(stderr, "tick: choose only one of --detach or --foreground")
 		return 2
 	}
 
@@ -2818,6 +2842,22 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		Verifier: verifierProvider,
 	}); warning != "" {
 		fmt.Fprintf(stderr, "[loopcoder] warning: %s\n", warning)
+	}
+
+	if !detach && !foreground {
+		defaultDetached, err := shouldDefaultDetachedForHost(cfg, stdout, stderr, deps)
+		if err != nil {
+			fmt.Fprintf(stderr, "tick: %v\n", err)
+			return 2
+		}
+		detach = defaultDetached
+	}
+	if detach {
+		if strings.TrimSpace(runID) == "" {
+			runID = state.RunIDForWave(deps.Now())
+		}
+		childArgs := childArgsWithDetachedForeground(args, runID)
+		return runDetachedCommand(resolvedRepo, runID, "tick", outputFormat, childArgs, stdout, stderr, deps)
 	}
 
 	progressRecorder, stopProgress := progressSupervisorForRegisteredRepo(context.Background(), resolvedRepo, runID, deps.Now, stderr)
@@ -4351,6 +4391,8 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var noPrettyAlias bool
 	var detach bool
 	var detachAlias bool
+	var foreground bool
+	var foregroundAlias bool
 	var supervisorRun bool
 	var supervisorOwner string
 	var supervisorGeneration int64
@@ -4395,6 +4437,8 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.BoolVar(&keepWorktreeAlias, "KeepWorktree", false, "keep worktree")
 	fs.BoolVar(&detach, "detach", false, "launch detached supervisor")
 	fs.BoolVar(&detachAlias, "Detach", false, "launch detached supervisor")
+	fs.BoolVar(&foreground, "foreground", false, "run in the foreground instead of detached supervision")
+	fs.BoolVar(&foregroundAlias, "Foreground", false, "run in the foreground instead of detached supervision")
 	fs.BoolVar(&supervisorRun, "supervisor-run", false, "run as detached supervisor child")
 	fs.StringVar(&supervisorOwner, "supervisor-owner", "", "detached supervisor owner")
 	fs.Int64Var(&supervisorGeneration, "supervisor-generation", 0, "detached supervisor generation")
@@ -4464,6 +4508,7 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	opts.ConfigFromBase = opts.ConfigFromBase || configFromBaseAlias
 	opts.KeepWorktree = opts.KeepWorktree || keepWorktreeAlias
 	detach = detach || detachAlias
+	foreground = foreground || foregroundAlias
 	strict = strict || strictAlias
 	pretty = pretty || prettyAlias
 	noPretty = noPretty || noPrettyAlias
@@ -4498,6 +4543,10 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if detach && supervisorRun {
 		fmt.Fprintln(stderr, "dispatch: --detach cannot be combined with --supervisor-run")
+		return 2
+	}
+	if detach && foreground {
+		fmt.Fprintln(stderr, "dispatch: choose only one of --detach or --foreground")
 		return 2
 	}
 
@@ -4537,6 +4586,18 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	opts.Provider = selection.Provider
 	opts.Model = selection.Model
 	opts.Effort = selection.Effort
+
+	if !detach && !foreground && !supervisorRun {
+		defaultDetached, err := shouldDefaultDetachedForHost(cfg, stdout, stderr, deps)
+		if err != nil {
+			fmt.Fprintf(stderr, "dispatch: %v\n", err)
+			return 2
+		}
+		detach = defaultDetached
+	}
+	if detach && strings.TrimSpace(opts.RunID) == "" {
+		opts.RunID = state.RunIDForIssue(opts.IssueNumber, deps.Now())
+	}
 
 	if err := replayCurrentHostProgressBeforeDispatch(context.Background(), opts.RepoPath, opts.RunID, stderr, deps); err != nil {
 		fmt.Fprintf(stderr, "dispatch: replay host progress: %v\n", err)
@@ -5199,6 +5260,10 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var prettyAlias bool
 	var noPretty bool
 	var noPrettyAlias bool
+	var detach bool
+	var detachAlias bool
+	var foreground bool
+	var foregroundAlias bool
 	format := "text"
 	var formatAlias string
 	var verbose bool
@@ -5234,6 +5299,10 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable report on stderr")
 	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable report on stderr")
 	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable report on stderr")
+	fs.BoolVar(&detach, "detach", false, "launch detached supervisor")
+	fs.BoolVar(&detachAlias, "Detach", false, "launch detached supervisor")
+	fs.BoolVar(&foreground, "foreground", false, "run in the foreground instead of detached supervision")
+	fs.BoolVar(&foregroundAlias, "Foreground", false, "run in the foreground instead of detached supervision")
 	fs.StringVar(&format, "format", "text", "output format")
 	fs.StringVar(&formatAlias, "Format", "", "output format")
 	fs.BoolVar(&verbose, "verbose", false, "include raw verifier JSON and report header")
@@ -5277,6 +5346,8 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	pretty = pretty || prettyAlias
 	noPretty = noPretty || noPrettyAlias
+	detach = detach || detachAlias
+	foreground = foreground || foregroundAlias
 	if formatAlias != "" {
 		format = formatAlias
 	}
@@ -5296,6 +5367,10 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if timeout < 0 {
 		fmt.Fprintln(stderr, "dispatch-wave: --timeout must not be negative")
+		return 2
+	}
+	if detach && foreground {
+		fmt.Fprintln(stderr, "dispatch-wave: choose only one of --detach or --foreground")
 		return 2
 	}
 
@@ -5380,6 +5455,30 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	provider = selection.Provider
 	model = selection.Model
 	effort = selection.Effort
+
+	if !detach && !foreground {
+		defaultDetached, err := shouldDefaultDetachedForHost(cfg, stdout, stderr, deps)
+		if err != nil {
+			fmt.Fprintf(stderr, "dispatch-wave: %v\n", err)
+			return 2
+		}
+		detach = defaultDetached
+	}
+	if detach {
+		if strings.TrimSpace(runID) == "" {
+			runID = state.RunIDForWave(deps.Now())
+		}
+		childArgs := childArgsWithDetachedForeground(args, runID)
+		if fromReadySet && readySet != nil {
+			readySetPath, err := persistDetachedReadySetInput(resolvedRepo, runID, *readySet, deps)
+			if err != nil {
+				fmt.Fprintf(stderr, "dispatch-wave: persist detached ready-set input: %v\n", err)
+				return 1
+			}
+			childArgs = childArgsReplacingReadySetStdin(childArgs, readySetPath)
+		}
+		return runDetachedCommand(resolvedRepo, runID, "dispatch-wave", outputMode.Format, childArgs, stdout, stderr, deps)
+	}
 
 	prettyMode := prettyModeForTarget(stdout, deps, pretty)
 	renderPretty := outputMode.Format == "text" && shouldRenderPretty(noPretty)
@@ -6724,6 +6823,66 @@ func latestRunIDWithNote(repoPath string) (string, string, error) {
 		return "", "no run directories found", nil
 	}
 	return runID, "latest modified run selected", nil
+}
+
+func shouldDefaultDetachedForHost(cfg config.Config, stdout, stderr io.Writer, deps Deps) (bool, error) {
+	isTerminal := deps.IsTerminal
+	if isTerminal == nil {
+		isTerminal = isTerminalWriter
+	}
+	if isTerminal(stdout) || isTerminal(stderr) {
+		return false, nil
+	}
+	if strings.TrimSpace(os.Getenv(hostprofile.EnvName)) == "" && strings.TrimSpace(cfg.Host.Profile) == "" {
+		return false, nil
+	}
+	resolved, err := hostprofile.Resolve(hostprofile.Options{
+		Profile: cfg.Host.Profile,
+		Getenv:  os.Getenv,
+	})
+	if err != nil {
+		return false, err
+	}
+	return resolved.Source != hostprofile.SourceFallback, nil
+}
+
+func childArgsWithDetachedForeground(args []string, runID string) []string {
+	out := append([]string(nil), args...)
+	out = append(out, "--foreground")
+	if strings.TrimSpace(runID) != "" && !hasFlag(out, "run-id", "RunId") {
+		out = append(out, "--run-id", runID)
+	}
+	return out
+}
+
+func childArgsReplacingReadySetStdin(args []string, readySetPath string) []string {
+	if strings.TrimSpace(readySetPath) == "" {
+		return args
+	}
+	out := make([]string, 0, len(args)+2)
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--from-ready-set" || arg == "-from-ready-set" || arg == "--FromReadySet" || arg == "-FromReadySet" ||
+			strings.HasPrefix(arg, "--from-ready-set=") || strings.HasPrefix(arg, "-from-ready-set=") ||
+			strings.HasPrefix(arg, "--FromReadySet=") || strings.HasPrefix(arg, "-FromReadySet=") {
+			continue
+		}
+		out = append(out, arg)
+	}
+	out = append(out, "--ready-set-path", readySetPath)
+	return out
+}
+
+func hasFlag(args []string, names ...string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		for _, name := range names {
+			if arg == "--"+name || arg == "-"+name || strings.HasPrefix(arg, "--"+name+"=") || strings.HasPrefix(arg, "-"+name+"=") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func resolveRepo(repoPath string) (string, error) {

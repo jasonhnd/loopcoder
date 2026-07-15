@@ -229,11 +229,11 @@ step before a delivery or merge turn can finish. The old
 alias during the reporter transition.
 `loopcoder hook conductor-relay-guard` enforces local visible relay of Worker
 and Verifier reports from `loopcoder dispatch`, `loopcoder dispatch-wave`,
-and `loopcoder loopreview`. Do not redirect, hide, or suppress `dispatch` or
-`loopreview` stderr, and keep foreground `dispatch-wave` stdout visible because
-each Worker pretty block streams there as that Worker completes. The relay guard
-covers Bash, PowerShell, and pwsh tool events and treats backgrounded command
-output as pending until the block is surfaced.
+and `loopcoder loopreview`. Do not redirect, hide, or suppress foreground
+`dispatch` or `loopreview` stderr, and keep foreground `dispatch-wave` stdout
+visible because each Worker pretty block streams there as that Worker completes.
+The relay guard covers Bash, PowerShell, and pwsh tool events and treats
+backgrounded command output as pending until the block is surfaced.
 
 The Go binary also hard-gates mechanical progress while pending local relay
 blocks are unacknowledged. A gated command exits with reserved code `4`, prints
@@ -984,7 +984,8 @@ loopcoder dispatch \
   --issue-title "<title>" \
   --issue-body "<body>" \
   --base-branch main \
-  --provider codex
+  --provider codex \
+  --foreground
 
 loopcoder dispatch \
   --repo . \
@@ -992,7 +993,8 @@ loopcoder dispatch \
   --issue-title "<title>" \
   --provider codex \
   --strict \
-  --pretty
+  --pretty \
+  --foreground
 
 loopcoder dispatch \
   --repo . \
@@ -1001,8 +1003,10 @@ loopcoder dispatch \
   --detach
 
 loopcoder dispatch-wave --repo . --base-branch main --issue-numbers <n1>,<n2> --strict
+loopcoder dispatch-wave --repo . --base-branch main --issue-numbers <n1>,<n2> --strict --foreground
 
 loopcoder tick --repo . --strict
+loopcoder tick --repo . --strict --foreground
 loopcoder trigger goal-loop --repo . --max-iterations <n> --strict
 loopcoder promote --repo .
 
@@ -1240,8 +1244,9 @@ the incomplete-report finding. Antigravity is a provider-scoped exception:
 Worker records use the selected `agy --model` string, such as `Gemini 3.1 Pro
 (High)`, as `model_source: self-reported` and accept absent token usage.
 Reporter surfaces are local-only:
-`dispatch` / `loopreview` stderr pretty blocks, foreground `dispatch-wave`
-stdout Worker pretty blocks, `dispatch` / `loopreview` result JSON, and
+foreground `dispatch` / `loopreview` stderr pretty blocks,
+`dispatch-wave --foreground` stdout Worker pretty blocks, `dispatch` /
+`loopreview` result JSON, and
 gitignored `.loopcoder/` run records. PR bodies, merge commits, and merge
 comments are not reporter surfaces and must not contain `[reporter]` headers
 or canonical JSON.

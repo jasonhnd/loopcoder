@@ -22,6 +22,10 @@ const (
 	guardianEnvConfig = "LOOPCODER_MACOS_GUARDIAN_CONFIG"
 	guardianArg       = "__loopcoder_macos_guardian"
 	guardianReadFD    = uintptr(3)
+	guardianReadyFD   = uintptr(4)
+
+	guardianAuthorityLoadTimeout = 8 * time.Second
+	guardianReadySignalTimeout   = 1500 * time.Millisecond
 )
 
 type darwinGuardianHandle struct {
@@ -63,6 +67,22 @@ func startGuardian(opts GuardianOptions) (guardianHandle, error) {
 			_ = writeFile.Close()
 		}
 	}()
+	readyRead, readyWrite, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("start guardian readiness pipe: %w", err)
+	}
+	closeReadyRead := true
+	defer func() {
+		if closeReadyRead {
+			_ = readyRead.Close()
+		}
+	}()
+	closeReadyWrite := true
+	defer func() {
+		if closeReadyWrite {
+			_ = readyWrite.Close()
+		}
+	}()
 
 	cfg := guardianConfigFromOptions(opts)
 	encoded, err := encodeGuardianConfig(cfg)
@@ -81,7 +101,7 @@ func startGuardian(opts GuardianOptions) (guardianHandle, error) {
 
 	cmd := exec.Command(exe, guardianArg)
 	cmd.Env = append(os.Environ(), guardianEnvActive+"=1", guardianEnvConfig+"="+encoded)
-	cmd.ExtraFiles = []*os.File{readFile}
+	cmd.ExtraFiles = []*os.File{readFile, readyWrite}
 	cmd.Stdin = devNull
 	cmd.Stdout = devNull
 	cmd.Stderr = devNull
@@ -90,6 +110,14 @@ func startGuardian(opts GuardianOptions) (guardianHandle, error) {
 	}
 	closeRead = false
 	_ = readFile.Close()
+	closeReadyWrite = false
+	_ = readyWrite.Close()
+	if err := waitGuardianReadySignal(cmd, readyRead); err != nil {
+		_ = writeFile.Close()
+		return nil, err
+	}
+	closeReadyRead = false
+	_ = readyRead.Close()
 	closeWrite = false
 	handle := &darwinGuardianHandle{write: writeFile, cmd: cmd}
 	writeGuardianEvent(cfg.DiagnosticPath, guardianEvent{
@@ -149,9 +177,47 @@ func runGuardianProcess() int {
 		return 2
 	}
 	defer readFile.Close()
+	readyFile := os.NewFile(guardianReadyFD, "loopcoder-guardian-ready")
+	if readyFile == nil {
+		writeGuardianEvent(cfg.DiagnosticPath, guardianEvent{
+			SchemaVersion: guardianSchema,
+			Event:         "startup-failed",
+			At:            time.Now().UTC().Format(time.RFC3339Nano),
+			Error:         "missing readiness fd " + strconv.Itoa(int(guardianReadyFD)),
+		})
+		return 2
+	}
+	return runGuardianProcessWithFiles(cfg, readFile, readyFile, loadGuardianAuthority, killDarwinProcessGroup)
+}
+
+func runGuardianProcessWithFiles(cfg guardianConfig, readFile, readyFile *os.File, load guardianAuthorityLoader, kill guardianGroupKiller) int {
+	defer readyFile.Close()
+	retainedAuthority := cfg.RetainedAuthority.providerExecutionAuthority()
+	if err := verifyGuardianAuthority(retainedAuthority, cfg); err != nil {
+		writeGuardianEvent(cfg.DiagnosticPath, guardianEvent{
+			SchemaVersion: guardianSchema,
+			Event:         "startup-failed",
+			At:            time.Now().UTC().Format(time.RFC3339Nano),
+			Error:         "retain authority before readiness: " + err.Error(),
+		})
+		return 2
+	}
+	if _, err := readyFile.Write([]byte{'1'}); err != nil {
+		writeGuardianEvent(cfg.DiagnosticPath, guardianEvent{
+			SchemaVersion:   guardianSchema,
+			Event:           "readiness-failed",
+			At:              time.Now().UTC().Format(time.RFC3339Nano),
+			ProjectID:       cfg.ProjectID,
+			RunID:           cfg.RunID,
+			AttemptID:       cfg.AttemptID,
+			OwnerID:         cfg.OwnerID,
+			ClaimGeneration: cfg.ClaimGeneration,
+			Error:           "signal readiness: " + err.Error(),
+		})
+	}
 
 	var token [1]byte
-	_, err = readFile.Read(token[:])
+	_, err := readFile.Read(token[:])
 	switch {
 	case err == nil && token[0] == 'r':
 		writeGuardianEvent(cfg.DiagnosticPath, guardianEvent{
@@ -166,9 +232,11 @@ func runGuardianProcess() int {
 		})
 		return 0
 	case err == io.EOF:
-		ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), guardianAuthorityLoadTimeout)
 		defer cancel()
-		event := guardianVerifyAndKill(ctx, cfg, retryLoadGuardianAuthority, killDarwinProcessGroup)
+		event := guardianVerifyAndKill(ctx, cfg, func(ctx context.Context, cfg guardianConfig) (storage.ProviderExecutionAuthority, error) {
+			return retryGuardianAuthorityLoad(ctx, cfg, load)
+		}, kill)
 		writeGuardianEvent(cfg.DiagnosticPath, event)
 		if event.Event == "killed" {
 			return 0
@@ -190,19 +258,38 @@ func runGuardianProcess() int {
 	}
 }
 
-func retryLoadGuardianAuthority(ctx context.Context, cfg guardianConfig) (authority storage.ProviderExecutionAuthority, err error) {
-	ticker := time.NewTicker(25 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		authority, err = loadGuardianAuthority(ctx, cfg)
-		if err == nil {
-			return authority, nil
+func waitGuardianReadySignal(cmd *exec.Cmd, readyRead *os.File) error {
+	done := make(chan error, 1)
+	go func() {
+		var token [1]byte
+		n, err := readyRead.Read(token[:])
+		if err != nil {
+			done <- fmt.Errorf("start guardian readiness: %w", err)
+			return
 		}
-		select {
-		case <-ctx.Done():
-			return storage.ProviderExecutionAuthority{}, err
-		case <-ticker.C:
+		if n != 1 || token[0] != '1' {
+			done <- fmt.Errorf("start guardian readiness: unexpected token %q", token[:n])
+			return
 		}
+		done <- nil
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			_ = cmd.Wait()
+		}
+		return err
+	case <-time.After(guardianReadySignalTimeout):
+		_ = readyRead.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+		return fmt.Errorf("start guardian readiness: timed out")
 	}
 }
 
