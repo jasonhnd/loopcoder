@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -120,6 +121,71 @@ func TestVerdictJSONSchemaIsValidJSON(t *testing.T) {
 	if !json.Valid([]byte(VerdictJSONSchema)) {
 		t.Fatalf("VerdictJSONSchema is not valid JSON: %s", VerdictJSONSchema)
 	}
+}
+
+func TestVerdictJSONSchemaMatchesAcceptedWireContractAndStrictRequired(t *testing.T) {
+	var schema map[string]any
+	if err := json.Unmarshal([]byte(VerdictJSONSchema), &schema); err != nil {
+		t.Fatalf("unmarshal VerdictJSONSchema: %v", err)
+	}
+
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("schema properties = %#v, want object", schema["properties"])
+	}
+	got := mapKeys(properties)
+	want := []string{"evidence", "findings", "spec_conformance", "verdict"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("top-level schema properties = %#v, want %#v", got, want)
+	}
+
+	assertObjectSchemasRequireAllProperties(t, "#", schema)
+}
+
+func assertObjectSchemasRequireAllProperties(t *testing.T, path string, node any) {
+	t.Helper()
+
+	switch typed := node.(type) {
+	case map[string]any:
+		if schemaType, _ := typed["type"].(string); schemaType == "object" {
+			properties, _ := typed["properties"].(map[string]any)
+			if len(properties) > 0 {
+				got := mapKeys(properties)
+				required := stringArray(typed["required"])
+				if !reflect.DeepEqual(required, got) {
+					t.Fatalf("%s required = %#v, want exactly all properties %#v", path, required, got)
+				}
+			}
+		}
+		for key, child := range typed {
+			assertObjectSchemasRequireAllProperties(t, path+"/"+key, child)
+		}
+	case []any:
+		for i, child := range typed {
+			assertObjectSchemasRequireAllProperties(t, fmt.Sprintf("%s/%d", path, i), child)
+		}
+	}
+}
+
+func mapKeys(values map[string]any) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func stringArray(value any) []string {
+	values, _ := value.([]any)
+	out := make([]string, 0, len(values))
+	for _, item := range values {
+		if text, ok := item.(string); ok {
+			out = append(out, text)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func TestNormalizeVerdictNeedsHumanUsesFindingReasonBeforePositiveEvidence(t *testing.T) {
