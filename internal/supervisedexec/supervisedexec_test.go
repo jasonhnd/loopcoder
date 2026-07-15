@@ -193,9 +193,20 @@ func TestDarwinGuardianReapsProviderAfterSupervisorSIGKILL(t *testing.T) {
 	if raceBuildEnabled {
 		attempts = 5
 	}
+	stopWithin := 2 * time.Second
+	finalReapWithin := 30 * time.Second
+	if raceBuildEnabled {
+		stopWithin = 10 * time.Second
+		finalReapWithin = 60 * time.Second
+	}
+	testRoot := t.TempDir()
+	var pendingReaps []processReapTarget
 	for i := 0; i < attempts; i++ {
-		t.Run(fmt.Sprintf("attempt-%03d", i), func(t *testing.T) {
-			root := t.TempDir()
+		if !t.Run(fmt.Sprintf("attempt-%03d", i), func(t *testing.T) {
+			root := filepath.Join(testRoot, fmt.Sprintf("attempt-%03d", i))
+			if err := os.MkdirAll(root, 0o700); err != nil {
+				t.Fatalf("create attempt root: %v", err)
+			}
 			storePath := filepath.Join(root, "home", "data", "loopcoder.db")
 			diagPath := filepath.Join(root, "home", "logs", fmt.Sprintf("guardian-%03d.jsonl", i))
 			readyPath := filepath.Join(root, "ready.json")
@@ -224,15 +235,19 @@ func TestDarwinGuardianReapsProviderAfterSupervisorSIGKILL(t *testing.T) {
 				t.Fatalf("kill supervisor: %v", err)
 			}
 			_ = parent.Wait()
-			reapWithin := 2 * time.Second
-			if raceBuildEnabled {
-				reapWithin = 10 * time.Second
-			}
-			waitNotExecuting(t, ready.ProviderPID, reapWithin, "provider", diagPath)
-			waitNotExecuting(t, ready.GuardianPID, reapWithin, "guardian", diagPath)
+			waitNotExecuting(t, ready.ProviderPID, stopWithin, "provider", diagPath)
+			waitNotExecuting(t, ready.GuardianPID, stopWithin, "guardian", diagPath)
+			pendingReaps = append(pendingReaps,
+				processReapTarget{pid: ready.ProviderPID, label: "provider", diagnosticPath: diagPath},
+				processReapTarget{pid: ready.GuardianPID, label: "guardian", diagnosticPath: diagPath},
+			)
+			pendingReaps = drainReapedProcesses(t, pendingReaps, 0)
 			assertGuardianDiagnostic(t, diagPath, "killed")
-		})
+		}) {
+			break
+		}
 	}
+	assertProcessesReaped(t, pendingReaps, finalReapWithin)
 }
 
 func TestRunCompletedExitCodeNonZero(t *testing.T) {
