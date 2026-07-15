@@ -116,6 +116,7 @@ func TestDuplicateTransitionProducesAtMostOneWakeDecisionAcrossRestart(t *testin
 			wakes++
 			return nil
 		},
+		Checkpoint: func(context.Context, Snapshot) error { return nil },
 	})
 	if err != nil {
 		t.Fatalf("first Run: %v", err)
@@ -131,12 +132,44 @@ func TestDuplicateTransitionProducesAtMostOneWakeDecisionAcrossRestart(t *testin
 			wakes++
 			return nil
 		},
+		Checkpoint: func(context.Context, Snapshot) error { return nil },
 	})
 	if err != nil {
 		t.Fatalf("second Run: %v", err)
 	}
 	if first.WakeDecisions != 1 || second.WakeDecisions != 0 || wakes != 1 {
 		t.Fatalf("decisions first=%d second=%d wakes=%d, want 1/0/1", first.WakeDecisions, second.WakeDecisions, wakes)
+	}
+}
+
+func TestWakeDecisionIsCheckpointedBeforeDelivery(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 16, 5, 0, 0, 0, time.UTC)}
+	checkpointed := false
+	delivered := false
+	_, err := Run(context.Background(), Options{
+		Kind: KindApproval, WaitID: "approval-checkpoint", Clock: clock, Policy: fastPolicy(),
+		Probe: func(context.Context) (Observation, error) {
+			return Observation{EventID: "approved", State: StateReady, Code: "approved", Consequential: true}, nil
+		},
+		Checkpoint: func(_ context.Context, snapshot Snapshot) error {
+			if !delivered && snapshot.PendingWake != nil && snapshot.LastDecisionKey != "" {
+				checkpointed = true
+			}
+			return nil
+		},
+		Wake: func(context.Context, WakeDecision) error {
+			if !checkpointed {
+				t.Fatal("wake delivered before durable decision checkpoint")
+			}
+			delivered = true
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !checkpointed || !delivered {
+		t.Fatalf("checkpointed=%v delivered=%v, want both", checkpointed, delivered)
 	}
 }
 

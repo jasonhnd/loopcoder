@@ -70,6 +70,7 @@ type Observation struct {
 type Probe func(context.Context) (Observation, error)
 type ReceiptFunc func(context.Context, Receipt) error
 type WakeFunc func(context.Context, WakeDecision) error
+type CheckpointFunc func(context.Context, Snapshot) error
 
 type Clock interface {
 	Now() time.Time
@@ -102,7 +103,10 @@ type Options struct {
 	Probe   Probe
 	Receipt ReceiptFunc
 	Wake    WakeFunc
-	Initial Snapshot
+	// Checkpoint durably stores the snapshot. Run calls it after recording a
+	// wake decision and before any external Wake delivery.
+	Checkpoint CheckpointFunc
+	Initial    Snapshot
 }
 
 type Receipt struct {
@@ -208,10 +212,16 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 	}
 
 	if snapshot.PendingWake != nil && opts.Wake != nil && snapshot.PendingWake.DecisionKey != snapshot.LastDeliveredDecisionKey {
+		if opts.Checkpoint == nil {
+			return finish(StopCanceled, errors.New("wake delivery requires a durable checkpoint callback"))
+		}
 		if err := opts.Wake(ctx, *snapshot.PendingWake); err == nil {
 			snapshot.LastDeliveredDecisionKey = snapshot.PendingWake.DecisionKey
 			snapshot.PendingWake = nil
 			report.WakeDelivered++
+			if err := opts.Checkpoint(ctx, snapshot); err != nil {
+				return finish(StopCanceled, fmt.Errorf("checkpoint delivered wake decision: %w", err))
+			}
 		}
 	}
 
@@ -332,8 +342,16 @@ func decideWakeWithPrevious(ctx context.Context, opts Options, snapshot *Snapsho
 	snapshot.PendingWake = &decision
 	report.WakeDecisions++
 	report.LastPacket = packet
+	if opts.Checkpoint != nil {
+		if err := opts.Checkpoint(ctx, *snapshot); err != nil {
+			return fmt.Errorf("checkpoint wake decision: %w", err)
+		}
+	}
 	if opts.Wake == nil {
 		return nil
+	}
+	if opts.Checkpoint == nil {
+		return errors.New("wake delivery requires a durable checkpoint callback")
 	}
 	if err := opts.Wake(ctx, decision); err != nil {
 		return nil
@@ -341,6 +359,9 @@ func decideWakeWithPrevious(ctx context.Context, opts Options, snapshot *Snapsho
 	snapshot.LastDeliveredDecisionKey = key
 	snapshot.PendingWake = nil
 	report.WakeDelivered++
+	if err := opts.Checkpoint(ctx, *snapshot); err != nil {
+		return fmt.Errorf("checkpoint delivered wake decision: %w", err)
+	}
 	return nil
 }
 

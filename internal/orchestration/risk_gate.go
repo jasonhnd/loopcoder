@@ -483,11 +483,11 @@ func checkFailed(check gh.Check) bool {
 	bucket := strings.ToLower(strings.TrimSpace(check.Bucket))
 	state := strings.ToLower(strings.TrimSpace(check.State))
 	switch bucket {
-	case "fail", "failed", "cancel", "cancelled", "error", "timed_out":
+	case "fail", "failed", "cancel", "cancelled", "error", "timed_out", "skip", "skipped", "skipping":
 		return true
 	}
 	switch state {
-	case "failure", "failed", "error", "cancelled", "timed_out", "action_required":
+	case "failure", "failed", "error", "cancelled", "timed_out", "action_required", "skip", "skipped", "skipping":
 		return true
 	}
 	return false

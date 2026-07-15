@@ -85,6 +85,21 @@ func TestEvaluateRiskGateRejectsHeadChangedDuringCheckWait(t *testing.T) {
 	}
 }
 
+func TestEvaluateRiskGateDoesNotWaitForSkippedRequiredCheck(t *testing.T) {
+	reader := &sequencedRiskReader{checks: [][]gh.Check{{{Name: "verify", Bucket: "skipping"}}}}
+	clock := &riskWaitClock{now: time.Date(2026, 7, 16, 6, 0, 0, 0, time.UTC)}
+	decision, err := EvaluateRiskGate(context.Background(), RiskGateOptions{
+		Reader: reader, PRNumber: 967, RequiredChecks: []string{"verify"},
+		WaitForChecks: true, WaitClock: clock,
+	})
+	if err != nil {
+		t.Fatalf("EvaluateRiskGate: %v", err)
+	}
+	if decision.Status != RiskGateStatusNeedsHuman || decision.Wait != nil || len(clock.sleeps) != 0 {
+		t.Fatalf("decision=%#v sleeps=%v, want immediate terminal non-pass", decision, clock.sleeps)
+	}
+}
+
 func TestEvaluateRiskGateCorePathNeedsHuman(t *testing.T) {
 	decision, err := EvaluateRiskGate(context.Background(), RiskGateOptions{
 		Reader:         cleanRiskReader(353, "internal/agent/agent.go"),
