@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -31,12 +30,10 @@ func TestDarwinGuardianSupervisorEOFRejectsAuthorityMutationAfterReadiness(t *te
 
 	var loadCalls atomic.Int32
 	loader := func(context.Context, guardianConfig) (storage.ProviderExecutionAuthority, error) {
-		if loadCalls.Add(1) == 1 {
-			return authority, nil
-		}
 		mutated := authority
 		mutated.OwnerID = "worker:run-guardian:job-guardian:recovery"
 		mutated.ClaimGeneration++
+		loadCalls.Add(1)
 		return mutated, nil
 	}
 	var killedPGID atomic.Int64
@@ -63,7 +60,7 @@ func TestDarwinGuardianSupervisorEOFRejectsAuthorityMutationAfterReadiness(t *te
 	if got := killedPGID.Load(); got != 0 {
 		t.Fatalf("killed PGID = %d, want no kill", got)
 	}
-	if got := loadCalls.Load(); got < 2 {
+	if got := loadCalls.Load(); got != 1 {
 		t.Fatalf("authority loader calls = %d, want fresh EOF reload", got)
 	}
 	if !process.Alive(authority.ProviderPID) {
@@ -86,9 +83,7 @@ func TestDarwinGuardianSupervisorEOFRetriesCurrentAuthorityBeforeKill(t *testing
 	var loadCalls atomic.Int32
 	loader := func(context.Context, guardianConfig) (storage.ProviderExecutionAuthority, error) {
 		switch loadCalls.Add(1) {
-		case 1:
-			return authority, nil
-		case 2, 3:
+		case 1, 2:
 			return storage.ProviderExecutionAuthority{}, fmt.Errorf("configure sqlite: %w", context.DeadlineExceeded)
 		default:
 			return authority, nil
@@ -118,7 +113,7 @@ func TestDarwinGuardianSupervisorEOFRetriesCurrentAuthorityBeforeKill(t *testing
 	if got := killedPGID.Load(); got != int64(authority.ProviderPGID) {
 		t.Fatalf("killed PGID = %d, want %d", got, authority.ProviderPGID)
 	}
-	if got := loadCalls.Load(); got < 4 {
+	if got := loadCalls.Load(); got < 3 {
 		t.Fatalf("authority loader calls = %d, want transient EOF retries before kill", got)
 	}
 	assertGuardianDiagnostic(t, cfg.DiagnosticPath, "killed")
@@ -133,16 +128,13 @@ func TestDarwinGuardianReadinessDeliveryFailureAfterAuthorityRetentionStillKills
 	readFile, writeFile, readyRead, readyWrite := guardianTestPipes(t)
 	defer readFile.Close()
 	defer readyWrite.Close()
+	if err := readyRead.Close(); err != nil {
+		t.Fatalf("close readiness reader: %v", err)
+	}
 
-	retained := make(chan struct{})
-	allowRetainedReturn := make(chan struct{})
-	var retainOnce sync.Once
 	var loadCalls atomic.Int32
 	loader := func(context.Context, guardianConfig) (storage.ProviderExecutionAuthority, error) {
-		if loadCalls.Add(1) == 1 {
-			retainOnce.Do(func() { close(retained) })
-			<-allowRetainedReturn
-		}
+		loadCalls.Add(1)
 		return authority, nil
 	}
 	var killedPGID atomic.Int64
@@ -154,18 +146,9 @@ func TestDarwinGuardianReadinessDeliveryFailureAfterAuthorityRetentionStillKills
 		})
 	}()
 
-	select {
-	case <-retained:
-	case <-time.After(2 * time.Second):
-		t.Fatal("guardian did not retain authority before readiness")
-	}
-	if err := readyRead.Close(); err != nil {
-		t.Fatalf("close readiness reader: %v", err)
-	}
 	if err := writeFile.Close(); err != nil {
 		t.Fatalf("close supervisor liveness pipe: %v", err)
 	}
-	close(allowRetainedReturn)
 	select {
 	case code := <-done:
 		if code != 0 {
@@ -177,7 +160,7 @@ func TestDarwinGuardianReadinessDeliveryFailureAfterAuthorityRetentionStillKills
 	if got := killedPGID.Load(); got != int64(authority.ProviderPGID) {
 		t.Fatalf("killed PGID = %d, want %d", got, authority.ProviderPGID)
 	}
-	if got := loadCalls.Load(); got < 2 {
+	if got := loadCalls.Load(); got != 1 {
 		t.Fatalf("authority loader calls = %d, want fresh EOF reload after readiness failure", got)
 	}
 	assertGuardianDiagnostic(t, cfg.DiagnosticPath, "killed")
@@ -197,9 +180,7 @@ func TestDarwinGuardianSupervisorEOFFailsClosedWhenCurrentAuthorityUnreadable(t 
 
 	var loadCalls atomic.Int32
 	loader := func(context.Context, guardianConfig) (storage.ProviderExecutionAuthority, error) {
-		if loadCalls.Add(1) == 1 {
-			return authority, nil
-		}
+		loadCalls.Add(1)
 		return storage.ProviderExecutionAuthority{}, fmt.Errorf("configure sqlite: %w", context.DeadlineExceeded)
 	}
 	var killedPGID atomic.Int64
@@ -236,14 +217,8 @@ func TestDarwinGuardianSupervisorEOFFailsClosedWhenCurrentAuthorityUnreadable(t 
 }
 
 func TestDarwinGuardianStartupDeadlinesStayBelowTwoSeconds(t *testing.T) {
-	if guardianStartupAuthorityLoadTimeout >= 2*time.Second {
-		t.Fatalf("guardian startup authority timeout = %s, must stay below 2s", guardianStartupAuthorityLoadTimeout)
-	}
 	if guardianReadySignalTimeout >= 2*time.Second {
 		t.Fatalf("guardian ready signal timeout = %s, must stay below 2s", guardianReadySignalTimeout)
-	}
-	if guardianReadySignalTimeout <= guardianStartupAuthorityLoadTimeout {
-		t.Fatalf("guardian ready signal timeout = %s, must exceed startup authority timeout %s", guardianReadySignalTimeout, guardianStartupAuthorityLoadTimeout)
 	}
 	if guardianAuthorityLoadTimeout <= guardianReadySignalTimeout {
 		t.Fatalf("guardian EOF authority timeout = %s, must exceed startup readiness timeout %s", guardianAuthorityLoadTimeout, guardianReadySignalTimeout)
@@ -298,7 +273,7 @@ func TestDarwinGuardianLateReadinessFailsWithinStartupDeadline(t *testing.T) {
 	}
 }
 
-func TestDarwinGuardianStartupAuthorityLoadFailsWithinTwoSeconds(t *testing.T) {
+func TestDarwinGuardianStartupRejectsInvalidRetainedAuthorityWithoutLoading(t *testing.T) {
 	cfg := guardianConfig{
 		SchemaVersion:  guardianSchema,
 		DiagnosticPath: filepath.Join(t.TempDir(), "guardian.jsonl"),
@@ -309,10 +284,11 @@ func TestDarwinGuardianStartupAuthorityLoadFailsWithinTwoSeconds(t *testing.T) {
 	defer readyRead.Close()
 
 	var killed atomic.Bool
+	var loadCalls atomic.Int32
 	done := make(chan int, 1)
 	go func() {
 		done <- runGuardianProcessWithFiles(cfg, readFile, readyWrite, func(ctx context.Context, _ guardianConfig) (storage.ProviderExecutionAuthority, error) {
-			<-ctx.Done()
+			loadCalls.Add(1)
 			return storage.ProviderExecutionAuthority{}, ctx.Err()
 		}, func(int) error {
 			killed.Store(true)
@@ -325,7 +301,7 @@ func TestDarwinGuardianStartupAuthorityLoadFailsWithinTwoSeconds(t *testing.T) {
 	case err := <-readGuardianReadyToken(readyRead):
 		elapsed := time.Since(start)
 		if err == nil {
-			t.Fatal("guardian signaled readiness after startup authority load failure")
+			t.Fatal("guardian signaled readiness without retained authority")
 		}
 		if elapsed >= 2*time.Second {
 			t.Fatalf("guardian startup readiness failure took %s, want under 2s", elapsed)
@@ -342,12 +318,39 @@ func TestDarwinGuardianStartupAuthorityLoadFailsWithinTwoSeconds(t *testing.T) {
 		t.Fatal("guardian did not finish after startup authority load failure")
 	}
 	if killed.Load() {
-		t.Fatal("guardian killed provider before startup authority retention")
+		t.Fatal("guardian killed provider before retained authority validation")
+	}
+	if got := loadCalls.Load(); got != 0 {
+		t.Fatalf("authority loader calls = %d, want no startup load", got)
 	}
 	assertGuardianDiagnostic(t, cfg.DiagnosticPath, "startup-failed")
 }
 
-func TestDarwinGuardianReadinessWaitsForAuthorityRetention(t *testing.T) {
+func TestDarwinGuardianConfigRoundTripsRetainedAuthority(t *testing.T) {
+	cmd, authority := startGuardianAuthorityProcess(t)
+	defer cmd.Wait()
+	defer terminateProcessGroup(cmd.Process.Pid)
+
+	cfg := guardianConfigForAuthority(t, authority)
+	encoded, err := encodeGuardianConfig(cfg)
+	if err != nil {
+		t.Fatalf("encode guardian config: %v", err)
+	}
+	decoded, err := decodeGuardianConfig(encoded)
+	if err != nil {
+		t.Fatalf("decode guardian config: %v", err)
+	}
+	retained := decoded.RetainedAuthority.providerExecutionAuthority()
+	if err := verifyGuardianAuthority(retained, decoded); err != nil {
+		t.Fatalf("retained authority validation after round trip: %v", err)
+	}
+	if retained.ProviderPID != authority.ProviderPID || retained.ProviderPGID != authority.ProviderPGID ||
+		retained.ProcessBirthIdentity != authority.ProcessBirthIdentity || retained.ExecutableIdentity != authority.ExecutableIdentity {
+		t.Fatalf("retained authority changed after round trip: got %#v want %#v", retained, authority)
+	}
+}
+
+func TestDarwinGuardianReadinessDoesNotDependOnStartupLoader(t *testing.T) {
 	cmd, authority := startGuardianAuthorityProcess(t)
 	defer cmd.Wait()
 	defer terminateProcessGroup(cmd.Process.Pid)
@@ -358,20 +361,13 @@ func TestDarwinGuardianReadinessWaitsForAuthorityRetention(t *testing.T) {
 	defer writeFile.Close()
 	defer readyRead.Close()
 
-	loadStarted := make(chan struct{})
-	allowLoad := make(chan struct{})
-	var closeAllowLoad sync.Once
-	defer closeAllowLoad.Do(func() { close(allowLoad) })
 	var loadCalls atomic.Int32
 	var killed atomic.Bool
 	done := make(chan int, 1)
 	go func() {
 		done <- runGuardianProcessWithFiles(cfg, readFile, readyWrite, func(context.Context, guardianConfig) (storage.ProviderExecutionAuthority, error) {
-			if loadCalls.Add(1) == 1 {
-				close(loadStarted)
-			}
-			<-allowLoad
-			return authority, nil
+			loadCalls.Add(1)
+			select {}
 		}, func(int) error {
 			killed.Store(true)
 			return nil
@@ -379,24 +375,15 @@ func TestDarwinGuardianReadinessWaitsForAuthorityRetention(t *testing.T) {
 	}()
 
 	select {
-	case <-loadStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("guardian did not start retaining authority")
-	}
-	readyDone := readGuardianReadyToken(readyRead)
-	select {
-	case err := <-readyDone:
-		t.Fatalf("guardian signaled readiness before authority retention completed: %v", err)
-	case <-time.After(100 * time.Millisecond):
-	}
-	closeAllowLoad.Do(func() { close(allowLoad) })
-	select {
-	case err := <-readyDone:
+	case err := <-readGuardianReadyToken(readyRead):
 		if err != nil {
 			t.Fatalf("guardian readiness: %v", err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("guardian did not signal readiness after authority retention completed")
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("guardian readiness depended on startup authority loader")
+	}
+	if got := loadCalls.Load(); got != 0 {
+		t.Fatalf("authority loader calls before release = %d, want none", got)
 	}
 	if _, err := writeFile.Write([]byte{'r'}); err != nil {
 		t.Fatalf("write supervisor release: %v", err)
@@ -414,6 +401,9 @@ func TestDarwinGuardianReadinessWaitsForAuthorityRetention(t *testing.T) {
 	}
 	if killed.Load() {
 		t.Fatal("guardian killed provider before supervisor EOF")
+	}
+	if got := loadCalls.Load(); got != 0 {
+		t.Fatalf("authority loader calls after clean release = %d, want none", got)
 	}
 }
 
@@ -470,10 +460,12 @@ func TestDarwinGuardianCleanReleaseDoesNotKillRetainedAuthority(t *testing.T) {
 	defer readyRead.Close()
 
 	var killed atomic.Bool
+	var loadCalls atomic.Int32
 	done := make(chan int, 1)
 	go func() {
 		done <- runGuardianProcessWithFiles(cfg, readFile, readyWrite, func(context.Context, guardianConfig) (storage.ProviderExecutionAuthority, error) {
-			return authority, nil
+			loadCalls.Add(1)
+			return storage.ProviderExecutionAuthority{}, fmt.Errorf("unexpected load")
 		}, func(int) error {
 			killed.Store(true)
 			return nil
@@ -501,19 +493,23 @@ func TestDarwinGuardianCleanReleaseDoesNotKillRetainedAuthority(t *testing.T) {
 	if !process.Alive(authority.ProviderPID) {
 		t.Fatalf("provider pid %d is not alive after clean release", authority.ProviderPID)
 	}
+	if got := loadCalls.Load(); got != 0 {
+		t.Fatalf("authority loader calls after clean release = %d, want none", got)
+	}
 	assertGuardianDiagnostic(t, cfg.DiagnosticPath, "released")
 }
 
 func guardianConfigForAuthority(t *testing.T, authority storage.ProviderExecutionAuthority) guardianConfig {
 	t.Helper()
 	return guardianConfig{
-		SchemaVersion:   guardianSchema,
-		DiagnosticPath:  filepath.Join(t.TempDir(), "guardian.jsonl"),
-		ProjectID:       authority.ProjectID,
-		RunID:           authority.RunID,
-		AttemptID:       authority.AttemptID,
-		OwnerID:         authority.OwnerID,
-		ClaimGeneration: authority.ClaimGeneration,
+		SchemaVersion:     guardianSchema,
+		DiagnosticPath:    filepath.Join(t.TempDir(), "guardian.jsonl"),
+		ProjectID:         authority.ProjectID,
+		RunID:             authority.RunID,
+		AttemptID:         authority.AttemptID,
+		OwnerID:           authority.OwnerID,
+		ClaimGeneration:   authority.ClaimGeneration,
+		RetainedAuthority: guardianAuthoritySnapshotFromStorage(authority),
 	}
 }
 

@@ -1108,6 +1108,7 @@ func runGuardianSupervisorHelper(args []string) {
 	attemptID := "job-guardian-crash-" + suffix
 	ownerID := "worker:" + runID + ":" + attemptID + ":1"
 	var started StartedProcess
+	var persistedAuthority storage.ProviderExecutionAuthority
 	cmd := helperCommandForProcess("sleep", "30s")
 	_, err = Run(ctx, cmd, Options{
 		HardCap: 35 * time.Second,
@@ -1115,7 +1116,7 @@ func runGuardianSupervisorHelper(args []string) {
 		Role:    "worker",
 		OnStart: func(process StartedProcess) error {
 			started = process
-			_, err := storage.PersistProviderExecutionAuthority(ctx, store, storage.ProviderExecutionAuthority{
+			persisted, err := storage.PersistProviderExecutionAuthority(ctx, store, storage.ProviderExecutionAuthority{
 				ProjectID:            "proj-guardian",
 				RunID:                runID,
 				AttemptID:            attemptID,
@@ -1130,6 +1131,7 @@ func runGuardianSupervisorHelper(args []string) {
 				IdentityAmbiguous:    process.IdentityAmbiguous,
 				AmbiguityReason:      process.IdentityAmbiguityNote,
 			}, time.Now())
+			persistedAuthority = persisted
 			return err
 		},
 		Guardian: GuardianOptions{
@@ -1141,6 +1143,9 @@ func runGuardianSupervisorHelper(args []string) {
 			AttemptID:       attemptID,
 			OwnerID:         ownerID,
 			ClaimGeneration: 1,
+			ProviderAuthority: func() (storage.ProviderExecutionAuthority, bool) {
+				return persistedAuthority, persistedAuthority.ProviderPID > 0
+			},
 			OnStart: func(guardian GuardianProcess) error {
 				return writeGuardianReadyRecord(readyPath, guardianReadyRecord{
 					ProviderPID:  started.PID,

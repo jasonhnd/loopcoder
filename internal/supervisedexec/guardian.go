@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/process"
@@ -29,7 +28,8 @@ type GuardianOptions struct {
 	OwnerID         string
 	ClaimGeneration int64
 
-	OnStart func(GuardianProcess) error
+	ProviderAuthority func() (storage.ProviderExecutionAuthority, bool)
+	OnStart           func(GuardianProcess) error
 }
 
 // GuardianProcess describes the helper process watching parent liveness.
@@ -46,14 +46,15 @@ type guardianNoop struct{}
 func (guardianNoop) Release() error { return nil }
 
 type guardianConfig struct {
-	SchemaVersion   string `json:"schema_version"`
-	StorePath       string `json:"store_path"`
-	DiagnosticPath  string `json:"diagnostic_path"`
-	ProjectID       string `json:"project_id"`
-	RunID           string `json:"run_id"`
-	AttemptID       string `json:"attempt_id"`
-	OwnerID         string `json:"owner_id"`
-	ClaimGeneration int64  `json:"claim_generation"`
+	SchemaVersion     string                    `json:"schema_version"`
+	StorePath         string                    `json:"store_path"`
+	DiagnosticPath    string                    `json:"diagnostic_path"`
+	ProjectID         string                    `json:"project_id"`
+	RunID             string                    `json:"run_id"`
+	AttemptID         string                    `json:"attempt_id"`
+	OwnerID           string                    `json:"owner_id"`
+	ClaimGeneration   int64                     `json:"claim_generation"`
+	RetainedAuthority guardianAuthoritySnapshot `json:"retained_authority"`
 }
 
 type guardianEvent struct {
@@ -75,38 +76,19 @@ type guardianEvent struct {
 type guardianAuthorityLoader func(context.Context, guardianConfig) (storage.ProviderExecutionAuthority, error)
 type guardianGroupKiller func(int) error
 
-type guardianAuthorityCache struct {
-	mu         sync.RWMutex
-	loaded     chan struct{}
-	loadedOnce sync.Once
-	authority  storage.ProviderExecutionAuthority
-	ok         bool
-}
-
-func newGuardianAuthorityCache() *guardianAuthorityCache {
-	return &guardianAuthorityCache{loaded: make(chan struct{})}
-}
-
-func (cache *guardianAuthorityCache) store(authority storage.ProviderExecutionAuthority) {
-	if cache == nil {
-		return
-	}
-	cache.mu.Lock()
-	if !cache.ok {
-		cache.authority = authority
-		cache.ok = true
-	}
-	cache.mu.Unlock()
-	cache.loadedOnce.Do(func() { close(cache.loaded) })
-}
-
-func (cache *guardianAuthorityCache) cached() (storage.ProviderExecutionAuthority, bool) {
-	if cache == nil {
-		return storage.ProviderExecutionAuthority{}, false
-	}
-	cache.mu.RLock()
-	defer cache.mu.RUnlock()
-	return cache.authority, cache.ok
+type guardianAuthoritySnapshot struct {
+	ProjectID            string `json:"project_id"`
+	RunID                string `json:"run_id"`
+	AttemptID            string `json:"attempt_id"`
+	OwnerID              string `json:"owner_id"`
+	ClaimGeneration      int64  `json:"claim_generation"`
+	ProviderPID          int    `json:"provider_pid"`
+	ProviderPGID         int    `json:"provider_pgid"`
+	ProcessBirthIdentity string `json:"process_birth_identity"`
+	ExecutableIdentity   string `json:"executable_identity"`
+	IdentityAmbiguous    bool   `json:"identity_ambiguous"`
+	AmbiguityReason      string `json:"ambiguity_reason,omitempty"`
+	CompletedAt          string `json:"completed_at,omitempty"`
 }
 
 func normalizeGuardianOptions(opts GuardianOptions) GuardianOptions {
@@ -133,7 +115,7 @@ func validateGuardianOptions(opts GuardianOptions) error {
 }
 
 func guardianConfigFromOptions(opts GuardianOptions) guardianConfig {
-	return guardianConfig{
+	cfg := guardianConfig{
 		SchemaVersion:   guardianSchema,
 		StorePath:       opts.StorePath,
 		DiagnosticPath:  opts.DiagnosticPath,
@@ -142,6 +124,46 @@ func guardianConfigFromOptions(opts GuardianOptions) guardianConfig {
 		AttemptID:       opts.AttemptID,
 		OwnerID:         opts.OwnerID,
 		ClaimGeneration: opts.ClaimGeneration,
+	}
+	if opts.ProviderAuthority != nil {
+		if authority, ok := opts.ProviderAuthority(); ok {
+			cfg.RetainedAuthority = guardianAuthoritySnapshotFromStorage(authority)
+		}
+	}
+	return cfg
+}
+
+func guardianAuthoritySnapshotFromStorage(authority storage.ProviderExecutionAuthority) guardianAuthoritySnapshot {
+	return guardianAuthoritySnapshot{
+		ProjectID:            strings.TrimSpace(authority.ProjectID),
+		RunID:                strings.TrimSpace(authority.RunID),
+		AttemptID:            strings.TrimSpace(authority.AttemptID),
+		OwnerID:              strings.TrimSpace(authority.OwnerID),
+		ClaimGeneration:      authority.ClaimGeneration,
+		ProviderPID:          authority.ProviderPID,
+		ProviderPGID:         authority.ProviderPGID,
+		ProcessBirthIdentity: strings.TrimSpace(authority.ProcessBirthIdentity),
+		ExecutableIdentity:   strings.TrimSpace(authority.ExecutableIdentity),
+		IdentityAmbiguous:    authority.IdentityAmbiguous,
+		AmbiguityReason:      strings.TrimSpace(authority.AmbiguityReason),
+		CompletedAt:          strings.TrimSpace(authority.CompletedAt),
+	}
+}
+
+func (snapshot guardianAuthoritySnapshot) providerExecutionAuthority() storage.ProviderExecutionAuthority {
+	return storage.ProviderExecutionAuthority{
+		ProjectID:            strings.TrimSpace(snapshot.ProjectID),
+		RunID:                strings.TrimSpace(snapshot.RunID),
+		AttemptID:            strings.TrimSpace(snapshot.AttemptID),
+		OwnerID:              strings.TrimSpace(snapshot.OwnerID),
+		ClaimGeneration:      snapshot.ClaimGeneration,
+		ProviderPID:          snapshot.ProviderPID,
+		ProviderPGID:         snapshot.ProviderPGID,
+		ProcessBirthIdentity: strings.TrimSpace(snapshot.ProcessBirthIdentity),
+		ExecutableIdentity:   strings.TrimSpace(snapshot.ExecutableIdentity),
+		IdentityAmbiguous:    snapshot.IdentityAmbiguous,
+		AmbiguityReason:      strings.TrimSpace(snapshot.AmbiguityReason),
+		CompletedAt:          strings.TrimSpace(snapshot.CompletedAt),
 	}
 }
 
@@ -208,15 +230,7 @@ func guardianVerifyAndKill(ctx context.Context, cfg guardianConfig, load guardia
 	return event
 }
 
-func startGuardianAuthorityRetention(ctx context.Context, cfg guardianConfig, load guardianAuthorityLoader) *guardianAuthorityCache {
-	cache := newGuardianAuthorityCache()
-	go func() {
-		_, _ = retryGuardianAuthorityLoad(ctx, cfg, load, cache)
-	}()
-	return cache
-}
-
-func retryGuardianAuthorityLoad(ctx context.Context, cfg guardianConfig, load guardianAuthorityLoader, cache *guardianAuthorityCache) (authority storage.ProviderExecutionAuthority, err error) {
+func retryGuardianAuthorityLoad(ctx context.Context, cfg guardianConfig, load guardianAuthorityLoader) (authority storage.ProviderExecutionAuthority, err error) {
 	if load == nil {
 		return storage.ProviderExecutionAuthority{}, fmt.Errorf("authority loader is required")
 	}
@@ -225,9 +239,6 @@ func retryGuardianAuthorityLoad(ctx context.Context, cfg guardianConfig, load gu
 	for {
 		authority, err = load(ctx, cfg)
 		if err == nil {
-			if cache != nil {
-				cache.store(authority)
-			}
 			return authority, nil
 		}
 		select {
@@ -236,20 +247,9 @@ func retryGuardianAuthorityLoad(ctx context.Context, cfg guardianConfig, load gu
 				return storage.ProviderExecutionAuthority{}, err
 			}
 			return storage.ProviderExecutionAuthority{}, ctx.Err()
-		case <-cacheLoaded(cache):
-			if authority, ok := cache.cached(); ok {
-				return authority, nil
-			}
 		case <-ticker.C:
 		}
 	}
-}
-
-func cacheLoaded(cache *guardianAuthorityCache) <-chan struct{} {
-	if cache == nil {
-		return nil
-	}
-	return cache.loaded
 }
 
 func loadGuardianAuthority(ctx context.Context, cfg guardianConfig) (storage.ProviderExecutionAuthority, error) {

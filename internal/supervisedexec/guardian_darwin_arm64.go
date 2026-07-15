@@ -24,9 +24,8 @@ const (
 	guardianReadFD    = uintptr(3)
 	guardianReadyFD   = uintptr(4)
 
-	guardianStartupAuthorityLoadTimeout = 1 * time.Second
-	guardianAuthorityLoadTimeout        = 8 * time.Second
-	guardianReadySignalTimeout          = 1500 * time.Millisecond
+	guardianAuthorityLoadTimeout = 8 * time.Second
+	guardianReadySignalTimeout   = 1500 * time.Millisecond
 )
 
 type darwinGuardianHandle struct {
@@ -193,16 +192,13 @@ func runGuardianProcess() int {
 
 func runGuardianProcessWithFiles(cfg guardianConfig, readFile, readyFile *os.File, load guardianAuthorityLoader, kill guardianGroupKiller) int {
 	defer readyFile.Close()
-	authorityCache := newGuardianAuthorityCache()
-	loadCtx, cancelLoad := context.WithTimeout(context.Background(), guardianStartupAuthorityLoadTimeout)
-	_, loadErr := retryGuardianAuthorityLoad(loadCtx, cfg, load, authorityCache)
-	cancelLoad()
-	if loadErr != nil {
+	retainedAuthority := cfg.RetainedAuthority.providerExecutionAuthority()
+	if err := verifyGuardianAuthority(retainedAuthority, cfg); err != nil {
 		writeGuardianEvent(cfg.DiagnosticPath, guardianEvent{
 			SchemaVersion: guardianSchema,
 			Event:         "startup-failed",
 			At:            time.Now().UTC().Format(time.RFC3339Nano),
-			Error:         "retain authority before readiness: " + loadErr.Error(),
+			Error:         "retain authority before readiness: " + err.Error(),
 		})
 		return 2
 	}
@@ -239,7 +235,7 @@ func runGuardianProcessWithFiles(cfg guardianConfig, readFile, readyFile *os.Fil
 		ctx, cancel := context.WithTimeout(context.Background(), guardianAuthorityLoadTimeout)
 		defer cancel()
 		event := guardianVerifyAndKill(ctx, cfg, func(ctx context.Context, cfg guardianConfig) (storage.ProviderExecutionAuthority, error) {
-			return retryGuardianAuthorityLoad(ctx, cfg, load, nil)
+			return retryGuardianAuthorityLoad(ctx, cfg, load)
 		}, kill)
 		writeGuardianEvent(cfg.DiagnosticPath, event)
 		if event.Event == "killed" {
