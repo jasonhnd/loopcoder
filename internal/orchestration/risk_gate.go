@@ -99,18 +99,18 @@ func EvaluateRiskGate(ctx context.Context, opts RiskGateOptions) (RiskGateDecisi
 	}
 
 	requiredChecks := normalizeRequiredChecks(opts.RequiredChecks)
-	var headBeforeWait string
-	var headBeforeWaitErr error
+	var prBeforeWait gh.PullRequest
+	var identityBeforeWaitErr error
 	if opts.WaitForChecks && len(requiredChecks) > 0 {
 		headReader, ok := opts.Reader.(RiskGateHeadReader)
 		if !ok {
-			headBeforeWaitErr = fmt.Errorf("risk gate reader does not support PR head reads")
+			identityBeforeWaitErr = fmt.Errorf("risk gate reader does not support PR identity reads")
 		} else {
 			pr, err := headReader.ViewPR(ctx, opts.PRNumber)
-			headBeforeWait = strings.TrimSpace(pr.HeadRefOID)
-			headBeforeWaitErr = err
-			if err == nil && headBeforeWait == "" {
-				headBeforeWaitErr = fmt.Errorf("pull request head SHA is empty")
+			prBeforeWait = pr
+			identityBeforeWaitErr = err
+			if err == nil && (strings.TrimSpace(pr.HeadRefOID) == "" || strings.TrimSpace(pr.BaseRefName) == "" || strings.TrimSpace(pr.BaseRefOID) == "") {
+				identityBeforeWaitErr = fmt.Errorf("pull request head SHA, base branch, and base SHA are required")
 			}
 		}
 	}
@@ -119,8 +119,8 @@ func EvaluateRiskGate(ctx context.Context, opts RiskGateOptions) (RiskGateDecisi
 	checks, checksErr := opts.Reader.PRChecks(ctx, opts.PRNumber)
 	var waitReport *waitstate.Report
 	if opts.WaitForChecks && len(requiredChecks) > 0 && requiredChecksPending(requiredChecks, checks, checksErr) {
-		if headBeforeWaitErr != nil {
-			checksErr = fmt.Errorf("capture PR head before check wait: %w", headBeforeWaitErr)
+		if identityBeforeWaitErr != nil {
+			checksErr = fmt.Errorf("capture PR identity before check wait: %w", identityBeforeWaitErr)
 		} else {
 			report, waitErr := waitstate.WatchGitHubCI(ctx, waitstate.Options{
 				WaitID:  fmt.Sprintf("pr-%d-required-checks", opts.PRNumber),
@@ -140,14 +140,15 @@ func EvaluateRiskGate(ctx context.Context, opts RiskGateOptions) (RiskGateDecisi
 			} else {
 				headReader := opts.Reader.(RiskGateHeadReader)
 				pr, err := headReader.ViewPR(ctx, opts.PRNumber)
-				headAfterWait := strings.TrimSpace(pr.HeadRefOID)
 				switch {
 				case err != nil:
-					checksErr = fmt.Errorf("revalidate PR head after check wait: %w", err)
-				case headAfterWait == "":
-					checksErr = fmt.Errorf("revalidate PR head after check wait: pull request head SHA is empty")
-				case headAfterWait != headBeforeWait:
-					checksErr = fmt.Errorf("PR head changed during check wait from %s to %s; rerun risk evaluation", headBeforeWait, headAfterWait)
+					checksErr = fmt.Errorf("revalidate PR identity after check wait: %w", err)
+				case strings.TrimSpace(pr.HeadRefOID) == "" || strings.TrimSpace(pr.BaseRefName) == "" || strings.TrimSpace(pr.BaseRefOID) == "":
+					checksErr = fmt.Errorf("revalidate PR identity after check wait: head SHA, base branch, and base SHA are required")
+				case strings.TrimSpace(pr.HeadRefOID) != strings.TrimSpace(prBeforeWait.HeadRefOID):
+					checksErr = fmt.Errorf("PR head changed during check wait from %s to %s; rerun risk evaluation", prBeforeWait.HeadRefOID, pr.HeadRefOID)
+				case strings.TrimSpace(pr.BaseRefName) != strings.TrimSpace(prBeforeWait.BaseRefName) || strings.TrimSpace(pr.BaseRefOID) != strings.TrimSpace(prBeforeWait.BaseRefOID):
+					checksErr = fmt.Errorf("PR base changed during check wait from %s@%s to %s@%s; rerun risk evaluation", prBeforeWait.BaseRefName, prBeforeWait.BaseRefOID, pr.BaseRefName, pr.BaseRefOID)
 				}
 			}
 		}

@@ -132,6 +132,7 @@ type Snapshot struct {
 	WaitID                   string        `json:"wait_id"`
 	StartedAt                string        `json:"started_at"`
 	NextReceiptAt            string        `json:"next_receipt_at"`
+	NextProbeAt              string        `json:"next_probe_at,omitempty"`
 	LastEventID              string        `json:"last_event_id,omitempty"`
 	LastState                State         `json:"last_state,omitempty"`
 	LastCode                 string        `json:"last_code,omitempty"`
@@ -245,6 +246,24 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 		if err := emitReceipt(ctx, opts, &snapshot, &report, now, false, policy); err != nil {
 			return finish(StopCanceled, err)
 		}
+		if strings.TrimSpace(snapshot.NextProbeAt) != "" {
+			nextProbe, _ := time.Parse(time.RFC3339Nano, snapshot.NextProbeAt)
+			if now.Before(nextProbe) {
+				nextWake := nextProbe
+				nextReceipt, _ := time.Parse(time.RFC3339Nano, snapshot.NextReceiptAt)
+				if nextReceipt.Before(nextWake) {
+					nextWake = nextReceipt
+				}
+				if deadline.Before(nextWake) {
+					nextWake = deadline
+				}
+				if err := opts.Clock.Sleep(ctx, nextWake.Sub(now)); err != nil {
+					return finish(StopCanceled, err)
+				}
+				continue
+			}
+			snapshot.NextProbeAt = ""
+		}
 
 		previousState := snapshot.LastState
 		obs, probeErr := opts.Probe(ctx)
@@ -271,19 +290,11 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 			return finish(StopTransition, nil)
 		}
 
-		delay := nextDelay(policy, opts.WaitID, snapshot.PollAttempt, obs.RetryAfter)
-		nextReceipt, _ := time.Parse(time.RFC3339Nano, snapshot.NextReceiptAt)
-		if until := nextReceipt.Sub(now); until > 0 && until < delay {
-			delay = until
-		}
-		if until := deadline.Sub(now); until > 0 && until < delay {
-			delay = until
-		}
-		if delay <= 0 {
-			delay = policy.MinPollInterval
-		}
-		if err := opts.Clock.Sleep(ctx, delay); err != nil {
-			return finish(StopCanceled, err)
+		snapshot.NextProbeAt = timestamp(now.Add(nextDelay(policy, opts.WaitID, snapshot.PollAttempt, obs.RetryAfter)))
+		if opts.Checkpoint != nil {
+			if err := opts.Checkpoint(ctx, snapshot); err != nil {
+				return finish(StopCanceled, fmt.Errorf("checkpoint next probe: %w", err))
+			}
 		}
 	}
 }
@@ -441,6 +452,11 @@ func initializeSnapshot(kind Kind, waitID string, initial Snapshot, now time.Tim
 		if _, err := time.Parse(time.RFC3339Nano, initial.NextReceiptAt); err != nil {
 			return Snapshot{}, fmt.Errorf("invalid snapshot next_receipt_at: %w", err)
 		}
+		if strings.TrimSpace(initial.NextProbeAt) != "" {
+			if _, err := time.Parse(time.RFC3339Nano, initial.NextProbeAt); err != nil {
+				return Snapshot{}, fmt.Errorf("invalid snapshot next_probe_at: %w", err)
+			}
+		}
 		return initial, nil
 	}
 	return Snapshot{
@@ -493,13 +509,10 @@ func nextDelay(policy Policy, waitID string, attempt int, retryAfter time.Durati
 	if delay > policy.MaxPollInterval || delay < 0 {
 		delay = policy.MaxPollInterval
 	}
-	if retryAfter > delay {
-		delay = retryAfter
-	}
-	if delay > policy.MaxPollInterval {
-		delay = policy.MaxPollInterval
-	}
 	if policy.JitterPercent == 0 || delay == policy.MaxPollInterval && policy.MinPollInterval == policy.MaxPollInterval {
+		if retryAfter > delay {
+			return retryAfter
+		}
 		return delay
 	}
 	h := fnv.New32a()
@@ -511,7 +524,10 @@ func nextDelay(policy Policy, waitID string, attempt int, retryAfter time.Durati
 		return policy.MinPollInterval
 	}
 	if jittered > policy.MaxPollInterval {
-		return policy.MaxPollInterval
+		jittered = policy.MaxPollInterval
+	}
+	if retryAfter > jittered {
+		return retryAfter
 	}
 	return jittered
 }

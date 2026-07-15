@@ -249,6 +249,34 @@ func TestRestartUnavailableRateLimitAndHostDisconnectConvergeWithoutBusyLoop(t *
 	}
 }
 
+func TestRetryAfterIsProbeLowerBoundWhileReceiptsContinue(t *testing.T) {
+	start := time.Date(2026, 7, 16, 4, 0, 0, 0, time.UTC)
+	clock := &fakeClock{now: start}
+	probes := 0
+	receipts := 0
+	_, err := Run(context.Background(), Options{
+		Kind: KindQuotaReset, WaitID: "quota-retry-after", Clock: clock,
+		Policy: Policy{MinPollInterval: time.Minute, MaxPollInterval: 2 * time.Minute, ReceiptCadence: 5 * time.Minute, Timeout: 20 * time.Minute},
+		Probe: func(context.Context) (Observation, error) {
+			probes++
+			if probes == 1 {
+				return Observation{EventID: "limited", State: StateRateLimited, Code: "rate-limited", RetryAfter: 10 * time.Minute}, nil
+			}
+			if elapsed := clock.now.Sub(start); elapsed < 10*time.Minute {
+				t.Fatalf("probe resumed after %s, before Retry-After", elapsed)
+			}
+			return Observation{EventID: "reset", State: StateReady, Code: "quota-reset", Consequential: true}, nil
+		},
+		Receipt: func(context.Context, Receipt) error { receipts++; return nil },
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if probes != 2 || receipts != 3 || clock.now.Sub(start) != 10*time.Minute {
+		t.Fatalf("probes=%d receipts=%d elapsed=%s, want 2/3/10m", probes, receipts, clock.now.Sub(start))
+	}
+}
+
 func TestPollingAndReceiptsDoNotRenewExternalAuthority(t *testing.T) {
 	clock := &fakeClock{now: time.Date(2026, 7, 16, 5, 0, 0, 0, time.UTC)}
 	claimGeneration := int64(7)
