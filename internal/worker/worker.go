@@ -185,6 +185,7 @@ type dispatchContext struct {
 	ownershipStore         storage.Store
 	ownershipLease         *storage.AgentOwnershipLease
 	providerAuthorityFence *storage.ProviderExecutionAuthorityFence
+	providerAuthority      storage.ProviderExecutionAuthority
 	jobID                  string
 	attemptPath            string
 	tracker                *attemptTracker
@@ -473,6 +474,9 @@ func providerGuardianOptions(dispatch *dispatchContext) supervisedexec.GuardianO
 		AttemptID:       dispatch.jobID,
 		OwnerID:         dispatch.ownershipLease.OwnerID,
 		ClaimGeneration: dispatch.ownershipLease.ClaimGeneration,
+		ProviderAuthority: func() (storage.ProviderExecutionAuthority, bool) {
+			return dispatch.providerAuthority, dispatch.providerAuthority.ProviderPID > 0
+		},
 	}
 }
 
@@ -2189,16 +2193,18 @@ func persistProviderExecutionAuthority(ctx context.Context, dispatch *dispatchCo
 		IdentityAmbiguous:    started.IdentityAmbiguous,
 		AmbiguityReason:      started.IdentityAmbiguityNote,
 	}
-	if _, err := storage.PersistProviderExecutionAuthority(ctx, dispatch.ownershipStore, authority, startedAt); err != nil {
+	persisted, err := storage.PersistProviderExecutionAuthority(ctx, dispatch.ownershipStore, authority, startedAt)
+	if err != nil {
 		return fmt.Errorf("persist provider execution authority: %w", err)
 	}
 	dispatch.providerAuthorityFence = &storage.ProviderExecutionAuthorityFence{
-		ProjectID:       authority.ProjectID,
-		RunID:           authority.RunID,
-		AttemptID:       authority.AttemptID,
-		OwnerID:         authority.OwnerID,
-		ClaimGeneration: authority.ClaimGeneration,
+		ProjectID:       persisted.ProjectID,
+		RunID:           persisted.RunID,
+		AttemptID:       persisted.AttemptID,
+		OwnerID:         persisted.OwnerID,
+		ClaimGeneration: persisted.ClaimGeneration,
 	}
+	dispatch.providerAuthority = persisted
 	return nil
 }
 

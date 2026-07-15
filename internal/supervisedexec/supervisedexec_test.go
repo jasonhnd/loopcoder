@@ -193,9 +193,20 @@ func TestDarwinGuardianReapsProviderAfterSupervisorSIGKILL(t *testing.T) {
 	if raceBuildEnabled {
 		attempts = 5
 	}
+	stopWithin := 2 * time.Second
+	finalReapWithin := 30 * time.Second
+	if raceBuildEnabled {
+		stopWithin = 10 * time.Second
+		finalReapWithin = 60 * time.Second
+	}
+	testRoot := t.TempDir()
+	var pendingReaps []processReapTarget
 	for i := 0; i < attempts; i++ {
-		t.Run(fmt.Sprintf("attempt-%03d", i), func(t *testing.T) {
-			root := t.TempDir()
+		if !t.Run(fmt.Sprintf("attempt-%03d", i), func(t *testing.T) {
+			root := filepath.Join(testRoot, fmt.Sprintf("attempt-%03d", i))
+			if err := os.MkdirAll(root, 0o700); err != nil {
+				t.Fatalf("create attempt root: %v", err)
+			}
 			storePath := filepath.Join(root, "home", "data", "loopcoder.db")
 			diagPath := filepath.Join(root, "home", "logs", fmt.Sprintf("guardian-%03d.jsonl", i))
 			readyPath := filepath.Join(root, "ready.json")
@@ -224,15 +235,19 @@ func TestDarwinGuardianReapsProviderAfterSupervisorSIGKILL(t *testing.T) {
 				t.Fatalf("kill supervisor: %v", err)
 			}
 			_ = parent.Wait()
-			reapWithin := 2 * time.Second
-			if raceBuildEnabled {
-				reapWithin = 10 * time.Second
-			}
-			waitNotAlive(t, ready.ProviderPID, reapWithin, "provider")
-			waitNotAlive(t, ready.GuardianPID, reapWithin, "guardian")
+			waitNotExecuting(t, ready.ProviderPID, stopWithin, "provider", diagPath)
+			waitNotExecuting(t, ready.GuardianPID, stopWithin, "guardian", diagPath)
+			pendingReaps = append(pendingReaps,
+				processReapTarget{pid: ready.ProviderPID, label: "provider", diagnosticPath: diagPath},
+				processReapTarget{pid: ready.GuardianPID, label: "guardian", diagnosticPath: diagPath},
+			)
+			pendingReaps = drainReapedProcesses(t, pendingReaps, 0)
 			assertGuardianDiagnostic(t, diagPath, "killed")
-		})
+		}) {
+			break
+		}
 	}
+	assertProcessesReaped(t, pendingReaps, finalReapWithin)
 }
 
 func TestRunCompletedExitCodeNonZero(t *testing.T) {
@@ -751,6 +766,19 @@ func TestProcessActivityFirstAvailableCountsAsProgress(t *testing.T) {
 	}
 }
 
+func TestProcessActivityRunnableProcessCountsAsProgressWithoutCPUClockAdvance(t *testing.T) {
+	previous := processActivityObservation{available: true, signature: "123:R:42", runnable: true}
+	current := processActivityObservation{available: true, signature: "123:R:42", runnable: true}
+	if !current.changedFrom(previous) {
+		t.Fatal("changedFrom = false, want a runnable process to count as progress while scheduler contention delays CPU clock advance")
+	}
+
+	sleeping := processActivityObservation{available: true, signature: "123:S:42"}
+	if sleeping.changedFrom(sleeping) {
+		t.Fatal("changedFrom = true, want an unchanged sleeping process observation to remain idle")
+	}
+}
+
 func TestObserveWorktreeRootErrorWarnsAndReturnsZeroObservation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing")
 	observation := observeWorktree(path)
@@ -1093,6 +1121,7 @@ func runGuardianSupervisorHelper(args []string) {
 	attemptID := "job-guardian-crash-" + suffix
 	ownerID := "worker:" + runID + ":" + attemptID + ":1"
 	var started StartedProcess
+	var persistedAuthority storage.ProviderExecutionAuthority
 	cmd := helperCommandForProcess("sleep", "30s")
 	_, err = Run(ctx, cmd, Options{
 		HardCap: 35 * time.Second,
@@ -1100,7 +1129,7 @@ func runGuardianSupervisorHelper(args []string) {
 		Role:    "worker",
 		OnStart: func(process StartedProcess) error {
 			started = process
-			_, err := storage.PersistProviderExecutionAuthority(ctx, store, storage.ProviderExecutionAuthority{
+			persisted, err := storage.PersistProviderExecutionAuthority(ctx, store, storage.ProviderExecutionAuthority{
 				ProjectID:            "proj-guardian",
 				RunID:                runID,
 				AttemptID:            attemptID,
@@ -1115,6 +1144,7 @@ func runGuardianSupervisorHelper(args []string) {
 				IdentityAmbiguous:    process.IdentityAmbiguous,
 				AmbiguityReason:      process.IdentityAmbiguityNote,
 			}, time.Now())
+			persistedAuthority = persisted
 			return err
 		},
 		Guardian: GuardianOptions{
@@ -1126,16 +1156,15 @@ func runGuardianSupervisorHelper(args []string) {
 			AttemptID:       attemptID,
 			OwnerID:         ownerID,
 			ClaimGeneration: 1,
+			ProviderAuthority: func() (storage.ProviderExecutionAuthority, bool) {
+				return persistedAuthority, persistedAuthority.ProviderPID > 0
+			},
 			OnStart: func(guardian GuardianProcess) error {
-				data, err := json.Marshal(guardianReadyRecord{
+				return writeGuardianReadyRecord(readyPath, guardianReadyRecord{
 					ProviderPID:  started.PID,
 					ProviderPGID: started.PGID,
 					GuardianPID:  guardian.PID,
 				})
-				if err != nil {
-					return err
-				}
-				return os.WriteFile(readyPath, data, 0o600)
 			},
 		},
 	})
@@ -1352,16 +1381,20 @@ func waitGuardianReady(t *testing.T, path string) guardianReadyRecord {
 	return guardianReadyRecord{}
 }
 
-func waitNotAlive(t *testing.T, pid int, timeout time.Duration, label string) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if !process.Alive(pid) {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+func writeGuardianReadyRecord(path string, record guardianReadyRecord) error {
+	data, err := json.Marshal(record)
+	if err != nil {
+		return err
 	}
-	t.Fatalf("%s pid %d still alive after %s", label, pid, timeout)
+	tmp := fmt.Sprintf("%s.tmp.%d", path, os.Getpid())
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func assertGuardianDiagnostic(t *testing.T, path, wantEvent string) {

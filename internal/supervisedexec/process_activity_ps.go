@@ -30,10 +30,12 @@ func observeUnixProcessGroupActivity(pgid int) processActivityObservation {
 	}
 	sort.Slice(processes, func(i, j int) bool { return processes[i].pid < processes[j].pid })
 	parts := make([]string, 0, len(processes))
+	runnable := false
 	for _, process := range processes {
 		parts = append(parts, process.signature())
+		runnable = runnable || strings.HasPrefix(strings.ToUpper(process.state), "R")
 	}
-	return processActivityObservation{available: true, signature: strings.Join(parts, ",")}
+	return processActivityObservation{available: true, signature: strings.Join(parts, ","), runnable: runnable}
 }
 
 type psProcessActivity struct {

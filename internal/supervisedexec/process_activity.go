@@ -5,10 +5,11 @@ import "time"
 type processActivityObservation struct {
 	available bool
 	signature string
+	runnable  bool
 }
 
 func (o processActivityObservation) changedFrom(prev processActivityObservation) bool {
-	return o.available && (!prev.available || o.signature != prev.signature)
+	return o.available && (o.runnable || !prev.available || o.signature != prev.signature)
 }
 
 func processPollInterval(timeout, logInterval time.Duration) time.Duration {
