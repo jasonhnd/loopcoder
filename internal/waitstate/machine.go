@@ -131,6 +131,7 @@ type Snapshot struct {
 	Kind                     Kind          `json:"kind"`
 	WaitID                   string        `json:"wait_id"`
 	StartedAt                string        `json:"started_at"`
+	DeadlineAt               string        `json:"deadline_at"`
 	NextReceiptAt            string        `json:"next_receipt_at"`
 	NextProbeAt              string        `json:"next_probe_at,omitempty"`
 	LastEventID              string        `json:"last_event_id,omitempty"`
@@ -182,12 +183,13 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	opts.WaitID = boundedToken(opts.WaitID, 160)
+	var err error
+	opts.WaitID, err = normalizeWaitID(opts.WaitID)
+	if err != nil {
+		return Report{}, err
+	}
 	if !validKind(opts.Kind) {
 		return Report{}, fmt.Errorf("unsupported wait kind %q", opts.Kind)
-	}
-	if opts.WaitID == "" {
-		return Report{}, errors.New("wait_id is required")
 	}
 	if opts.Probe == nil {
 		return Report{}, errors.New("probe is required")
@@ -232,8 +234,7 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 		return finish(reason, nil)
 	}
 
-	startedAt, _ := time.Parse(time.RFC3339Nano, snapshot.StartedAt)
-	deadline := startedAt.Add(policy.Timeout)
+	deadline, _ := time.Parse(time.RFC3339Nano, snapshot.DeadlineAt)
 	for {
 		if err := ctx.Err(); err != nil {
 			return finish(StopCanceled, err)
@@ -419,10 +420,14 @@ func BuildStatePacket(input PacketInput) ([]byte, error) {
 	if !validKind(input.Kind) {
 		return nil, fmt.Errorf("unsupported wait kind %q", input.Kind)
 	}
+	waitID, err := normalizeWaitID(input.WaitID)
+	if err != nil {
+		return nil, err
+	}
 	packet := statePacket{
 		SchemaVersion: StatePacketSchema,
 		Kind:          input.Kind,
-		WaitID:        boundedToken(input.WaitID, 160),
+		WaitID:        waitID,
 		PreviousState: normalizeState(input.PreviousState),
 		CurrentState:  normalizeState(input.CurrentState),
 		EventID:       boundedToken(input.EventID, 160),
@@ -450,7 +455,7 @@ func BuildStatePacket(input PacketInput) ([]byte, error) {
 
 func initializeSnapshot(kind Kind, waitID string, initial Snapshot, now time.Time, policy Policy) (Snapshot, error) {
 	if initial.SchemaVersion != "" {
-		if initial.SchemaVersion != SnapshotSchema || initial.Kind != kind || boundedToken(initial.WaitID, 160) != waitID {
+		if initial.SchemaVersion != SnapshotSchema || initial.Kind != kind || initial.WaitID != waitID {
 			return Snapshot{}, errors.New("restart snapshot does not match wait identity")
 		}
 		if _, err := time.Parse(time.RFC3339Nano, initial.StartedAt); err != nil {
@@ -458,6 +463,9 @@ func initializeSnapshot(kind Kind, waitID string, initial Snapshot, now time.Tim
 		}
 		if _, err := time.Parse(time.RFC3339Nano, initial.NextReceiptAt); err != nil {
 			return Snapshot{}, fmt.Errorf("invalid snapshot next_receipt_at: %w", err)
+		}
+		if _, err := time.Parse(time.RFC3339Nano, initial.DeadlineAt); err != nil {
+			return Snapshot{}, fmt.Errorf("invalid snapshot deadline_at: %w", err)
 		}
 		if strings.TrimSpace(initial.NextProbeAt) != "" {
 			if _, err := time.Parse(time.RFC3339Nano, initial.NextProbeAt); err != nil {
@@ -471,6 +479,7 @@ func initializeSnapshot(kind Kind, waitID string, initial Snapshot, now time.Tim
 		Kind:          kind,
 		WaitID:        waitID,
 		StartedAt:     timestamp(now),
+		DeadlineAt:    timestamp(now.Add(policy.Timeout)),
 		NextReceiptAt: timestamp(now),
 	}, nil
 }
@@ -550,6 +559,23 @@ func completedSnapshotStopReason(snapshot Snapshot) string {
 		return StopTimeout
 	}
 	return StopTransition
+}
+
+func normalizeWaitID(value string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "", errors.New("wait_id is required")
+	}
+	if value != trimmed {
+		return "", errors.New("wait_id must not contain surrounding whitespace")
+	}
+	if len(value) > 160 {
+		return "", errors.New("wait_id must be at most 160 ASCII token bytes")
+	}
+	if boundedToken(value, 160) != value {
+		return "", errors.New("wait_id must contain only ASCII letters, digits, '.', '_', ':', '/', '@', '+', or '-'")
+	}
+	return value, nil
 }
 
 func normalizeObservation(obs Observation) Observation {

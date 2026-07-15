@@ -82,6 +82,52 @@ func TestTimeoutSnapshotDoesNotRepeatTimeoutAfterRestart(t *testing.T) {
 	}
 }
 
+func TestRestartPreservesOriginalAbsoluteDeadline(t *testing.T) {
+	start := time.Date(2026, 7, 16, 0, 45, 0, 0, time.UTC)
+	clock := &fakeClock{now: start, cancelAfterSleeps: 1}
+	first, err := Run(context.Background(), Options{
+		Kind: KindApproval, WaitID: "approval-original-deadline", Clock: clock,
+		Policy: Policy{MinPollInterval: 30 * time.Second, MaxPollInterval: 30 * time.Second, ReceiptCadence: 5 * time.Minute, Timeout: time.Minute},
+		Probe: func(context.Context) (Observation, error) {
+			return Observation{EventID: "pending", State: StateWaiting, Code: "approval-pending"}, nil
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("first Run error = %v, want context canceled", err)
+	}
+	if first.Snapshot.DeadlineAt != timestamp(start.Add(time.Minute)) {
+		t.Fatalf("deadline_at = %q, want original one-minute deadline", first.Snapshot.DeadlineAt)
+	}
+	clock = &fakeClock{now: start.Add(time.Minute)}
+	probes := 0
+	second, err := Run(context.Background(), Options{
+		Kind: KindApproval, WaitID: "approval-original-deadline", Clock: clock,
+		Policy: DefaultPolicy(), Initial: first.Snapshot,
+		Probe: func(context.Context) (Observation, error) {
+			probes++
+			return Observation{}, errors.New("expired original deadline must not probe")
+		},
+	})
+	if err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if second.StopReason != StopTimeout || probes != 0 {
+		t.Fatalf("second report = %#v, probes=%d", second, probes)
+	}
+}
+
+func TestWaitIDRejectsLossyNormalizationAndPrefixCollisions(t *testing.T) {
+	for _, waitID := range []string{"approval with spaces", "quota-重置", strings.Repeat("a", 160) + "-one", strings.Repeat("a", 160) + "-two"} {
+		_, err := Run(context.Background(), Options{
+			Kind: KindApproval, WaitID: waitID, Policy: fastPolicy(),
+			Probe: func(context.Context) (Observation, error) { return Observation{}, nil },
+		})
+		if err == nil {
+			t.Fatalf("Run accepted lossy wait_id %q", waitID)
+		}
+	}
+}
+
 func TestApprovalAndQuotaWaitsUseNoProvider(t *testing.T) {
 	for _, kind := range []Kind{KindApproval, KindQuotaReset} {
 		t.Run(string(kind), func(t *testing.T) {
