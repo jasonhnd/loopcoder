@@ -23,6 +23,8 @@ const (
 	guardianArg       = "__loopcoder_macos_guardian"
 	guardianReadFD    = uintptr(3)
 	guardianReadyFD   = uintptr(4)
+
+	guardianAuthorityLoadTimeout = 8 * time.Second
 )
 
 type darwinGuardianHandle struct {
@@ -184,8 +186,12 @@ func runGuardianProcess() int {
 		})
 		return 2
 	}
+	return runGuardianProcessWithFiles(cfg, readFile, readyFile, loadGuardianAuthority, killDarwinProcessGroup)
+}
+
+func runGuardianProcessWithFiles(cfg guardianConfig, readFile, readyFile *os.File, load guardianAuthorityLoader, kill guardianGroupKiller) int {
+	defer readyFile.Close()
 	if _, err := readyFile.Write([]byte{'1'}); err != nil {
-		_ = readyFile.Close()
 		writeGuardianEvent(cfg.DiagnosticPath, guardianEvent{
 			SchemaVersion: guardianSchema,
 			Event:         "startup-failed",
@@ -194,10 +200,12 @@ func runGuardianProcess() int {
 		})
 		return 2
 	}
-	_ = readyFile.Close()
+	retentionCtx, stopRetention := context.WithCancel(context.Background())
+	authorityCache := startGuardianAuthorityRetention(retentionCtx, cfg, load)
+	defer stopRetention()
 
 	var token [1]byte
-	_, err = readFile.Read(token[:])
+	_, err := readFile.Read(token[:])
 	switch {
 	case err == nil && token[0] == 'r':
 		writeGuardianEvent(cfg.DiagnosticPath, guardianEvent{
@@ -212,9 +220,11 @@ func runGuardianProcess() int {
 		})
 		return 0
 	case err == io.EOF:
-		ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), guardianAuthorityLoadTimeout)
 		defer cancel()
-		event := guardianVerifyAndKill(ctx, cfg, retryLoadGuardianAuthority, killDarwinProcessGroup)
+		event := guardianVerifyAndKill(ctx, cfg, func(ctx context.Context, cfg guardianConfig) (storage.ProviderExecutionAuthority, error) {
+			return authorityCache.load(ctx, cfg, load)
+		}, kill)
 		writeGuardianEvent(cfg.DiagnosticPath, event)
 		if event.Event == "killed" {
 			return 0
@@ -268,22 +278,6 @@ func waitGuardianReadySignal(cmd *exec.Cmd, readyRead *os.File) error {
 		}
 		_ = cmd.Wait()
 		return fmt.Errorf("start guardian readiness: timed out")
-	}
-}
-
-func retryLoadGuardianAuthority(ctx context.Context, cfg guardianConfig) (authority storage.ProviderExecutionAuthority, err error) {
-	ticker := time.NewTicker(25 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		authority, err = loadGuardianAuthority(ctx, cfg)
-		if err == nil {
-			return authority, nil
-		}
-		select {
-		case <-ctx.Done():
-			return storage.ProviderExecutionAuthority{}, err
-		case <-ticker.C:
-		}
 	}
 }
 

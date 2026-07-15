@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/process"
@@ -73,6 +74,51 @@ type guardianEvent struct {
 
 type guardianAuthorityLoader func(context.Context, guardianConfig) (storage.ProviderExecutionAuthority, error)
 type guardianGroupKiller func(int) error
+
+type guardianAuthorityCache struct {
+	mu         sync.RWMutex
+	loaded     chan struct{}
+	loadedOnce sync.Once
+	authority  storage.ProviderExecutionAuthority
+	ok         bool
+}
+
+func newGuardianAuthorityCache() *guardianAuthorityCache {
+	return &guardianAuthorityCache{loaded: make(chan struct{})}
+}
+
+func (cache *guardianAuthorityCache) store(authority storage.ProviderExecutionAuthority) {
+	if cache == nil {
+		return
+	}
+	cache.mu.Lock()
+	if !cache.ok {
+		cache.authority = authority
+		cache.ok = true
+	}
+	cache.mu.Unlock()
+	cache.loadedOnce.Do(func() { close(cache.loaded) })
+}
+
+func (cache *guardianAuthorityCache) cached() (storage.ProviderExecutionAuthority, bool) {
+	if cache == nil {
+		return storage.ProviderExecutionAuthority{}, false
+	}
+	cache.mu.RLock()
+	defer cache.mu.RUnlock()
+	return cache.authority, cache.ok
+}
+
+func (cache *guardianAuthorityCache) load(ctx context.Context, cfg guardianConfig, load guardianAuthorityLoader) (storage.ProviderExecutionAuthority, error) {
+	if authority, ok := cache.cached(); ok {
+		return authority, nil
+	}
+	authority, err := retryGuardianAuthorityLoad(ctx, cfg, load, cache)
+	if err == nil {
+		return authority, nil
+	}
+	return storage.ProviderExecutionAuthority{}, err
+}
 
 func normalizeGuardianOptions(opts GuardianOptions) GuardianOptions {
 	opts.StorePath = strings.TrimSpace(opts.StorePath)
@@ -171,6 +217,50 @@ func guardianVerifyAndKill(ctx context.Context, cfg guardianConfig, load guardia
 	event.Event = "killed"
 	event.Reason = "supervisor-liveness-channel-closed"
 	return event
+}
+
+func startGuardianAuthorityRetention(ctx context.Context, cfg guardianConfig, load guardianAuthorityLoader) *guardianAuthorityCache {
+	cache := newGuardianAuthorityCache()
+	go func() {
+		_, _ = retryGuardianAuthorityLoad(ctx, cfg, load, cache)
+	}()
+	return cache
+}
+
+func retryGuardianAuthorityLoad(ctx context.Context, cfg guardianConfig, load guardianAuthorityLoader, cache *guardianAuthorityCache) (authority storage.ProviderExecutionAuthority, err error) {
+	if load == nil {
+		return storage.ProviderExecutionAuthority{}, fmt.Errorf("authority loader is required")
+	}
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		authority, err = load(ctx, cfg)
+		if err == nil {
+			if cache != nil {
+				cache.store(authority)
+			}
+			return authority, nil
+		}
+		select {
+		case <-ctx.Done():
+			if err != nil {
+				return storage.ProviderExecutionAuthority{}, err
+			}
+			return storage.ProviderExecutionAuthority{}, ctx.Err()
+		case <-cacheLoaded(cache):
+			if authority, ok := cache.cached(); ok {
+				return authority, nil
+			}
+		case <-ticker.C:
+		}
+	}
+}
+
+func cacheLoaded(cache *guardianAuthorityCache) <-chan struct{} {
+	if cache == nil {
+		return nil
+	}
+	return cache.loaded
 }
 
 func loadGuardianAuthority(ctx context.Context, cfg guardianConfig) (storage.ProviderExecutionAuthority, error) {
