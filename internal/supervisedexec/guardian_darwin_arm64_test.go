@@ -124,6 +124,66 @@ func TestDarwinGuardianSupervisorEOFRetriesCurrentAuthorityBeforeKill(t *testing
 	assertGuardianDiagnostic(t, cfg.DiagnosticPath, "killed")
 }
 
+func TestDarwinGuardianReadinessDeliveryFailureAfterAuthorityRetentionStillKillsOnSupervisorEOF(t *testing.T) {
+	cmd, authority := startGuardianAuthorityProcess(t)
+	defer cmd.Wait()
+	defer terminateProcessGroup(cmd.Process.Pid)
+
+	cfg := guardianConfigForAuthority(t, authority)
+	readFile, writeFile, readyRead, readyWrite := guardianTestPipes(t)
+	defer readFile.Close()
+	defer readyWrite.Close()
+
+	retained := make(chan struct{})
+	allowRetainedReturn := make(chan struct{})
+	var retainOnce sync.Once
+	var loadCalls atomic.Int32
+	loader := func(context.Context, guardianConfig) (storage.ProviderExecutionAuthority, error) {
+		if loadCalls.Add(1) == 1 {
+			retainOnce.Do(func() { close(retained) })
+			<-allowRetainedReturn
+		}
+		return authority, nil
+	}
+	var killedPGID atomic.Int64
+	done := make(chan int, 1)
+	go func() {
+		done <- runGuardianProcessWithFiles(cfg, readFile, readyWrite, loader, func(pgid int) error {
+			killedPGID.Store(int64(pgid))
+			return nil
+		})
+	}()
+
+	select {
+	case <-retained:
+	case <-time.After(2 * time.Second):
+		t.Fatal("guardian did not retain authority before readiness")
+	}
+	if err := readyRead.Close(); err != nil {
+		t.Fatalf("close readiness reader: %v", err)
+	}
+	if err := writeFile.Close(); err != nil {
+		t.Fatalf("close supervisor liveness pipe: %v", err)
+	}
+	close(allowRetainedReturn)
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("guardian exit code = %d, want 0", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("guardian did not finish after readiness failure and supervisor EOF")
+	}
+	if got := killedPGID.Load(); got != int64(authority.ProviderPGID) {
+		t.Fatalf("killed PGID = %d, want %d", got, authority.ProviderPGID)
+	}
+	if got := loadCalls.Load(); got < 2 {
+		t.Fatalf("authority loader calls = %d, want fresh EOF reload after readiness failure", got)
+	}
+	assertGuardianDiagnostic(t, cfg.DiagnosticPath, "killed")
+	assertGuardianDiagnostic(t, cfg.DiagnosticPath, "readiness-failed")
+}
+
 func TestDarwinGuardianSupervisorEOFFailsClosedWhenCurrentAuthorityUnreadable(t *testing.T) {
 	cmd, authority := startGuardianAuthorityProcess(t)
 	defer cmd.Wait()

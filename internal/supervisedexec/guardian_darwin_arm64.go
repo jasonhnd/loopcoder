@@ -208,12 +208,16 @@ func runGuardianProcessWithFiles(cfg guardianConfig, readFile, readyFile *os.Fil
 	}
 	if _, err := readyFile.Write([]byte{'1'}); err != nil {
 		writeGuardianEvent(cfg.DiagnosticPath, guardianEvent{
-			SchemaVersion: guardianSchema,
-			Event:         "startup-failed",
-			At:            time.Now().UTC().Format(time.RFC3339Nano),
-			Error:         "signal readiness: " + err.Error(),
+			SchemaVersion:   guardianSchema,
+			Event:           "readiness-failed",
+			At:              time.Now().UTC().Format(time.RFC3339Nano),
+			ProjectID:       cfg.ProjectID,
+			RunID:           cfg.RunID,
+			AttemptID:       cfg.AttemptID,
+			OwnerID:         cfg.OwnerID,
+			ClaimGeneration: cfg.ClaimGeneration,
+			Error:           "signal readiness: " + err.Error(),
 		})
-		return 2
 	}
 
 	var token [1]byte
