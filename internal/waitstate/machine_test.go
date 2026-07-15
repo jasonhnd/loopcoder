@@ -36,6 +36,9 @@ func TestThirtyMinuteCIWaitUsesNoProviderAndEmitsPolicyReceipts(t *testing.T) {
 	if report.StopReason != StopTimeout || report.ProviderInvocations != 0 {
 		t.Fatalf("report = %#v, want timeout and zero provider invocations", report)
 	}
+	if report.DurationMS != (30 * time.Minute).Milliseconds() {
+		t.Fatalf("duration_ms = %d, want %d", report.DurationMS, (30 * time.Minute).Milliseconds())
+	}
 	if elapsed := clock.now.Sub(time.Date(2026, 7, 16, 0, 0, 0, 0, time.UTC)); elapsed != 30*time.Minute {
 		t.Fatalf("elapsed = %s, want 30m", elapsed)
 	}
@@ -97,6 +100,9 @@ func TestRestartPreservesOriginalAbsoluteDeadline(t *testing.T) {
 	}
 	if first.Snapshot.DeadlineAt != timestamp(start.Add(time.Minute)) {
 		t.Fatalf("deadline_at = %q, want original one-minute deadline", first.Snapshot.DeadlineAt)
+	}
+	if first.DurationMS != (30 * time.Second).Milliseconds() {
+		t.Fatalf("duration_ms = %d, want canceled sleep duration %d", first.DurationMS, (30 * time.Second).Milliseconds())
 	}
 	clock = &fakeClock{now: start.Add(time.Minute)}
 	probes := 0

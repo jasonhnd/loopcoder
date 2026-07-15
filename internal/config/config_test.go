@@ -1216,6 +1216,36 @@ func TestParseRejectsInvalidGuardrailBudgetCaps(t *testing.T) {
 	}
 }
 
+func TestParseOrchestrationCostBudgetDefaultsAndOverrides(t *testing.T) {
+	defaults, err := Parse([]byte("version: 1\n"))
+	if err != nil {
+		t.Fatalf("Parse defaults: %v", err)
+	}
+	if defaults.Orchestration.CostBudget.MaxModelCalls != 8 || defaults.Orchestration.CostBudget.MaxTokens != 500_000 || defaults.Orchestration.CostBudget.MaxOverheadPercent != 10 {
+		t.Fatalf("default cost budget = %#v", defaults.Orchestration.CostBudget)
+	}
+
+	overridden, err := Parse([]byte("version: 1\norchestration:\n  cost_budget:\n    max_model_calls: 4\n    max_tokens: 9000\n    max_overhead_percent: 7\n"))
+	if err != nil {
+		t.Fatalf("Parse override: %v", err)
+	}
+	if overridden.Orchestration.CostBudget.MaxModelCalls != 4 || overridden.Orchestration.CostBudget.MaxTokens != 9000 || overridden.Orchestration.CostBudget.MaxOverheadPercent != 7 {
+		t.Fatalf("overridden cost budget = %#v", overridden.Orchestration.CostBudget)
+	}
+}
+
+func TestParseRejectsInvalidOrchestrationCostBudget(t *testing.T) {
+	for _, body := range []string{
+		"version: 1\norchestration:\n  cost_budget:\n    max_model_calls: 0\n",
+		"version: 1\norchestration:\n  cost_budget:\n    max_tokens: -1\n",
+		"version: 1\norchestration:\n  cost_budget:\n    max_overhead_percent: 101\n",
+	} {
+		if _, err := Parse([]byte(body)); err == nil || !strings.Contains(err.Error(), "orchestration.cost_budget") {
+			t.Fatalf("Parse(%q) error = %v", body, err)
+		}
+	}
+}
+
 func TestParseRejectsInvalidGuardrailCircuitBreakerCaps(t *testing.T) {
 	tests := []struct {
 		name string

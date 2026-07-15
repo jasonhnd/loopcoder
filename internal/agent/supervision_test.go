@@ -95,6 +95,41 @@ func TestProviderRunnerDoesNotMarkParentContextCancellationHung(t *testing.T) {
 	}
 }
 
+func TestProviderRunnerRelaysLaunchBeforeIdentityCallback(t *testing.T) {
+	launched := false
+	started := false
+	restore := stubRunSupervised(t, func(_ context.Context, _ *exec.Cmd, opts supervisedexec.Options) (supervisedexec.Result, error) {
+		if opts.OnLaunch == nil || opts.OnStart == nil {
+			t.Fatal("launch callbacks were not relayed")
+		}
+		opts.OnLaunch(123)
+		if !launched {
+			t.Fatal("OnLaunch did not mark the provider launch")
+		}
+		if err := opts.OnStart(supervisedexec.StartedProcess{PID: 123}); err != nil {
+			t.Fatalf("OnStart: %v", err)
+		}
+		return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted}, nil
+	})
+	defer restore()
+
+	_, _ = ExecCodexRunner{}.Run(context.Background(), Invocation{
+		WorktreePath: t.TempDir(),
+		Prompt:       "do work",
+		LogPath:      filepath.Join(t.TempDir(), "codex.log"),
+		OnProviderLaunch: func(pid int) {
+			launched = pid == 123
+		},
+		OnProviderStart: func(process ProviderProcess) error {
+			started = process.PID == 123
+			return nil
+		},
+	})
+	if !launched || !started {
+		t.Fatalf("launched=%v started=%v", launched, started)
+	}
+}
+
 func stubRunSupervised(t *testing.T, fn func(context.Context, *exec.Cmd, supervisedexec.Options) (supervisedexec.Result, error)) func() {
 	t.Helper()
 	original := runSupervised

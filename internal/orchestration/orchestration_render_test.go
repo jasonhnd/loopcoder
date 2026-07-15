@@ -1,6 +1,7 @@
 package orchestration
 
 import (
+	"bytes"
 	"encoding/json"
 	"go/ast"
 	"go/parser"
@@ -11,9 +12,34 @@ import (
 	"testing"
 
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
+	"github.com/jasonhnd/loopcoder/internal/orchestrationcost"
 	reportpkg "github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
+
+func TestRenderTickCostIncludesNormalizedDecisionDetails(t *testing.T) {
+	cost, err := orchestrationcost.Build("run-cost-decisions", orchestrationcost.DefaultPolicy(), nil)
+	if err != nil {
+		t.Fatalf("Build cost: %v", err)
+	}
+	cost = orchestrationcost.ApplyBudgetDecision(cost, orchestrationcost.Decision{
+		Status: "allowed", Allowed: true, Reason: "within budget", Observed: "calls=0 tokens=0", Limit: "calls=8 tokens=500000", Evidence: []string{"budget-evidence"}, Remediation: "none",
+	})
+	cost = orchestrationcost.ApplyReleaseDecision(cost, orchestrationcost.Decision{
+		Status: "needs-human", Allowed: false, Reason: "overhead-ratio-exceeded", Observed: "10.01%", Limit: "10%", Evidence: []string{"release-evidence"}, Remediation: "reduce coordination calls",
+	})
+	buffer := bytes.NewBuffer(nil)
+	renderTickOrchestrationCost(buffer, cost)
+	text := buffer.String()
+	for _, want := range []string{
+		`budget_decision[0] status=allowed allowed=true reason="within budget" observed="calls=0 tokens=0" limit="calls=8 tokens=500000" remediation="none" evidence="budget-evidence"`,
+		`release_gate status=needs-human allowed=false reason="overhead-ratio-exceeded" observed="10.01%" limit="10%" remediation="reduce coordination calls" evidence="release-evidence"`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("cost text missing %q:\n%s", want, text)
+		}
+	}
+}
 
 func TestRenderTickTextGoldenBytes(t *testing.T) {
 	report := TickReport{
@@ -51,6 +77,20 @@ func TestRenderTickTextGoldenBytes(t *testing.T) {
 		"Stop reason: no-ready-work\n" +
 		"Started at: 2026-07-05T00:00:00Z\n" +
 		"Finished at: 2026-07-05T00:00:01Z\n" +
+		"\n" +
+		"Orchestration cost\n" +
+		"- status=allowed calls=0 tokens=0 overhead_ratio=0.00% external_host_tokens=unknown\n" +
+		"- role=planner calls=0 tokens=0 usage=exact waits=0 retries=0 duplicate_retries=0 delivery_only_retries=0 duplicate_suppressions=0 packet_bytes=0 duration_ms=0\n" +
+		"- role=worker calls=0 tokens=0 usage=exact waits=0 retries=0 duplicate_retries=0 delivery_only_retries=0 duplicate_suppressions=0 packet_bytes=0 duration_ms=0\n" +
+		"- role=verifier calls=0 tokens=0 usage=exact waits=0 retries=0 duplicate_retries=0 delivery_only_retries=0 duplicate_suppressions=0 packet_bytes=0 duration_ms=0\n" +
+		"- role=recovery calls=0 tokens=0 usage=exact waits=0 retries=0 duplicate_retries=0 delivery_only_retries=0 duplicate_suppressions=0 packet_bytes=0 duration_ms=0\n" +
+		"- role=delivery calls=0 tokens=0 usage=exact waits=0 retries=0 duplicate_retries=0 delivery_only_retries=0 duplicate_suppressions=0 packet_bytes=0 duration_ms=0\n" +
+		"- role=waiting calls=0 tokens=0 usage=exact waits=0 retries=0 duplicate_retries=0 delivery_only_retries=0 duplicate_suppressions=0 packet_bytes=0 duration_ms=0\n" +
+		"  reason: within orchestration cost policy\n" +
+		"  next_action: continue\n" +
+		"  evidence: roles=6\n" +
+		"  evidence: model_calls=0\n" +
+		"  evidence: external_host_usage=unknown\n" +
 		"\n" +
 		"Compile\n" +
 		"- created=1 updated=2 unchanged=3 closed=4 plan_approval_required=yes\n" +

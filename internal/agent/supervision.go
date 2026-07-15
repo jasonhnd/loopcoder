@@ -30,6 +30,7 @@ func runProviderCommand(ctx context.Context, cmd *exec.Cmd, inv Invocation, prov
 		Guardian:        inv.Guardian,
 		LivenessMode:    supervisedexec.LivenessMode(inv.LivenessMode),
 		LivenessCommand: inv.LivenessCommand,
+		OnLaunch:        inv.OnProviderLaunch,
 	}
 	if inv.OnProviderStart != nil {
 		opts.OnStart = func(started supervisedexec.StartedProcess) error {

@@ -144,16 +144,18 @@ type Snapshot struct {
 }
 
 type Report struct {
-	Kind                Kind            `json:"kind"`
-	WaitID              string          `json:"wait_id"`
-	StopReason          string          `json:"stop_reason"`
-	Polls               int             `json:"polls"`
-	Receipts            int             `json:"receipts"`
-	WakeDecisions       int             `json:"wake_decisions"`
-	WakeDelivered       int             `json:"wake_delivered"`
-	ProviderInvocations int             `json:"provider_invocations"`
-	LastPacket          json.RawMessage `json:"last_packet,omitempty"`
-	Snapshot            Snapshot        `json:"snapshot"`
+	Kind                  Kind            `json:"kind"`
+	WaitID                string          `json:"wait_id"`
+	StopReason            string          `json:"stop_reason"`
+	DurationMS            int64           `json:"duration_ms"`
+	Polls                 int             `json:"polls"`
+	Receipts              int             `json:"receipts"`
+	WakeDecisions         int             `json:"wake_decisions"`
+	WakeDelivered         int             `json:"wake_delivered"`
+	DuplicateSuppressions int             `json:"duplicate_suppressions"`
+	ProviderInvocations   int             `json:"provider_invocations"`
+	LastPacket            json.RawMessage `json:"last_packet,omitempty"`
+	Snapshot              Snapshot        `json:"snapshot"`
 }
 
 type PacketInput struct {
@@ -211,6 +213,11 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 	finish := func(reason string, runErr error) (Report, error) {
 		report.StopReason = reason
 		report.Snapshot = snapshot
+		now = opts.Clock.Now().UTC()
+		startedAt, parseErr := time.Parse(time.RFC3339Nano, snapshot.StartedAt)
+		if parseErr == nil && now.After(startedAt) {
+			report.DurationMS = now.Sub(startedAt).Milliseconds()
+		}
 		return report, runErr
 	}
 
@@ -292,6 +299,7 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 			snapshot.PollAttempt = 0
 		} else {
 			snapshot.PollAttempt++
+			report.DuplicateSuppressions++
 		}
 		if transition && consequential(obs) {
 			if err := decideWakeWithPrevious(ctx, opts, &snapshot, &report, obs, previousState, now, StopTransition); err != nil {
@@ -344,6 +352,7 @@ func runKind(ctx context.Context, kind Kind, opts Options) (Report, error) {
 func decideWakeWithPrevious(ctx context.Context, opts Options, snapshot *Snapshot, report *Report, obs Observation, previous State, now time.Time, reason string) error {
 	key := decisionKey(opts.Kind, opts.WaitID, obs)
 	if key == snapshot.LastDecisionKey {
+		report.DuplicateSuppressions++
 		return nil
 	}
 	packet, err := BuildStatePacket(PacketInput{

@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	"github.com/jasonhnd/loopcoder/internal/observability"
+	"github.com/jasonhnd/loopcoder/internal/orchestrationcost"
 )
 
 func MarshalTickJSON(report TickReport) ([]byte, error) {
@@ -80,6 +82,8 @@ func RenderTickText(report TickReport) string {
 	fmt.Fprintf(&out, "Stop reason: %s\n", report.StopReason)
 	fmt.Fprintf(&out, "Started at: %s\n", report.StartedAt)
 	fmt.Fprintf(&out, "Finished at: %s\n", report.FinishedAt)
+
+	renderTickOrchestrationCost(&out, report.OrchestrationCost)
 
 	fmt.Fprintln(&out)
 	fmt.Fprintln(&out, "Compile")
@@ -365,6 +369,76 @@ func TickExitCode(report TickReport) int {
 	default:
 		return 1
 	}
+}
+
+func renderTickOrchestrationCost(out *bytes.Buffer, cost orchestrationcost.Report) {
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "Orchestration cost")
+	fmt.Fprintf(out, "- status=%s calls=%d tokens=%s overhead_ratio=%s external_host_tokens=%s\n",
+		cost.Status,
+		cost.Totals.ModelCalls,
+		formatTickCostTokens(cost.Totals.Tokens),
+		cost.OverheadRatio.Display,
+		cost.ExternalHostUsage.State,
+	)
+	for _, role := range cost.Roles {
+		fmt.Fprintf(out, "- role=%s calls=%d tokens=%s usage=%s waits=%d retries=%d duplicate_retries=%d delivery_only_retries=%d duplicate_suppressions=%d packet_bytes=%d duration_ms=%d\n",
+			role.Role,
+			role.ModelCalls,
+			formatTickCostTokens(role.Tokens),
+			role.UsageState,
+			role.Waits,
+			role.Retries,
+			role.DuplicateRetries,
+			role.DeliveryOnlyRetries,
+			role.DuplicateSuppressions,
+			role.ContextPacketBytes,
+			role.DurationMS,
+		)
+	}
+	for index, decision := range cost.BudgetDecisions {
+		renderTickCostDecision(out, fmt.Sprintf("budget_decision[%d]", index), decision)
+	}
+	if cost.ReleaseGate != nil {
+		renderTickCostDecision(out, "release_gate", *cost.ReleaseGate)
+	}
+	if cost.Reason != "" {
+		fmt.Fprintf(out, "  reason: %s\n", cost.Reason)
+	}
+	if cost.NextAction != "" {
+		fmt.Fprintf(out, "  next_action: %s\n", cost.NextAction)
+	}
+	for _, evidence := range cost.Evidence {
+		fmt.Fprintf(out, "  evidence: %s\n", evidence)
+	}
+	for _, remediation := range cost.Remediation {
+		fmt.Fprintf(out, "  remediation: %s\n", remediation)
+	}
+}
+
+func renderTickCostDecision(out *bytes.Buffer, label string, decision orchestrationcost.Decision) {
+	fmt.Fprintf(out, "- %s status=%s allowed=%t reason=%q observed=%q limit=%q",
+		label,
+		decision.Status,
+		decision.Allowed,
+		decision.Reason,
+		decision.Observed,
+		decision.Limit,
+	)
+	if decision.PRNumber > 0 || decision.Consumed {
+		fmt.Fprintf(out, " pr_number=%d consumed=%t", decision.PRNumber, decision.Consumed)
+	}
+	fmt.Fprintf(out, " remediation=%q evidence=%q\n",
+		decision.Remediation,
+		strings.Join(decision.Evidence, ","),
+	)
+}
+
+func formatTickCostTokens(tokens *int64) string {
+	if tokens == nil {
+		return orchestrationcost.UsageUnknown
+	}
+	return strconv.FormatInt(*tokens, 10)
 }
 
 func renderTickConfiguredEvidence(out *bytes.Buffer, evidence []config.EvidenceArtifact) {
