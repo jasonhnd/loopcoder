@@ -53,6 +53,38 @@ func TestEvaluateRiskGateWaitsLocallyForRequiredChecks(t *testing.T) {
 	}
 }
 
+func TestEvaluateRiskGateRejectsHeadChangedDuringCheckWait(t *testing.T) {
+	reader := &sequencedRiskReader{
+		checks: [][]gh.Check{
+			{{Name: "verify", Bucket: "pending"}},
+			{{Name: "verify", Bucket: "pass"}},
+		},
+		heads: []string{"old-head", "new-head"},
+	}
+	decision, err := EvaluateRiskGate(context.Background(), RiskGateOptions{
+		Reader:         reader,
+		PRNumber:       967,
+		RequiredChecks: []string{"verify"},
+		WaitForChecks:  true,
+		WaitClock:      &riskWaitClock{now: time.Date(2026, 7, 16, 6, 0, 0, 0, time.UTC)},
+		WaitPolicy: waitstate.Policy{
+			MinPollInterval: time.Second,
+			MaxPollInterval: time.Second,
+			Timeout:         time.Minute,
+		},
+	})
+	if err != nil {
+		t.Fatalf("EvaluateRiskGate: %v", err)
+	}
+	if decision.Status != RiskGateStatusNeedsHuman {
+		t.Fatalf("status = %q, want needs-human", decision.Status)
+	}
+	if len(decision.RedLines) != 1 || decision.RedLines[0].Category != RiskRedLineBuild ||
+		!strings.Contains(decision.RedLines[0].Detail, "head changed during check wait") {
+		t.Fatalf("red lines = %#v, want stale-head rejection", decision.RedLines)
+	}
+}
+
 func TestEvaluateRiskGateCorePathNeedsHuman(t *testing.T) {
 	decision, err := EvaluateRiskGate(context.Background(), RiskGateOptions{
 		Reader:         cleanRiskReader(353, "internal/agent/agent.go"),
@@ -451,8 +483,10 @@ func addedLineDiff(file, line string) string {
 }
 
 type sequencedRiskReader struct {
-	checks [][]gh.Check
-	calls  int
+	checks    [][]gh.Check
+	calls     int
+	heads     []string
+	headCalls int
 }
 
 func (r *sequencedRiskReader) PRChecks(context.Context, int) ([]gh.Check, error) {
@@ -470,6 +504,18 @@ func (*sequencedRiskReader) PRDiff(context.Context, int) (string, error) {
 
 func (*sequencedRiskReader) PRDiffNameOnly(context.Context, int) ([]string, error) {
 	return []string{"README.md"}, nil
+}
+
+func (r *sequencedRiskReader) ViewPR(context.Context, int) (gh.PullRequest, error) {
+	if len(r.heads) == 0 {
+		return gh.PullRequest{HeadRefOID: "stable-head"}, nil
+	}
+	index := r.headCalls
+	r.headCalls++
+	if index >= len(r.heads) {
+		index = len(r.heads) - 1
+	}
+	return gh.PullRequest{HeadRefOID: r.heads[index]}, nil
 }
 
 type riskWaitClock struct {

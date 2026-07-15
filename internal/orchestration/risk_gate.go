@@ -44,6 +44,10 @@ type RiskGateReader interface {
 	PRDiffNameOnly(ctx context.Context, number int) ([]string, error)
 }
 
+type RiskGateHeadReader interface {
+	ViewPR(ctx context.Context, number int) (gh.PullRequest, error)
+}
+
 type PreProdWriter interface {
 	MergeToPreProd(ctx context.Context, prNumber int, preProdBranch string) (gh.PreProdMergeResult, error)
 	RevertOnPreProd(ctx context.Context, prNumber int, preProdBranch, mergeSHA string) (gh.PreProdRevertResult, error)
@@ -95,26 +99,57 @@ func EvaluateRiskGate(ctx context.Context, opts RiskGateOptions) (RiskGateDecisi
 	}
 
 	requiredChecks := normalizeRequiredChecks(opts.RequiredChecks)
+	var headBeforeWait string
+	var headBeforeWaitErr error
+	if opts.WaitForChecks && len(requiredChecks) > 0 {
+		headReader, ok := opts.Reader.(RiskGateHeadReader)
+		if !ok {
+			headBeforeWaitErr = fmt.Errorf("risk gate reader does not support PR head reads")
+		} else {
+			pr, err := headReader.ViewPR(ctx, opts.PRNumber)
+			headBeforeWait = strings.TrimSpace(pr.HeadRefOID)
+			headBeforeWaitErr = err
+			if err == nil && headBeforeWait == "" {
+				headBeforeWaitErr = fmt.Errorf("pull request head SHA is empty")
+			}
+		}
+	}
 	changedFiles, filesErr := opts.Reader.PRDiffNameOnly(ctx, opts.PRNumber)
 	diff, diffErr := opts.Reader.PRDiff(ctx, opts.PRNumber)
 	checks, checksErr := opts.Reader.PRChecks(ctx, opts.PRNumber)
 	var waitReport *waitstate.Report
 	if opts.WaitForChecks && len(requiredChecks) > 0 && requiredChecksPending(requiredChecks, checks, checksErr) {
-		report, waitErr := waitstate.WatchGitHubCI(ctx, waitstate.Options{
-			WaitID:  fmt.Sprintf("pr-%d-required-checks", opts.PRNumber),
-			Policy:  opts.WaitPolicy,
-			Clock:   opts.WaitClock,
-			Receipt: opts.WaitReceipt,
-			Probe: func(ctx context.Context) (waitstate.Observation, error) {
-				observed, err := opts.Reader.PRChecks(ctx, opts.PRNumber)
-				checks = append([]gh.Check(nil), observed...)
-				checksErr = err
-				return requiredChecksObservation(requiredChecks, observed, err)
-			},
-		})
-		waitReport = &report
-		if waitErr != nil {
-			checksErr = waitErr
+		if headBeforeWaitErr != nil {
+			checksErr = fmt.Errorf("capture PR head before check wait: %w", headBeforeWaitErr)
+		} else {
+			report, waitErr := waitstate.WatchGitHubCI(ctx, waitstate.Options{
+				WaitID:  fmt.Sprintf("pr-%d-required-checks", opts.PRNumber),
+				Policy:  opts.WaitPolicy,
+				Clock:   opts.WaitClock,
+				Receipt: opts.WaitReceipt,
+				Probe: func(ctx context.Context) (waitstate.Observation, error) {
+					observed, err := opts.Reader.PRChecks(ctx, opts.PRNumber)
+					checks = append([]gh.Check(nil), observed...)
+					checksErr = err
+					return requiredChecksObservation(requiredChecks, observed, err)
+				},
+			})
+			waitReport = &report
+			if waitErr != nil {
+				checksErr = waitErr
+			} else {
+				headReader := opts.Reader.(RiskGateHeadReader)
+				pr, err := headReader.ViewPR(ctx, opts.PRNumber)
+				headAfterWait := strings.TrimSpace(pr.HeadRefOID)
+				switch {
+				case err != nil:
+					checksErr = fmt.Errorf("revalidate PR head after check wait: %w", err)
+				case headAfterWait == "":
+					checksErr = fmt.Errorf("revalidate PR head after check wait: pull request head SHA is empty")
+				case headAfterWait != headBeforeWait:
+					checksErr = fmt.Errorf("PR head changed during check wait from %s to %s; rerun risk evaluation", headBeforeWait, headAfterWait)
+				}
+			}
 		}
 	}
 

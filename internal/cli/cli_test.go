@@ -6908,6 +6908,9 @@ func TestTickOptionsFromConfigWiresDomainRedLines(t *testing.T) {
 	if !reflect.DeepEqual(opts.AdditionalRiskRedLines, want) {
 		t.Fatalf("AdditionalRiskRedLines = %#v, want %#v", opts.AdditionalRiskRedLines, want)
 	}
+	if !opts.WaitForChecks {
+		t.Fatal("trigger tick options must enable deterministic local check waiting")
+	}
 }
 
 func TestTickSelfAcksOwnRelayRecordsWithoutGatingStartup(t *testing.T) {
