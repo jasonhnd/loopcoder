@@ -1106,7 +1106,7 @@ func TestTaskBoundaryHandlerReevaluatesRouteThroughNestedSchedulerEvent(t *testi
 			Permission: "write",
 			Required:   true,
 		}},
-		Execute: func(context.Context, orchestration.ChildRunPlan) (orchestration.ChildRunResult, error) {
+		Execute: func(context.Context, orchestration.ChildExecutionRequest) (orchestration.ChildRunResult, error) {
 			if err := replaceStoredQuotaReset(t, ctx, store, "qsnap-codex-a-good", fixture.now.Add(30*time.Minute)); err != nil {
 				return orchestration.ChildRunResult{}, err
 			}

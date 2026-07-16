@@ -572,6 +572,12 @@ func recordHandoffTransactionTx(ctx context.Context, tx Tx, req HandoffRequest) 
 	if err := requireRowsAffected(ctx, tx, req.ChildRunID, record.DestinationExecutorID, record.DestinationClaimGeneration); err != nil {
 		return HandoffTransaction{}, err
 	}
+	if _, err := tx.Exec(ctx, `UPDATE child_execution_requests
+		SET claim_generation = ?, lifecycle_status = ?, updated_at = ?
+		WHERE child_run_id = ? AND legacy_ambiguous = 0 AND claim_generation IN (0, ?)`,
+		record.DestinationClaimGeneration, ClaimPhaseClaimed, req.RequestedAt, req.ChildRunID, req.SourceClaimGeneration); err != nil {
+		return HandoffTransaction{}, fmt.Errorf("record handoff: transfer child execution request fence: %w", err)
+	}
 	if err := reconcileHandoffAgentAuthorityTx(ctx, tx, req, record, status, terminalCode, lease); err != nil {
 		return HandoffTransaction{}, err
 	}

@@ -9651,7 +9651,7 @@ func TestNestedSubprocessExecutorUnitRunsDeterministicCommand(t *testing.T) {
 	child.ID = child.ChildKey
 	child.RunID = "run-20260102T030405Z-child-0-alpha"
 	executor := nestedSubprocessExecutor(nestedRunOptions{RepoPath: repo, Model: "deterministic-subprocess", Effort: "none"}, Deps{Now: fixedCLINow}, &stderr)
-	result, err := executor(context.Background(), child)
+	result, err := executor(context.Background(), nestedExecutionRequestForCLITest(child))
 	if err != nil {
 		t.Fatalf("nestedSubprocessExecutor: %v; stderr=%q", err, stderr.String())
 	}
@@ -9664,6 +9664,45 @@ func TestNestedSubprocessExecutorUnitRunsDeterministicCommand(t *testing.T) {
 	}
 	if len(attempts) != 1 || attempts[0].Provider != nestedTestSubprocessProvider || attempts[0].Report == nil {
 		t.Fatalf("attempts = %#v, want test-subprocess report", attempts)
+	}
+}
+
+func TestNestedDispatchExecutorUsesProviderNeutralExecutionWork(t *testing.T) {
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	var stderr bytes.Buffer
+	repo := t.TempDir()
+	child := nestedPlanItem("contract", 1005, nil, true, "read-only", nil)
+	child.ID = child.ChildKey
+	child.RunID = "run-20260717T010203Z-child-0-contract"
+	request := nestedExecutionRequestForCLITest(child)
+	request.Work = orchestration.ChildExecutionWork{
+		Instructions:   "Use the immutable request.",
+		Branch:         "feature/issue-1005",
+		Provider:       "configured-provider",
+		Model:          "configured-model",
+		Effort:         "high",
+		TimeoutSeconds: 30,
+	}
+	request.ProviderDecision = orchestration.ChildProviderDecisionRef{
+		AdapterID:         "adapter-reference",
+		ModelCapabilityID: "model-capability-reference",
+	}
+	var got worker.Options
+	executor := nestedDispatchExecutor(nestedRunOptions{RepoPath: repo, BaseBranch: "pre-prod", Provider: "fallback-provider", Model: "fallback-model", Effort: "medium"}, Deps{
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			got = opts
+			return worker.Result{OK: true, Status: state.StatusSucceeded, RunID: child.RunID, Issue: child.Issue}, nil
+		},
+	}, &stderr)
+	result, err := executor(context.Background(), request)
+	if err != nil {
+		t.Fatalf("nestedDispatchExecutor: %v", err)
+	}
+	if result.Status != orchestration.NestedStatusSucceeded {
+		t.Fatalf("result = %#v", result)
+	}
+	if got.Provider != request.Work.Provider || got.Model != request.Work.Model || got.Effort != request.Work.Effort || got.ProviderKey != request.IdempotencyKey || got.Branch != request.Work.Branch || got.IssueBody == "" {
+		t.Fatalf("worker options did not preserve execution work: %#v", got)
 	}
 }
 
@@ -9680,7 +9719,7 @@ func TestNestedSubprocessExecutorUnitRedactsOutputBeforePersistingAttempt(t *tes
 	child.ID = child.ChildKey
 	child.RunID = "run-20260102T030405Z-child-0-redact"
 	executor := nestedSubprocessExecutor(nestedRunOptions{RepoPath: repo, Model: "deterministic-subprocess", Effort: "none"}, Deps{Now: fixedCLINow}, &stderr)
-	_, err := executor(context.Background(), child)
+	_, err := executor(context.Background(), nestedExecutionRequestForCLITest(child))
 	if err == nil {
 		t.Fatal("nestedSubprocessExecutor returned nil error, want command failure")
 	}
@@ -9700,6 +9739,26 @@ func TestNestedSubprocessExecutorUnitRedactsOutputBeforePersistingAttempt(t *tes
 	}
 	if strings.Contains(string(data), canary) || strings.Contains(string(data), "AKIA") {
 		t.Fatalf("attempt file retained credential canary: %s", data)
+	}
+}
+
+func nestedExecutionRequestForCLITest(child orchestration.ChildRunPlan) orchestration.ChildExecutionRequest {
+	return orchestration.ChildExecutionRequest{
+		ID:             child.ChildKey,
+		ChildKey:       child.ChildKey,
+		RunID:          child.RunID,
+		Title:          child.Title,
+		Role:           child.Role,
+		Issue:          child.Issue,
+		Permission:     child.Permission,
+		Scope:          child.Scope,
+		DependsOn:      append([]string(nil), child.DependsOn...),
+		Aggregation:    child.Aggregation,
+		Required:       child.Required,
+		Optional:       child.Optional,
+		Ordinal:        child.Ordinal,
+		Depth:          child.Depth,
+		IdempotencyKey: "child-run:" + child.RunID,
 	}
 }
 

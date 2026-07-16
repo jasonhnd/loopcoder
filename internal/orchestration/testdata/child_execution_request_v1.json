@@ -1,0 +1,82 @@
+{
+  "schema_version": "loopcoder.child_execution_request.v1",
+  "parent_run_id": "run-20260717T010203Z-wave",
+  "plan_id": "plan-run-20260717T010203Z-contract",
+  "id": "contract-child",
+  "child_key": "contract-child",
+  "child_run_id": "run-20260717T010203Z-child-0-contract-child",
+  "title": "Contract child",
+  "role": "worker",
+  "issue": 1005,
+  "permission": "write",
+  "scope": {
+    "repo": ".",
+    "paths": [
+      "src"
+    ],
+    "issues": [
+      1005
+    ],
+    "commands": [
+      "go test ./internal/orchestration"
+    ]
+  },
+  "repository_identity": "project:test",
+  "checkout_identity": "/repo",
+  "scoped_repository_identity": "/repo",
+  "canonical_paths": [
+    "/repo/src"
+  ],
+  "allowed_mutation_scope": {
+    "paths": [
+      "/repo/src"
+    ],
+    "issues": [
+      1005
+    ],
+    "pull_requests": [],
+    "data": []
+  },
+  "capabilities": {
+    "network": [
+      "github-api"
+    ],
+    "commands": [
+      "go test ./internal/orchestration"
+    ],
+    "delegation": []
+  },
+  "depends_on": [],
+  "aggregation": {
+    "mode": "collect",
+    "required": true,
+    "include_report": true
+  },
+  "required": true,
+  "optional": false,
+  "ordinal": 0,
+  "depth": 1,
+  "idempotency_key": "child-run:run-20260717T010203Z-child-0-contract-child",
+  "claim_generation": 0,
+  "provider_decision": {
+    "routing_decision_id": "",
+    "adapter_id": "generic-adapter",
+    "model_capability_id": "capability-reasoning",
+    "reasoning_profile_id": "high"
+  },
+  "budget_references": [
+    "budget:test",
+    "sub-agent:run-20260717T010203Z-child-0-contract-child"
+  ],
+  "deadline_reference": "2026-07-17T01:04:03Z",
+  "work": {
+    "instructions": "Verify the immutable child contract.",
+    "branch": "feature/issue-1005",
+    "provider": "generic-adapter",
+    "model": "capability-reasoning",
+    "effort": "high",
+    "timeout_seconds": 120
+  },
+  "contract_fingerprint": "sha256:f8fdc6f5226a6256926dac5adfe80566dbeace08b7b3ea9fd7e641e649921d6e",
+  "lifecycle_status": "queued"
+}
