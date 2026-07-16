@@ -90,7 +90,7 @@ func DefaultPolicy() Policy {
 		MinPollInterval: 15 * time.Second,
 		MaxPollInterval: 2 * time.Minute,
 		ReceiptCadence:  5 * time.Minute,
-		Timeout:         30 * time.Minute,
+		Timeout:         2 * time.Hour,
 		JitterPercent:   10,
 	}
 }

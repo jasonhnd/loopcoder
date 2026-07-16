@@ -23,6 +23,9 @@ func TestV080WorkflowPolicy(t *testing.T) {
 	if err := validateV080WorkflowPolicy(workflow, checks); err != nil {
 		t.Fatal(err)
 	}
+	if !workflowJobContains(workflow.Jobs["race"], "scripts/ci-race-changed.sh") {
+		t.Fatal("pull-request race job must run scripts/ci-race-changed.sh")
+	}
 }
 
 func TestV080ReleaseWorkflowPolicy(t *testing.T) {
@@ -32,6 +35,18 @@ func TestV080ReleaseWorkflowPolicy(t *testing.T) {
 	if err := validateV080ReleaseWorkflowPolicy(workflow); err != nil {
 		t.Fatal(err)
 	}
+	if !workflowJobContains(workflow.Jobs["build"], "go test -race -count=1 -timeout=20m ./...") {
+		t.Fatal("release build must run the full Go race suite before packaging")
+	}
+}
+
+func workflowJobContains(job workflowJobPolicy, needle string) bool {
+	for _, step := range job.Steps {
+		if strings.Contains(step.Run, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestV080ReleaseSmokeUsesInstallerBackedCandidate(t *testing.T) {

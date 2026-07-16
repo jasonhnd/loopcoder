@@ -50,6 +50,16 @@ func TestThirtyMinuteCIWaitUsesNoProviderAndEmitsPolicyReceipts(t *testing.T) {
 	}
 }
 
+func TestDefaultPolicyCoversQueuedMacOSCIWithoutChangingReceiptCadence(t *testing.T) {
+	policy := DefaultPolicy()
+	if policy.Timeout != 2*time.Hour {
+		t.Fatalf("default timeout = %s, want 2h", policy.Timeout)
+	}
+	if policy.ReceiptCadence != 5*time.Minute {
+		t.Fatalf("default receipt cadence = %s, want 5m", policy.ReceiptCadence)
+	}
+}
+
 func TestTimeoutSnapshotDoesNotRepeatTimeoutAfterRestart(t *testing.T) {
 	clock := &fakeClock{now: time.Date(2026, 7, 16, 0, 30, 0, 0, time.UTC)}
 	first, err := Run(context.Background(), Options{

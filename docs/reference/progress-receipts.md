@@ -119,6 +119,13 @@ to detached supervision. Explicit `--detach` uses the same contract, and
 `--foreground` is the deterministic opt-out. A detached launch returns a run ID
 plus explicit `status`, `attach`, and `cancel` commands. Detached supervisor
 receipts are persisted to the progress receipt store and the delivery outbox.
+
+The local CI watcher remains provider-free while GitHub queues or runs required
+checks. Its default wait is bounded at two hours so scarce macOS arm64 runner
+queues do not become false 30-minute failures; five-minute receipt cadence is
+unchanged. The explicit 30-minute acceptance fixture remains the proof that a
+long wait performs zero provider calls and emits every policy receipt.
+
 If the host goes offline, the run remains observable through
 `loopcoder status --repo . --run <run-id> --receipts` and
 `loopcoder attach --repo . --run <run-id>`; no notification is claimed.

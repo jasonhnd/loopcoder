@@ -29,7 +29,7 @@ func TestDeterministicActivitiesRejectProviderUsageAndReportExactZero(t *testing
 	}
 }
 
-func TestUnknownUsageStaysUnknownAndBlocksNextProvider(t *testing.T) {
+func TestTerminalUnknownUsageStaysUnknownAndFallsBackToCallBudget(t *testing.T) {
 	report, err := Build("run-unknown", DefaultPolicy(), []Event{EventFromReport("worker-1", RoleWorker, true, &reporter.Report{})})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
@@ -38,11 +38,23 @@ func TestUnknownUsageStaysUnknownAndBlocksNextProvider(t *testing.T) {
 		t.Fatalf("report = %#v", report)
 	}
 	decision := CheckBeforeModelCall(report, 1)
-	if decision.Allowed || decision.Reason != "token-budget-unknown" {
+	if !decision.Allowed || decision.Reason != "within orchestration call budget; token usage unknown" {
 		t.Fatalf("decision = %#v", decision)
 	}
 	if report.OverheadRatio.State != UsageUnknown || report.OverheadRatio.Display != UsageUnknown {
 		t.Fatalf("overhead ratio = %#v, want unknown useful denominator", report.OverheadRatio)
+	}
+}
+
+func TestPendingProviderReservationBlocksNextProvider(t *testing.T) {
+	event := EventFromReport("worker-1", RoleWorker, true, nil, "provider-call-reserved")
+	report, err := Build("run-pending", DefaultPolicy(), []Event{event})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	decision := CheckBeforeModelCall(report, 1)
+	if decision.Allowed || decision.Reason != "provider-call-usage-pending" {
+		t.Fatalf("decision = %#v", decision)
 	}
 }
 

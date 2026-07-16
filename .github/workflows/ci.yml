@@ -96,6 +96,8 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
@@ -112,8 +114,11 @@ jobs:
           test "${actual_goos}" = "darwin"
           test "${actual_goarch}" = "arm64"
 
-      - name: Go test (race detector)
-        run: go test -race -timeout=20m ./...
+      - name: Go test changed packages (race detector)
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE_SHA: ${{ github.event.before }}
+        run: bash scripts/ci-race-changed.sh "${PR_BASE_SHA:-${PUSH_BASE_SHA:-}}"
 
   security:
     runs-on: macos-15

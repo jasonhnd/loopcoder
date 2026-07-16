@@ -43,6 +43,9 @@ jobs:
           test "${actual_goos}" = "darwin"
           test "${actual_goarch}" = "arm64"
 
+      - name: Full Go race suite
+        run: go test -race -count=1 -timeout=20m ./...
+
       - name: Build archive
         env:
           GOOS: darwin

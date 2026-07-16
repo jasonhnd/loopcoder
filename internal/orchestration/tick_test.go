@@ -616,7 +616,7 @@ func TestRecordTickCostEventAssignsStableOccurrenceIDs(t *testing.T) {
 	}
 }
 
-func TestTickUnknownProviderUsageIsNotZeroAndBlocksNextProvider(t *testing.T) {
+func TestTickTerminalUnknownProviderUsageAllowsVerifierButBlocksRelease(t *testing.T) {
 	opts := reviewReadyTickOptions(t.TempDir(), 102, "https://github.com/owner/repo/pull/78")
 	opts.DispatchWave = func(context.Context, DispatchWaveOptions) (DispatchWaveReport, error) {
 		return tickWaveReport(DispatchWaveIssueResult{Issue: 102, Status: DispatchWaveStatusSucceeded, ProviderInvoked: true, PR: "https://github.com/owner/repo/pull/78", Report: tickProviderReportUnknown()}), nil
@@ -627,15 +627,21 @@ func TestTickUnknownProviderUsageIsNotZeroAndBlocksNextProvider(t *testing.T) {
 			return loopreview.Result{}, err
 		}
 		verifierCalls++
-		return tickLoopreview(loopreview.VerdictPass, "unexpected"), nil
+		result := tickLoopreview(loopreview.VerdictPass, "review passed")
+		result.ProviderInvoked = true
+		result.Verdict.Report = tickProviderReport(10)
+		return result, nil
 	}
 
 	report, err := Tick(context.Background(), opts)
 	if err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
-	if verifierCalls != 0 || report.OrchestrationCost.Totals.Tokens != nil || report.OrchestrationCost.Totals.UsageState != orchestrationcost.UsageUnknown {
+	if verifierCalls != 1 || report.Status != TickStatusNeedsHuman || report.OrchestrationCost.Totals.Tokens != nil || report.OrchestrationCost.Totals.UsageState != orchestrationcost.UsageUnknown {
 		t.Fatalf("verifier_calls=%d cost=%#v", verifierCalls, report.OrchestrationCost)
+	}
+	if report.OrchestrationCost.ReleaseGate == nil || report.OrchestrationCost.ReleaseGate.Allowed || report.OrchestrationCost.ReleaseGate.Reason != "token-budget-unknown" {
+		t.Fatalf("release gate = %#v", report.OrchestrationCost.ReleaseGate)
 	}
 	if report.OrchestrationCost.ExternalHostUsage.State != orchestrationcost.UsageUnknown || report.OrchestrationCost.ExternalHostUsage.Tokens != nil {
 		t.Fatalf("external host usage = %#v", report.OrchestrationCost.ExternalHostUsage)
@@ -645,6 +651,7 @@ func TestTickUnknownProviderUsageIsNotZeroAndBlocksNextProvider(t *testing.T) {
 func TestTickReloadsPerRunCostLedgerBeforeAnotherProvider(t *testing.T) {
 	repo := t.TempDir()
 	opts := reviewReadyTickOptions(repo, 104, "https://github.com/owner/repo/pull/80")
+	opts.CostPolicy = orchestrationcost.Policy{MaxModelCalls: 1, MaxTokens: 500_000, MaxOverheadPercent: 10}
 	persisted, err := orchestrationcost.Build(opts.RunID, orchestrationcost.DefaultPolicy(), []orchestrationcost.Event{
 		orchestrationcost.EventFromReport("worker:prior", orchestrationcost.RoleWorker, true, tickProviderReportUnknown(), "prior tick"),
 	})
