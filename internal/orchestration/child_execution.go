@@ -341,9 +341,11 @@ func validateChildExecutionResult(request ChildExecutionRequest, result ChildRun
 	}{
 		{field: "id", got: result.ID, want: request.ID},
 		{field: "child_key", got: result.ChildKey, want: request.ChildKey},
+		{field: "title", got: result.Title, want: request.Title},
 		{field: "run_id", got: result.RunID, want: request.RunID},
 		{field: "role", got: result.Role, want: request.Role},
 		{field: "permission", got: result.Permission, want: request.Permission},
+		{field: "provider_idempotency_key", got: result.ProviderKey, want: request.IdempotencyKey},
 		{field: "execution_contract_schema", got: result.ContractSchema, want: request.SchemaVersion},
 		{field: "execution_contract_fingerprint", got: result.ContractFingerprint, want: request.ContractFingerprint},
 	}
@@ -360,6 +362,24 @@ func validateChildExecutionResult(request ChildExecutionRequest, result ChildRun
 	}
 	if result.Issue > 0 && result.Issue != request.Issue {
 		return fmt.Errorf("child executor changed immutable issue from %d to %d", request.Issue, result.Issue)
+	}
+	if len(result.DependsOn) > 0 && !reflect.DeepEqual(result.DependsOn, request.DependsOn) {
+		return fmt.Errorf("child executor changed immutable dependencies for %q", request.ChildKey)
+	}
+	if strings.TrimSpace(result.Aggregation.Mode) != "" && !reflect.DeepEqual(result.Aggregation, request.Aggregation) {
+		return fmt.Errorf("child executor changed immutable aggregation for %q", request.ChildKey)
+	}
+	if (result.Required || result.Optional) && (result.Required != request.Required || result.Optional != request.Optional) {
+		return fmt.Errorf("child executor changed immutable aggregation requirement for %q", request.ChildKey)
+	}
+	if result.Ordinal > 0 && result.Ordinal != request.Ordinal {
+		return fmt.Errorf("child executor changed immutable ordinal from %d to %d", request.Ordinal, result.Ordinal)
+	}
+	if result.Depth > 0 && result.Depth != request.Depth {
+		return fmt.Errorf("child executor changed immutable depth from %d to %d", request.Depth, result.Depth)
+	}
+	if result.ClaimGeneration > 0 && result.ClaimGeneration != request.ClaimGeneration {
+		return fmt.Errorf("child executor changed immutable claim generation from %d to %d", request.ClaimGeneration, result.ClaimGeneration)
 	}
 	return nil
 }

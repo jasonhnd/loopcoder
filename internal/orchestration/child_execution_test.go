@@ -321,6 +321,48 @@ func TestScheduleNestedRunsFailsClosedWhenExecutorChangesContract(t *testing.T) 
 	}
 }
 
+func TestValidateChildExecutionResultRejectsImmutableContractMutations(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, "src"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	plan, child := childExecutionRequestFixture()
+	request, err := BuildChildExecutionRequest(repo, plan, child)
+	if err != nil {
+		t.Fatalf("BuildChildExecutionRequest: %v", err)
+	}
+	request, err = bindChildExecutionRequest(request, 7, NestedStatusRunning)
+	if err != nil {
+		t.Fatalf("bindChildExecutionRequest: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		result ChildRunResult
+		want   string
+	}{
+		{name: "title", result: ChildRunResult{Title: "changed"}, want: "immutable title"},
+		{name: "idempotency key", result: ChildRunResult{ProviderKey: "child-run:other"}, want: "immutable provider_idempotency_key"},
+		{name: "dependencies", result: ChildRunResult{DependsOn: []string{"other"}}, want: "immutable dependencies"},
+		{name: "aggregation", result: ChildRunResult{Aggregation: ChildAggregation{Mode: ChildAggregationIgnore}}, want: "immutable aggregation"},
+		{name: "requirement", result: ChildRunResult{Optional: true}, want: "immutable aggregation requirement"},
+		{name: "ordinal", result: ChildRunResult{Ordinal: 1}, want: "immutable ordinal"},
+		{name: "depth", result: ChildRunResult{Depth: request.Depth + 1}, want: "immutable depth"},
+		{name: "claim generation", result: ChildRunResult{ClaimGeneration: request.ClaimGeneration + 1}, want: "immutable claim generation"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateChildExecutionResult(request, tt.result)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("validateChildExecutionResult error = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+	if err := validateChildExecutionResult(request, ChildRunResult{Status: NestedStatusSucceeded}); err != nil {
+		t.Fatalf("sparse valid result rejected: %v", err)
+	}
+}
+
 func childExecutionRequestFixture() (ChildPlan, ChildRunPlan) {
 	created := state.FormatTimestamp(childExecutionFixtureTime())
 	child := ChildRunPlan{
