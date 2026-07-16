@@ -36,8 +36,11 @@ Release, and runs the release's native smoke jobs before the release is public.
 For v0.8, [`../specs/0884-macos-arm64-only.md`](../specs/0884-macos-arm64-only.md)
 is binding: native implementation and release proof target `darwin/arm64`
 only. Unsupported OS/arch diagnostics may use credential-free fixtures, but
-they are not advertised as native support or required native smoke. The final
-publication job does not rebuild or re-upload archives; it only promotes the
+they are not advertised as native support or required native smoke. Windows,
+Linux/Ubuntu, WSL, containers used as a LoopCoder runtime, Intel
+macOS, and Rosetta/amd64 macOS are unsupported in v0.8.0; users who need those
+hosts remain on v0.7.0 or contribute to a later approved platform roadmap. The
+final publication job does not rebuild or re-upload archives; it only promotes the
 already-smoked draft release after the protected `release-publication`
 environment grants approval.
 
@@ -48,7 +51,7 @@ evidence remain available without presenting the release as final.
 The v0.8 native smoke job runs on the supported `darwin/arm64` host:
 
 ```powershell
-pwsh scripts/release-smoke.ps1 -Version 0.8.0
+pwsh scripts/release-smoke.ps1 -Version 0.8.0 -PreviousVersion 0.7.0
 ```
 
 The smoke script targets the staged draft release. It downloads the current
@@ -157,29 +160,38 @@ gh api "repos/OWNER/REPO/branches/main/protection"
 gh api "repos/OWNER/REPO/environments/release-publication"
 ```
 
-## v0.7.0 Self-Bootstrap Acceptance
+## v0.8.0 Self-Bootstrap Acceptance
 
-Before tagging v0.7.0, run the self-bootstrap acceptance path in
+Before tagging v0.8.0, run the self-bootstrap acceptance path in
 [`self-bootstrap.md`](self-bootstrap.md). At minimum, the release record must
 include:
 
-- the scripted smoke result from `pwsh scripts/self-bootstrap-smoke.ps1`;
+- the scripted smoke result from `pwsh scripts/self-bootstrap-smoke.ps1
+  -Version 0.8.0 -Binary <staged-binary>`;
+- the staged candidate binary path, SHA-256, version stamp, and proof that the
+  same archive is later eligible for publication;
+- native `darwin/arm64` host evidence;
 - project registry evidence for the loopcoder checkout;
 - proof that `$LOOPCODER_HOME/data/loopcoder.db`,
   `$LOOPCODER_HOME/projects/<project_id>/`, `$LOOPCODER_HOME/logs/`, and
   `$LOOPCODER_HOME/tmp/` exist outside the repository;
 - doctor JSON showing storage, project registry, provider compatibility, and
   nested-run health;
-- status and report JSON showing at least one parent/child run tree;
-- issue-to-PR evidence for the v0.7.0 implementation issues;
+- status and report human/JSON output showing the same parent/child run tree;
+- zero paid provider calls and no private credential dependency;
+- issue-to-PR-to-candidate-SHA evidence for the v0.8.0 implementation issues;
 - the normal consumer artifact smoke,
-  `pwsh scripts/release-smoke.ps1 -Version 0.7.0`, after release assets exist.
+  `pwsh scripts/release-smoke.ps1 -Version 0.8.0 -PreviousVersion 0.7.0`;
+- schema-9 planning, owner-only backup, atomic schema-30 application,
+  idempotent replay, and a copied backup opened by v0.7.0;
 - the completed go/no-go report from
-  [`v0.7.0-go-no-go.md`](v0.7.0-go-no-go.md), attached to the release
-  readiness PR or issue.
+  [`v0.8.0-go-no-go.md`](v0.8.0-go-no-go.md), attached to the release
+  readiness issue.
 
 This acceptance path is verification-only. It must not force production
 auto-merge, fake success without PR evidence, or depend on paid provider
 services that are not available to the operator.
 
-Historical changelog entries and accepted specs are release history. Do not terminology-sweep old release entries or shipped specs merely because current naming changed.
+Historical changelog entries, release notes, go/no-go records, and accepted
+specs are release history. Do not terminology-sweep old release evidence merely
+because the current platform or naming changed.

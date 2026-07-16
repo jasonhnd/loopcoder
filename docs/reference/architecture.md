@@ -12,6 +12,16 @@ or cloud service: a human-launched conductor session stays open, follows
 operations such as ready-set classification, worker dispatch, verification,
 recovery, state publishing, and leases.
 
+## Platform Contract
+
+LoopCoder v0.8.0 supports native macOS Apple Silicon (`darwin/arm64`) only.
+Windows, Linux/Ubuntu, WSL, containers used as a LoopCoder runtime, Intel
+macOS, and Rosetta/amd64 macOS are unsupported for v0.8.0 runtime, install,
+upgrade, CI, smoke, and release behavior. v0.7.0 remains the final legacy
+multi-platform release; other platforms can return only through a separately
+approved future roadmap. Provider-neutral architecture does not imply
+host-platform support.
+
 The built loop is:
 
 ```text
@@ -55,10 +65,12 @@ owns commit, push, PR creation, and cleanup.
 
 The worker provider is selected through the shared provider registry. The
 current worker provider registry supports `codex`, `claude`, `antigravity`,
-and experimental direct `gemini`, with `codex` as the default in the dispatch
-path. The static model registry used by `loopcoder models` covers `codex`,
-`claude`, and `antigravity`; the direct `gemini` adapter remains outside that
-registry. See [`worker.md`](worker.md) for provider details and
+`grok`, and experimental direct `gemini`, with `codex` as the default in the
+dispatch path. The static model registry used by `loopcoder models` covers
+`codex`, `claude`, and `antigravity`; `grok` is represented as a
+dynamic-inventory provider without fabricated static model defaults, and the
+direct `gemini` adapter remains outside that registry. See
+[`worker.md`](worker.md) for provider details and
 [`runtime-capabilities.md`](runtime-capabilities.md) for the provider and host
 runtime capability contract.
 
@@ -105,14 +117,14 @@ loopcoder is organized around stable responsibilities with native adapters:
 | Verifier | Review PRs against issue, diff, checks, and spec | `loopcoder loopreview` read-only provider invocation |
 | LocalGate | Run configured local tests/typecheck/build commands | `loopcoder verify-local` |
 | Gate | Decide whether pre-prod may promote to production | New scaffolds write `human-merge`; legacy empty or missing gates normalize to `auto` |
-| Reporter | Surface progress, verdicts, failures, and final status | The conductor chat |
+| Reporter | Persist and surface progress, verdicts, failures, and final status | Durable progress/outbox records plus host-specific chat delivery |
 
 `.delivery.yml` selects per-repo defaults such as base branch, worker provider,
 verifier provider, promotion gate, required hosted checks, local command gates,
 model/depth strictness, and resilience thresholds. Worker and Verifier
 model/depth values resolve independently from command flags, then role-scoped
 config, then the static model registry defaults. For compatibility, an empty or
-missing promotion gate normalizes to `auto` at runtime. New v0.6.1 scaffolds
+missing promotion gate normalizes to `auto` at runtime. New v0.8.0 scaffolds
 write `adapters.gate: human-merge`; projects opt into automatic production
 promotion with `loopcoder init --repo . --gate auto` or an explicit config edit.
 
@@ -128,6 +140,7 @@ authentication. The registry providers are:
 | `codex` | OpenAI Codex | `codex` | `gpt-5.5` / `high` |
 | `claude` | Anthropic | `claude` | `claude-opus-4-8[1m]` / `max` |
 | `antigravity` | Google Antigravity | `agy` | `Gemini 3.1 Pro` / `High` |
+| `grok` | xAI | `grok` | Dynamic provider inventory; no static model/depth default |
 
 Selection is role-scoped. Worker and Verifier each resolve provider, model, and
 depth independently. If model is absent, the resolved provider's registry
@@ -157,9 +170,11 @@ The current state model has three layers:
 
 - GitHub is authoritative for issue state, `blocked-by:#N` labels, open PRs,
   PR branches, closing references, and hosted checks.
-- Local run state under `.loopcoder/runs/<RunId>/` records the durable run
-  lifecycle, worker attempts, event transitions, and recovery briefs for
-  liveness and retry decisions.
+- Registered projects keep durable run lifecycle, worker attempts, event
+  transitions, recovery briefs, progress receipts, relay obligations, logs,
+  and scratch data under `$LOOPCODER_HOME/projects/<project_id>/`. Repo-local
+  `.loopcoder/runs/<RunId>/` remains only an explicit unregistered fallback and
+  legacy read source.
 - `loopcoder state push`, `state pull`, `lease acquire`, and `lease release`
   publish scrubbed run snapshots and a best-effort conductor lease on the
   dedicated state branch when cross-session state is needed.
@@ -233,18 +248,24 @@ promotion path unless the project explicitly opts into `auto`.
 
 ### Resilience
 
-Current resilience is attempt-state and recovery tooling, not a background
-supervisor. `loopcoder dispatch` writes compact attempt sidecars under
-`.loopcoder/runs/<RunId>/workers/*.attempt.json` and appends phase events to
-`events.jsonl`; `heartbeat_at`, `last_progress_at`, phase changes, log size,
-exit code, and status let `ready-set` and `resume` classify attempts as running,
-stale, hung, orphaned, failed, completed-without-PR, or needing recovery. On
-failure, dispatch writes a scrubbed Markdown recovery brief with issue, branch,
-worktree, log, changed files, existing PR lookup, and log tail. `recover` first
-adopts an existing PR when one is found, otherwise retries on a retry branch
-with bounded backoff until the configured max attempts, then blocks for a human
-decision. `statebranch` can publish scrubbed run snapshots, log tails, and a
-best-effort lease to `loopcoder/state`. Design rationale:
+Current resilience combines durable attempt state with detached supervision.
+Host-profiled non-interactive `dispatch`, `dispatch-wave`, and `tick` persist a
+claim before launching a detached supervisor, return a durable run ID, and
+continue provider execution after the initiating host turn exits. On Darwin
+arm64, a retained guardian observes supervisor lifetime and reaps the verified
+provider process group after abrupt supervisor death. Provider authority stores
+PID, process group, process birth identity, executable identity, owner, and
+generation; `ps`, `status`, `kill`, and recovery fail closed when that identity
+is stale, ambiguous, missing, or reused.
+
+Progress receipts are persisted at least every five minutes during active
+work and enter the durable delivery outbox. Waiting for CI, approval, quota
+reset, outbox delivery, or worker terminalization uses a local restartable
+state machine with no provider invocation. Recovery reconciles live provider
+authority before redispatch, adopts existing PRs and already-applied delivery
+effects idempotently, and fences concurrent recovery so useful provider work is
+not executed twice. Ambiguous external effects become `needs-human` rather
+than an automatic takeover. Design rationale:
 [`../specs/0041-resilience.md`](../specs/0041-resilience.md).
 
 Nested child execution adds a SQLite-backed ownership layer for child provider

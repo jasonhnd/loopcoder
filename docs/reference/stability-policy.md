@@ -3,17 +3,20 @@
 This living reference describes loopcoder's 0.x compatibility policy for
 project configuration, documented commands, and documented GitHub labels.
 
-Current stable release: `0.6.1`.
+Current release candidate: `0.8.0`.
 
-v0.6.1 is the customer-ready bridge for the public 0.6 line. It is the
-customer install and upgrade target for the 0.6 capabilities; the latest public
-release before this bridge was v0.5.4, and customer docs should not direct
-users to install or upgrade to a nonexistent public v0.6.0 release.
+v0.8.0 becomes the customer install target only when its tag, signed checksums,
+single Darwin arm64 archive, provenance, staged smoke, publication approval,
+and completed go/no-go record all exist. Candidate documentation is not proof
+that publication occurred.
 
-v0.7.0 release-readiness material may exist in `CHANGELOG.md`, release notes,
-smoke scripts, and reference docs before the release is published. That material
-is not a customer install promise until the v0.7.0 tag, signed checksums, and
-platform assets exist and the go/no-go report is completed.
+v0.8.0 supports native macOS Apple Silicon (`darwin/arm64`) only. Windows,
+Linux/Ubuntu, WSL, containers used as a LoopCoder runtime, Intel macOS, and
+Rosetta/amd64 macOS are unsupported runtime, install, upgrade, CI, smoke, and
+release tuples. v0.7.0 remains the final legacy multi-platform release; users
+who require those hosts should stay on v0.7.0 or contribute to a separately
+approved future platform roadmap. Frozen v0.7.0 release notes, artifacts, and
+go/no-go evidence remain historical truth and are not current v0.8 promises.
 
 ## 0.x Stability Promise
 
@@ -90,13 +93,21 @@ In v0.6.1, `doctor --format json` also exposes the ordered check list for host
 tools, including local `.loopcoder/` exclude protection, tracked local-state
 risk, reportquery readability, installed skill freshness, and project hook
 wiring.
-For v0.7.0, `doctor --format json` also exposes the machine-local runtime
+Since v0.7.0, `doctor --format json` also exposes the machine-local runtime
 health surface used by release smoke: `runtime.database`,
 `runtime.project_registry`, `runtime.migration`, `runtime.nested_runs`,
 `host_profile`, and the `provider_compatibility[]` matrix. Release checks may
 accept `experimental` provider compatibility only for documented host-profile
 fallbacks such as `generic-local`; `unsupported` remains a release-blocking
 signal for selected Worker and Verifier roles.
+
+For v0.8.0, the startup platform gate precedes storage, provider, credential,
+network, repository, and migration initialization. Unsupported hosts return
+exit code `78` and the stable `ErrUnsupportedPlatform` human or JSON diagnostic
+with `side_effects_performed: false`. On the supported host, doctor also
+reports durable process authority, detached-run health, progress/outbox state,
+provider inventory, and quota evidence without inventing unavailable provider
+facts.
 
 If the selected binary is too old, the schema version is unsupported, or a known
 field, flag, provider key, model/depth token, or label has been removed or
@@ -129,5 +140,10 @@ requirements must record that change in the changelog.
 - [`0554-model-depth-selection.md`](../specs/0554-model-depth-selection.md):
   static model registry, `loopcoder models`, strict validation, and
   Antigravity provider setup.
+- [`0884-macos-arm64-only.md`](../specs/0884-macos-arm64-only.md): binding
+  v0.8.0 platform, installer, upgrade, CI, release, and historical-evidence
+  contract.
+- [`v0.8.0-go-no-go.md`](v0.8.0-go-no-go.md): current release-candidate gates
+  and evidence record.
 - [`v0.7.0-go-no-go.md`](v0.7.0-go-no-go.md): release-readiness evidence and
-  human gate checklist for the v0.7.0 candidate.
+  completed historical gate record for v0.7.0.

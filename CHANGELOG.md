@@ -5,6 +5,131 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-07-16
+
+v0.8.0 is the current release candidate. It turns the v0.7 machine-local
+runtime into a resource-aware, provider-neutral orchestration layer with
+durable process ownership, bounded agent federation, explainable routing, and
+auditable migration. Publication remains gated by the completed v0.8.0
+go/no-go record and protected release environment.
+
+### Added
+
+- **Guided DeliveryRun contracts** - versioned runs, tasks, dependency edges,
+  attempts, decisions, approvals, overrides, immutable fingerprints, and
+  approval-gated `delivery plan|decide|continue` operations are stored as
+  normalized SQLite records.
+- **Provider and account inventory** - bounded, fixed-argv probes discover
+  Codex, Claude, Antigravity, Grok, and declared future adapters without
+  reading credential values or treating installation as authentication.
+- **Dynamic model capability catalog** - model, role, context, tool, permission,
+  and provenance evidence is lifecycle-bound and fails closed when stale or
+  ambiguous. Grok uses dynamic provider inventory rather than fabricated
+  static defaults.
+- **Quota and usage intelligence** - supported machine-readable provider
+  sources and optional CodexBar evidence produce immutable quota snapshots;
+  unavailable or stale telemetry remains explicit instead of guessed. A local
+  append-only usage ledger reconciles provider and LoopCoder observations.
+- **Hierarchical budgets and availability** - machine, provider, account,
+  model, project, run, and task scopes support atomic reserve, commit, release,
+  retry, and conservative overage handling.
+- **Explainable routing and fallback** - deterministic task requirements,
+  capability-first hard eligibility, quota/reset-aware scoring, policy-bound
+  fallback, independent verifier selection, and reason-coded decisions replace
+  implicit provider choice.
+- **Controlled agent federation** - provider-native sub-agent capability is
+  admitted only through durable registrations, parent authority, depth,
+  fan-out, concurrency, permission, budget, cancellation, and one-writer
+  fences. Provider-native children cannot bypass LoopCoder's run graph.
+- **Grok provider** - the `grok` worker adapter, bounded install/auth/catalog
+  discovery, ACP billing telemetry when advertised and explicitly allowed,
+  dynamic model attribution, and native-agent capability probing are available
+  without auto-installing, auto-updating, or logging in to Grok Build.
+- **Durable detached execution** - non-interactive dispatch defaults to a
+  detached supervisor, persists provider PID/process-group/birth identity, and
+  returns a run ID for `status`, `attach`, and `cancel`. A Darwin guardian reaps
+  verified provider groups after abrupt supervisor death.
+- **Provider-free waiting and progress delivery** - CI, approval, quota reset,
+  outbox, and worker-terminal waits use a restartable local state machine with
+  no model invocation. Active work emits durable progress at least every five
+  minutes and routes receipts through the delivery outbox.
+- **Orchestration cost accounting** - model calls, tokens when known, wall
+  time, waiting, retries, recovery, delivery, and verifier work are recorded
+  per run; unresolved reservations remain fail-closed while terminal providers
+  with unavailable usage can continue only under conservative call budgets.
+- **Auditable storage migration** - `migrate storage` plans schema 9 through 30
+  without side effects, verifies an owner-only backup before mutation, applies
+  ordered steps atomically, reports stable rollback limits, and is idempotent
+  on replay.
+
+### Changed
+
+- **macOS Apple Silicon only** - native `darwin/arm64` is the sole supported
+  v0.8.0 runtime, installer, upgrade, CI, smoke, and release tuple. The release
+  contains one `loopcoder_<version>_darwin_arm64.tar.gz` archive plus checksum,
+  signature, and provenance material.
+- **Four required CI contexts** - pull requests emit `verify`, `test`, `race`,
+  and `security` on pinned `macos-15`. PR race work is limited to changed Go
+  packages; the release build reruns the complete repository race suite before
+  packaging.
+- **Machine-local project payloads** - registered projects write attempts,
+  events, lifecycle, recovery, relay, audit, logs, and scratch data below
+  `$LOOPCODER_HOME/projects/<project_id>/` instead of the repository.
+- **Recovery semantics** - live provider authority is reconciled before any
+  redispatch. Existing PR, already-applied push, no-change, and delivery retry
+  outcomes are typed and idempotent so administrative completion cannot rerun
+  useful provider work.
+- **Release verification** - staged smoke uses the exact signed candidate for
+  fresh install, self-bootstrap, v0.7 schema migration, copied-backup rollback,
+  already-latest upgrade, and public artifact checks before publication.
+
+### Breaking Changes
+
+- Windows, Linux/Ubuntu, WSL, containers used as a LoopCoder runtime, Intel
+  macOS, and Rosetta/amd64 macOS are unsupported in v0.8.0. No v0.8 artifact,
+  native CI job, smoke job, or compatibility commitment exists for those
+  tuples. v0.7.0 remains the final legacy multi-platform release.
+- The v0.8.0 binary rejects unsupported hosts with exit code `78` and stable
+  `ErrUnsupportedPlatform` human/JSON diagnostics before network, credentials,
+  provider launch, storage migration, or repository mutation.
+- A schema-30 database cannot be opened by v0.7.0. Rollback requires stopping
+  every LoopCoder process, copying the verified schema-9 backup into an offline
+  home, and accepting loss of v0.8-only state created after migration.
+
+### Upgrade From 0.7.0
+
+On native Darwin arm64:
+
+```text
+loopcoder upgrade --version 0.8.0
+loopcoder version
+loopcoder migrate storage --format json
+loopcoder migrate storage --apply --format json
+loopcoder skill install --repo .
+loopcoder projects register --repo .
+loopcoder doctor --repo . --format json
+```
+
+Planning is read-only; `--apply` is required for migration. Stop all LoopCoder
+processes before apply or rollback. See
+[`docs/reference/storage-migration.md`](docs/reference/storage-migration.md)
+for backup verification, interruption behavior, limitation codes, and the
+offline v0.7.0 restore procedure.
+
+### Known Limitations
+
+- Provider quota is used for routing only when a supported, sufficiently fresh
+  source supplies the required evidence. LoopCoder does not scrape private
+  credentials, invent exact five-hour or weekly limits, or treat CLI presence
+  as usable capacity.
+- Antigravity remains write-only in the verified adapter contract and cannot be
+  selected as the read-only verifier. Direct `gemini` remains experimental.
+- Grok dynamic models and quota depend on capabilities exposed by the installed
+  Grok CLI; missing or unsupported protocols remain explicit unavailable facts.
+- Durable supervision covers provider work on the local supported machine. It
+  does not create an autonomous cloud conductor or guarantee universal
+  exactly-once external side effects after arbitrary provider failures.
+
 ## [0.7.0] - 2026-07-11
 
 v0.7.0 is the current customer install target. It moves loopcoder's local
