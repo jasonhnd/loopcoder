@@ -121,16 +121,19 @@ type ChildRunPlan struct {
 }
 
 type NestedScheduleReport struct {
-	Version          int              `json:"version"`
-	RepoPath         string           `json:"repo_path"`
-	BaseBranch       string           `json:"base_branch"`
-	ParentRunID      string           `json:"parent_run_id"`
-	Status           string           `json:"status"`
-	StartedAt        string           `json:"started_at"`
-	FinishedAt       string           `json:"finished_at"`
-	ConcurrencyLimit int              `json:"concurrency_limit"`
-	Children         []ChildRunResult `json:"children"`
-	Summary          NestedSummary    `json:"summary"`
+	Version            int                       `json:"version"`
+	RepoPath           string                    `json:"repo_path"`
+	BaseBranch         string                    `json:"base_branch"`
+	ParentRunID        string                    `json:"parent_run_id"`
+	Status             string                    `json:"status"`
+	Outcome            string                    `json:"outcome,omitempty"`
+	StartedAt          string                    `json:"started_at"`
+	FinishedAt         string                    `json:"finished_at"`
+	ConcurrencyLimit   int                       `json:"concurrency_limit"`
+	Children           []ChildRunResult          `json:"children"`
+	Summary            NestedSummary             `json:"summary"`
+	ExecutorCapability *NestedExecutorCapability `json:"executor_capability,omitempty"`
+	Refusals           []NestedPermissionRefusal `json:"refusals,omitempty"`
 }
 
 type ChildRunResult struct {
@@ -149,6 +152,7 @@ type ChildRunResult struct {
 	Ordinal             int              `json:"ordinal"`
 	Depth               int              `json:"depth"`
 	Status              string           `json:"status"`
+	Outcome             string           `json:"outcome,omitempty"`
 	ReplayAction        string           `json:"replay_action,omitempty"`
 	ClaimOutcome        string           `json:"claim_outcome,omitempty"`
 	ClaimOwner          string           `json:"claim_owner,omitempty"`

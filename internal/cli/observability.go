@@ -174,6 +174,31 @@ func nestedJSONPayload(report orchestration.NestedScheduleReport) any {
 func nestedObservability(report orchestration.NestedScheduleReport) observability.Document {
 	items := make([]observability.RenderItem, 0, len(report.Children))
 	for _, child := range report.Children {
+		if report.Outcome == orchestration.NestedOutcomePermissionNotEnforceable {
+			provider := ""
+			if report.ExecutorCapability != nil {
+				provider = report.ExecutorCapability.Provider
+			}
+			items = append(items, observability.RenderItem{
+				ID:         firstNonEmptyNested(child.ChildKey, child.ID, "nested-permission-refusal"),
+				Kind:       "nested-permission-preflight",
+				Status:     child.Status,
+				Provider:   provider,
+				Permission: child.Permission,
+				Reason:     child.Reason,
+				NextAction: child.NextAction,
+				Confidence: "exact",
+				Freshness:  "preflight",
+				SourceRefs: []observability.SourceRef{{
+					Table:         "nested_plan_input",
+					RecordID:      firstNonEmptyNested(child.ID, child.ChildKey, "nested-permission-refusal"),
+					DeliveryRunID: report.ParentRunID,
+					Field:         "permission",
+					Provenance:    "ephemeral_preflight",
+				}},
+			})
+			continue
+		}
 		if child.Report != nil {
 			items = append(items, observability.ItemFromReport(child.RunID, "nested-child", child.Status, child.Reason, child.NextAction, *child.Report, []observability.SourceRef{{
 				Table:         "run_edges",
