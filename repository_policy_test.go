@@ -84,6 +84,160 @@ func TestV080ReleaseSmokeUsesInstallerBackedCandidate(t *testing.T) {
 	}
 }
 
+func TestV080LivingDocumentationPolicy(t *testing.T) {
+	root := repositoryPolicyRoot(t)
+	files := []string{
+		"README.md",
+		"CHANGELOG.md",
+		"docs/reference/architecture.md",
+		"docs/reference/stability-policy.md",
+		"docs/reference/usage.md",
+		"docs/reference/releasing.md",
+		"docs/reference/self-bootstrap.md",
+		"docs/reference/v0.8.0-go-no-go.md",
+		".github/release-notes/v0.8.0.md",
+	}
+	for _, name := range files {
+		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
+		if err != nil {
+			t.Fatalf("read living documentation %s: %v", name, err)
+		}
+		if err := validateV080LivingDocumentation(name, string(data)); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+
+	for _, name := range []string{
+		"CHANGELOG.md",
+		"docs/reference/releasing.md",
+		"docs/reference/v0.8.0-go-no-go.md",
+		".github/release-notes/v0.8.0.md",
+	} {
+		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
+		if err != nil {
+			t.Fatalf("read CI documentation %s: %v", name, err)
+		}
+		current := currentV080Documentation(name, string(data))
+		for _, context := range requiredV080Contexts {
+			if !strings.Contains(current, "`"+context+"`") {
+				t.Errorf("%s does not name current v0.8 CI context %q", name, context)
+			}
+		}
+	}
+}
+
+func TestV080LivingDocumentationRejectsUnsupportedCurrentClaims(t *testing.T) {
+	base := "LoopCoder v0.8.0 supports native macOS Apple Silicon (`darwin/arm64`) only. " +
+		"Windows, Linux/Ubuntu, WSL, containers, and Intel macOS are unsupported. " +
+		"v0.7.0 is the final legacy multi-platform release.\n"
+
+	for _, claim := range []string{
+		"LoopCoder v0.8.0 supports Windows.\n",
+		"LoopCoder v0.8.0 publishes a linux/amd64 archive.\n",
+		"LoopCoder v0.8.0 CI runs on ubuntu-latest.\n",
+		"LoopCoder v0.8.0 is cross-platform.\n",
+	} {
+		if err := validateV080LivingDocumentation("fixture.md", base+claim); err == nil {
+			t.Fatalf("current unsupported-platform claim was accepted: %q", claim)
+		}
+	}
+
+	historical := base + "Historical v0.7.0 evidence: Windows and Linux archives were supported and published.\n"
+	if err := validateV080LivingDocumentation("fixture.md", historical); err != nil {
+		t.Fatalf("truthful v0.7 historical evidence was rejected: %v", err)
+	}
+}
+
+func TestV080FrozenHistoricalReleaseEvidenceRemainsTruthful(t *testing.T) {
+	root := repositoryPolicyRoot(t)
+	required := map[string][]string{
+		".github/release-notes/v0.7.0.md": {
+			"smoked on Ubuntu, macOS, and Windows",
+			"v0.7.0 is the stable install target",
+		},
+		"docs/reference/v0.7.0-go-no-go.md": {
+			"6 platform archives",
+			"native smoke ubuntu/macos/windows all success",
+		},
+	}
+	for name, markers := range required {
+		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
+		if err != nil {
+			t.Fatalf("read frozen historical evidence %s: %v", name, err)
+		}
+		for _, marker := range markers {
+			if !strings.Contains(string(data), marker) {
+				t.Errorf("%s lost frozen historical marker %q", name, marker)
+			}
+		}
+	}
+}
+
+func validateV080LivingDocumentation(name, content string) error {
+	current := currentV080Documentation(name, content)
+	lower := strings.ToLower(current)
+	for _, required := range []string{"darwin/arm64", "v0.7.0"} {
+		if !strings.Contains(lower, strings.ToLower(required)) {
+			return fmt.Errorf("missing current platform/fallback marker %q", required)
+		}
+	}
+	for _, stale := range []string{
+		"[![cross-platform]",
+		"current stable release: `0.6.1`",
+		"v0.7.0 is the current customer",
+		"current v0.7.0 `loopcoder doctor",
+		"v0.7.0 candidate",
+		"matches the v0.6.1 binary installed by the current release",
+		"go install github.com/jasonhnd/loopcoder/cmd/loopcoder@v0.6.1",
+		"loopcoder upgrade --version 0.6.1",
+	} {
+		if strings.Contains(lower, stale) {
+			return fmt.Errorf("contains stale current-release claim %q", stale)
+		}
+	}
+
+	for _, line := range strings.Split(current, "\n") {
+		lineLower := strings.ToLower(strings.TrimSpace(line))
+		if !strings.Contains(lineLower, "v0.8") {
+			continue
+		}
+		denied := strings.Contains(lineLower, "unsupported") ||
+			strings.Contains(lineLower, "not supported") ||
+			strings.Contains(lineLower, "only") ||
+			strings.Contains(lineLower, "no v0.8")
+		if denied || strings.Contains(lineLower, "v0.7.0") || strings.Contains(lineLower, "historical") {
+			continue
+		}
+		unsupported := strings.Contains(lineLower, "windows") ||
+			strings.Contains(lineLower, "linux") ||
+			strings.Contains(lineLower, "ubuntu") ||
+			strings.Contains(lineLower, "darwin/amd64") ||
+			strings.Contains(lineLower, "linux/amd64") ||
+			strings.Contains(lineLower, "macos-latest") ||
+			strings.Contains(lineLower, "cross-platform")
+		promise := strings.Contains(lineLower, "support") ||
+			strings.Contains(lineLower, "publish") ||
+			strings.Contains(lineLower, "artifact") ||
+			strings.Contains(lineLower, "runs on") ||
+			strings.Contains(lineLower, "ci runs") ||
+			strings.Contains(lineLower, "cross-platform")
+		if unsupported && promise {
+			return fmt.Errorf("contains unsupported current-v0.8 platform promise %q", strings.TrimSpace(line))
+		}
+	}
+	return nil
+}
+
+func currentV080Documentation(name, content string) string {
+	if filepath.Base(name) != "CHANGELOG.md" {
+		return content
+	}
+	if index := strings.Index(content, "## [0.7.0]"); index >= 0 {
+		return content[:index]
+	}
+	return content
+}
+
 func TestV080WorkflowPolicyRejectsUnsupportedShapes(t *testing.T) {
 	baseWorkflow := workflowPolicy{
 		Jobs: map[string]workflowJobPolicy{
