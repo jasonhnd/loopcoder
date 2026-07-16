@@ -25,6 +25,7 @@ import (
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/detachedrun"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
+	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/hostprofile"
 	"github.com/jasonhnd/loopcoder/internal/inspect"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
@@ -99,6 +100,7 @@ type Deps struct {
 	Init                        func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
 	Upgrade                     func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
 	MigrateLocalState           func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error)
+	MigrateStorage              func(ctx context.Context, opts storage.SchemaMigrationOptions) (storage.SchemaMigrationResult, error)
 	SkillInstall                func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
 	StatePush                   func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
 	StatePull                   func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
@@ -131,7 +133,7 @@ var commands = []Command{
 	{Name: "trigger", Summary: "run automation triggers for tick"},
 	{Name: "promote", Summary: "promote pre-prod to main"},
 	{Name: "upgrade", Summary: "self-update from GitHub Releases"},
-	{Name: "migrate", Summary: "import legacy repo-local state into local storage"},
+	{Name: "migrate", Summary: "plan storage upgrades or import legacy repo-local state"},
 	{Name: "skill", Summary: "install bundled playbook skill files"},
 	{Name: "dispatch", Summary: "dispatch one issue worker"},
 	{Name: "nested", Summary: "submit and execute a nested child plan"},
@@ -260,6 +262,16 @@ func DefaultDeps() Deps {
 		},
 		MigrateLocalState: func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error) {
 			return localmigrate.LocalState(ctx, opts, localmigrate.DefaultDeps())
+		},
+		MigrateStorage: func(ctx context.Context, opts storage.SchemaMigrationOptions) (storage.SchemaMigrationResult, error) {
+			if strings.TrimSpace(opts.Path) == "" {
+				layout, err := home.Resolve(home.DefaultDeps())
+				if err != nil {
+					return storage.SchemaMigrationResult{}, err
+				}
+				opts.Path = layout.DatabasePath()
+			}
+			return storage.RunSchemaMigration(ctx, opts)
 		},
 		SkillInstall: func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error) {
 			return InstallSkill(ctx, opts, DefaultSkillInstallDeps())
@@ -1496,6 +1508,8 @@ func runMigrate(args []string, stdout, stderr io.Writer, deps Deps) int {
 	switch args[0] {
 	case "local-state":
 		return runMigrateLocalState(args[1:], stdout, stderr, deps)
+	case "storage":
+		return runMigrateStorage(args[1:], stdout, stderr, deps)
 	default:
 		fmt.Fprintf(stderr, "migrate: unknown subcommand %q\n\n", args[0])
 		printMigrateHelp(stderr)
@@ -1506,17 +1520,104 @@ func runMigrate(args []string, stdout, stderr io.Writer, deps Deps) int {
 func printMigrateHelp(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  loopcoder migrate local-state --repo <path> [--dry-run] [--format text|json]")
+	fmt.Fprintln(w, "  loopcoder migrate storage [--database <path>] [--apply] [--format text|json]")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Import legacy repo-local .loopcoder records into machine-local storage.")
+	fmt.Fprintln(w, "Plan or apply machine-local storage changes.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Subcommands:")
 	fmt.Fprintln(w, "  local-state   import v0.6.x repo-local run, relay, recovery, and report records")
+	fmt.Fprintln(w, "  storage       plan or apply the v0.7-to-v0.8 SQLite schema migration")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
 	fmt.Fprintln(w, "  --repo        repository path for local-state (default \".\")")
 	fmt.Fprintln(w, "  --dry-run     scan without writing machine-local storage")
-	fmt.Fprintln(w, "  --format      output format for local-state: text or json (default \"text\")")
+	fmt.Fprintln(w, "  --database    SQLite path for storage (default LOOPCODER_HOME/data/loopcoder.db)")
+	fmt.Fprintln(w, "  --apply       apply the storage plan; omitted means read-only planning")
+	fmt.Fprintln(w, "  --format      output format: text or json (default \"text\")")
 	fmt.Fprintln(w, "  --help        show command help")
+}
+
+func runMigrateStorage(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.MigrateStorage == nil {
+		deps.MigrateStorage = DefaultDeps().MigrateStorage
+	}
+	fs := flag.NewFlagSet("migrate storage", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	databasePath := ""
+	format := "text"
+	apply := false
+	fs.StringVar(&databasePath, "database", "", "SQLite database path")
+	fs.StringVar(&format, "format", "text", "output format")
+	fs.BoolVar(&apply, "apply", false, "apply the planned schema migration")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "migrate storage: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format != "text" && format != "json" {
+		fmt.Fprintf(stderr, "migrate storage: invalid --format %q; want text or json\n", format)
+		return 2
+	}
+
+	result, err := deps.MigrateStorage(context.Background(), storage.SchemaMigrationOptions{
+		Path:  databasePath,
+		Apply: apply,
+		Now:   deps.Now,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "migrate storage: %v\n", err)
+		return 1
+	}
+	if format == "json" {
+		return writeProjectJSON(stdout, stderr, "migrate storage", result)
+	}
+	if _, err := io.WriteString(stdout, renderMigrateStorageText(result)); err != nil {
+		fmt.Fprintf(stderr, "migrate storage: write output: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func renderMigrateStorageText(result storage.SchemaMigrationResult) string {
+	var out strings.Builder
+	fmt.Fprintln(&out, "STORAGE SCHEMA MIGRATION")
+	fmt.Fprintf(&out, "status: %s\n", result.Status)
+	fmt.Fprintf(&out, "mode: %s\n", map[bool]string{true: "apply", false: "plan"}[result.Applied])
+	fmt.Fprintf(&out, "database: %s\n", result.Plan.DatabasePath)
+	fmt.Fprintf(&out, "source_schema: %d\n", result.Plan.SourceSchemaVersion)
+	fmt.Fprintf(&out, "target_schema: %d\n", result.Plan.TargetSchemaVersion)
+	fmt.Fprintf(&out, "plan_status: %s\n", result.Plan.Status)
+	fmt.Fprintf(&out, "plan_fingerprint: %s\n", result.Plan.PlanFingerprint)
+	fmt.Fprintf(&out, "backup_required: %t\n", result.Plan.BackupRequired)
+	if len(result.Plan.Steps) > 0 {
+		fmt.Fprintln(&out, "steps:")
+		for _, step := range result.Plan.Steps {
+			fmt.Fprintf(&out, "  - %d: %s\n", step.Version, step.Name)
+		}
+	}
+	if result.Backup != nil {
+		fmt.Fprintf(&out, "backup: %s\n", result.Backup.Path)
+		fmt.Fprintf(&out, "backup_sha256: %s\n", result.Backup.SHA256)
+		fmt.Fprintf(&out, "backup_verified: %t\n", result.Backup.Verified)
+	}
+	fmt.Fprintf(&out, "rollback_supported: %t\n", result.Rollback.Supported)
+	if result.Rollback.Strategy != "" {
+		fmt.Fprintf(&out, "rollback_strategy: %s\n", result.Rollback.Strategy)
+	}
+	if len(result.Rollback.Limitations) > 0 {
+		fmt.Fprintln(&out, "rollback_limitations:")
+		for _, limitation := range result.Rollback.Limitations {
+			fmt.Fprintf(&out, "  - %s\n", limitation)
+		}
+	}
+	if result.Health != nil {
+		fmt.Fprintf(&out, "health: %s\n", result.Health.Message)
+	}
+	return out.String()
 }
 
 func runMigrateLocalState(args []string, stdout, stderr io.Writer, deps Deps) int {

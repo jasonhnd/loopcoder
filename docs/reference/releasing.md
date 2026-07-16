@@ -60,8 +60,12 @@ registry / `doctor --format json` / `migrate local-state --dry-run` /
 `report --format json` path, invokes the self-bootstrap acceptance smoke for
 nested run-tree observability, confirms the selected binary recognizes itself
 as already latest, and verifies upgrade from the previous release when
-`-PreviousVersion` is set. It is verification-only and must not create tags,
-publish releases, or upload assets.
+`-PreviousVersion` is set. For a v0.7.0 predecessor it also creates a real
+schema-9 database with that published binary, proves `migrate storage` planning
+is read-only, applies schema 9 through 30, checks idempotent replay and the
+verified owner-only backup, then proves the restored backup opens with v0.7.0.
+It is verification-only and must not create tags, publish releases, or upload
+assets.
 
 Provider live smoke, including Grok, is not part of required CI or default
 release smoke. It is an explicit operator diagnostic only, must be enabled by
