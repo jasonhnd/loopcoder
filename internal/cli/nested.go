@@ -219,6 +219,10 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	plan, err := orchestration.ParseChildPlanJSON(planData)
 	if err != nil {
+		var permissionErr *orchestration.PermissionNotEnforceableError
+		if errors.As(err, &permissionErr) {
+			return renderNestedPermissionRefusal(stdout, stderr, opts, plan, nestedExecutorCapability(opts), permissionErr, deps)
+		}
 		fmt.Fprintf(stderr, "nested run: %v\n", err)
 		return 2
 	}
@@ -226,12 +230,30 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "nested run: %v\n", err)
 		return 2
 	}
+	if err := orchestration.PrepareNestedPlanForExecution(&plan, 0); err != nil {
+		fmt.Fprintf(stderr, "nested run: %v\n", err)
+		return 1
+	}
 
 	cfg, err := loadDeliveryConfig(resolvedRepo, opts.BaseBranch, opts.ConfigFromBase)
 	if err != nil {
 		fmt.Fprintf(stderr, "nested run: %v\n", err)
 		return 1
 	}
+	capabilityOpts := opts
+	if capabilityOpts.Provider != nestedTestSubprocessProvider {
+		capabilityOpts.Provider = firstNonEmptyNested(capabilityOpts.Provider, cfg.Adapters.Worker, defaultProviderForRole("worker"))
+	}
+	capability := nestedExecutorCapability(capabilityOpts)
+	if err := orchestration.CheckNestedExecutorPermissions(&plan, capability); err != nil {
+		var permissionErr *orchestration.PermissionNotEnforceableError
+		if errors.As(err, &permissionErr) {
+			return renderNestedPermissionRefusal(stdout, stderr, capabilityOpts, plan, capability, permissionErr, deps)
+		}
+		fmt.Fprintf(stderr, "nested run: permission preflight: %v\n", err)
+		return 1
+	}
+	opts.Provider = capabilityOpts.Provider
 
 	if opts.Provider != nestedTestSubprocessProvider {
 		selection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
@@ -322,6 +344,31 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 func nestedReportHasContent(report orchestration.NestedScheduleReport) bool {
 	return report.Version != 0 || strings.TrimSpace(report.ParentRunID) != "" || len(report.Children) > 0
+}
+
+func nestedExecutorCapability(opts nestedRunOptions) orchestration.NestedExecutorCapability {
+	executorID := "worker-dispatch"
+	registrationID := "builtin:worker-dispatch:v1"
+	if opts.Provider == nestedTestSubprocessProvider {
+		executorID = nestedTestSubprocessProvider
+		registrationID = "builtin:test-subprocess:v1"
+	}
+	return orchestration.NestedExecutorCapability{
+		ExecutorID:             executorID,
+		RegistrationID:         registrationID,
+		Provider:               strings.TrimSpace(opts.Provider),
+		EnforceablePermissions: []string{},
+		ProviderNative:         false,
+	}
+}
+
+func renderNestedPermissionRefusal(stdout, stderr io.Writer, opts nestedRunOptions, plan orchestration.ChildPlan, capability orchestration.NestedExecutorCapability, permissionErr *orchestration.PermissionNotEnforceableError, deps Deps) int {
+	report := orchestration.NestedPermissionRefusalReport(opts.RepoPath, opts.BaseBranch, plan, capability, permissionErr, deps.Now())
+	if err := renderNestedRun(stdout, opts.Format, report, deps); err != nil {
+		fmt.Fprintf(stderr, "nested run: write permission refusal: %v\n", err)
+		return 1
+	}
+	return 1
 }
 
 func nestedDispatchExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) orchestration.ChildRunExecutor {
@@ -617,6 +664,18 @@ func renderNestedText(report orchestration.NestedScheduleReport) string {
 	fmt.Fprintln(&b, "NESTED RUN")
 	fmt.Fprintf(&b, "ParentRunId: %s\n", report.ParentRunID)
 	fmt.Fprintf(&b, "Status: %s\n", report.Status)
+	if report.Outcome != "" {
+		fmt.Fprintf(&b, "Outcome: %s\n", report.Outcome)
+	}
+	if report.ExecutorCapability != nil {
+		fmt.Fprintf(&b, "Executor: %s registration=%s provider=%s enforceable_permissions=%s provider_native=%t\n",
+			reporter.BoundDecisionText(report.ExecutorCapability.ExecutorID),
+			reporter.BoundDecisionText(report.ExecutorCapability.RegistrationID),
+			reporter.BoundDecisionText(report.ExecutorCapability.Provider),
+			reporter.BoundDecisionText(strings.Join(report.ExecutorCapability.EnforceablePermissions, ",")),
+			report.ExecutorCapability.ProviderNative,
+		)
+	}
 	fmt.Fprintf(&b, "Children: %d (required=%d optional=%d succeeded=%d failed=%d needs-human=%d cancelled=%d skipped=%d)\n",
 		len(report.Children),
 		report.Summary.RequiredCount,
@@ -631,6 +690,9 @@ func renderNestedText(report orchestration.NestedScheduleReport) string {
 		line := fmt.Sprintf("- %s %s %s", child.ChildKey, child.RunID, child.Status)
 		if child.ReplayAction != "" {
 			line += " action=" + child.ReplayAction
+		}
+		if child.Outcome != "" {
+			line += " outcome=" + child.Outcome
 		}
 		if child.ClaimOutcome != "" {
 			line += " claim=" + child.ClaimOutcome
@@ -660,6 +722,16 @@ func renderNestedText(report orchestration.NestedScheduleReport) string {
 			line += " next_action=" + reporter.BoundDecisionText(child.NextAction)
 		}
 		fmt.Fprintln(&b, line)
+	}
+	for _, refusal := range report.Refusals {
+		fmt.Fprintf(&b, "Refusal: child=%s code=%s permission=%s capability_result=%s provider_native=%t next_action=%s\n",
+			reporter.BoundDecisionText(refusal.ChildKey),
+			reporter.BoundDecisionText(refusal.Code),
+			reporter.BoundDecisionText(refusal.RequestedPermission),
+			reporter.BoundDecisionText(refusal.CapabilityResult),
+			refusal.ProviderNativeRequested,
+			reporter.BoundDecisionText(refusal.NextAction),
+		)
 	}
 	switch report.Status {
 	case orchestration.NestedStatusSucceeded:

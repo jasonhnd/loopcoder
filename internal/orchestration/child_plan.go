@@ -63,7 +63,7 @@ func ParseChildPlanJSON(data []byte) (ChildPlan, error) {
 		return ChildPlan{}, fmt.Errorf("parse child plan: trailing JSON value")
 	}
 	if err := ValidateChildPlan(&plan); err != nil {
-		return ChildPlan{}, err
+		return plan, err
 	}
 	return plan, nil
 }
@@ -148,7 +148,9 @@ func normalizeAndValidateChildItems(plan *ChildPlan) error {
 		}
 		item.Permission = normalizeChildPermission(item.Permission)
 		if !validChildPermission(item.Permission) {
-			return fmt.Errorf("child %q permission must be one of read-only, write, orchestrate", item.ChildKey)
+			refusal := newNestedPermissionRefusal(*item, NestedExecutorCapability{}, item.Permission, childRequiresNativeRegistration(*item), NestedCapabilityUnknownPermission)
+			refusal.Reason = boundedNestedPermissionText(fmt.Sprintf("child %q permission must be one of read-only, write, orchestrate; requested %q is not enforceable", item.ChildKey, item.Permission))
+			return &PermissionNotEnforceableError{Refusals: []NestedPermissionRefusal{refusal}}
 		}
 		item.Scope = normalizeStructuredScope(item.Scope, item.Issue, item.ScopeIssues)
 		item.Issue = firstPositive(item.Issue, firstScopeIssue(item.Scope))
