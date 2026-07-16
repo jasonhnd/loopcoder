@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
@@ -51,6 +52,7 @@ type DispatchWaveOptions struct {
 	Provider       string
 	Model          string
 	Effort         string
+	Timeout        time.Duration
 	ConfigFromBase bool
 	ThrottleLimit  int
 	Thresholds     config.ResilienceWorker
@@ -60,10 +62,11 @@ type DispatchWaveOptions struct {
 	Now            time.Time
 	Stderr         io.Writer
 
-	ComputeReadySet ReadySetFunc
-	Dispatch        WorkerDispatchFunc
-	LoadAttempts    LoadAttemptsFunc
-	OnIssueComplete DispatchWaveIssueCompleteFunc
+	ComputeReadySet    ReadySetFunc
+	Dispatch           WorkerDispatchFunc
+	LoadAttempts       LoadAttemptsFunc
+	OnIssueComplete    DispatchWaveIssueCompleteFunc
+	BeforeProviderCall func(issue int) error
 }
 
 type DispatchWaveReport struct {
@@ -80,6 +83,11 @@ type DispatchWaveReport struct {
 type DispatchWaveIssueResult struct {
 	Issue               int
 	Status              string
+	ProviderInvoked     bool     `json:"provider_invoked,omitempty"`
+	Outcome             string   `json:"outcome,omitempty"`
+	ProviderOutcome     string   `json:"provider_outcome,omitempty"`
+	DeliveryOutcome     string   `json:"delivery_outcome,omitempty"`
+	Evidence            []string `json:"evidence,omitempty"`
 	Branch              string
 	PR                  string
 	AttemptPath         string
@@ -406,9 +414,21 @@ func dispatchWaveIssue(ctx context.Context, opts DispatchWaveOptions, issueNumbe
 		Provider:       opts.Provider,
 		Model:          opts.Model,
 		Effort:         opts.Effort,
+		Timeout:        opts.Timeout,
 		ConfigFromBase: opts.ConfigFromBase,
 		Stderr:         opts.Stderr,
+		BeforeProviderCall: func() error {
+			if opts.BeforeProviderCall == nil {
+				return nil
+			}
+			return opts.BeforeProviderCall(issueNumber)
+		},
 	})
+	result.ProviderInvoked = dispatchResult.ProviderInvoked
+	result.Outcome = dispatchResult.Outcome
+	result.ProviderOutcome = dispatchResult.ProviderOutcome
+	result.DeliveryOutcome = dispatchResult.DeliveryOutcome
+	result.Evidence = append([]string(nil), dispatchResult.Evidence...)
 	if err != nil {
 		result.Status = dispatchWaveFailureStatus(err, dispatchResult)
 		result.Error = err.Error()
@@ -429,6 +449,9 @@ func dispatchWaveIssue(ctx context.Context, opts DispatchWaveOptions, issueNumbe
 }
 
 func dispatchWaveFailureStatus(err error, result worker.Result) string {
+	if agent.IsProviderCallRefused(err) {
+		return DispatchWaveStatusNeedsHuman
+	}
 	if mapped := state.FailureStatus(err); mapped != state.StatusFailed {
 		return mapped
 	}

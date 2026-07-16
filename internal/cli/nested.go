@@ -18,9 +18,11 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/pathid"
+	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
+	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	"github.com/jasonhnd/loopcoder/internal/worker"
 )
 
@@ -82,7 +84,7 @@ func printNestedHelp(w io.Writer) {
 	fmt.Fprintln(w, "  --model string                optional worker model override for this run")
 	fmt.Fprintln(w, "  --effort string               optional worker reasoning effort override for this run")
 	fmt.Fprintln(w, "  --parent-permission string    parent permission ceiling: read-only, write, or orchestrate (default \"orchestrate\")")
-	fmt.Fprintln(w, "  --format string               output format: text or json (default \"text\")")
+	fmt.Fprintln(w, "  --format string               output format: text, json, or jsonl (default \"text\")")
 	fmt.Fprintln(w, "  --timeout duration            optional timeout for the nested run, for example 30s or 5m")
 	fmt.Fprintln(w, "  --config-from-base            read .delivery.yml from base branch when absent from working tree")
 	fmt.Fprintln(w, "  --strict                      reject invalid model/depth selections instead of warning")
@@ -185,13 +187,13 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 2
 	}
 	switch opts.Format {
-	case "text", "json":
+	case "text", "json", "jsonl":
 	default:
-		fmt.Fprintf(stderr, "nested run: invalid --format %q; want text or json\n", opts.Format)
+		fmt.Fprintf(stderr, "nested run: invalid --format %q; want text, json, or jsonl\n", opts.Format)
 		return 2
 	}
 	warnings := stderr
-	if opts.Format == "json" {
+	if opts.Format == "json" || opts.Format == "jsonl" {
 		warnings = io.Discard
 	}
 	parentPermission := normalizeNestedPermission(opts.ParentPermission)
@@ -277,21 +279,29 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if opts.Provider == nestedTestSubprocessProvider {
 		executor = nestedSubprocessExecutor(opts, deps, warnings)
 	}
+	progressRecorder, stopProgress := progressSupervisorForRegisteredRepo(context.Background(), resolvedRepo, plan.RootRunID, deps.Now, stderr)
+	defer func() {
+		if err := stopProgress(); err != nil {
+			fmt.Fprintf(stderr, "nested run: progress receipt shutdown: %v\n", err)
+		}
+	}()
 
 	report, err := orchestration.ScheduleNestedRuns(ctx, orchestration.NestedScheduleOptions{
-		RepoPath:         resolvedRepo,
-		BaseBranch:       opts.BaseBranch,
-		Plan:             &plan,
-		Store:            store,
-		Budget:           cfg.Guardrails.Budget,
-		CircuitBreaker:   cfg.Guardrails.CircuitBreaker,
-		ConcurrencyLimit: plan.MaxConcurrency,
-		MaxDepth:         plan.MaxDepth,
-		Execute:          executor,
+		RepoPath:                 resolvedRepo,
+		BaseBranch:               opts.BaseBranch,
+		Plan:                     &plan,
+		Store:                    store,
+		Budget:                   cfg.Guardrails.Budget,
+		CircuitBreaker:           cfg.Guardrails.CircuitBreaker,
+		ConcurrencyLimit:         plan.MaxConcurrency,
+		MaxDepth:                 plan.MaxDepth,
+		Progress:                 progressRecorder,
+		AllowUnbudgetedLocalTest: opts.Provider == nestedTestSubprocessProvider,
+		Execute:                  executor,
 	})
 	if err != nil {
 		if nestedReportHasContent(report) {
-			if renderErr := renderNestedRun(stdout, opts.Format, report); renderErr != nil {
+			if renderErr := renderNestedRun(stdout, opts.Format, report, deps); renderErr != nil {
 				fmt.Fprintf(stderr, "nested run: write output after failure: %v\n", renderErr)
 			}
 		}
@@ -300,7 +310,7 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		}
 		return 1
 	}
-	if err := renderNestedRun(stdout, opts.Format, report); err != nil {
+	if err := renderNestedRun(stdout, opts.Format, report, deps); err != nil {
 		fmt.Fprintf(stderr, "nested run: write output: %v\n", err)
 		return 1
 	}
@@ -393,10 +403,15 @@ func nestedSubprocessExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer
 			if command == "" {
 				continue
 			}
-			cmd := shellCommand(runCtx, command)
+			cmd := shellCommand(context.Background(), command)
 			cmd.Dir = opts.RepoPath
-			out, err := cmd.CombinedOutput()
-			output.Write(out)
+			cmd.Stdout = &output
+			cmd.Stderr = &output
+			result, err := supervisedexec.Run(runCtx, cmd, supervisedexec.Options{
+				HardCap: nestedSubprocessHardCap(metadata),
+				RunID:   child.RunID,
+				Role:    "nested-test-subprocess",
+			})
 			if err != nil {
 				status = normalizeExecutorFailureStatus(err)
 				exitCode = commandExitCode(err)
@@ -405,9 +420,22 @@ func nestedSubprocessExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer
 				}
 				break
 			}
+			if result.Killed {
+				status = orchestration.NestedStatusTimedOut
+				exitCode = 1
+				if runCtx.Err() != nil {
+					status = normalizeExecutorFailureStatus(runCtx.Err())
+				}
+				break
+			}
+			if result.ExitCode != 0 {
+				status = orchestration.NestedStatusFailed
+				exitCode = result.ExitCode
+				break
+			}
 		}
 		ended := deps.Now().UTC()
-		summary := strings.TrimSpace(output.String())
+		summary := strings.TrimSpace(recovery.Scrub(output.String()))
 		if summary == "" {
 			summary = "test subprocess completed"
 		}
@@ -533,6 +561,9 @@ func enforceNestedPlanScope(repoPath, parentPermission string, plan *orchestrati
 		if err != nil {
 			return fmt.Errorf("child %q scope.repo: %w", child.ChildKey, err)
 		}
+		if absolutePathOnDifferentVolume(parentRepo.Display, childRepo) {
+			return fmt.Errorf("child %q scope.repo %q escapes parent repo %s", child.ChildKey, child.Scope.Repo, repoPath)
+		}
 		childRepoID, err := pathid.Canonicalize(childRepo)
 		if err != nil {
 			return fmt.Errorf("child %q scope.repo: %w", child.ChildKey, err)
@@ -544,6 +575,9 @@ func enforceNestedPlanScope(repoPath, parentPermission string, plan *orchestrati
 			resolvedPath, err := resolveNestedScopedPath(childRepoID.Display, scopedPath)
 			if err != nil {
 				return fmt.Errorf("child %q scope.paths %q: %w", child.ChildKey, scopedPath, err)
+			}
+			if absolutePathOnDifferentVolume(childRepoID.Display, resolvedPath) || absolutePathOnDifferentVolume(parentRepo.Display, resolvedPath) {
+				return fmt.Errorf("child %q scope.paths %q escapes approved repo scope", child.ChildKey, scopedPath)
 			}
 			scopedID, err := pathid.Canonicalize(resolvedPath)
 			if err != nil {
@@ -557,17 +591,25 @@ func enforceNestedPlanScope(repoPath, parentPermission string, plan *orchestrati
 	return nil
 }
 
-func renderNestedRun(w io.Writer, format string, report orchestration.NestedScheduleReport) error {
+func renderNestedRun(w io.Writer, format string, report orchestration.NestedScheduleReport, deps Deps) error {
 	if format == "json" {
-		data, err := json.MarshalIndent(report, "", "  ")
+		data, err := json.MarshalIndent(nestedJSONPayload(report), "", "  ")
 		if err != nil {
 			return err
 		}
 		_, err = w.Write(append(data, '\n'))
 		return err
 	}
-	_, err := fmt.Fprint(w, renderNestedText(report))
-	return err
+	if format == "jsonl" {
+		return renderCanonicalMachine(w, nestedObservability(report), "jsonl")
+	}
+	if _, err := fmt.Fprint(w, renderNestedText(report)); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(w); err != nil {
+		return err
+	}
+	return renderCanonicalHuman(w, nestedObservability(report), deps)
 }
 
 func renderNestedText(report orchestration.NestedScheduleReport) string {
@@ -868,6 +910,15 @@ func pathWithin(parent, child string) bool {
 	return strings.HasPrefix(child, parent+string(filepath.Separator))
 }
 
+func absolutePathOnDifferentVolume(base, candidate string) bool {
+	if runtime.GOOS != "windows" || !filepath.IsAbs(candidate) {
+		return false
+	}
+	baseVolume := filepath.VolumeName(filepath.Clean(base))
+	candidateVolume := filepath.VolumeName(filepath.Clean(candidate))
+	return baseVolume != "" && candidateVolume != "" && !strings.EqualFold(baseVolume, candidateVolume)
+}
+
 func shellCommand(ctx context.Context, command string) *exec.Cmd {
 	if runtime.GOOS == "windows" {
 		return exec.CommandContext(ctx, "powershell", "-NoProfile", "-Command", command)
@@ -886,6 +937,13 @@ func normalizeExecutorFailureStatus(err error) string {
 		return orchestration.NestedStatusTimedOut
 	}
 	return orchestration.NestedStatusFailed
+}
+
+func nestedSubprocessHardCap(metadata nestedChildMetadata) time.Duration {
+	if metadata.TimeoutSeconds <= 0 {
+		return supervisedexec.DefaultHardCap
+	}
+	return time.Duration(metadata.TimeoutSeconds+1) * time.Second
 }
 
 func normalizeExecutorStatus(status string) string {

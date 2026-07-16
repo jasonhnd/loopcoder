@@ -187,6 +187,8 @@ func prettyProviderDisplay(provider string) string {
 		return "Google / gemini"
 	case "antigravity":
 		return "Google Antigravity / antigravity"
+	case "grok":
+		return "xAI Grok Build / grok"
 	default:
 		return prettyValue(provider)
 	}

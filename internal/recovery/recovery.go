@@ -15,20 +15,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
+	"github.com/jasonhnd/loopcoder/internal/progress"
+	"github.com/jasonhnd/loopcoder/internal/providerreconcile"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/sanitize"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
-)
-
-var (
-	githubTokenPattern = regexp.MustCompile(`(?i)(ghp|github_pat|gho|ghu|ghs|ghr)_[A-Za-z0-9_]+`)
-	apiKeyPattern      = regexp.MustCompile(`(?i)sk-[A-Za-z0-9_-]{20,}`)
-	bearerPattern      = regexp.MustCompile(`(?i)(Bearer\s+)[A-Za-z0-9._~+/=-]+`)
-	assignmentPattern  = regexp.MustCompile(`(?i)((token|password|secret|api[_-]?key)\s*[=:]\s*)\S+`)
 )
 
 type BriefInput struct {
@@ -64,63 +61,72 @@ const (
 )
 
 type Options struct {
-	RepoPath         string
-	IssueNumber      int
-	IssueTitle       string
-	IssueBody        string
-	RunID            string
-	BaseBranch       string
-	MaxAttempts      int
-	BackoffSeconds   []int
-	Provider         string
-	Model            string
-	Effort           string
-	ConfigFromBase   bool
-	UpgradedModel    string
-	UpgradedEffort   string
-	FailureContext   string
-	SkipAdoptPR      bool
-	VerifierProvider string
-	VerifierModel    string
-	VerifierEffort   string
-	VerifierTimeout  time.Duration
-	Budget           config.GuardrailBudget
-	CircuitBreaker   config.GuardrailCircuitBreaker
-	Now              time.Time
-	Stderr           io.Writer
+	RepoPath           string
+	IssueNumber        int
+	IssueTitle         string
+	IssueBody          string
+	RunID              string
+	BaseBranch         string
+	MaxAttempts        int
+	BackoffSeconds     []int
+	Provider           string
+	Model              string
+	Effort             string
+	ConfigFromBase     bool
+	UpgradedModel      string
+	UpgradedEffort     string
+	FailureContext     string
+	SkipAdoptPR        bool
+	VerifierProvider   string
+	VerifierModel      string
+	VerifierEffort     string
+	VerifierTimeout    time.Duration
+	Budget             config.GuardrailBudget
+	CircuitBreaker     config.GuardrailCircuitBreaker
+	Progress           progress.Recorder
+	Now                time.Time
+	Stderr             io.Writer
+	BeforeProviderCall func(kind string) error
+	AfterProviderCall  func(kind string, invoked bool, report *reporter.Report)
 }
 
 type DispatchOptions struct {
-	RepoPath        string
-	IssueNumber     int
-	IssueTitle      string
-	IssueBody       string
-	BaseBranch      string
-	Branch          string
-	RunID           string
-	Attempt         int
-	RecoveryContext string
-	Provider        string
-	Model           string
-	Effort          string
-	ConfigFromBase  bool
-	Stderr          io.Writer
+	RepoPath           string
+	IssueNumber        int
+	IssueTitle         string
+	IssueBody          string
+	BaseBranch         string
+	Branch             string
+	RunID              string
+	Attempt            int
+	RecoveryContext    string
+	Provider           string
+	Model              string
+	Effort             string
+	ConfigFromBase     bool
+	Stderr             io.Writer
+	BeforeProviderCall func() error
 }
 
 type DispatchResult struct {
-	OK          bool             `json:"ok"`
-	Issue       int              `json:"issue"`
-	Branch      string           `json:"branch"`
-	RunID       string           `json:"run_id"`
-	PR          string           `json:"pr"`
-	Summary     string           `json:"summary"`
-	AttemptPath string           `json:"attempt_path"`
-	Status      string           `json:"status"`
-	ExitCode    int              `json:"exit_code"`
-	LogBytes    int64            `json:"log_bytes"`
-	Reason      string           `json:"reason,omitempty"`
-	NextAction  string           `json:"next_action,omitempty"`
-	Report      *reporter.Report `json:"report,omitempty"`
+	OK              bool             `json:"ok"`
+	ProviderInvoked bool             `json:"provider_invoked,omitempty"`
+	Issue           int              `json:"issue"`
+	Branch          string           `json:"branch"`
+	RunID           string           `json:"run_id"`
+	PR              string           `json:"pr"`
+	Summary         string           `json:"summary"`
+	AttemptPath     string           `json:"attempt_path"`
+	Status          string           `json:"status"`
+	Outcome         string           `json:"outcome,omitempty"`
+	ProviderOutcome string           `json:"provider_outcome,omitempty"`
+	DeliveryOutcome string           `json:"delivery_outcome,omitempty"`
+	Evidence        []string         `json:"evidence,omitempty"`
+	ExitCode        int              `json:"exit_code"`
+	LogBytes        int64            `json:"log_bytes"`
+	Reason          string           `json:"reason,omitempty"`
+	NextAction      string           `json:"next_action,omitempty"`
+	Report          *reporter.Report `json:"report,omitempty"`
 }
 
 type Result struct {
@@ -130,6 +136,7 @@ type Result struct {
 	ReviewResult     *loopreview.Result
 	RecoveryAttempts []AttemptRecord
 	AdoptedPR        *AdoptedPR
+	Reconciliation   *providerreconcile.Receipt
 }
 
 type PullRequestReader interface {
@@ -190,11 +197,7 @@ type AttemptRecord struct {
 
 // Scrub redacts common secret shapes before text is written to recovery state.
 func Scrub(text string) string {
-	text = githubTokenPattern.ReplaceAllString(text, "[REDACTED_GITHUB_TOKEN]")
-	text = apiKeyPattern.ReplaceAllString(text, "[REDACTED_API_KEY]")
-	text = bearerPattern.ReplaceAllString(text, "${1}[REDACTED_TOKEN]")
-	text = assignmentPattern.ReplaceAllString(text, "${1}[REDACTED_SECRET]")
-	return text
+	return sanitize.Text(text)
 }
 
 // RenderBrief renders the Markdown recovery context consumed by retry workers.
@@ -291,6 +294,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	emitRecoveryProgress(ctx, opts, "recovery-started", "", false)
 
 	attempts, priorAttempts, latestStatus, latestBriefPath, latestBriefText, err := loadRecoverySnapshot(repoPath, opts, deps)
 	if err != nil {
@@ -330,6 +334,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 				}, nil
 			}
 		}
+		emitRecoveryProgress(ctx, opts, "recovery-adopted", adopted.URL, true)
 		return Result{
 			Action:    ActionAdopt,
 			Report:    renderAdoptReport(opts.IssueNumber, opts.RunID, priorAttempts, latestStatus, *adopted),
@@ -365,12 +370,27 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 				recoveryAttempts = append(recoveryAttempts, recordHungNeedsHuman(repoPath, opts, deps, priorAttempts, latestBriefPath))
 			}
 			report.WriteString(renderBlockedReport(opts.IssueNumber, opts.RunID, priorAttempts, opts.MaxAttempts, latestStatus, latestBriefPath, latestBriefText, attempts, blockReason))
+			emitRecoveryProgress(ctx, opts, "recovery-blocked", "max attempts reached", true)
 			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: lastDispatchResult, ReviewResult: lastReviewResult, RecoveryAttempts: recoveryAttempts}, nil
 		}
 
 		if blocked, blockedReport := evaluateRecoverGuardrails(repoPath, opts, attempts, priorAttempts, latestStatus, latestBriefPath, latestBriefText); blocked {
 			report.WriteString(blockedReport)
+			emitRecoveryProgress(ctx, opts, "recovery-blocked", "guardrail blocked recovery", true)
 			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: lastDispatchResult, ReviewResult: lastReviewResult, RecoveryAttempts: recoveryAttempts}, nil
+		}
+
+		reconcileDecision := providerreconcile.Check(ctx, providerreconcile.Options{
+			RepoPath: repoPath,
+			RunID:    opts.RunID,
+			Issue:    opts.IssueNumber,
+			Attempts: attemptsFromHistory(attempts),
+			Now:      recoverNow(opts),
+		})
+		if reconcileDecision.BlockRedispatch {
+			report.WriteString(renderProviderReconcileBlockedReport(opts.IssueNumber, opts.RunID, reconcileDecision))
+			emitRecoveryProgress(ctx, opts, "recovery-blocked", reconcileDecision.NextAction, true)
+			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: lastDispatchResult, ReviewResult: lastReviewResult, RecoveryAttempts: recoveryAttempts, Reconciliation: &reconcileDecision}, nil
 		}
 
 		nextAttempt := priorAttempts + 1
@@ -404,6 +424,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			record.FinishedAt = state.FormatTimestamp(recoverNow(opts))
 			_ = deps.RecordAttempt(repoPath, opts.RunID, record)
 			recoveryAttempts = append(recoveryAttempts, record)
+			emitRecoveryProgress(context.Background(), opts, "recovery-failed", err.Error(), true)
 			return Result{Action: ActionRetry, Report: report.String(), RecoveryAttempts: recoveryAttempts}, err
 		}
 
@@ -422,7 +443,20 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			Effort:          effort,
 			ConfigFromBase:  opts.ConfigFromBase,
 			Stderr:          opts.Stderr,
+			BeforeProviderCall: func() error {
+				if opts.BeforeProviderCall == nil {
+					return nil
+				}
+				return opts.BeforeProviderCall("worker")
+			},
 		})
+		if opts.AfterProviderCall != nil {
+			opts.AfterProviderCall("worker", dispatchResult.ProviderInvoked, dispatchResult.Report)
+		}
+		if agent.IsProviderCallRefused(dispatchErr) {
+			report.WriteString("BLOCKED: orchestration cost budget: " + dispatchErr.Error() + "\n")
+			return Result{Action: ActionBlocked, Report: report.String(), RecoveryAttempts: recoveryAttempts}, nil
+		}
 		lastDispatchResult = &dispatchResult
 		record.DispatchResult = &dispatchResult
 		record.PR = dispatchResult.PR
@@ -434,6 +468,20 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 				record.Status = StatusHung
 				record.Error = ensureHungReason(record.Error)
 			}
+			if dispatchProviderWorkReusable(dispatchResult) {
+				record.Status = "needs-human"
+				if strings.EqualFold(dispatchResult.Outcome, "delivery_failed") {
+					record.Status = "failed"
+				}
+				_ = deps.RecordAttempt(repoPath, opts.RunID, record)
+				recoveryAttempts = append(recoveryAttempts, record)
+				if data, marshalErr := json.Marshal(dispatchResult); marshalErr == nil {
+					report.WriteString(string(data) + "\n")
+				}
+				report.WriteString(renderReviewBlockedReport(opts.IssueNumber, opts.RunID, dispatchResult.PR, "provider work completed; retry only delivery finalization: "+record.Error))
+				emitRecoveryProgress(ctx, opts, "recovery-blocked", "provider work reusable; delivery finalization failed", true)
+				return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: &dispatchResult, RecoveryAttempts: recoveryAttempts}, nil
+			}
 			if opts.CircuitBreaker.Enabled() {
 				decision := recordRetryCircuitOutcome(repoPath, opts, priorAttempts, false, record.Error)
 				if !decision.Allowed {
@@ -442,6 +490,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 					recoveryAttempts = append(recoveryAttempts, record)
 					attempts, priorAttempts, latestStatus, latestBriefPath, latestBriefText, _ = loadRecoverySnapshot(repoPath, opts, deps)
 					report.WriteString(renderCircuitBlockedReport(opts.IssueNumber, opts.RunID, priorAttempts, latestStatus, latestBriefPath, latestBriefText, attempts, decision))
+					emitRecoveryProgress(ctx, opts, "recovery-blocked", "circuit breaker blocked recovery", true)
 					return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: &dispatchResult, RecoveryAttempts: recoveryAttempts}, nil
 				}
 			}
@@ -460,6 +509,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			_ = deps.RecordAttempt(repoPath, opts.RunID, record)
 			recoveryAttempts = append(recoveryAttempts, record)
 			report.WriteString(renderReviewBlockedReport(opts.IssueNumber, opts.RunID, dispatchResult.PR, record.Error))
+			emitRecoveryProgress(ctx, opts, "recovery-blocked", record.Error, true)
 			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: &dispatchResult, RecoveryAttempts: recoveryAttempts}, nil
 		}
 
@@ -473,9 +523,11 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			recoveryAttempts = append(recoveryAttempts, record)
 			data, marshalErr := json.Marshal(dispatchResult)
 			if marshalErr != nil {
+				emitRecoveryProgress(ctx, opts, "recovery-failed", marshalErr.Error(), true)
 				return Result{Action: ActionRetry, Report: report.String(), DispatchResult: &dispatchResult, RecoveryAttempts: recoveryAttempts}, marshalErr
 			}
 			report.WriteString(string(data) + "\n")
+			emitRecoveryProgress(ctx, opts, "recovery-retried", dispatchResult.Status, true)
 			return Result{Action: ActionRetry, Report: report.String(), DispatchResult: &dispatchResult, RecoveryAttempts: recoveryAttempts}, nil
 		}
 
@@ -486,6 +538,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			_ = deps.RecordAttempt(repoPath, opts.RunID, record)
 			recoveryAttempts = append(recoveryAttempts, record)
 			report.WriteString(renderReviewBlockedReport(opts.IssueNumber, opts.RunID, dispatchResult.PR, record.Error))
+			emitRecoveryProgress(ctx, opts, "recovery-blocked", record.Error, true)
 			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: &dispatchResult, RecoveryAttempts: recoveryAttempts}, nil
 		}
 		reviewResult, reviewErr := deps.Review(ctx, loopreview.Options{
@@ -498,7 +551,16 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			ConfigFromBase: opts.ConfigFromBase,
 			Timeout:        opts.VerifierTimeout,
 			Stderr:         opts.Stderr,
+			BeforeProviderCall: func() error {
+				if opts.BeforeProviderCall == nil {
+					return nil
+				}
+				return opts.BeforeProviderCall("verifier")
+			},
 		})
+		if opts.AfterProviderCall != nil {
+			opts.AfterProviderCall("verifier", reviewResult.ProviderInvoked, reviewResult.Verdict.Report)
+		}
 		lastReviewResult = &reviewResult
 		record.Review = &reviewResult.Verdict
 		if reviewErr != nil {
@@ -507,6 +569,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			_ = deps.RecordAttempt(repoPath, opts.RunID, record)
 			recoveryAttempts = append(recoveryAttempts, record)
 			report.WriteString(renderReviewBlockedReport(opts.IssueNumber, opts.RunID, dispatchResult.PR, reviewErr.Error()))
+			emitRecoveryProgress(ctx, opts, "recovery-blocked", reviewErr.Error(), true)
 			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: &dispatchResult, ReviewResult: &reviewResult, RecoveryAttempts: recoveryAttempts}, nil
 		}
 		switch reviewResult.Verdict.Verdict {
@@ -515,6 +578,7 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			_ = deps.RecordAttempt(repoPath, opts.RunID, record)
 			recoveryAttempts = append(recoveryAttempts, record)
 			report.WriteString(renderReviewResultReport(opts.IssueNumber, opts.RunID, dispatchResult.PR, reviewResult))
+			emitRecoveryProgress(ctx, opts, "recovery-succeeded", dispatchResult.PR, true)
 			return Result{Action: ActionSucceeded, Report: report.String(), DispatchResult: &dispatchResult, ReviewResult: &reviewResult, RecoveryAttempts: recoveryAttempts}, nil
 		case loopreview.VerdictFail:
 			record.Status = "failed"
@@ -530,9 +594,94 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 			_ = deps.RecordAttempt(repoPath, opts.RunID, record)
 			recoveryAttempts = append(recoveryAttempts, record)
 			report.WriteString(renderReviewBlockedReport(opts.IssueNumber, opts.RunID, dispatchResult.PR, record.Error))
+			emitRecoveryProgress(ctx, opts, "recovery-blocked", record.Error, true)
 			return Result{Action: ActionBlocked, Report: report.String(), DispatchResult: &dispatchResult, ReviewResult: &reviewResult, RecoveryAttempts: recoveryAttempts}, nil
 		}
 	}
+}
+
+func emitRecoveryProgress(ctx context.Context, opts Options, status, detail string, terminal bool) {
+	if opts.Progress == nil {
+		return
+	}
+	now := recoverNow(opts)
+	known := progress.KnownRecoveryInProgress
+	if terminal {
+		known = progress.KnownTerminal
+		if strings.Contains(status, "blocked") {
+			known = progress.KnownBlocked
+		}
+	}
+	observation := progress.Observation{
+		DeliveryRunID: opts.RunID,
+		RunID:         opts.RunID,
+		TaskID:        fmt.Sprintf("issue-%d", opts.IssueNumber),
+		CorrelationID: fmt.Sprintf("recovery:issue-%d", opts.IssueNumber),
+		Phase:         "recovery",
+		Status:        strings.TrimSpace(status),
+		KnownState:    known,
+		Reason:        progress.ReasonStateChange,
+		TaskCounts:    recoveryProgressCounts(known),
+		Evidence: []progress.EvidenceRef{{
+			RecordKind:     "recovery-run",
+			RecordID:       fmt.Sprintf("%s:issue-%d", opts.RunID, opts.IssueNumber),
+			Summary:        "recovery state changed",
+			Classification: "local-diagnostic",
+			Confidence:     "exact",
+		}},
+		OccurredAt: now,
+		Terminal:   terminal,
+	}
+	if detail != "" {
+		observation.NextAction = progress.ActionState{State: "recover", Summary: boundedRecoveryProgressText(detail)}
+		if strings.Contains(status, "blocked") || strings.Contains(status, "failed") {
+			observation.Blocker = progress.ActionState{State: "blocked", Summary: boundedRecoveryProgressText(detail)}
+		}
+	}
+	var err error
+	if terminal {
+		_, err = opts.Progress.Terminal(ctx, observation)
+	} else {
+		_, err = opts.Progress.Emit(ctx, observation)
+	}
+	if err != nil && !errors.Is(err, progress.ErrEmitterClosed) {
+		progress.ReportDiagnostic(ctx, opts.Progress, observation, err)
+	}
+}
+
+func dispatchProviderWorkReusable(result DispatchResult) bool {
+	if !strings.EqualFold(strings.TrimSpace(result.ProviderOutcome), "provider_completed") {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(result.Outcome)) {
+	case "delivery_failed", "push_conflict":
+		return true
+	default:
+		return false
+	}
+}
+
+func recoveryProgressCounts(known string) progress.TaskCounts {
+	counts := progress.TaskCounts{Total: 1}
+	switch known {
+	case progress.KnownRecoveryInProgress:
+		counts.Running = 1
+	case progress.KnownBlocked:
+		counts.Blocked = 1
+	case progress.KnownTerminal:
+		counts.Succeeded = 1
+	default:
+		counts.Unknown = 1
+	}
+	return counts
+}
+
+func boundedRecoveryProgressText(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) > 180 {
+		return value[:180]
+	}
+	return value
 }
 
 func withRecoverDefaults(deps Deps) Deps {
@@ -1026,6 +1175,30 @@ func renderCircuitBlockedReport(issueNumber int, runID string, priorAttempts int
 	fmt.Fprintln(&out)
 	fmt.Fprintln(&out, "Human decision needed: inspect the latest recovery brief and circuit-breaker evidence, then decide whether to clarify the issue, raise the no-progress threshold, close/supersede it, or explicitly start a new scoped run.")
 	return out.String()
+}
+
+func renderProviderReconcileBlockedReport(issueNumber int, runID string, decision providerreconcile.Receipt) string {
+	var out bytes.Buffer
+	fmt.Fprintln(&out, "BLOCKED: provider reconciliation needs-human")
+	fmt.Fprintf(&out, "Issue: #%d\n", issueNumber)
+	fmt.Fprintf(&out, "RunId: %s\n", runID)
+	fmt.Fprintf(&out, "Outcome: %s\n", decision.Outcome)
+	fmt.Fprintf(&out, "Action: %s\n", decision.Action)
+	fmt.Fprintf(&out, "Reason: %s\n", decision.Reason)
+	fmt.Fprintf(&out, "Next action: %s\n", decision.NextAction)
+	if len(decision.Evidence) > 0 {
+		fmt.Fprintf(&out, "Evidence: %s\n", strings.Join(decision.Evidence, "; "))
+	}
+	fmt.Fprintf(&out, "Receipt: %s\n", decision.JSONLine())
+	return out.String()
+}
+
+func attemptsFromHistory(history []attemptHistoryEntry) []state.Attempt {
+	out := make([]state.Attempt, 0, len(history))
+	for _, item := range history {
+		out = append(out, item.Record)
+	}
+	return out
 }
 
 func ledgerWriteFailedCircuitDecision(opts Options, repoPath string, err error) guardrails.Decision {

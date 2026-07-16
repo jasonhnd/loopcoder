@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -77,6 +78,230 @@ func TestParseReadsHostProfile(t *testing.T) {
 	}
 	if cfg.Host.Profile != "codex" {
 		t.Fatalf("Host.Profile = %q, want codex", cfg.Host.Profile)
+	}
+}
+
+func TestParseRejectsUnsafeWorkerAdapterName(t *testing.T) {
+	_, err := Parse([]byte("version: 1\nadapters:\n  worker: \"../../evil\"\n"))
+	if err == nil {
+		t.Fatal("Parse returned nil error, want unsafe worker adapter rejection")
+	}
+	for _, want := range []string{"adapters.worker", "../../evil", "safe provider adapter name"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %v, want containing %q", err, want)
+		}
+	}
+}
+
+func TestParseRejectsUnsafeVerifierAdapterName(t *testing.T) {
+	_, err := Parse([]byte("version: 1\nadapters:\n  verifier: \"bad;provider\"\n"))
+	if err == nil {
+		t.Fatal("Parse returned nil error, want unsafe verifier adapter rejection")
+	}
+	for _, want := range []string{"adapters.verifier", "bad;provider", "safe provider adapter name"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %v, want containing %q", err, want)
+		}
+	}
+}
+
+func TestParseReadsProviderInventoryProfileSelection(t *testing.T) {
+	cfg, err := Parse([]byte("version: 1\nprovider_inventory:\n  profile_selection:\n    codex: acct_abcdefghijklmnopqrstuvwxyz123456\n"))
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+	if cfg.ProviderInventory.ProfileSelection["codex"] != "acct_abcdefghijklmnopqrstuvwxyz123456" {
+		t.Fatalf("ProfileSelection = %#v", cfg.ProviderInventory.ProfileSelection)
+	}
+
+	_, err = Parse([]byte("version: 1\nprovider_inventory:\n  profile_selection:\n    codex: jane@example.com\n"))
+	if err == nil {
+		t.Fatal("Parse returned nil error, want opaque acct_ id validation")
+	}
+	if !strings.Contains(err.Error(), "profile_selection.codex") || !strings.Contains(err.Error(), "acct_") {
+		t.Fatalf("error = %v, want profile selection acct_ hint", err)
+	}
+}
+
+func TestParseReadsAndValidatesCodexBarOptIn(t *testing.T) {
+	cfg, err := Parse([]byte(`
+version: 1
+provider_inventory:
+  codexbar:
+    enabled: true
+    providers:
+      - provider: codex
+        trust_class: internal-protocol
+      - provider: claude
+        trust_class: credential-delegated
+`))
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+	if !cfg.ProviderInventory.CodexBar.Enabled || len(cfg.ProviderInventory.CodexBar.Providers) != 2 {
+		t.Fatalf("CodexBar config = %#v", cfg.ProviderInventory.CodexBar)
+	}
+
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "enabled with no providers",
+			body: "version: 1\nprovider_inventory:\n  codexbar:\n    enabled: true\n",
+			want: "provider_inventory.codexbar.providers",
+		},
+		{
+			name: "unsafe provider",
+			body: "version: 1\nprovider_inventory:\n  codexbar:\n    enabled: true\n    providers:\n      - provider: \"codex;all\"\n        trust_class: local-machine\n",
+			want: "safe provider key",
+		},
+		{
+			name: "unknown trust",
+			body: "version: 1\nprovider_inventory:\n  codexbar:\n    enabled: true\n    providers:\n      - provider: codex\n        trust_class: unknown\n",
+			want: "trust_class",
+		},
+		{
+			name: "duplicate provider",
+			body: "version: 1\nprovider_inventory:\n  codexbar:\n    enabled: true\n    providers:\n      - provider: codex\n        trust_class: local-machine\n      - provider: codex\n        trust_class: local-machine\n",
+			want: "duplicated",
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse([]byte(tt.body))
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Parse error = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestCustomRoleDefinitionsRoundTripThroughConfigAndJSON(t *testing.T) {
+	cfg, err := Parse([]byte(`
+version: 1
+role_definitions:
+  - schema_version: loopcoder.role_definition.v1
+    record_version: 1
+    role_key: docs-auditor
+    role_version: "1"
+    description: Custom read-only docs auditor
+    allowed_risk_tiers: [low, medium]
+    minimum_capabilities:
+      - dimension: roles_supported
+        required_value: verifier
+        minimum_confidence: exact
+        freshness_required: fresh
+        source: fixture
+      - dimension: json_output
+        required_value: true
+        minimum_confidence: exact
+        freshness_required: fresh
+        source: fixture
+    permission_floor: read-only
+    permission_ceiling: read-only
+    default_output_contract: verification-verdict
+    independence_requirements:
+      high: different-provider
+    forbidden_bindings: [provider_name, model_id, account_profile_id]
+    quality_floor: strong
+    reasoning_depth: deep
+    required_tools: [filesystem-read]
+    minimum_context_window_tokens: 120000
+    max_side_effect_class: provider-launch
+    verification_requirements:
+      - verification_kind: loopreview
+        required_for_risk_tiers: [high]
+        independence_level: different-provider
+        permission_required: read-only
+        output_contract: verification-verdict
+        source: fixture
+    latency_tolerance: relaxed
+    cost_tolerance: high
+    policy_version: fixture-policy-v1
+`))
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+	if len(cfg.RoleDefinitions) != 1 {
+		t.Fatalf("RoleDefinitions = %#v, want one custom role", cfg.RoleDefinitions)
+	}
+	data, err := json.Marshal(cfg.RoleDefinitions)
+	if err != nil {
+		t.Fatalf("json.Marshal role definitions: %v", err)
+	}
+	var roundTrip []RoleDefinition
+	if err := json.Unmarshal(data, &roundTrip); err != nil {
+		t.Fatalf("json.Unmarshal role definitions: %v", err)
+	}
+	if !reflect.DeepEqual(roundTrip, cfg.RoleDefinitions) {
+		t.Fatalf("role definitions JSON round trip = %#v, want %#v", roundTrip, cfg.RoleDefinitions)
+	}
+	if strings.Contains(string(data), "provider:") || strings.Contains(string(data), "model_id\":\"gpt") {
+		t.Fatalf("role definition JSON contains provider/model binding: %s", data)
+	}
+}
+
+func TestParseRejectsInvalidCustomRoleDefinitions(t *testing.T) {
+	valid := `
+version: 1
+role_definitions:
+  - schema_version: loopcoder.role_definition.v1
+    record_version: 1
+    role_key: docs-auditor
+    role_version: "1"
+    description: Custom read-only docs auditor
+    allowed_risk_tiers: [medium]
+    minimum_capabilities:
+      - dimension: roles_supported
+        required_value: verifier
+        minimum_confidence: exact
+        freshness_required: fresh
+        source: fixture
+      - dimension: json_output
+        required_value: true
+        minimum_confidence: exact
+        freshness_required: fresh
+        source: fixture
+    permission_floor: read-only
+    permission_ceiling: read-only
+    default_output_contract: verification-verdict
+    independence_requirements:
+      high: different-provider
+    quality_floor: strong
+    reasoning_depth: deep
+    minimum_context_window_tokens: 120000
+    max_side_effect_class: provider-launch
+    verification_requirements:
+      - verification_kind: loopreview
+        required_for_risk_tiers: [high]
+        independence_level: different-provider
+        permission_required: read-only
+        output_contract: verification-verdict
+        source: fixture
+    latency_tolerance: relaxed
+    cost_tolerance: high
+    policy_version: fixture-policy-v1
+`
+	cases := map[string]string{
+		"record version": strings.Replace(valid, "record_version: 1", "record_version: 2", 1),
+		"role id":        strings.Replace(valid, "role_key: docs-auditor", "role_definition_id: roledef_mismatch\n    role_key: docs-auditor", 1),
+		"dimension":      strings.Replace(valid, "dimension: json_output", "dimension: future_capability", 1),
+		"capability":     strings.Replace(valid, "required_value: true", "required_value: false", 1),
+		"confidence":     strings.Replace(valid, "minimum_confidence: exact", "minimum_confidence: unknown", 1),
+		"freshness":      strings.Replace(valid, "freshness_required: fresh", "freshness_required: stale", 1),
+		"permission":     strings.Replace(valid, "permission_floor: read-only\n    permission_ceiling: read-only", "permission_floor: orchestrate\n    permission_ceiling: write", 1),
+		"context":        strings.Replace(valid, "minimum_context_window_tokens: 120000", "minimum_context_window_tokens: -1", 1),
+		"independence":   strings.Replace(valid, "high: different-provider", "unknown: same-session", 1),
+		"verification":   strings.Replace(valid, "verification_kind: loopreview", "verification_kind: future-review", 1),
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse([]byte(data)); err == nil {
+				t.Fatal("Parse returned nil error, want invalid custom role rejected")
+			}
+		})
 	}
 }
 
@@ -988,6 +1213,36 @@ func TestParseRejectsInvalidGuardrailBudgetCaps(t *testing.T) {
 				t.Fatalf("error = %v, want containing %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestParseOrchestrationCostBudgetDefaultsAndOverrides(t *testing.T) {
+	defaults, err := Parse([]byte("version: 1\n"))
+	if err != nil {
+		t.Fatalf("Parse defaults: %v", err)
+	}
+	if defaults.Orchestration.CostBudget.MaxModelCalls != 8 || defaults.Orchestration.CostBudget.MaxTokens != 500_000 || defaults.Orchestration.CostBudget.MaxOverheadPercent != 10 {
+		t.Fatalf("default cost budget = %#v", defaults.Orchestration.CostBudget)
+	}
+
+	overridden, err := Parse([]byte("version: 1\norchestration:\n  cost_budget:\n    max_model_calls: 4\n    max_tokens: 9000\n    max_overhead_percent: 7\n"))
+	if err != nil {
+		t.Fatalf("Parse override: %v", err)
+	}
+	if overridden.Orchestration.CostBudget.MaxModelCalls != 4 || overridden.Orchestration.CostBudget.MaxTokens != 9000 || overridden.Orchestration.CostBudget.MaxOverheadPercent != 7 {
+		t.Fatalf("overridden cost budget = %#v", overridden.Orchestration.CostBudget)
+	}
+}
+
+func TestParseRejectsInvalidOrchestrationCostBudget(t *testing.T) {
+	for _, body := range []string{
+		"version: 1\norchestration:\n  cost_budget:\n    max_model_calls: 0\n",
+		"version: 1\norchestration:\n  cost_budget:\n    max_tokens: -1\n",
+		"version: 1\norchestration:\n  cost_budget:\n    max_overhead_percent: 101\n",
+	} {
+		if _, err := Parse([]byte(body)); err == nil || !strings.Contains(err.Error(), "orchestration.cost_budget") {
+			t.Fatalf("Parse(%q) error = %v", body, err)
+		}
 	}
 }
 

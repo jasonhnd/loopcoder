@@ -4,12 +4,12 @@
 
 **Turn a delivery need into reviewed pull requests -- without leaving the chat.**
 
-[![Version](https://img.shields.io/badge/version-v0.7.0-brightgreen.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v0.8.0-brightgreen.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Claude Code Skill](https://img.shields.io/badge/Claude%20Code-Skill-green.svg)](SKILL.md)
-[![Cross-platform](https://img.shields.io/badge/cross--platform-Go-00ADD8.svg)](docs/specs/0089-go-migration.md)
+[![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-black.svg)](docs/specs/0884-macos-arm64-only.md)
 
-[What it is](#what-it-is) | [The loop](#the-loop) | [Install](#install) | [Usage](#usage) | [Upgrade](#upgrade-from-061-to-070) | [How it works](#how-it-works) | [Design](#design)
+[What it is](#what-it-is) | [The loop](#the-loop) | [Install](#install) | [Usage](#usage) | [Upgrade](#upgrade-from-070-to-080) | [How it works](#how-it-works) | [Design](#design)
 
 </div>
 
@@ -19,14 +19,14 @@ loopcoder is an autonomous delivery loop. Describe what you want shipped in one 
 
 It removes the copy-paste churn of AI coding: ask the model, paste issues into GitHub, run an agent, review the diff, repeat. With loopcoder that loop runs from the conversation. One chat. No window-switching. New scaffolds write `adapters.gate: human-merge` so humans choose production merges explicitly; legacy empty or missing gate configs still normalize to `auto` at runtime for compatibility. Repo-facing artifacts and worker summaries are written in English.
 
-v0.7.0 is the current customer install target. It packages machine-local runtime storage, the project registry, explicit v0.6.x local-state migration, nested run-tree observability, provider/host compatibility diagnostics, signed release smoke, role-scoped model/depth discovery, the Google Antigravity `agy` provider path, reporter output, first-run `init --repo/--gate`, machine-readable `doctor`, local-state protection, and richer `report` records into the published release.
+v0.8.0 is the release candidate described by this tree. It adds provider inventory and quota-aware routing, Grok support, bounded agent federation, durable detached supervision, five-minute progress receipts, provider-free CI/approval/quota waiting, orchestration cost budgets, and an auditable v0.7-to-v0.8 SQLite migration. It becomes the customer install target only after the signed release and go/no-go record are published. The supported v0.8.0 product, install, upgrade, CI, smoke, and release tuple is native macOS Apple Silicon (`darwin/arm64`) only.
 
 ## The loop
 
 ```mermaid
 flowchart LR
   need([your need]) --> plan[plan issues + DAG]
-  plan --> dispatch[dispatch workers<br/>codex / claude / antigravity]
+  plan --> dispatch[dispatch workers<br/>codex / claude / antigravity / grok]
   dispatch --> pr[pull requests]
   pr --> review[loopreview verifier<br/>read-only verdict + required checks]
   review --> preprod[pre-prod]
@@ -51,21 +51,21 @@ loop  > done. 2 PRs promoted, 0 blocked.
 
 ## Install
 
-Install v0.7.0 from GitHub Releases with the no-Go scripts:
+After publication, install v0.8.0 from GitHub Releases on native macOS Apple Silicon
+(`darwin/arm64`) with the no-Go shell installer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.7.0
+curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.0
 ```
 
-```powershell
-$env:LOOPCODER_VERSION = "0.7.0"
-irm https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.ps1 | iex
-```
+Windows, Linux, WSL, containers, and Intel macOS are not supported by the
+current v0.8.0 installer. Users who need those hosts should remain on the
+historical v0.7.0 release.
 
-Or install with Go:
+Or install with Go on the supported host:
 
 ```bash
-go install github.com/jasonhnd/loopcoder/cmd/loopcoder@v0.7.0
+go install github.com/jasonhnd/loopcoder/cmd/loopcoder@v0.8.0
 ```
 
 Then confirm the binary:
@@ -76,36 +76,40 @@ loopcoder version
 
 For a first consumer repository, follow the [`Quickstart (new project)`](docs/reference/usage.md#quickstart-new-project): install once, run `loopcoder version`, run `loopcoder init --repo .`, install the playbook and project conductor hooks with `loopcoder skill install --repo .`, run `loopcoder doctor --repo .`, run `loopcoder report --repo .`, then drive dispatch, `tick`, and `loopreview` through `/loopcoder <your need>`.
 
-Prerequisites on `PATH`: `git`, authenticated `gh`, and at least one supported provider CLI. The release install scripts verify signed `SHA256SUMS` before trusting checksums, using cosign on the script path. `codex` is the default worker; `codex` and `claude` are verified worker and verifier providers; `antigravity` uses executable `agy`; the direct `gemini` adapter is still experimental/unverified.
+Prerequisites on `PATH`: `git`, authenticated `gh`, and at least one supported provider CLI. The release installer verifies signed `SHA256SUMS` before trusting checksums, using cosign on the script path. `codex` is the default worker; `codex` and `claude` are verified worker and verifier providers; `antigravity` uses executable `agy`; the direct `gemini` adapter is still experimental/unverified.
 
-Cross-platform: macOS, Linux, and Windows -- a single Go binary, no PowerShell runtime. See [`docs/reference/usage.md`](docs/reference/usage.md) for setup and end-to-end usage. loopcoder is also usable as a Claude Code skill; point the `loopcoder` skill at this repo.
+Current v0.8.0 support is native macOS Apple Silicon only (`darwin/arm64`). See [`docs/reference/usage.md`](docs/reference/usage.md) for setup and end-to-end usage. loopcoder is also usable as a Claude Code skill; point the `loopcoder` skill at this repo.
 
-## Upgrade From 0.6.1 To 0.7.0
+## Upgrade From 0.7.0 To 0.8.0
 
-Upgrade from the v0.6.1 bridge to v0.7.0, then refresh each project's hooks, register the checkout, inspect the local-state migration dry run, and run doctor:
+On native macOS Apple Silicon, upgrade the binary, inspect the storage plan before running any stateful v0.8 command, apply it explicitly, then refresh each project's hooks and run doctor:
 
 ```text
-loopcoder upgrade --version 0.7.0
+loopcoder upgrade --version 0.8.0
 loopcoder version
+loopcoder migrate storage --format json
+loopcoder migrate storage --apply --format json
 loopcoder skill install --repo .
 loopcoder projects register --repo .
 loopcoder migrate local-state --repo . --dry-run
 loopcoder doctor --repo .
 ```
 
-`loopcoder upgrade --version 0.7.0` selects the machine-level binary from GitHub Releases, verifies signed checksums, swaps the selected binary atomically or stages the Windows deferred replacement, and refreshes the global bundled skill. Each project must still run `loopcoder skill install --repo <repo>` to write or refresh project hook settings, `.loopcoder/conductor-workspace`, and local `.git/info/exclude` protection for `.loopcoder/`. `loopcoder projects register --repo <repo>` records the checkout in the machine-local project registry. `loopcoder migrate local-state --repo <repo> --dry-run` previews compatible v0.6.x repo-local `.loopcoder/` imports; run the non-dry-run migration only after reviewing the copied record set. `loopcoder doctor --repo <repo>` is the read-only readiness check; `doctor --fix` remains an explicit local repair/cleanup mode, not a first-run requirement.
+`loopcoder upgrade --version 0.8.0` selects only the signed Darwin arm64 archive and swaps the machine-level binary atomically. `migrate storage` is plan-only unless `--apply` is present; the apply path verifies an owner-only schema-9 backup, then migrates schema 9 through 30 atomically. Stop all LoopCoder processes before migration or rollback. Each project must still run `loopcoder skill install --repo <repo>` to refresh project hook settings and local `.git/info/exclude` protection. `projects register` records the checkout in the machine-local registry, while `migrate local-state --dry-run` previews older repo-local `.loopcoder/` imports. See [storage migration](docs/reference/storage-migration.md) for interruption, backup, and offline rollback rules.
 
-Environment variables cannot be edited by loopcoder. If doctor reports old `LOOPCODER_CONDUCTOR_ATTEST_SCOPE` or `LOOPCODER_CONDUCTOR_ATTEST_STATE_DIR`, move those shell settings to `LOOPCODER_CONDUCTOR_REPORTER_SCOPE` or `LOOPCODER_CONDUCTOR_REPORTER_STATE_DIR` yourself and reopen the shell. Re-running `loopcoder upgrade --version 0.7.0` after selecting v0.7.0 should report that the selected binary is already latest. If you are still on v0.5.4 or older 0.5.x releases, upgrade through the v0.6.1 bridge before selecting v0.7.0.
+Windows, Linux/Ubuntu, WSL, containers used as a LoopCoder runtime, Intel macOS, and Rosetta/amd64 macOS are unsupported in v0.8.0. Those users should remain on the final legacy multi-platform release, v0.7.0, or contribute to a separately approved future platform roadmap. Re-running the v0.8.0 upgrade reports the selected version as already latest.
 
 ## Usage
 
 - In a conductor session: `/loopcoder <your need>` -- the conductor plans, dispatches, verifies, and reports; production promotion follows `adapters.gate`. New scaffolds are human-directed by default, while legacy gate-less configs and explicit `gate: auto` configs use automatic production promotion when the gate passes.
-- The mechanical layer is the `loopcoder` binary. The conductor calls it; you can too. The stable command inventory below matches the v0.7.0 install commands in this README:
+- The mechanical layer is the `loopcoder` binary. The conductor calls it; you can too. The stable command inventory below matches v0.8.0:
 
 ```bash
 loopcoder version                             # print version and build information
 loopcoder models                              # list provider model/depth registry
 loopcoder models --provider antigravity       # list agy-backed model choices
+loopcoder providers refresh --repo .          # refresh bounded provider CLI installation inventory
+loopcoder budget smoke --repo . --project-id <project-id> --format json # exercise local quota usage budget accounting
 loopcoder audit --repo . --layer sast         # run read-only security audit
 loopcoder doctor --repo .                     # read-only readiness and migration report
 loopcoder doctor --repo . --format json       # machine-readable readiness report
@@ -116,16 +120,23 @@ loopcoder skill install --repo .              # install global skill and project
 loopcoder discover --repo .                   # advanced: discover CI failures and file issues
 loopcoder compile --repo .                    # advanced: compile ROADMAP.md into issues
 loopcoder ready-set     --repo .              # classify ready vs blocked work
+loopcoder delivery plan --project-id <id> --run-id <id> --format json # side-effect-free v0.8 DeliveryRun proposal
+loopcoder delivery decide --project-id <id> --run-id <id> --action approve --expected-authorization-fingerprint <sha256:...>
+loopcoder delivery continue --project-id <id> --run-id <id> --expected-authorization-fingerprint <sha256:...>
 loopcoder tick          --repo .              # run one unattended delivery pass
 loopcoder trigger goal-loop --repo .          # advanced: run an automation trigger
 loopcoder promote      --repo .               # may change production branch when gates pass
-loopcoder upgrade --version 0.7.0             # signed self-upgrade from GitHub Releases
+loopcoder upgrade --version 0.8.0             # signed Darwin arm64 self-upgrade
 loopcoder dispatch-wave --repo .              # dispatch the current ready wave
 loopcoder dispatch      --repo . --issue-number 41 --issue-title "Add /healthz endpoint" --provider claude --strict
+loopcoder dispatch      --repo . --issue-number 41 --issue-title "Add /healthz endpoint" --foreground
+loopcoder dispatch      --repo . --issue-number 41 --issue-title "Add /healthz endpoint" --detach
 loopcoder relay list    --repo .              # inspect pending local relay blocks
 loopcoder relay flush   --repo .              # print pending relay blocks verbatim and clear them
 loopcoder resume        --repo .              # reconcile a run after an interruption
 loopcoder status        --repo .              # render local-only run status
+loopcoder attach        --repo . --run <run-id> # follow durable detached run progress
+loopcoder cancel        --repo . --run <run-id> # request detached run cancellation
 loopcoder report        --repo .              # list recent local reporter records
 loopcoder report --repo . --format json       # list reports plus records/source/run/path context
 loopcoder state push    --repo . --run-id <id> # explicitly publish summaries to the state branch
@@ -135,7 +146,7 @@ loopcoder lease release --repo . --run-id <id> # release conductor lease
 loopcoder recover       --repo . --issue-number 41 --issue-title "Add /healthz endpoint" --run-id <id>
 loopcoder loopreview    --repo . --pr-number 43 --provider claude --strict
 loopcoder verify-local  --repo . --pr-number 43
-loopcoder dispatch-wave --repo . --issue-numbers 41,42
+loopcoder dispatch-wave --repo . --issue-numbers 41,42 --foreground
 loopcoder hook conductor-reporter             # internal: host hook integration
 loopcoder ps --repo .                         # list loopcoder-managed worker processes
 loopcoder kill --repo . --run <run-id>        # terminate loopcoder-managed processes for one run
@@ -143,7 +154,7 @@ loopcoder kill --repo . --all                 # terminate all loopcoder-managed 
 loopcoder attest        --role conductor --provider codex-cli --model gpt-5 --permission orchestrate --action "dispatch issue #41" --duration-ms 120000 --total-tokens 12345
 ```
 
-v0.7.0 adds the following commands and output fields:
+Machine-local registry and migration commands retained from v0.7.0 include:
 
 ```bash
 loopcoder projects register --repo .          # add or refresh this checkout in the global project registry
@@ -157,7 +168,7 @@ loopcoder status --repo . --format json       # inspect latest run tree as stabl
 loopcoder report --repo . --run <id> --format json # include run_tree in JSON
 ```
 
-`dispatch` and `loopreview` emit local-only human-readable report receipts to stderr by default, while foreground `dispatch-wave` streams each Worker receipt to stdout as that Worker completes and still prints the aggregate wave report. Receipts are conclusion-first and use the stable section order `Target`, `Verdict`, `Review summary`, `Run`, and `Next`; verifier receipts include verdict, finding counts, and needs-human reasons. The durable local machine surfaces are the `[reporter]` header, canonical report JSON, the `dispatch` / `loopreview` result JSON, and gitignored `.loopcoder/` run records, not PR bodies or merge artifacts. Use `--pretty` to force emoji output and `--no-pretty` to suppress the display. `loopcoder attest` remains a compatibility alias for direct Conductor self-reports.
+Host-profiled non-interactive `dispatch`, `dispatch-wave`, and `tick` launches default to detached supervision and immediately return the run id plus `status`, `attach`, and `cancel` commands; pass `--foreground` for synchronous local execution. Foreground `dispatch` and `loopreview` emit local-only human-readable report receipts to stderr by default, while foreground `dispatch-wave` streams each Worker receipt to stdout as that Worker completes and still prints the aggregate wave report. Receipts are conclusion-first and use the stable section order `Target`, `Verdict`, `Review summary`, `Run`, and `Next`; verifier receipts include verdict, finding counts, and needs-human reasons. The durable local machine surfaces are the `[reporter]` header, canonical report JSON, the `dispatch` / `loopreview` result JSON, and gitignored `.loopcoder/` run records, not PR bodies or merge artifacts. Use `--pretty` to force emoji output and `--no-pretty` to suppress the display. `loopcoder attest` remains a compatibility alias for direct Conductor self-reports.
 
 ### Model And Depth
 
@@ -168,6 +179,8 @@ loopcoder models
 loopcoder models --provider codex
 loopcoder models --provider claude
 loopcoder models --provider antigravity
+loopcoder models --provider grok
+loopcoder providers refresh --repo .
 ```
 
 Initial registry defaults:
@@ -177,6 +190,7 @@ Initial registry defaults:
 | `codex` | `codex` | `gpt-5.5` | `high` |
 | `claude` | `claude` | `claude-opus-4-8[1m]` | `max` |
 | `antigravity` | `agy` | `Gemini 3.1 Pro` | `High` |
+| `grok` | `grok` | provider dynamic inventory | provider default |
 
 Worker and Verifier model selection is role-scoped. For each role, provider resolves from command flags, then `.delivery.yml`, then built-in role fallback. Model resolves from command flags, then `worker.model` / `verifier.model`, then the selected provider's registry default. Depth resolves from command `--effort`, then `worker.reasoning_effort` / `verifier.reasoning_effort`, then the selected model's default depth.
 
@@ -197,6 +211,7 @@ The provider key is `antigravity`; the executable is `agy`.
 agy login
 agy models
 loopcoder models --provider antigravity
+loopcoder providers refresh --repo .
 loopcoder doctor --repo .
 ```
 
@@ -210,23 +225,53 @@ The mandatory `--add-dir` pins Antigravity to the worker worktree. Antigravity W
 
 ### Doctor And Migration Preview
 
-The current v0.7.0 `loopcoder doctor --repo .` is a read-only operational
+The current v0.8.0 `loopcoder doctor --repo .` is a read-only operational
 health command for git, gh auth, `.delivery.yml`, provider CLIs, selected
 binary version, reporter/relay wiring, installed skill freshness, audit
 readiness, local-state exclude protection, tracked `.loopcoder/` files,
 reportquery readability, and stale local state counts.
 
-v0.7.0 expands `doctor` with resolved host profile, provider/host
-compatibility, storage permissions, storage health, project registry identity,
-and migration status. `--format json` emits
+It includes resolved host profile, provider/host compatibility, storage
+permissions and health, project registry identity, migration status, provider
+inventory and quota evidence, and durable run health. `--format json` emits
 `repo_path`, `version`, `commit`, `date`, `exit_code`, a root `host_profile`
-object, `provider_compatibility[]` entries for the smoke matrix, and ordered
-`checks[]` objects with `name`, `code`, `status`, `hard`, `message`, and
-`fix_command`.
+object, `provider_compatibility[]` entries for the smoke matrix, a root
+`provider_inventory` object, and ordered `checks[]` objects with `name`,
+`code`, `status`, `hard`, `message`, and `fix_command`.
+
+`loopcoder providers refresh --repo .` runs the same bounded provider CLI
+installation and auth-readiness probes and persists machine-local
+ProviderInstallation, ProbeResult, AccountProfile, and AuthReadiness history in
+`$LOOPCODER_HOME/data/loopcoder.db`. Probes use fixed argv arrays, an explicit
+non-credential environment allowlist, strict time/output caps, redacted
+provider output, and no shell interpolation.
+The allowlist includes location and platform variables needed by script shims
+such as `LOCALAPPDATA`, `APPDATA`, `ProgramFiles`, `SystemRoot`, `ComSpec`,
+`PSModulePath`, `PATH`, `PATHEXT`, `TEMP`, `TMP`, `HOME`, `USERPROFILE`,
+`TMPDIR`, `LANG`, and `LC_ALL`; any variable name containing `key`, `secret`,
+`token`, `password`, `credential`, or `auth` is still denied even if listed.
+Installation evidence is not auth readiness, account readiness, model
+authorization, quota, or usable capacity; human and JSON output keep
+`usable_for_invocation` as `unknown` from install evidence alone. Unsupported
+auth readiness returns `unknown` with a reason. Unsupported quota telemetry
+returns an immutable QuotaSnapshot with unavailable confidence, unknown reset
+semantics, and explicit `unsupported-source` / `not-collected` gap reasons
+instead of guessing capacity. Built-in local declarations use `codex login
+status`, `claude auth status --json`, and Gemini auth-reference existence checks
+without reading credential values or files. Network-declared auth and quota
+probes, including Antigravity's `agy models`, are recorded but not executed by
+default; their readiness or telemetry is `unknown`/`unavailable` with
+`network-permission-denied` or `network-denied`. The initial auth schema
+intentionally has no `expires_at` field because no current adapter exposes a
+credential-blind machine-readable expiry value.
+
+### Budget Accounting
+
+`loopcoder budget smoke --repo . --project-id <project-id> --ceiling 100 --reserve 40 --commit 25 --format json` runs a local-only reserve/commit/release smoke check against the machine-local budget store. It creates machine and project hard budget policies by default, reserves capacity, commits observed usage, releases the unused reservation balance, and prints the resulting JSON accounting summary. Use `--policy-mode soft --overflow-behavior warn-only` to exercise soft-budget warning paths; text output prints budget warnings, and JSON output includes the same `gap_reasons`. Reusing the same `--idempotency-key` replays the same operation keys instead of reserving, committing, or releasing twice. Budget accounting is local evidence only and is not a permission, safety, provider-auth, or provider-global quota override.
 
 ### Project Registry
 
-`loopcoder projects` manages the v0.7.0 machine-local project registry in `$LOOPCODER_HOME/data/loopcoder.db`. On Unix-like systems, loopcoder creates and tightens `$LOOPCODER_HOME` and `data/` to owner-only directory permissions and the SQLite database plus `-wal`/`-shm` sidecars to owner-only file permissions. Existing broader modes are reported by `doctor` and repaired by `doctor --fix`; symlink and non-regular storage paths are refused. On Windows, v0.7.0 does not implement owner-only DACL hardening, and `doctor` reports that limitation explicitly instead of claiming POSIX mode protection. Registration is idempotent and uses the strongest available identity: normalized GitHub owner/name, then normalized git remote URL, then canonical local path. Display name is metadata only, so two repositories with the same folder name but different remotes remain separate projects. Git remote URLs are sanitized before output or persistence; loopcoder never stores URL credentials, tokens, credential-like query strings, or fragments in project metadata.
+`loopcoder projects` manages the machine-local project registry in `$LOOPCODER_HOME/data/loopcoder.db`. On the supported Darwin arm64 host, LoopCoder creates and tightens `$LOOPCODER_HOME` and `data/` to owner-only directory permissions and the SQLite database plus `-wal`/`-shm` sidecars to owner-only file permissions. Existing broader modes are reported by `doctor` and repaired by `doctor --fix`; symlink and non-regular storage paths are refused. Registration is idempotent and uses the strongest available identity: normalized GitHub owner/name, then normalized git remote URL, then canonical local path. Display name is metadata only, so two repositories with the same folder name but different remotes remain separate projects. Git remote URLs are sanitized before output or persistence; LoopCoder never stores URL credentials, tokens, credential-like query strings, or fragments in project metadata.
 
 ```text
 loopcoder projects register --repo .
@@ -245,7 +290,7 @@ loopcoder projects remove --repo .
 
 The command copies local state into the machine-local store only. It does not delete `.loopcoder/`, rewrite local files, edit tracked repository files, mutate GitHub, or publish state. Existing file readers remain the compatibility fallback, and registered projects query global project history before repo-local legacy files. `loopcoder report --repo . --format json` includes imported records after migration.
 
-Registered projects write new audit logs under `$LOOPCODER_HOME/projects/<project_id>/audit/`. Legacy audit logs remain file-only repo-local state: `migrate local-state` does not import `.loopcoder/audit/`, and an audit-only checkout does not require migration. Back up local runtime state by copying `$LOOPCODER_HOME/data/loopcoder.db` plus `$LOOPCODER_HOME/projects/`, `$LOOPCODER_HOME/logs/`, and `$LOOPCODER_HOME/tmp/` when present and no loopcoder command is running. To roll back or remove v0.7.0 machine-local runtime state, stop loopcoder commands, restore or delete those same paths together, then re-run `loopcoder doctor --repo .`; repo-local `.loopcoder/` history is left untouched unless you delete it yourself.
+Registered projects write new audit logs under `$LOOPCODER_HOME/projects/<project_id>/audit/`. Legacy audit logs remain file-only repo-local state: `migrate local-state` does not import `.loopcoder/audit/`, and an audit-only checkout does not require migration. Back up local runtime state by copying `$LOOPCODER_HOME/data/loopcoder.db` plus `$LOOPCODER_HOME/projects/`, `$LOOPCODER_HOME/logs/`, and `$LOOPCODER_HOME/tmp/` when present and no LoopCoder command is running. For a v0.8-to-v0.7 rollback, stop every LoopCoder process, copy the verified migration backup rather than moving it, restore the v0.7.0 binary, and understand that v0.8-only state is discarded. Never point v0.7.0 at a schema-30 database. The exact machine-readable limitation codes are documented in [storage migration](docs/reference/storage-migration.md).
 
 `loopcoder doctor --repo . --fix` performs only explicit local repairs: tighten existing Unix storage permissions in place, migrate legacy `.delivery.yml attestation` keys to `report`, refresh conductor hook settings to `loopcoder hook conductor-reporter`, move legacy hook state from `conductor-attest` to `conductor-reporter`, rewrite eligible local state keys from `attestation` to `report`, and prune cleanup-eligible gitignored `.loopcoder/` state. It does not delete or recreate the SQLite database, install provider CLIs, run provider login, flush pending relay records, edit tracked docs, choose models, commit, push, or mutate GitHub.
 
@@ -278,7 +323,7 @@ During the 0.6.x transition window, readers accept legacy `[attestation]` header
 - Gate: clean `tick` PRs can auto-merge only into the configured pre-prod branch after `loopreview = pass`, green required checks, and a deterministic red-line risk gate. The separate `promote` step follows `adapters.gate`: `gate: auto` auto-promotes to production only when CI is green, `loopreview` passed, configured evidence is present, and the red-line floor is clean; `gate: human-merge` requires an explicit human-directed production merge.
 - Ports and adapters: GitHub work items, git-worktree workspace, configured conductor, provider-pluggable worker, GitHub PRs and checks, independent verifier, pre-prod risk gate, and production promotion gate. `.delivery.yml adapters` names the role slots, including `conductor`, `worker`, `verifier`, and `gate`.
 - Doc-first: a design or spec document merges before any code implements it. See [`docs/PROCESS.md`](docs/PROCESS.md).
-- Cross-platform: one Go binary; providers run through native adapters, and worktree creation is serialized with a cross-platform file lock.
+- Provider-neutral: Codex, Claude, Antigravity, Grok, and future adapters use the same routing, authority, progress, and recovery contracts on the supported Darwin arm64 host.
 
 ## Why loopcoder
 
@@ -290,8 +335,9 @@ During the 0.6.x transition window, readers accept legacy `[attestation]` header
 - Verification gate wiring -- required CI checks must be green before a PR is merge-eligible; `loopreview` adds read-only verifier output and a timeout-to-`needs-human` safety net.
 - Audit -- `loopcoder audit` provides a read-only security audit with a deterministic SAST floor for CI and an optional read-only LLM review lens for local adversarial analysis. See [`docs/reference/audit.md`](docs/reference/audit.md).
 - Reporter -- worker and verifier invocations produce validated local-only reports. PR bodies, merge commits, and merge comments do not carry `[reporter]` headers or canonical JSON.
-- Doctor and upgrade -- v0.7.0 has a signed v0.6.1 upgrade path, project registry diagnostics, explicit local-state migration dry run, migration status report, explicit `doctor --fix` repair mode, `doctor --format json`, local-state protection checks, and stale local state retention policy.
-- Cross-platform native binary -- `go install`, no runtime dependency beyond `git`, `gh`, and the selected provider CLIs.
+- Durable orchestration -- non-interactive dispatch defaults to detached supervision, progress receipts are durable, local waiting does not call a model, and verified process authority prevents duplicate recovery and unrelated-process termination.
+- Doctor, migration, and upgrade -- v0.8.0 has a signed Darwin arm64 upgrade path, side-effect-free migration planning, verified schema-9 backup, atomic schema-30 application, project registry diagnostics, and explicit repair guidance.
+- Native Darwin arm64 binary -- `go install` or the signed release archive; no runtime dependency beyond `git`, `gh`, and the selected provider CLIs.
 
 ## Design
 
@@ -300,7 +346,9 @@ During the 0.6.x transition window, readers accept legacy `[attestation]` header
 - [`docs/reference/architecture.md`](docs/reference/architecture.md) -- current architecture and limits.
 - [`docs/reference/audit.md`](docs/reference/audit.md) -- read-only security audit command.
 - [`docs/reference/releasing.md`](docs/reference/releasing.md) -- release documentation rule.
-- [`docs/reference/self-bootstrap.md`](docs/reference/self-bootstrap.md) -- v0.7.0 self-bootstrap acceptance checklist.
+- [`docs/reference/self-bootstrap.md`](docs/reference/self-bootstrap.md) -- v0.8.0 self-bootstrap acceptance checklist.
+- [`docs/reference/storage-migration.md`](docs/reference/storage-migration.md) -- v0.7-to-v0.8 SQLite planning, verified backup, and offline rollback contract.
+- [`docs/reference/v0.8.0-go-no-go.md`](docs/reference/v0.8.0-go-no-go.md) -- v0.8.0 release evidence template and decision record.
 - [`docs/reference/v0.7.0-go-no-go.md`](docs/reference/v0.7.0-go-no-go.md) -- v0.7.0 release go/no-go report.
 - [`docs/reference/usage.md`](docs/reference/usage.md) -- setup and end-to-end usage.
 - [`docs/specs/0028-scheduling.md`](docs/specs/0028-scheduling.md) -- dependency-aware scheduling.
@@ -316,9 +364,9 @@ During the 0.6.x transition window, readers accept legacy `[attestation]` header
 
 ## Status
 
-v0.7.0 is the current customer-ready release. It adds machine-local runtime storage, project registry commands, explicit v0.6.x local-state migration, nested run-tree observability, provider/host compatibility diagnostics, and the staged signed release flow on top of the 0.6 capabilities. The repository remains self-hosted with `gate: human-merge` for loopcoder-core safety; consumer projects can opt into automatic production promotion with `loopcoder init --repo . --gate auto` or an explicit config edit.
+v0.8.0 is the current release candidate for native macOS Apple Silicon only. It combines provider and quota discovery, deterministic routing, Grok integration, nested agent federation, durable detached execution, five-minute progress delivery, provider-free waits, orchestration cost budgets, and audited local storage migration. Publication remains blocked until the signed artifact, staged smoke, self-bootstrap, release evidence, and human environment approval all pass. The repository remains self-hosted with `gate: human-merge` for LoopCoder-core safety; consumer projects can opt into automatic production promotion with `loopcoder init --repo . --gate auto` or an explicit config edit.
 
-The v0.7.0 release was published on 2026-07-11 after `pwsh scripts/self-bootstrap-smoke.ps1`, staged native release smoke, required-reviewer approval in the `release-publication` environment, and post-publication public artifact verification. The completed go/no-go report is [`docs/reference/v0.7.0-go-no-go.md`](docs/reference/v0.7.0-go-no-go.md).
+v0.7.0 remains available as the final legacy multi-platform release. Its historical artifacts and completed [`v0.7.0 go/no-go report`](docs/reference/v0.7.0-go-no-go.md) are preserved without implying v0.8.0 support for Windows, Linux, WSL, containers, Intel macOS, or Rosetta.
 
 ## License
 

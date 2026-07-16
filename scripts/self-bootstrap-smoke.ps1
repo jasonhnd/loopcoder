@@ -2,7 +2,7 @@
 param(
     [string]$Repo = ".",
     [string]$Binary = "",
-    [string]$Version = "0.7.0",
+    [string]$Version = "0.8.0",
     [switch]$KeepArtifacts
 )
 
@@ -44,10 +44,72 @@ function Assert-OutsideRepo([string]$Path, [string]$RepoPath, [string]$Label) {
     }
 }
 
+function Assert-DarwinArm64Host {
+    if (-not $IsMacOS) {
+        Fail "self-bootstrap smoke must run on darwin/arm64; current host is not macOS"
+    }
+    $osArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
+    $processArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant()
+    if ($osArchitecture -ne "arm64" -or $processArchitecture -ne "arm64") {
+        Fail "self-bootstrap smoke must run natively on darwin/arm64; OS architecture=$osArchitecture process architecture=$processArchitecture"
+    }
+    return "darwin/arm64"
+}
+
+function Get-SHA256([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) {
+        Fail "expected file does not exist: $Path"
+    }
+    return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+}
+
+function Get-TreeInventory([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return @("<absent>")
+    }
+
+    $root = (Resolve-Path -LiteralPath $Path).Path
+    $entries = [System.Collections.Generic.List[string]]::new()
+    $entries.Add(".|directory")
+    foreach ($item in @(Get-ChildItem -LiteralPath $root -Recurse -Force | Sort-Object FullName)) {
+        $relative = [System.IO.Path]::GetRelativePath($root, $item.FullName).Replace("\", "/")
+        if ($item.PSIsContainer) {
+            $entries.Add("$relative|directory")
+        }
+        else {
+            $entries.Add("$relative|file|$($item.Length)|$(Get-SHA256 $item.FullName)")
+        }
+    }
+    return @($entries)
+}
+
+function Get-RepositoryRuntimeInventory([string]$RepoPath) {
+    $entries = [System.Collections.Generic.List[string]]::new()
+    foreach ($relativeRoot in @(".loopcoder/runs", ".loopcoder/logs", ".loopcoder/recovery", ".loopcoder/relay")) {
+        foreach ($entry in @(Get-TreeInventory (Join-Path $RepoPath $relativeRoot))) {
+            $entries.Add("$relativeRoot|$entry")
+        }
+    }
+    return @($entries)
+}
+
+function Assert-InventoryUnchanged([string[]]$Before, [string[]]$After, [string]$Label) {
+    $difference = @(Compare-Object -ReferenceObject $Before -DifferenceObject $After)
+    if ($difference.Count -gt 0) {
+        $rendered = $difference | ForEach-Object { "$($_.SideIndicator) $($_.InputObject)" }
+        Fail "$Label changed unexpectedly:`n$($rendered -join "`n")"
+    }
+}
+
+# The platform refusal must happen before temporary state, storage, provider, or
+# repository mutation. Keep this call above repo resolution and temp creation.
+$hostTuple = Assert-DarwinArm64Host
+
 $repoPath = (Resolve-Path -LiteralPath $Repo).Path
 if (-not (Test-Path -LiteralPath (Join-Path $repoPath ".git"))) {
     Fail "self-bootstrap smoke must run against a git checkout; .git not found under $repoPath"
 }
+$repoRuntimeBefore = @(Get-RepositoryRuntimeInventory $repoPath)
 
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("loopcoder-self-bootstrap-" + [System.Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $tmp | Out-Null
@@ -58,9 +120,10 @@ New-Item -ItemType Directory -Path $loopcoderHome, $artifactDir | Out-Null
 $oldHome = [Environment]::GetEnvironmentVariable("LOOPCODER_HOME", "Process")
 [Environment]::SetEnvironmentVariable("LOOPCODER_HOME", $loopcoderHome, "Process")
 
+$usingStagedBinary = -not [string]::IsNullOrWhiteSpace($Binary)
 $binaryPath = $Binary
 if ([string]::IsNullOrWhiteSpace($binaryPath)) {
-    $binaryPath = Join-Path $tmp ($(if ($IsWindows) { "loopcoder.exe" } else { "loopcoder" }))
+    $binaryPath = Join-Path $tmp "loopcoder"
     Invoke-Checked "build local loopcoder binary" {
         Push-Location -LiteralPath $repoPath
         try {
@@ -75,14 +138,32 @@ else {
     $binaryPath = (Resolve-Path -LiteralPath $binaryPath).Path
 }
 
+$binaryHash = Get-SHA256 $binaryPath
+Invoke-Checked "record selected loopcoder binary identity" {
+    $script:versionOutput = @(& $binaryPath version)
+    $script:versionOutput | ForEach-Object { Write-Host $_ }
+}
+$versionText = ($versionOutput -join "`n").Trim()
+$versionText | Set-Content -LiteralPath (Join-Path $artifactDir "candidate-version.txt") -Encoding utf8
+$binaryHash | Set-Content -LiteralPath (Join-Path $artifactDir "candidate-sha256.txt") -Encoding utf8
+if ($versionText -notmatch "(^|\s)platform=darwin/arm64(\s|$)") {
+    Fail "selected binary is not a darwin/arm64 binary: $versionText"
+}
+$plainVersion = $Version.TrimStart("v")
+if ($usingStagedBinary) {
+    $versionPattern = "(^|\s)version=v?$([regex]::Escape($plainVersion))(\s|$)"
+    if ($versionText -notmatch $versionPattern) {
+        Fail "staged binary did not report requested version $plainVersion`: $versionText"
+    }
+    if ($versionText -match "(^|\s)(commit|date)=unknown(\s|$)") {
+        Fail "staged binary must report non-placeholder commit and date: $versionText"
+    }
+}
+
 $parentRun = "run-20260709T000000Z-wave"
 $childRun = "run-20260709T000001Z-child-0-self-bootstrap-alpha"
 $childRunBeta = "run-20260709T000001Z-child-1-self-bootstrap-beta"
 $childRunGamma = "run-20260709T000001Z-child-2-self-bootstrap-gamma"
-$runsRoot = Join-Path $repoPath ".loopcoder/runs"
-$parentDir = Join-Path $runsRoot $parentRun
-$childDir = Join-Path $runsRoot $childRun
-$childDirs = @($childRun, $childRunBeta, $childRunGamma) | ForEach-Object { Join-Path $runsRoot $_ }
 
 try {
     Invoke-Checked "register loopcoder checkout in machine-local project registry" {
@@ -98,16 +179,30 @@ try {
     if (-not (Test-Path -LiteralPath $dbPath)) {
         Fail "project registration did not create $dbPath"
     }
-    Assert-OutsideRepo -Path $dbPath -RepoPath $repoPath -Label "v0.7.0 database"
+    Assert-OutsideRepo -Path $dbPath -RepoPath $repoPath -Label "v0.8.0 database"
 
-    if (Test-Path -LiteralPath $parentDir) {
-        Remove-Item -LiteralPath $parentDir -Recurse -Force
+    $databaseHashBeforePlan = Get-SHA256 $dbPath
+    $backupRoot = Join-Path $loopcoderHome "data/backups"
+    $backupInventoryBeforePlan = @(Get-TreeInventory $backupRoot)
+    Invoke-Checked "render read-only fresh-schema storage migration plan" {
+        $script:storagePlanOutput = @(& $binaryPath migrate storage --format json)
+        $script:storagePlanOutput | Set-Content -LiteralPath (Join-Path $artifactDir "storage-plan.json") -Encoding utf8
+        $script:storagePlanOutput | ForEach-Object { Write-Host $_ }
     }
-    foreach ($dir in $childDirs) {
-        if (Test-Path -LiteralPath $dir) {
-            Remove-Item -LiteralPath $dir -Recurse -Force
-        }
+    $storagePlan = ConvertFrom-JsonOutput $storagePlanOutput "migrate storage"
+    if (-not $storagePlan.dry_run -or $storagePlan.applied -or $storagePlan.status -ne "planned") {
+        Fail "fresh-schema migration plan was not read-only"
     }
+    if ($storagePlan.plan.source_schema_version -ne 30 -or $storagePlan.plan.target_schema_version -ne 30 -or $storagePlan.plan.status -ne "current") {
+        Fail "fresh-schema migration plan did not report schema 30 as current"
+    }
+    if ($storagePlan.plan.backup_required) {
+        Fail "fresh-schema migration plan unexpectedly required a backup"
+    }
+    if ((Get-SHA256 $dbPath) -ne $databaseHashBeforePlan) {
+        Fail "read-only fresh-schema migration plan modified the database"
+    }
+    Assert-InventoryUnchanged -Before $backupInventoryBeforePlan -After @(Get-TreeInventory $backupRoot) -Label "fresh-schema backup inventory"
 
     $planPath = Join-Path $artifactDir "child-plan.json"
     $childPlan = @{
@@ -196,8 +291,18 @@ try {
     if (-not $alpha -or $alpha.status -ne "succeeded" -or -not $alpha.attempt_path) {
         Fail "nested run did not produce a successful durable alpha child attempt"
     }
+    Assert-OutsideRepo -Path $alpha.attempt_path -RepoPath $repoPath -Label "nested child attempt"
 
-    Invoke-Checked "render status run tree" {
+    Invoke-Checked "render status run tree (human)" {
+        $script:statusTextOutput = @(& $binaryPath status --repo $repoPath --run $childRun --format text)
+        $script:statusTextOutput | Set-Content -LiteralPath (Join-Path $artifactDir "status.txt") -Encoding utf8
+        $script:statusTextOutput | ForEach-Object { Write-Host $_ }
+    }
+    if (($statusTextOutput -join "`n") -notmatch [regex]::Escape($childRun)) {
+        Fail "status human output did not include selected child run $childRun"
+    }
+
+    Invoke-Checked "render status run tree (JSON)" {
         $script:statusOutput = @(& $binaryPath status --repo $repoPath --run $childRun --format json)
         $script:statusOutput | Set-Content -LiteralPath (Join-Path $artifactDir "status.json") -Encoding utf8
     }
@@ -210,7 +315,16 @@ try {
         Fail "status JSON child node is missing issue/report metadata"
     }
 
-    Invoke-Checked "render report run tree" {
+    Invoke-Checked "render report run tree (human)" {
+        $script:reportTextOutput = @(& $binaryPath report --repo $repoPath --run $childRun --format text)
+        $script:reportTextOutput | Set-Content -LiteralPath (Join-Path $artifactDir "report.txt") -Encoding utf8
+        $script:reportTextOutput | ForEach-Object { Write-Host $_ }
+    }
+    if (($reportTextOutput -join "`n") -notmatch [regex]::Escape($childRun)) {
+        Fail "report human output did not include selected child run $childRun"
+    }
+
+    Invoke-Checked "render report run tree (JSON)" {
         $script:reportOutput = @(& $binaryPath report --repo $repoPath --run $childRun --format json)
         $script:reportOutput | Set-Content -LiteralPath (Join-Path $artifactDir "report.json") -Encoding utf8
     }
@@ -230,10 +344,24 @@ try {
         Fail "doctor JSON reported unexpected database path: $($doctor.runtime.database.path)"
     }
     if (-not $doctor.runtime.database.exists -or $doctor.runtime.database.status -ne "ok") {
-        Fail "doctor JSON did not report healthy v0.7.0 storage"
+        Fail "doctor JSON did not report healthy v0.8.0 storage"
     }
     if (-not $doctor.runtime.project_registry.registered -or $doctor.runtime.project_registry.project_id -ne $registered.project.project_id) {
         Fail "doctor JSON did not report the registered loopcoder project"
+    }
+    foreach ($runtimePath in @(
+        $doctor.runtime.project_registry.payload_root,
+        $doctor.runtime.project_registry.runs_root,
+        $doctor.runtime.project_registry.relay_root,
+        $doctor.runtime.project_registry.recovery_root,
+        $doctor.runtime.project_registry.audit_root,
+        $doctor.runtime.project_registry.logs_root,
+        $doctor.runtime.project_registry.tmp_root
+    )) {
+        if ([string]::IsNullOrWhiteSpace($runtimePath)) {
+            Fail "doctor JSON omitted a registered runtime payload path"
+        }
+        Assert-OutsideRepo -Path $runtimePath -RepoPath $repoPath -Label "doctor runtime payload path"
     }
     if ($doctor.runtime.nested_runs.parent_edges -lt 1 -or $doctor.runtime.nested_runs.child_edges -lt 1 -or $doctor.runtime.nested_runs.status -ne "ok") {
         Fail "doctor JSON did not report healthy nested run edges"
@@ -245,22 +373,77 @@ try {
         Write-Host "doctor exited $doctorExit because external readiness checks may fail without gh/provider auth; runtime self-bootstrap assertions passed."
     }
 
-    Write-Host "self-bootstrap smoke passed for v$Version"
-    Write-Host "repo: $repoPath"
-    Write-Host "loopcoder_home: $loopcoderHome"
-    Write-Host "database: $dbPath"
-    Write-Host "project_id: $($registered.project.project_id)"
-    Write-Host "parent_run: $parentRun"
-    Write-Host "child_run: $childRun"
-    Write-Host "artifacts: $artifactDir"
+    Assert-InventoryUnchanged -Before $repoRuntimeBefore -After @(Get-RepositoryRuntimeInventory $repoPath) -Label "repository-local runtime payload inventory"
+
+    $evidence = [ordered]@{
+        schema_version = "loopcoder.self_bootstrap_evidence.v1"
+        requested_version = $plainVersion
+        staged_candidate = $usingStagedBinary
+        host_tuple = $hostTuple
+        binary = [ordered]@{
+            path = $binaryPath
+            sha256 = $binaryHash
+            version_output = $versionText
+        }
+        provider = "test-subprocess"
+        paid_provider_calls = 0
+        project_id = $registered.project.project_id
+        database_path = $dbPath
+        database_outside_repo = $true
+        registered_payload_root = $doctor.runtime.project_registry.payload_root
+        registered_payload_outside_repo = $true
+        repository_runtime_unchanged = $true
+        storage_plan = [ordered]@{
+            path = (Join-Path $artifactDir "storage-plan.json")
+            source_schema_version = $storagePlan.plan.source_schema_version
+            target_schema_version = $storagePlan.plan.target_schema_version
+            status = $storagePlan.plan.status
+            database_unchanged = $true
+            backup_created = $false
+        }
+        runs = [ordered]@{
+            parent = $parentRun
+            children = @($childRun, $childRunBeta, $childRunGamma)
+            status = $nested.status
+        }
+        artifacts = [ordered]@{
+            status_human = (Join-Path $artifactDir "status.txt")
+            status_json = (Join-Path $artifactDir "status.json")
+            report_human = (Join-Path $artifactDir "report.txt")
+            report_json = (Join-Path $artifactDir "report.json")
+            doctor_json = (Join-Path $artifactDir "doctor.json")
+        }
+    }
+    $evidenceJson = $evidence | ConvertTo-Json -Depth 8
+    $evidenceJson | Set-Content -LiteralPath (Join-Path $artifactDir "self-bootstrap-evidence.json") -Encoding utf8
+
+    $humanEvidence = @(
+        "self-bootstrap smoke passed for v$plainVersion",
+        "host: $hostTuple",
+        "candidate: $binaryPath",
+        "candidate_sha256: $binaryHash",
+        "provider: test-subprocess (paid calls: 0)",
+        "repo: $repoPath",
+        "loopcoder_home: $loopcoderHome",
+        "database: $dbPath",
+        "project_id: $($registered.project.project_id)",
+        "parent_run: $parentRun",
+        "child_runs: $childRun, $childRunBeta, $childRunGamma",
+        "repository_runtime_unchanged: true",
+        "artifacts: $artifactDir"
+    )
+    $humanEvidence | Set-Content -LiteralPath (Join-Path $artifactDir "self-bootstrap-evidence.txt") -Encoding utf8
+    $humanEvidence | ForEach-Object { Write-Host $_ }
+    Write-Host "self-bootstrap evidence JSON:"
+    $evidenceJson | Write-Host
+
+    if ($KeepArtifacts) {
+        Write-Host "retained artifacts: $artifactDir"
+    }
 }
 finally {
     [Environment]::SetEnvironmentVariable("LOOPCODER_HOME", $oldHome, "Process")
     if (-not $KeepArtifacts) {
-        Remove-Item -LiteralPath $parentDir -Recurse -Force -ErrorAction SilentlyContinue
-        foreach ($dir in $childDirs) {
-            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
-        }
         Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }
 }

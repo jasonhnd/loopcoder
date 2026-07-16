@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/jasonhnd/loopcoder/internal/observability"
 )
 
 type ResumeReport struct {
@@ -90,11 +92,67 @@ type ResumeRunTreeSummary struct {
 
 func MarshalResumeJSON(resume ResumeReport) ([]byte, error) {
 	resume = normalizeResume(resume)
-	data, err := json.MarshalIndent(resume, "", "  ")
+	payload := struct {
+		Observability observability.Document `json:"observability"`
+		ResumeReport
+	}{
+		Observability: ObservabilityDocument(resume),
+		ResumeReport:  resume,
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("marshal resume JSON: %w", err)
 	}
 	return append(data, '\n'), nil
+}
+
+func ObservabilityDocument(resume ResumeReport) observability.Document {
+	resume = normalizeResume(resume)
+	runID := ""
+	if resume.RunID != nil {
+		runID = *resume.RunID
+	}
+	items := make([]observability.RenderItem, 0, len(resume.Issues)+len(resume.RunTree.Nodes))
+	for _, issue := range resume.Issues {
+		status := issue.ActionKind
+		if strings.TrimSpace(status) == "" {
+			status = issue.State
+		}
+		next := issue.Action
+		reason := strings.Join(issue.Evidence, "; ")
+		if strings.TrimSpace(reason) == "" {
+			reason = issue.Classification
+		}
+		items = append(items, observability.RenderItem{
+			ID:         fmt.Sprintf("issue-%d", issue.Issue),
+			Kind:       "resume-issue",
+			Status:     status,
+			Reason:     reason,
+			NextAction: next,
+			Confidence: "exact",
+			Freshness:  "durable",
+			SourceRefs: []observability.SourceRef{{Table: "resume", RecordID: fmt.Sprintf("issue-%d", issue.Issue), DeliveryRunID: runID, Provenance: "resume"}},
+		})
+	}
+	for _, node := range resume.RunTree.Nodes {
+		next := ""
+		reason := ""
+		if node.RecoveryDecision != nil {
+			next = node.RecoveryDecision.Action
+			reason = node.RecoveryDecision.Reason
+		}
+		items = append(items, observability.RenderItem{
+			ID:         node.RunID,
+			Kind:       "run-tree-node",
+			Status:     node.State,
+			Reason:     reason,
+			NextAction: next,
+			Confidence: "exact",
+			Freshness:  "durable",
+			SourceRefs: []observability.SourceRef{{Table: "run_tree", RecordID: node.RunID, DeliveryRunID: node.RunID, Provenance: "resume"}},
+		})
+	}
+	return observability.NewDocument("resume", observability.Correlation{DeliveryRunID: runID, Source: "resume"}, items, nil)
 }
 
 func RenderResumeText(report ResumeReport) string {

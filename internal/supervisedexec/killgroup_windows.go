@@ -3,7 +3,10 @@
 package supervisedexec
 
 import (
+	"fmt"
 	"os/exec"
+	"sort"
+	"strings"
 	"sync"
 	"unsafe"
 
@@ -17,6 +20,17 @@ type windowsKillGroup struct {
 	mu     sync.Mutex
 	job    windows.Handle
 	closed bool
+}
+
+type jobObjectBasicAccountingInformation struct {
+	TotalUserTime             windows.Filetime
+	TotalKernelTime           windows.Filetime
+	ThisPeriodTotalUserTime   windows.Filetime
+	ThisPeriodTotalKernelTime windows.Filetime
+	TotalPageFaultCount       uint32
+	TotalProcesses            uint32
+	ActiveProcesses           uint32
+	TotalTerminatedProcesses  uint32
 }
 
 func newKillGroup(runID string) killGroup {
@@ -61,6 +75,66 @@ func (g *windowsKillGroup) adopt(cmd *exec.Cmd) error {
 	}
 	defer windows.CloseHandle(h)
 	return windows.AssignProcessToJobObject(g.job, h)
+}
+
+func (g *windowsKillGroup) activity() processActivityObservation {
+	g.mu.Lock()
+	job := g.job
+	closed := g.closed
+	g.mu.Unlock()
+	if job == 0 || closed {
+		return processActivityObservation{}
+	}
+
+	const maxProcessIDs = 256
+	headerSize := 8
+	entrySize := int(unsafe.Sizeof(uintptr(0)))
+	buf := make([]byte, headerSize+(maxProcessIDs*entrySize))
+	var returned uint32
+	if err := windows.QueryInformationJobObject(
+		job,
+		windows.JobObjectBasicProcessIdList,
+		uintptr(unsafe.Pointer(&buf[0])), // #nosec G103 -- documented Windows syscall interop for a local byte buffer.
+		uint32(len(buf)),
+		&returned,
+	); err != nil {
+		return processActivityObservation{}
+	}
+	count := *(*uint32)(unsafe.Pointer(&buf[4])) // #nosec G103 -- fixed JOBOBJECT_BASIC_PROCESS_ID_LIST layout.
+	if count == 0 {
+		return processActivityObservation{}
+	}
+	if count > maxProcessIDs {
+		count = maxProcessIDs
+	}
+	raw := (*[maxProcessIDs]uintptr)(unsafe.Pointer(&buf[headerSize]))[:count:count] // #nosec G103 -- fixed JOBOBJECT_BASIC_PROCESS_ID_LIST layout.
+	pids := make([]int, 0, len(raw))
+	for _, pid := range raw {
+		if pid != 0 {
+			pids = append(pids, int(pid))
+		}
+	}
+	if len(pids) == 0 {
+		return processActivityObservation{}
+	}
+	accounting := jobObjectBasicAccountingInformation{}
+	_ = windows.QueryInformationJobObject(
+		job,
+		windows.JobObjectBasicAccountingInformation,
+		uintptr(unsafe.Pointer(&accounting)), // #nosec G103 -- documented Windows syscall interop for a local struct.
+		uint32(unsafe.Sizeof(accounting)),
+		&returned,
+	)
+	sort.Ints(pids)
+	parts := make([]string, 0, len(pids))
+	for _, pid := range pids {
+		parts = append(parts, fmt.Sprintf("%d", pid))
+	}
+	parts = append(parts,
+		fmt.Sprintf("user=%d:%d", accounting.TotalUserTime.HighDateTime, accounting.TotalUserTime.LowDateTime),
+		fmt.Sprintf("kernel=%d:%d", accounting.TotalKernelTime.HighDateTime, accounting.TotalKernelTime.LowDateTime),
+	)
+	return processActivityObservation{available: true, signature: strings.Join(parts, ",")}
 }
 
 func (g *windowsKillGroup) kill() error {

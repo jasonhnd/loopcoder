@@ -3,14 +3,15 @@ package orchestration
 import (
 	"bytes"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/observability"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
 
 func RenderDispatchWaveText(report DispatchWaveReport) string {
+	report = SanitizeDispatchWaveReportForOutput(report)
 	var out bytes.Buffer
 	succeeded, failed, skipped, needsHuman := dispatchWaveCounts(report.Results)
 	dispatched := succeeded + failed
@@ -42,10 +43,10 @@ func RenderDispatchWaveText(report DispatchWaveReport) string {
 				fmt.Fprintf(&out, "  report: %s\n", formatDispatchWaveReport(*result.Report))
 			}
 			if strings.TrimSpace(result.AttemptPath) != "" {
-				fmt.Fprintf(&out, "  attempt: %s\n", filepath.ToSlash(result.AttemptPath))
+				fmt.Fprintf(&out, "  attempt_id: %s\n", result.AttemptPath)
 			}
 			if strings.TrimSpace(result.RecoveryContextPath) != "" {
-				fmt.Fprintf(&out, "  recovery: %s\n", filepath.ToSlash(result.RecoveryContextPath))
+				fmt.Fprintf(&out, "  recovery_id: %s\n", result.RecoveryContextPath)
 			}
 			if strings.TrimSpace(result.Reason) != "" {
 				fmt.Fprintf(&out, "  reason: %s\n", result.Reason)
@@ -66,7 +67,40 @@ func RenderDispatchWaveText(report DispatchWaveReport) string {
 	return out.String()
 }
 
+func DispatchWaveObservabilityDocument(report DispatchWaveReport) observability.Document {
+	report = SanitizeDispatchWaveReportForOutput(report)
+	items := make([]observability.RenderItem, 0, len(report.Results))
+	for _, result := range report.Results {
+		if result.Report != nil {
+			items = append(items, observability.ItemFromReport(fmt.Sprintf("issue-%d", result.Issue), "worker", result.Status, result.Reason, result.NextAction, *result.Report, []observability.SourceRef{{
+				Table:         "dispatch_wave",
+				RecordID:      result.AttemptPath,
+				DeliveryRunID: report.RunID,
+				Provenance:    "dispatch-wave",
+			}}))
+			continue
+		}
+		items = append(items, observability.RenderItem{
+			ID:         fmt.Sprintf("issue-%d", result.Issue),
+			Kind:       "worker",
+			Status:     result.Status,
+			Reason:     result.Reason,
+			NextAction: result.NextAction,
+			Confidence: "exact",
+			Freshness:  "durable",
+			SourceRefs: []observability.SourceRef{{
+				Table:         "dispatch_wave",
+				RecordID:      firstNonEmpty(result.AttemptPath, fmt.Sprintf("issue-%d", result.Issue)),
+				DeliveryRunID: report.RunID,
+				Provenance:    "dispatch-wave",
+			}},
+		})
+	}
+	return observability.NewDocument("dispatch-wave", observability.Correlation{DeliveryRunID: report.RunID, Source: "dispatch-wave"}, items, nil)
+}
+
 func RenderDispatchWaveIssueCompletion(result DispatchWaveIssueResult, pretty string) string {
+	result = sanitizeDispatchWaveIssueResultForOutput(result)
 	var out bytes.Buffer
 	fmt.Fprintf(&out, "DISPATCH WAVE WORKER #%d %s\n", result.Issue, result.Status)
 	if strings.TrimSpace(result.Branch) != "" {
@@ -76,10 +110,10 @@ func RenderDispatchWaveIssueCompletion(result DispatchWaveIssueResult, pretty st
 		fmt.Fprintf(&out, "pr: %s\n", result.PR)
 	}
 	if strings.TrimSpace(result.AttemptPath) != "" {
-		fmt.Fprintf(&out, "attempt: %s\n", filepath.ToSlash(result.AttemptPath))
+		fmt.Fprintf(&out, "attempt_id: %s\n", result.AttemptPath)
 	}
 	if strings.TrimSpace(result.RecoveryContextPath) != "" {
-		fmt.Fprintf(&out, "recovery: %s\n", filepath.ToSlash(result.RecoveryContextPath))
+		fmt.Fprintf(&out, "recovery_id: %s\n", result.RecoveryContextPath)
 	}
 	if strings.TrimSpace(result.Reason) != "" {
 		fmt.Fprintf(&out, "reason: %s\n", result.Reason)
@@ -96,6 +130,27 @@ func RenderDispatchWaveIssueCompletion(result DispatchWaveIssueResult, pretty st
 	}
 	fmt.Fprintln(&out)
 	return out.String()
+}
+
+func SanitizeDispatchWaveReportForOutput(report DispatchWaveReport) DispatchWaveReport {
+	if len(report.Results) == 0 {
+		return report
+	}
+	report.Results = append([]DispatchWaveIssueResult(nil), report.Results...)
+	for i := range report.Results {
+		report.Results[i] = sanitizeDispatchWaveIssueResultForOutput(report.Results[i])
+	}
+	return report
+}
+
+func sanitizeDispatchWaveIssueResultForOutput(result DispatchWaveIssueResult) DispatchWaveIssueResult {
+	if strings.TrimSpace(result.AttemptPath) != "" {
+		result.AttemptPath = observability.StableRecordID(result.AttemptPath)
+	}
+	if strings.TrimSpace(result.RecoveryContextPath) != "" {
+		result.RecoveryContextPath = observability.StableRecordID(result.RecoveryContextPath)
+	}
+	return result
 }
 
 func formatDispatchWaveReport(record reporter.Report) string {

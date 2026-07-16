@@ -18,104 +18,7 @@ env:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-
-      - name: YAML validity check
-        run: |
-          set -euo pipefail
-
-          mapfile -t yaml_files < <(
-            {
-              printf '%s\n' '.delivery.yml'
-              find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) -print
-            } | sort
-          )
-
-          if command -v yq >/dev/null 2>&1; then
-            for file in "${yaml_files[@]}"; do
-              yq '.' "$file" >/dev/null
-            done
-            exit 0
-          fi
-
-          python3 - "${yaml_files[@]}" <<'PY'
-          import sys
-
-          import yaml
-
-          for path in sys.argv[1:]:
-              with open(path, encoding="utf-8") as yaml_file:
-                  yaml.safe_load(yaml_file)
-          PY
-
-      - name: CI check mapping check
-        run: |
-          set -euo pipefail
-
-          if command -v yq >/dev/null 2>&1; then
-            mapfile -t required_checks < <(yq -r '(.ci.checks // []) | .[]' '.delivery.yml')
-            mapfile -t workflow_files < <(find .github/workflows -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) -print | sort)
-            job_ids_file="$(mktemp)"
-            trap 'rm -f "$job_ids_file"' EXIT
-
-            for file in "${workflow_files[@]}"; do
-              yq -r '(.jobs // {}) | keys | .[]' "$file" >>"$job_ids_file"
-            done
-
-            missing=()
-            for check in "${required_checks[@]}"; do
-              if ! grep -Fxq "$check" "$job_ids_file"; then
-                missing+=("$check")
-              fi
-            done
-
-            if ((${#missing[@]} > 0)); then
-              echo "The following ci.checks entries do not match any workflow job id:"
-              printf '  - %s\n' "${missing[@]}"
-              exit 1
-            fi
-
-            exit 0
-          fi
-
-          python3 - <<'PY'
-          import glob
-          import sys
-
-          import yaml
-
-          with open(".delivery.yml", encoding="utf-8") as delivery_file:
-              delivery = yaml.safe_load(delivery_file) or {}
-
-          required_checks = [
-              str(check) for check in (delivery.get("ci") or {}).get("checks") or []
-          ]
-          job_ids = set()
-
-          workflow_paths = sorted(
-              glob.glob(".github/workflows/*.yml")
-              + glob.glob(".github/workflows/*.yaml")
-          )
-          for workflow_path in workflow_paths:
-              with open(workflow_path, encoding="utf-8") as workflow_file:
-                  workflow = yaml.safe_load(workflow_file) or {}
-              job_ids.update(str(job_id) for job_id in (workflow.get("jobs") or {}).keys())
-
-          missing = [check for check in required_checks if check not in job_ids]
-          if missing:
-              print("The following ci.checks entries do not match any workflow job id:")
-              for check in missing:
-                  print(f"  - {check}")
-              sys.exit(1)
-          PY
-
-      - name: Release draft staging unit test
-        run: bash scripts/stage-draft-release_test.sh
-
-  go:
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
@@ -124,6 +27,58 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           check-latest: false
           cache: true
+
+      - name: Assert darwin/arm64 Go host
+        run: |
+          set -euo pipefail
+          actual_goos="$(go env GOOS)"
+          actual_goarch="$(go env GOARCH)"
+          printf 'Go host tuple: %s/%s\n' "${actual_goos}" "${actual_goarch}"
+          test "${actual_goos}" = "darwin"
+          test "${actual_goarch}" = "arm64"
+
+      - name: YAML validity check
+        run: |
+          set -euo pipefail
+
+          ruby -e '
+            require "yaml"
+
+            paths = [".delivery.yml"] + Dir.glob([".github/workflows/**/*.yml", ".github/workflows/**/*.yaml"]).select { |path| File.file?(path) }
+            paths.sort.each { |path| YAML.load_file(path) }
+          '
+
+      - name: CI check mapping check
+        run: go test . -run TestV080WorkflowPolicy -count=1
+
+      - name: Repository workflow policy
+        run: go test . -run TestV080WorkflowPolicy -count=1
+
+      - name: Release draft staging unit test
+        run: bash scripts/stage-draft-release_test.sh
+
+      - name: Installer unit test
+        run: bash scripts/install_test.sh
+
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+          cache: true
+
+      - name: Assert darwin/arm64 Go host
+        run: |
+          set -euo pipefail
+          actual_goos="$(go env GOOS)"
+          actual_goarch="$(go env GOARCH)"
+          printf 'Go host tuple: %s/%s\n' "${actual_goos}" "${actual_goarch}"
+          test "${actual_goos}" = "darwin"
+          test "${actual_goarch}" = "arm64"
 
       - name: Go build
         run: go build ./cmd/loopcoder
@@ -137,22 +92,12 @@ jobs:
       - name: Go test
         run: go test ./...
 
-      - name: Go test (race detector)
-        run: go test -race ./...
-
-  native:
-    name: native (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+  race:
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
@@ -160,16 +105,23 @@ jobs:
           check-latest: false
           cache: true
 
-      - name: Native Go environment
+      - name: Assert darwin/arm64 Go host
         run: |
-          go version
-          go env GOVERSION GOOS GOARCH
+          set -euo pipefail
+          actual_goos="$(go env GOOS)"
+          actual_goarch="$(go env GOARCH)"
+          printf 'Go host tuple: %s/%s\n' "${actual_goos}" "${actual_goarch}"
+          test "${actual_goos}" = "darwin"
+          test "${actual_goarch}" = "arm64"
 
-      - name: Native Go test
-        run: go test ./...
+      - name: Go test changed packages (race detector)
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE_SHA: ${{ github.event.before }}
+        run: bash scripts/ci-race-changed.sh "${PR_BASE_SHA:-${PUSH_BASE_SHA:-}}"
 
-  staticcheck:
-    runs-on: ubuntu-latest
+  security:
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
@@ -179,37 +131,14 @@ jobs:
           check-latest: false
           cache: true
 
-      - name: Staticcheck
+      - name: Assert darwin/arm64 Go host
         run: |
-          echo "staticcheck ${STATICCHECK_VERSION}"
-          go run honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION} ./...
-
-  govulncheck:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          check-latest: false
-          cache: true
-
-      - name: Govulncheck
-        run: |
-          echo "govulncheck ${GOVULNCHECK_VERSION}"
-          go run golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION} ./...
-
-  audit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          check-latest: false
-          cache: true
+          set -euo pipefail
+          actual_goos="$(go env GOOS)"
+          actual_goarch="$(go env GOARCH)"
+          printf 'Go host tuple: %s/%s\n' "${actual_goos}" "${actual_goarch}"
+          test "${actual_goos}" = "darwin"
+          test "${actual_goarch}" = "arm64"
 
       - name: Install audit tools
         run: |
@@ -221,6 +150,12 @@ jobs:
           go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}
           echo "gosec ${GOSEC_VERSION}"
           go install github.com/securego/gosec/v2/cmd/gosec@${GOSEC_VERSION}
+
+      - name: Staticcheck
+        run: staticcheck ./...
+
+      - name: Govulncheck
+        run: govulncheck ./...
 
       - name: Build loopcoder
         run: go build -o ./bin/loopcoder ./cmd/loopcoder

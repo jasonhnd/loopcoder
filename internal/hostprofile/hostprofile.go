@@ -34,6 +34,13 @@ type Resolved struct {
 	Runtime    runtimecap.HostRuntime
 }
 
+type OriginOptions struct {
+	ProjectID     string
+	DeliveryRunID string
+	CorrelationID string
+	Getenv        func(string) string
+}
+
 func Resolve(opts Options) (Resolved, error) {
 	contract := opts.Contract
 	if len(contract.Hosts) == 0 {
@@ -128,6 +135,80 @@ func detect(contract runtimecap.Contract, getenv func(string) string) Resolved {
 		}
 	}
 	return Resolved{}
+}
+
+func CodexOriginBindingRequest(opts OriginOptions) (runtimecap.HostRunOriginBindingRequest, bool) {
+	return originBindingRequest(opts, "codex-cli", "codex-cli-thread", []string{
+		"CODEX_THREAD_ID",
+		"CODEX_SESSION_ID",
+	}, []string{
+		"CODEX_CLI",
+	})
+}
+
+func ClaudeOriginBindingRequest(opts OriginOptions) (runtimecap.HostRunOriginBindingRequest, bool) {
+	return originBindingRequest(opts, "claude-code", "claude-code-session", []string{
+		"CLAUDE_CODE_SESSION_ID",
+	}, []string{
+		"CLAUDECODE",
+		"CLAUDE_CODE_ENTRYPOINT",
+	})
+}
+
+func PaseoOriginBindingRequest(opts OriginOptions) (runtimecap.HostRunOriginBindingRequest, bool) {
+	return originBindingRequest(opts, "paseo-style", "paseo-agent", []string{
+		"PASEO_AGENT_ID",
+	}, []string{
+		"PASEO_HOST",
+	})
+}
+
+func originBindingRequest(opts OriginOptions, host, kind string, opaqueEnvNames, markerEnvNames []string) (runtimecap.HostRunOriginBindingRequest, bool) {
+	getenv := opts.Getenv
+	if getenv == nil {
+		getenv = func(string) string { return "" }
+	}
+	metadata := map[string]string{
+		"host": host,
+	}
+	var opaqueValues []string
+	for _, envName := range opaqueEnvNames {
+		value := strings.TrimSpace(getenv(envName))
+		if value == "" {
+			continue
+		}
+		opaqueValues = append(opaqueValues, value)
+		metadata["env."+envName] = "present"
+	}
+	opaque := firstNonEmpty(opaqueValues...)
+	if opaque == "" {
+		return runtimecap.HostRunOriginBindingRequest{}, false
+	}
+	for _, envName := range markerEnvNames {
+		if strings.TrimSpace(getenv(envName)) != "" {
+			metadata["env."+envName] = "present"
+		}
+	}
+	return runtimecap.HostRunOriginBindingRequest{
+		ProjectID:     strings.TrimSpace(opts.ProjectID),
+		DeliveryRunID: strings.TrimSpace(opts.DeliveryRunID),
+		CorrelationID: strings.TrimSpace(opts.CorrelationID),
+		Origin: runtimecap.HostRunOriginDeclaration{
+			SchemaVersion: runtimecap.HostRunOriginSchemaVersion,
+			Kind:          kind,
+			OpaqueID:      opaque,
+			Metadata:      metadata,
+		},
+	}, true
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func unknownProfileError(raw, selector string, contract runtimecap.Contract) error {

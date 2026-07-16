@@ -1,139 +1,161 @@
 # Self-Bootstrap Acceptance
 
-This checklist defines the v0.7.0 self-bootstrap acceptance scenario: loopcoder
-uses the loopcoder repository, the v0.7.0 milestone issue set, local runtime
-state, nested child runs, and release checks to prove that the project can
-develop and review itself without hiding evidence.
+This checklist defines the v0.8.0 self-bootstrap acceptance scenario. It proves
+that the release candidate can operate on the LoopCoder repository, persist
+durable machine-local state, execute a bounded child graph, render human and
+JSON evidence, and recover or roll back without paid provider quota.
 
-The scenario is acceptance evidence, not an automatic production merge. Human
-review remains the final gate, and the run is only accepted when a human can
-audit the path from issue to PR to local report/status output.
+The scenario is release evidence, not publication authority. It cannot promote
+`main`, create a tag, publish a release, waive a failed check, or replace the
+required human approval in the `release-publication` environment.
 
-## Scripted Smoke
+## Platform Boundary
 
-Run the deterministic local smoke from a loopcoder source checkout:
+The v0.8.0 self-bootstrap path supports native macOS Apple Silicon
+(`darwin/arm64`) only. Windows, Linux/Ubuntu, WSL, containers used as a
+LoopCoder runtime, Intel macOS, and Rosetta/amd64 macOS are unsupported. Those
+hosts must remain on the historical v0.7.0 release or wait for a separately
+approved future platform roadmap.
+
+The smoke must fail before creating temporary state, opening storage, invoking
+a provider, contacting GitHub, or mutating a repository when the host tuple is
+unsupported.
+
+## Deterministic Candidate Smoke
+
+Run from a LoopCoder source checkout on Darwin arm64:
 
 ```text
-pwsh scripts/self-bootstrap-smoke.ps1
+pwsh scripts/self-bootstrap-smoke.ps1 -Version 0.8.0
 ```
 
-The script builds the local `loopcoder` binary unless `-Binary <path>` is
-provided. It sets `LOOPCODER_HOME` to a temporary directory, registers the
-loopcoder checkout in the v0.7.0 project registry, submits a deterministic v1
-child plan through `loopcoder nested run --provider test-subprocess`, executes
-three local child subprocesses, and verifies the JSON surfaces exposed by
-`doctor`, `status`, and `report`.
+For release evidence, pass the binary extracted from the staged candidate:
 
-The smoke proves:
+```text
+pwsh scripts/self-bootstrap-smoke.ps1 \
+  -Version 0.8.0 \
+  -Binary <staged-candidate>/loopcoder \
+  -KeepArtifacts
+```
 
-- `loopcoder projects register --repo .` resolves the loopcoder checkout and
-  writes the registry database under `$LOOPCODER_HOME/data/loopcoder.db`.
-- `$LOOPCODER_HOME/data/loopcoder.db` exists outside the repository.
-- `doctor --repo . --format json` exposes storage health, project registry
-  health, provider compatibility, and nested-run health.
-- `nested run --repo . --plan <plan> --provider test-subprocess --format json`
-  executes three real local child subprocesses, including a dependent child.
-- `status --repo . --run <child> --format json` exposes a parent/child run
-  tree with issue and worker report metadata.
-- `report --repo . --run <child> --format json` includes both the child worker
-  report record and the same run tree.
-- `report --repo .` renders compact human receipts with `Target`, `Verdict`,
-  `Review summary`, `Run`, and `Next` sections, while `report --repo .
-  --verbose` keeps raw canonical records available outside the default chat
-  view.
+The script may build a local development binary only when `-Binary` is absent.
+It records the selected binary path, SHA-256, and `loopcoder version` output so
+a release run can prove that self-bootstrap consumed the same candidate later
+eligible for publication.
 
-The smoke does not require provider authentication, paid services, GitHub
-mutation, remote dispatch, review, merge, tags, or release assets. If `doctor`
-exits non-zero only because local `gh` or provider CLIs are missing or
-unauthenticated, the smoke still fails only when the v0.7.0 runtime assertions
-above are missing. Use `-KeepArtifacts` to retain the temporary `LOOPCODER_HOME`
-and JSON outputs.
+The smoke uses a temporary `LOOPCODER_HOME`, the reserved
+`test-subprocess` provider, fixed child-plan input, and local git commands. It
+must not read provider credentials, call a paid model, use provider-native
+sub-agents, mutate GitHub, or require network access.
 
-## Manual Acceptance Checklist
+The smoke proves all of the following:
 
-Use the v0.7.0 milestone and the issue chain named by issue #654:
+- the runtime and selected binary report native `darwin/arm64`;
+- `projects register` resolves the LoopCoder checkout and creates
+  `$LOOPCODER_HOME/data/loopcoder.db` outside the repository;
+- registered run payloads are written below
+  `$LOOPCODER_HOME/projects/<project_id>/`, not the repository;
+- `migrate storage` planning is read-only and reports the current source and
+  target schema without creating a backup for a fresh schema-30 database;
+- a deterministic three-child graph executes with dependency-aware fan-out and
+  fan-in, durable parent/child identity, and no remote provider call;
+- `status` and `report` both produce representative human output and valid JSON
+  for the same run tree;
+- progress, report, and doctor artifacts are retained only under the temporary
+  evidence directory when `-KeepArtifacts` is used;
+- doctor reports database, registry, nested-run, provider compatibility, and
+  host-profile evidence honestly, while optional missing provider login or
+  GitHub readiness remains visible rather than fabricated as success;
+- no new runtime payload appears under the registered repository's
+  `.loopcoder/runs`, `.loopcoder/logs`, `.loopcoder/recovery`, or
+  `.loopcoder/relay` paths.
 
-- #632: v0.7.0 roadmap for global local runtime, multi-project state,
-  provider compatibility, and nested sub-agent orchestration.
-- #638: docs, migration, and v0.7.0 release readiness.
-- #648: nested fan-out/fan-in scheduler.
-- #650: resume and recovery for interrupted parent and child runs.
-- #651: run tree observability in status and report.
-- #652: v0.7.0 doctor checks and safe fix guidance.
-- #653: v0.6.x to v0.7.0 migration command and docs.
+## v0.7.0 Upgrade And Rollback Smoke
 
-Acceptance requires all of the following evidence:
+The staged release workflow must run the exact candidate artifact through:
 
-1. Self-bootstrap issue evidence: implementation issues in the milestone have
-   PR links, and each PR references the issue or merged design/spec it
-   implements.
-2. Nested run evidence: at least one parent run launched or recorded a child
-   run, and both parent and child run IDs are visible in local `status` or
-   `report` JSON.
-3. Recovery evidence: an interrupted, failed, or completed child run is visible
-   enough for `resume`, `status`, or `doctor` to classify the next action
-   without duplicate dispatch.
-4. Observability evidence: `loopcoder status --repo . --format json` and
-   `loopcoder report --repo . --run <run-id> --format json` expose the run
-   tree; `loopcoder report --repo .` is readable as compact receipts without
-   embedded raw JSON; local report records stay out of PR bodies, issue
-   comments, commits, merge artifacts, docs, examples, and tracked fixtures.
-5. Registry evidence: `loopcoder projects show --repo . --format json` resolves
-   the loopcoder repository and reports a stable `project_id` and
-   `identity_source`.
-6. Storage evidence: `loopcoder doctor --repo . --format json` reports the
-   database at `$LOOPCODER_HOME/data/loopcoder.db`, and that path is outside
-   the repository checkout.
-7. Provider compatibility evidence: doctor JSON includes the
-   `provider_compatibility[]` matrix and selected Worker/Verifier compatibility
-   checks. Unsupported read-only provider combinations must fail closed or warn
-   explicitly.
-8. Doctor readiness evidence: `loopcoder doctor --repo .` is clean, or every
-   warning is documented as optional and non-blocking for the acceptance run.
-   Hard failures require fixing or a human `needs-human` decision.
-9. Release readiness evidence: the release smoke passes for the candidate
-   artifact when assets exist:
+```text
+pwsh scripts/release-smoke.ps1 \
+  -Version v0.8.0 \
+  -PreviousVersion 0.7.0
+```
 
-   ```text
-   pwsh scripts/release-smoke.ps1 -Version 0.7.0
-   ```
+That path must use the published v0.7.0 Darwin arm64 binary to create a real
+schema-9 database, then prove that the v0.8.0 candidate:
 
-10. Human audit evidence: a reviewer can follow every accepted item from
-    GitHub issue, to PR, to checks/verifier result, to local report/status run
-    evidence.
-11. Go/no-go evidence: the final release readiness PR or issue includes the
-    completed [`v0.7.0-go-no-go.md`](v0.7.0-go-no-go.md) report, with unsigned
-    or missing assets recorded as NO-GO rather than inferred success.
+1. renders a side-effect-free migration plan;
+2. applies schema 9 through 30 only after `--apply`;
+3. creates exactly one verified owner-only backup;
+4. preserves project identity, run history, reports, and multi-project state;
+5. treats repeated apply as `no-op`;
+6. upgrades through the signed installer seam to the exact staged candidate;
+7. copies, rather than moves or mutates, the backup for rollback; and
+8. proves the restored backup still opens with the published v0.7.0 binary.
+
+All LoopCoder processes must be stopped before migration or rollback. A v0.7.0
+binary must never open the migrated schema-30 database. Rolling back to the
+backup discards v0.8-only state created after migration. See
+[`storage-migration.md`](storage-migration.md) for stable limitation codes and
+the executable offline procedure.
+
+## Required Release Evidence
+
+The final v0.8.0 evidence record must connect these boundaries:
+
+1. #959 and children #960-#968: durable provider ownership, detached
+   supervision, five-minute progress, provider-free waits, and orchestration
+   cost limits.
+2. #867: schema planning, verified backup, atomic migration, idempotent replay,
+   corrupt/disk-full handling, and rollback proof.
+3. #953: current living documentation and the Darwin arm64-only policy test.
+4. #868: deterministic fresh and v0.7-upgrade self-bootstrap evidence.
+5. #869: final candidate SHA, signed artifact identities, staged smoke,
+   environment approval, publication result, and post-publication verification.
+
+Every implementation issue must identify its merged PR and candidate ancestor.
+Local reporter blocks, raw run records, credentials, provider output, and
+machine-local paths must not be copied into GitHub-visible artifacts. Release
+evidence records commands, hashes, stable result summaries, and public workflow
+URLs only.
 
 ## Non-Acceptance Cases
 
-Do not count the self-bootstrap as accepted when any of these are true:
+The release remains NO-GO when any of the following is true:
 
-- An implementation issue has no PR evidence.
-- A PR claims a run/report result that is not visible in local loopcoder output.
-- The local database is inside the repository or under tracked source paths.
-- Parent/child run relationships are only described in prose and not visible in
-  `status` or `report` JSON.
-- Doctor hides provider compatibility or reports unsupported provider behavior
-  as success.
-- Release readiness depends on a paid service or an unavailable provider rather
-  than deterministic local or GitHub release evidence.
-- The path to acceptance requires an automatic production merge.
+- self-bootstrap used a locally rebuilt binary when claiming staged-artifact
+  evidence;
+- the host was not native Darwin arm64;
+- any default smoke path consumed paid quota or required private credentials;
+- state or evidence was written inside the registered repository;
+- human and JSON outputs describe different run identities or outcomes;
+- migration planning changed a file, backup verification was skipped, or
+  rollback was not opened by v0.7.0;
+- an implementation issue lacks merged-PR and candidate-ancestor evidence;
+- a failed or cancelled release run deleted its diagnosable draft or claimed
+  publication success;
+- the release-publication approval or post-publication public verification is
+  missing.
 
 ## Evidence Template
 
-Record the final acceptance evidence in the release checklist or PR summary:
-
 ```text
-self-bootstrap smoke: pwsh scripts/self-bootstrap-smoke.ps1
-registry project_id: <project_id>
-database path: <LOOPCODER_HOME>/data/loopcoder.db outside repo: yes
+candidate SHA: <sha>
+candidate binary: <absolute local path used by smoke>
+candidate binary SHA-256: <sha256>
+host tuple: darwin/arm64
+self-bootstrap: pwsh scripts/self-bootstrap-smoke.ps1 -Version 0.8.0 -Binary <path> -KeepArtifacts
+project_id: <project_id>
+database outside repo: yes
+registered payload outside repo: yes
 parent run: <run-id>
-child run: <run-id>
-status JSON: <local path or command output location>
-report JSON: <local path or command output location>
-doctor JSON: <local path or command output location>
-implementation issues: #<n> -> PR #<n>, ...
-release smoke: pwsh scripts/release-smoke.ps1 -Version 0.7.0
+child runs: <run-id>, ...
+status human/JSON: <artifact paths>
+report human/JSON: <artifact paths>
+doctor JSON: <artifact path>
+storage plan JSON: <artifact path>
+upgrade smoke: pwsh scripts/release-smoke.ps1 -Version v0.8.0 -PreviousVersion 0.7.0
+migration backup verified and opened by v0.7.0: yes
+paid provider calls: 0
+implementation evidence: #<issue> -> PR #<pr> -> <merge SHA>, ...
 human audit decision: pass | fail | needs-human
 ```

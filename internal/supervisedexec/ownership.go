@@ -54,6 +54,8 @@ type killGroup interface {
 	prepare(cmd *exec.Cmd)
 	// adopt records or assigns the started process into the group.
 	adopt(cmd *exec.Cmd) error
+	// activity returns a best-effort process-tree snapshot for stall liveness.
+	activity() processActivityObservation
 	// kill terminates the whole group.
 	kill() error
 	// close releases the group handle.

@@ -20,6 +20,8 @@ import (
 
 	loopcoder "github.com/jasonhnd/loopcoder"
 	"github.com/jasonhnd/loopcoder/internal/audit"
+	"github.com/jasonhnd/loopcoder/internal/availability"
+	budgetpkg "github.com/jasonhnd/loopcoder/internal/budget"
 	"github.com/jasonhnd/loopcoder/internal/claudehooks"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
@@ -30,14 +32,17 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/models"
 	"github.com/jasonhnd/loopcoder/internal/provider"
+	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reportquery"
+	"github.com/jasonhnd/loopcoder/internal/routing"
 	"github.com/jasonhnd/loopcoder/internal/runtimecap"
 	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	"github.com/jasonhnd/loopcoder/internal/upgrade"
+	"github.com/jasonhnd/loopcoder/internal/usageledger"
 	"gopkg.in/yaml.v3"
 )
 
@@ -83,6 +88,8 @@ type Deps struct {
 	ProjectShow        func(context.Context, registry.Options) (registry.ShowResult, error)
 	ProjectDuplicates  func(context.Context, registry.Options) ([]registry.DuplicatePhysicalIdentity, error)
 	ProjectRepair      func(context.Context, registry.Options) ([]registry.DuplicatePhysicalIdentity, error)
+	ProviderInventory  func(context.Context, providerinventory.Options) (providerinventory.Report, error)
+	Now                func() time.Time
 }
 
 type CommandResult struct {
@@ -92,12 +99,13 @@ type CommandResult struct {
 }
 
 type Check struct {
-	Name       string
-	Code       string
-	Status     Status
-	Message    string
-	Hard       bool
-	FixCommand string
+	Name           string
+	Code           string
+	Status         Status
+	Message        string
+	Hard           bool
+	FixCommand     string
+	LegacySurfaces []LegacySurface
 }
 
 type Report struct {
@@ -106,8 +114,11 @@ type Report struct {
 	Commit                string
 	Date                  string
 	HostProfile           HostProfile
+	HostNegotiation       runtimecap.HostNegotiation
 	Runtime               RuntimeHealth
 	ProviderCompatibility []ProviderCompatibility
+	ProviderInventory     providerinventory.Report
+	QuotaUsageBudget      usageledger.QuotaUsageBudget
 	Checks                []Check
 }
 
@@ -116,8 +127,12 @@ type HostProfile struct {
 	Source             string
 	Selector           string
 	InvocationStyle    string
+	PreservesStdout    bool
+	PreservesStderr    bool
 	SupportsHooks      bool
 	SupportsJSONOutput bool
+	SupportsTimeouts   bool
+	SupportsCancel     bool
 	DetectedBy         []string
 	KnownLimitations   []string
 }
@@ -171,7 +186,32 @@ type RuntimeProjectRegistry struct {
 type RuntimeMigration struct {
 	Status         Status
 	LegacySurfaces int
+	Surfaces       []LegacySurface
 	Message        string
+}
+
+type LegacySurface struct {
+	Surface        string
+	Identifier     string
+	Classification string
+	Remediation    string
+	Legacy         string
+	Current        string
+	Location       string
+	Detail         string
+	Conflict       bool
+}
+
+type renderedLegacySurface struct {
+	Surface        string `json:"surface"`
+	Identifier     string `json:"identifier"`
+	Classification string `json:"classification"`
+	Remediation    string `json:"remediation"`
+	Legacy         string `json:"legacy,omitempty"`
+	Current        string `json:"current,omitempty"`
+	Location       string `json:"location,omitempty"`
+	Detail         string `json:"detail,omitempty"`
+	Conflict       bool   `json:"conflict,omitempty"`
 }
 
 type RuntimeNestedRuns struct {
@@ -206,18 +246,26 @@ func Render(w io.Writer, report Report) error {
 		if _, err := fmt.Fprintf(w, "[%s] %s: %s\n", check.Status, check.Name, check.Message); err != nil {
 			return err
 		}
+		if len(check.LegacySurfaces) > 0 {
+			for _, surface := range check.LegacySurfaces {
+				if _, err := fmt.Fprintf(w, "  - %s: identifier=%s classification=%s remediation=%s\n", surface.Surface, surface.Identifier, surface.Classification, surface.Remediation); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	return nil
 }
 
 func RenderJSON(w io.Writer, report Report) error {
 	type renderedCheck struct {
-		Name       string `json:"name"`
-		Code       string `json:"code,omitempty"`
-		Status     Status `json:"status"`
-		Hard       bool   `json:"hard"`
-		Message    string `json:"message"`
-		FixCommand string `json:"fix_command"`
+		Name           string                  `json:"name"`
+		Code           string                  `json:"code,omitempty"`
+		Status         Status                  `json:"status"`
+		Hard           bool                    `json:"hard"`
+		Message        string                  `json:"message"`
+		FixCommand     string                  `json:"fix_command"`
+		LegacySurfaces []renderedLegacySurface `json:"legacy_surfaces,omitempty"`
 	}
 	type renderedHostProfile struct {
 		Name               string   `json:"name"`
@@ -267,9 +315,10 @@ func RenderJSON(w io.Writer, report Report) error {
 			Message        string `json:"message"`
 		} `json:"project_registry"`
 		Migration struct {
-			Status         Status `json:"status"`
-			LegacySurfaces int    `json:"legacy_surfaces"`
-			Message        string `json:"message"`
+			Status         Status                  `json:"status"`
+			LegacySurfaces int                     `json:"legacy_surfaces"`
+			Surfaces       []renderedLegacySurface `json:"surfaces,omitempty"`
+			Message        string                  `json:"message"`
 		} `json:"migration"`
 		NestedRuns struct {
 			Status       Status `json:"status"`
@@ -280,15 +329,50 @@ func RenderJSON(w io.Writer, report Report) error {
 			Message      string `json:"message"`
 		} `json:"nested_runs"`
 	}
+	type renderedAgentFederationProvider struct {
+		AdapterID            string   `json:"adapter_id"`
+		NestedSubagents      bool     `json:"nested_subagents"`
+		CapabilityConfidence string   `json:"capability_confidence"`
+		Support              string   `json:"support"`
+		GapReasons           []string `json:"gap_reasons"`
+	}
+	type renderedAgentFederation struct {
+		SchemaVersion                string                            `json:"schema_version"`
+		GeneratedAt                  string                            `json:"generated_at"`
+		AgentFederationPolicyVersion string                            `json:"agent_federation_policy_version"`
+		Providers                    []renderedAgentFederationProvider `json:"providers"`
+		ScopePolicy                  struct {
+			MonotonicInheritance      bool `json:"monotonic_inheritance"`
+			CredentialMaterialAllowed bool `json:"credential_material_allowed"`
+			OneWriterRequired         bool `json:"one_writer_required"`
+		} `json:"scope_policy"`
+		BudgetPolicy struct {
+			HierarchicalBudgetsRequired bool `json:"hierarchical_budgets_required"`
+			ChildReservationRequired    bool `json:"child_reservation_required"`
+		} `json:"budget_policy"`
+		GapReasons []string `json:"gap_reasons"`
+	}
+	type renderedDecompositionRouting struct {
+		SchemaVersion            string                         `json:"schema_version"`
+		GeneratedAt              string                         `json:"generated_at"`
+		RoutingPolicyProfiles    []routing.RoutingPolicyProfile `json:"routing_policy_profiles"`
+		RoleDefinitions          []routing.RoleDefinition       `json:"role_definitions"`
+		GraphBounds              map[string]any                 `json:"graph_bounds"`
+		EligibilityPolicyVersion string                         `json:"eligibility_policy_version"`
+		FallbackPolicyVersion    string                         `json:"fallback_policy_version"`
+		GapReasons               []string                       `json:"gap_reasons"`
+	}
 	checks := make([]renderedCheck, 0, len(report.Checks))
 	for _, check := range report.Checks {
+		surfaces := renderLegacySurfaces(check.LegacySurfaces)
 		checks = append(checks, renderedCheck{
-			Name:       check.Name,
-			Code:       check.Code,
-			Status:     check.Status,
-			Hard:       check.Hard,
-			Message:    check.Message,
-			FixCommand: check.FixCommand,
+			Name:           check.Name,
+			Code:           check.Code,
+			Status:         check.Status,
+			Hard:           check.Hard,
+			Message:        check.Message,
+			FixCommand:     check.FixCommand,
+			LegacySurfaces: surfaces,
 		})
 	}
 	compatibility := make([]renderedProviderCompatibility, 0, len(report.ProviderCompatibility))
@@ -305,6 +389,48 @@ func RenderJSON(w io.Writer, report Report) error {
 			KnownLimitations:     append([]string(nil), entry.KnownLimitations...),
 		})
 	}
+	agentFederation := renderedAgentFederation{
+		SchemaVersion:                "loopcoder.agent_federation_json.v1",
+		GeneratedAt:                  report.Date,
+		AgentFederationPolicyVersion: storage.AgentPolicyVersion,
+		Providers:                    []renderedAgentFederationProvider{},
+		GapReasons:                   []string{},
+	}
+	agentFederation.ScopePolicy.MonotonicInheritance = true
+	agentFederation.ScopePolicy.CredentialMaterialAllowed = false
+	agentFederation.ScopePolicy.OneWriterRequired = true
+	agentFederation.BudgetPolicy.HierarchicalBudgetsRequired = true
+	agentFederation.BudgetPolicy.ChildReservationRequired = true
+	for _, entry := range report.ProviderCompatibility {
+		if entry.Role != string(runtimecap.RoleNestedSubagents) {
+			continue
+		}
+		gaps := append([]string(nil), entry.MissingCapabilities...)
+		if strings.TrimSpace(entry.Code) != "" && entry.Support != string(runtimecap.SupportSupported) {
+			gaps = append(gaps, entry.Code)
+		}
+		sort.Strings(gaps)
+		agentFederation.Providers = append(agentFederation.Providers, renderedAgentFederationProvider{
+			AdapterID:            entry.Provider,
+			NestedSubagents:      entry.Support == string(runtimecap.SupportSupported),
+			CapabilityConfidence: "exact",
+			Support:              entry.Support,
+			GapReasons:           gaps,
+		})
+	}
+	decompositionRouting := renderedDecompositionRouting{
+		SchemaVersion:            "loopcoder.decomposition_routing_json.v1",
+		GeneratedAt:              report.Date,
+		RoutingPolicyProfiles:    routing.BuiltInRoutingPolicyProfiles(parseReportTime(report.Date)),
+		RoleDefinitions:          routing.BuiltInRoleDefinitions(),
+		GraphBounds:              map[string]any{},
+		EligibilityPolicyVersion: routing.PolicyVersion,
+		FallbackPolicyVersion:    "0804.fallback.v1",
+		GapReasons:               decompositionRoutingGaps(report),
+	}
+	for _, profile := range decompositionRouting.RoutingPolicyProfiles {
+		decompositionRouting.GraphBounds[profile.ProfileKey] = profile.GraphBounds
+	}
 	payload := struct {
 		RepoPath              string                          `json:"repo_path"`
 		Version               string                          `json:"version"`
@@ -312,8 +438,13 @@ func RenderJSON(w io.Writer, report Report) error {
 		Date                  string                          `json:"date"`
 		ExitCode              int                             `json:"exit_code"`
 		Host                  renderedHostProfile             `json:"host_profile"`
+		HostNegotiation       runtimecap.HostNegotiation      `json:"host_capability_negotiation"`
 		Runtime               renderedRuntime                 `json:"runtime"`
+		AgentFederation       renderedAgentFederation         `json:"agent_federation"`
+		DecompositionRouting  renderedDecompositionRouting    `json:"decomposition_routing"`
 		ProviderCompatibility []renderedProviderCompatibility `json:"provider_compatibility"`
+		ProviderInventory     providerinventory.Report        `json:"provider_inventory"`
+		QuotaUsageBudget      usageledger.QuotaUsageBudget    `json:"quota_usage_budget"`
 		Checks                []renderedCheck                 `json:"checks"`
 	}{
 		RepoPath: report.RepoPath,
@@ -331,7 +462,12 @@ func RenderJSON(w io.Writer, report Report) error {
 			DetectedBy:         append([]string(nil), report.HostProfile.DetectedBy...),
 			KnownLimitations:   append([]string(nil), report.HostProfile.KnownLimitations...),
 		},
+		HostNegotiation:       normalizeHostNegotiation(report),
+		AgentFederation:       agentFederation,
+		DecompositionRouting:  decompositionRouting,
 		ProviderCompatibility: compatibility,
+		ProviderInventory:     normalizeProviderInventory(report.ProviderInventory),
+		QuotaUsageBudget:      normalizeQuotaUsageBudget(report.QuotaUsageBudget),
 		Checks:                checks,
 	}
 	payload.Runtime.HomeDir = filepath.ToSlash(report.Runtime.HomeDir)
@@ -357,6 +493,7 @@ func RenderJSON(w io.Writer, report Report) error {
 	payload.Runtime.ProjectRegistry.Message = report.Runtime.ProjectRegistry.Message
 	payload.Runtime.Migration.Status = report.Runtime.Migration.Status
 	payload.Runtime.Migration.LegacySurfaces = report.Runtime.Migration.LegacySurfaces
+	payload.Runtime.Migration.Surfaces = renderLegacySurfaces(report.Runtime.Migration.Surfaces)
 	payload.Runtime.Migration.Message = report.Runtime.Migration.Message
 	payload.Runtime.NestedRuns.Status = report.Runtime.NestedRuns.Status
 	payload.Runtime.NestedRuns.RunCount = report.Runtime.NestedRuns.RunCount
@@ -367,6 +504,176 @@ func RenderJSON(w io.Writer, report Report) error {
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(payload)
+}
+
+func normalizeHostNegotiation(report Report) runtimecap.HostNegotiation {
+	if strings.TrimSpace(report.HostNegotiation.SchemaVersion) != "" {
+		return report.HostNegotiation
+	}
+	return runtimecap.NegotiateHost(runtimecap.HostNegotiationRequest{
+		SchemaVersion: runtimecap.HostNegotiationSchemaVersion,
+		Host: runtimecap.HostProfileRecord{
+			Name:   report.HostProfile.Name,
+			Source: report.HostProfile.Source,
+		},
+		Capabilities: runtimecap.HostCapabilityDeclarations(runtimecap.HostRuntime{
+			Name:               report.HostProfile.Name,
+			InvocationStyle:    report.HostProfile.InvocationStyle,
+			PreservesStdout:    report.HostProfile.PreservesStdout,
+			PreservesStderr:    report.HostProfile.PreservesStderr,
+			SupportsJSONOutput: report.HostProfile.SupportsJSONOutput,
+			SupportsTimeouts:   report.HostProfile.SupportsTimeouts,
+			SupportsCancel:     report.HostProfile.SupportsCancel,
+			SupportsHooks:      report.HostProfile.SupportsHooks,
+			KnownLimitations:   append([]string(nil), report.HostProfile.KnownLimitations...),
+		}),
+	})
+}
+
+func normalizeQuotaUsageBudget(report usageledger.QuotaUsageBudget) usageledger.QuotaUsageBudget {
+	if strings.TrimSpace(report.SchemaVersion) == "" {
+		report.SchemaVersion = usageledger.QuotaUsageBudgetSchema
+	}
+	if strings.TrimSpace(report.GeneratedAt) == "" {
+		report.GeneratedAt = "1970-01-01T00:00:00Z"
+	}
+	if strings.TrimSpace(report.QuotaUsageFingerprint) == "" {
+		report.QuotaUsageFingerprint = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+	}
+	if report.Confidence == "" {
+		report.Confidence = providerinventory.ConfidenceUnknown
+	}
+	if report.QuotaSources == nil {
+		report.QuotaSources = []providerinventory.QuotaTelemetrySource{}
+	}
+	if report.QuotaSnapshots == nil {
+		report.QuotaSnapshots = []providerinventory.QuotaSnapshot{}
+	}
+	if report.UsageSummary == nil {
+		report.UsageSummary = []usageledger.UsageSummary{}
+	}
+	if report.BudgetSummary == nil {
+		report.BudgetSummary = []any{}
+	}
+	if report.AvailabilityScores == nil {
+		report.AvailabilityScores = []any{}
+	}
+	if report.CircuitBreakers == nil {
+		report.CircuitBreakers = []any{}
+	}
+	if report.GapReasons == nil {
+		report.GapReasons = []string{}
+	}
+	return report
+}
+
+func parseReportTime(value string) time.Time {
+	if t, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(value)); err == nil {
+		return t.UTC()
+	}
+	return time.Unix(0, 0).UTC()
+}
+
+func decompositionRoutingGaps(report Report) []string {
+	gaps := append([]string(nil), report.ProviderInventory.GapReasons...)
+	if len(report.ProviderInventory.Installations) == 0 {
+		gaps = append(gaps, "provider-inventory-missing")
+	}
+	if len(report.ProviderInventory.ModelCapabilities) == 0 {
+		gaps = append(gaps, "model-capability-inventory-missing")
+	}
+	for _, model := range report.ProviderInventory.ModelCapabilities {
+		if model.FreshnessState == providerinventory.FreshnessStale || model.FreshnessState == providerinventory.FreshnessExpired {
+			gaps = append(gaps, "stale-model-capability")
+			break
+		}
+	}
+	for _, auth := range report.ProviderInventory.AuthReadiness {
+		if auth.ReadinessState != providerinventory.ReadinessReady || auth.FreshnessState == providerinventory.FreshnessStale || auth.FreshnessState == providerinventory.FreshnessExpired {
+			gaps = append(gaps, "stale-or-unready-auth-readiness")
+			break
+		}
+	}
+	sort.Strings(gaps)
+	return dedupeDoctorStrings(gaps)
+}
+
+func dedupeDoctorStrings(values []string) []string {
+	out := values[:0]
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func renderLegacySurfaces(surfaces []LegacySurface) []renderedLegacySurface {
+	if len(surfaces) == 0 {
+		return nil
+	}
+	out := make([]renderedLegacySurface, 0, len(surfaces))
+	for _, surface := range surfaces {
+		out = append(out, renderedLegacySurface{
+			Surface:        surface.Surface,
+			Identifier:     filepath.ToSlash(surface.Identifier),
+			Classification: surface.Classification,
+			Remediation:    surface.Remediation,
+			Legacy:         surface.Legacy,
+			Current:        surface.Current,
+			Location:       filepath.ToSlash(surface.Location),
+			Detail:         surface.Detail,
+			Conflict:       surface.Conflict,
+		})
+	}
+	return out
+}
+
+func normalizeProviderInventory(report providerinventory.Report) providerinventory.Report {
+	if strings.TrimSpace(report.SchemaVersion) == "" {
+		report.SchemaVersion = providerinventory.ProviderInventoryJSONSchema
+	}
+	if strings.TrimSpace(report.GeneratedAt) == "" {
+		report.GeneratedAt = "1970-01-01T00:00:00Z"
+	}
+	if strings.TrimSpace(report.InventoryFingerprint) == "" {
+		report.InventoryFingerprint = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+	}
+	if report.Confidence == "" {
+		report.Confidence = providerinventory.ConfidenceUnknown
+	}
+	if report.Installations == nil {
+		report.Installations = []providerinventory.ProviderInstallation{}
+	}
+	if report.ProbeResults == nil {
+		report.ProbeResults = []providerinventory.ProbeResult{}
+	}
+	if report.AccountProfiles == nil {
+		report.AccountProfiles = []providerinventory.AccountProfile{}
+	}
+	if report.AuthReadiness == nil {
+		report.AuthReadiness = []providerinventory.AuthReadiness{}
+	}
+	if report.ModelCatalogSnapshots == nil {
+		report.ModelCatalogSnapshots = []providerinventory.ModelCatalogSnapshot{}
+	}
+	if report.ModelCapabilities == nil {
+		report.ModelCapabilities = []providerinventory.ModelCapability{}
+	}
+	if report.QuotaTelemetrySources == nil {
+		report.QuotaTelemetrySources = []providerinventory.QuotaTelemetrySource{}
+	}
+	if report.QuotaSnapshots == nil {
+		report.QuotaSnapshots = []providerinventory.QuotaSnapshot{}
+	}
+	if report.GapReasons == nil {
+		report.GapReasons = []string{}
+	}
+	return report
 }
 
 func WithMetadata(report Report, repoPath string, build BuildInfo) Report {
@@ -387,6 +694,9 @@ func WithMetadata(report Report, repoPath string, build BuildInfo) Report {
 		if resolved, err := hostprofile.Resolve(hostprofile.Options{Getenv: func(string) string { return "" }}); err == nil {
 			report.HostProfile = renderHostProfile(resolved)
 		}
+	}
+	if strings.TrimSpace(report.HostNegotiation.SchemaVersion) == "" {
+		report.HostNegotiation = normalizeHostNegotiation(report)
 	}
 	return report
 }
@@ -419,6 +729,10 @@ func DefaultDeps() Deps {
 		ProjectRepair: func(ctx context.Context, opts registry.Options) ([]registry.DuplicatePhysicalIdentity, error) {
 			return registry.RepairDuplicatePhysicalIdentities(ctx, opts, registry.DefaultDeps())
 		},
+		ProviderInventory: func(ctx context.Context, opts providerinventory.Options) (providerinventory.Report, error) {
+			return providerinventory.Discover(ctx, opts, providerinventory.DefaultDeps())
+		},
+		Now: time.Now,
 	}
 }
 
@@ -436,14 +750,18 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 		baseBranch = lcdefaults.BaseBranch
 	}
 	build := normalizeBuildInfo(opts.BuildInfo)
+	now := deps.Now().UTC()
 
 	if opts.Fix {
 		return runFix(ctx, repoPath, baseBranch, build, deps)
 	}
 
 	delivery := loadDelivery(ctx, repoPath, baseBranch, deps)
+	inventory, inventoryCheck := discoverProviderInventory(ctx, repoPath, delivery.Config, deps)
 	checks := make([]Check, 0, 10)
 	host, hostCheck := resolveHostProfile(delivery, deps)
+	runtime := runtimeHealth(ctx, repoPath, deps)
+	usageBudget, usageCheck := buildQuotaUsageBudget(ctx, repoPath, runtime.ProjectRegistry.ProjectID, inventory, now)
 
 	gitCheck, gitPresent := checkGit(deps)
 	checks = append(checks, gitCheck)
@@ -457,7 +775,12 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 	checks = append(checks, checkDeliveryConfig(delivery))
 	checks = append(checks, hostCheck)
 	checks = append(checks, checkModelSelections(delivery))
-	checks = append(checks, checkProviders(ctx, deps, configuredProviders(delivery.Config))...)
+	if inventoryCheck.Name != "" {
+		checks = append(checks, inventoryCheck)
+	}
+	checks = append(checks, checkQuotaTelemetry(inventory))
+	checks = append(checks, usageCheck)
+	checks = append(checks, checkProviders(inventory, configuredProviders(delivery.Config))...)
 	checks = append(checks, checkProviderCompatibility(delivery.Config, host)...)
 
 	originCheck, originPresent := checkOrigin(ctx, deps, repoPath, gitPresent)
@@ -486,8 +809,11 @@ func Run(ctx context.Context, opts Options, deps Deps) Report {
 
 	return WithMetadata(Report{
 		HostProfile:           host,
-		Runtime:               runtimeHealth(ctx, repoPath, deps),
+		HostNegotiation:       normalizeHostNegotiation(Report{HostProfile: host}),
+		Runtime:               runtime,
 		ProviderCompatibility: renderProviderCompatibility(provider.SmokeMatrix(runtimecap.DefaultContract())),
+		ProviderInventory:     inventory,
+		QuotaUsageBudget:      usageBudget,
 		Checks:                checks,
 	}, repoPath, build)
 }
@@ -503,12 +829,14 @@ func runFix(ctx context.Context, repoPath, baseBranch string, build BuildInfo, d
 		fixStaleState(repoPath),
 	}
 	status := scanMigrationStatus(repoPath, deps)
-	remaining := migrationLegacyCount(status)
+	remainingSurfaces := migrationLegacySurfaces(status, true)
+	remaining := len(remainingSurfaces)
 	if remaining > 0 {
 		checks = append(checks, Check{
-			Name:    "post-upgrade repair",
-			Status:  StatusWarn,
-			Message: fmt.Sprintf("repair completed with %d legacy surface(s) still reported; env vars must be changed in the shell and unreadable state may need manual repair", remaining),
+			Name:           "post-upgrade repair",
+			Status:         StatusWarn,
+			Message:        fmt.Sprintf("repair completed with %d legacy surface(s) still reported; see per-surface remediation below", remaining),
+			LegacySurfaces: remainingSurfaces,
 		})
 	} else {
 		checks = append(checks, Check{
@@ -523,11 +851,19 @@ func runFix(ctx context.Context, repoPath, baseBranch string, build BuildInfo, d
 		BaseBranch: baseBranch,
 		BuildInfo:  build,
 	}, deps)
+	readOnly.Runtime.Migration = runtimeMigrationWithMode(repoPath, deps, true)
+	for i := range readOnly.Checks {
+		if readOnly.Checks[i].Name == "migration status" {
+			readOnly.Checks[i] = checkMigrationStatusWithMode(repoPath, deps, true)
+		}
+	}
 	checks = append(checks, readOnly.Checks...)
 	return WithMetadata(Report{
 		Runtime:               readOnly.Runtime,
 		HostProfile:           readOnly.HostProfile,
 		ProviderCompatibility: readOnly.ProviderCompatibility,
+		ProviderInventory:     readOnly.ProviderInventory,
+		QuotaUsageBudget:      readOnly.QuotaUsageBudget,
 		Checks:                checks,
 	}, repoPath, build)
 }
@@ -847,6 +1183,12 @@ func normalizeDeps(deps Deps) Deps {
 	}
 	if deps.ProjectRepair == nil {
 		deps.ProjectRepair = defaults.ProjectRepair
+	}
+	if deps.ProviderInventory == nil {
+		deps.ProviderInventory = defaults.ProviderInventory
+	}
+	if deps.Now == nil {
+		deps.Now = defaults.Now
 	}
 	return deps
 }
@@ -1482,13 +1824,18 @@ func runtimeProjectRegistry(ctx context.Context, repoPath, dbPath string, databa
 }
 
 func runtimeMigration(repoPath string, deps Deps) RuntimeMigration {
+	return runtimeMigrationWithMode(repoPath, deps, false)
+}
+
+func runtimeMigrationWithMode(repoPath string, deps Deps, afterFix bool) RuntimeMigration {
 	status := scanMigrationStatus(repoPath, deps)
-	legacyCount := migrationLegacyCount(status)
-	if legacyCount > 0 {
+	surfaces := migrationLegacySurfaces(status, afterFix)
+	if len(surfaces) > 0 {
 		return RuntimeMigration{
 			Status:         StatusWarn,
-			LegacySurfaces: legacyCount,
-			Message:        "legacy surfaces require explicit doctor --fix migration",
+			LegacySurfaces: len(surfaces),
+			Surfaces:       surfaces,
+			Message:        legacySurfaceSummary(afterFix),
 		}
 	}
 	if strings.TrimSpace(status.ScanWarning) != "" {
@@ -1954,8 +2301,12 @@ func renderHostProfile(resolved hostprofile.Resolved) HostProfile {
 		Source:             string(resolved.Source),
 		Selector:           resolved.Selector,
 		InvocationStyle:    resolved.Runtime.InvocationStyle,
+		PreservesStdout:    resolved.Runtime.PreservesStdout,
+		PreservesStderr:    resolved.Runtime.PreservesStderr,
 		SupportsHooks:      resolved.Runtime.SupportsHooks,
 		SupportsJSONOutput: resolved.Runtime.SupportsJSONOutput,
+		SupportsTimeouts:   resolved.Runtime.SupportsTimeouts,
+		SupportsCancel:     resolved.Runtime.SupportsCancel,
 		DetectedBy:         append([]string(nil), resolved.DetectedBy...),
 		KnownLimitations:   append([]string(nil), resolved.Runtime.KnownLimitations...),
 	}
@@ -2060,42 +2411,270 @@ func configuredProviders(cfg config.Config) []providerSpec {
 	return providers
 }
 
-func checkProviders(ctx context.Context, deps Deps, providers []providerSpec) []Check {
+func discoverProviderInventory(ctx context.Context, repoPath string, cfg config.Config, deps Deps) (providerinventory.Report, Check) {
+	report, err := deps.ProviderInventory(ctx, providerinventory.Options{
+		RepoPath: repoPath,
+		Config:   cfg,
+	})
+	if err != nil {
+		return normalizeProviderInventory(providerinventory.Report{}), Check{
+			Name:    "provider inventory",
+			Code:    "provider_inventory_failed",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("bounded provider CLI discovery failed: %v", err),
+		}
+	}
+	return normalizeProviderInventory(report), Check{
+		Name:    "provider inventory",
+		Code:    "provider_inventory_refreshed",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("bounded provider probes captured %d installation(s), %d probe result(s), %d account profile(s), %d auth readiness record(s), %d model catalog snapshot(s), %d model capability record(s), %d quota source declaration(s), and %d quota snapshot(s); model authorization, quota, and invocation approval remain separate", len(report.Installations), len(report.ProbeResults), len(report.AccountProfiles), len(report.AuthReadiness), len(report.ModelCatalogSnapshots), len(report.ModelCapabilities), len(report.QuotaTelemetrySources), len(report.QuotaSnapshots)),
+	}
+}
+
+func checkQuotaTelemetry(inventory providerinventory.Report) Check {
+	if len(inventory.QuotaSnapshots) == 0 {
+		return Check{
+			Name:    "quota telemetry",
+			Code:    "quota_telemetry_absent",
+			Status:  StatusWarn,
+			Message: "no quota snapshots are present; quota remains unknown until an allowlisted source is declared",
+		}
+	}
+	parts := make([]string, 0, len(inventory.QuotaSnapshots))
+	for _, snapshot := range inventory.QuotaSnapshots {
+		source := snapshot.QuotaSourceID
+		if len(source) > 18 {
+			source = source[:18] + "..."
+		}
+		gaps := "none"
+		if len(snapshot.GapReasons) > 0 {
+			gaps = strings.Join(snapshot.GapReasons, ",")
+		}
+		reset := string(snapshot.ResetSemantics)
+		if strings.TrimSpace(snapshot.ResetAt) != "" {
+			reset += "@" + snapshot.ResetAt
+		}
+		conflicts := "none"
+		if len(snapshot.ConflictSet) > 0 {
+			conflicts = strings.Join(snapshot.ConflictSet, ",")
+		}
+		parts = append(parts, fmt.Sprintf("%s scope=%s unit=%s source=%s confidence=%s freshness=%s reset=%s conflict_set=%s gaps=%s",
+			firstNonEmpty(snapshot.AdapterID, "provider"),
+			firstNonEmpty(snapshot.ScopeKey, "unknown"),
+			firstNonEmpty(snapshot.Unit, "unknown"),
+			source,
+			snapshot.Confidence,
+			snapshot.FreshnessState,
+			reset,
+			conflicts,
+			gaps,
+		))
+	}
+	sort.Strings(parts)
+	return Check{
+		Name:    "quota telemetry",
+		Code:    "quota_telemetry_honest",
+		Status:  StatusOK,
+		Message: "quota snapshots: " + strings.Join(parts, "; "),
+	}
+}
+
+func buildQuotaUsageBudget(ctx context.Context, repoPath, projectID string, inventory providerinventory.Report, now time.Time) (usageledger.QuotaUsageBudget, Check) {
+	store := storage.Store(nil)
+	layout, layoutErr := home.Resolve(home.DefaultDeps())
+	if layoutErr == nil {
+		if health, healthErr := storage.CheckHealth(ctx, layout.DatabasePath()); healthErr == nil && health.OK && health.SchemaVersion == storage.CurrentSchemaVersion {
+			opened, openErr := storage.Open(ctx, storage.Options{Path: layout.DatabasePath(), Now: func() time.Time { return now }})
+			if openErr == nil {
+				store = opened
+				defer store.Close()
+			}
+		}
+	}
+	budget, err := usageledger.BuildQuotaUsageBudgetFromReports(ctx, store, repoPath, projectID, now)
+	if err != nil {
+		return normalizeQuotaUsageBudget(usageledger.QuotaUsageBudget{}), Check{
+			Name:    "quota usage budget",
+			Code:    "quota_usage_budget_failed",
+			Status:  StatusWarn,
+			Message: fmt.Sprintf("could not derive local usage ledger summary from reports: %v", err),
+		}
+	}
+	budget = normalizeQuotaUsageBudget(budget)
+	budget.QuotaSources = inventory.QuotaTelemetrySources
+	budget.QuotaSnapshots = inventory.QuotaSnapshots
+	var typedBudgetSummaries []budgetpkg.Summary
+	if store != nil {
+		summaries, summaryErr := budgetpkg.Summaries(ctx, store, projectID)
+		if summaryErr == nil && len(summaries) > 0 {
+			typedBudgetSummaries = summaries
+			budget.BudgetSummary = make([]any, 0, len(summaries))
+			for _, summary := range summaries {
+				budget.BudgetSummary = append(budget.BudgetSummary, summary)
+			}
+			budget.GapReasons = append(budget.GapReasons, "operator-configured-budget-policy")
+			budget.Confidence = providerinventory.ConfidenceEstimated
+		}
+		loaded, loadErr := availability.Load(ctx, store)
+		if loadErr == nil {
+			derived := availability.Derive(availability.Inputs{
+				Inventory:       inventory,
+				UsageSummaries:  budget.UsageSummary,
+				BudgetSummaries: typedBudgetSummaries,
+				Observations:    loaded.Observations,
+				CircuitBreakers: loaded.CircuitBreakers,
+				Policy: availability.Policy{
+					ExactQuotaRequired: true,
+				},
+				Now: now,
+			})
+			_ = availability.Persist(ctx, store, derived)
+			budget.AvailabilityScores = make([]any, 0, len(derived.Scores))
+			for _, score := range derived.Scores {
+				budget.AvailabilityScores = append(budget.AvailabilityScores, score)
+			}
+			budget.CircuitBreakers = make([]any, 0, len(derived.CircuitBreakers))
+			for _, breaker := range derived.CircuitBreakers {
+				budget.CircuitBreakers = append(budget.CircuitBreakers, breaker)
+			}
+			if len(derived.Scores) > 0 {
+				budget.GapReasons = append(budget.GapReasons, "availability-read-model-derived")
+				budget.Confidence = providerinventory.ConfidenceEstimated
+			}
+		}
+	}
+	budget = usageledger.FinalizeQuotaUsageBudget(normalizeQuotaUsageBudget(budget))
+	if len(budget.UsageSummary) == 0 && len(budget.BudgetSummary) == 0 && len(budget.AvailabilityScores) == 0 {
+		return budget, Check{
+			Name:    "quota usage budget",
+			Code:    "quota_usage_budget_empty",
+			Status:  StatusWarn,
+			Message: "no local usage records found; quota remains unknown and no provider-wide usage is inferred",
+		}
+	}
+	if len(budget.AvailabilityScores) > 0 && len(budget.BudgetSummary) == 0 && len(budget.UsageSummary) == 0 {
+		return budget, Check{
+			Name:    "quota usage budget",
+			Code:    "quota_usage_budget_availability_state",
+			Status:  StatusOK,
+			Message: fmt.Sprintf("availability read model derived %d score(s), confidence=%s; gaps=%s", len(budget.AvailabilityScores), budget.Confidence, strings.Join(budget.GapReasons, ",")),
+		}
+	}
+	if len(budget.BudgetSummary) > 0 {
+		return budget, Check{
+			Name:    "quota usage budget",
+			Code:    "quota_usage_budget_policy_state",
+			Status:  StatusOK,
+			Message: fmt.Sprintf("local budget accounting summarized %d budget scope(s), %d usage scope(s), %d availability score(s), confidence=%s; gaps=%s", len(budget.BudgetSummary), len(budget.UsageSummary), len(budget.AvailabilityScores), budget.Confidence, strings.Join(budget.GapReasons, ",")),
+		}
+	}
+	return budget, Check{
+		Name:    "quota usage budget",
+		Code:    "quota_usage_budget_local_estimate",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("local usage ledger summarized %d scope(s) with confidence=%s; not provider-global quota; gaps=%s", len(budget.UsageSummary), budget.Confidence, strings.Join(budget.GapReasons, ",")),
+	}
+}
+
+func checkProviders(inventory providerinventory.Report, providers []providerSpec) []Check {
 	checks := make([]Check, 0, len(providers))
 	for _, provider := range providers {
 		roleText := strings.Join(provider.Roles, ", ")
 		cliName := providerCLIName(provider.Name)
-		path, err := deps.LookPath(cliName)
-		if err != nil || strings.TrimSpace(path) == "" {
+		installations := installationsForProvider(inventory, provider.Name)
+		if len(installations) == 0 {
 			status := StatusWarn
 			hard := false
 			fix := ""
 			if provider.Name == "antigravity" {
 				status = StatusFail
 				hard = true
-				fix = "; install Google Antigravity CLI and run: agy login"
+				fix = "; install Google Antigravity CLI"
 			}
 			checks = append(checks, Check{
 				Name:    "provider " + provider.Name,
 				Code:    "missing_executable",
 				Status:  status,
-				Message: fmt.Sprintf("configured for %s but CLI %q was not found on PATH%s", roleText, cliName, fix),
+				Message: fmt.Sprintf("configured for %s but declared CLI %q was not found through bounded provider inventory probes%s", roleText, cliName, fix),
 				Hard:    hard,
 			})
 			continue
 		}
-		if provider.Name == "antigravity" {
-			checks = append(checks, checkAntigravityOAuth(ctx, deps, roleText, path))
-			continue
+		best := installations[0]
+		status := StatusOK
+		code := "provider_installed"
+		for _, installation := range installations {
+			if installation.InstallationState == providerinventory.InstallationInstalled {
+				best = installation
+				break
+			}
 		}
+		if best.InstallationState != providerinventory.InstallationInstalled {
+			status = StatusWarn
+			code = "provider_installation_probe_failed"
+		}
+		authSummary := providerAuthSummary(inventory, provider.Name)
 		checks = append(checks, Check{
-			Name:    "provider " + provider.Name,
-			Code:    "provider_ready",
-			Status:  StatusOK,
-			Message: fmt.Sprintf("configured for %s; CLI %q found at %s; authentication not checked by a stable cheap probe", roleText, cliName, path),
+			Name:   "provider " + provider.Name,
+			Code:   code,
+			Status: status,
+			Message: fmt.Sprintf("configured for %s; CLI %q discovered via %s at %s; state=%s confidence=%s freshness=%s captured_at=%s usable_for_invocation=%s; %s; model authorization, quota, and invocation approval remain separate",
+				roleText,
+				cliName,
+				best.DiscoverySource,
+				best.CanonicalPathRedacted,
+				best.InstallationState,
+				best.Confidence,
+				best.FreshnessState,
+				best.CapturedAt,
+				best.UsableForInvocation,
+				authSummary,
+			),
 		})
 	}
 	return checks
+}
+
+func providerAuthSummary(inventory providerinventory.Report, providerName string) string {
+	var latest *providerinventory.AuthReadiness
+	for i := range inventory.AuthReadiness {
+		entry := &inventory.AuthReadiness[i]
+		if entry.AdapterID != providerName {
+			continue
+		}
+		if latest == nil || entry.CapturedAt > latest.CapturedAt || (entry.CapturedAt == latest.CapturedAt && entry.AuthReadinessID > latest.AuthReadinessID) {
+			latest = entry
+		}
+	}
+	if latest == nil {
+		return "auth_readiness=unknown evidence=not-run"
+	}
+	parts := []string{
+		"auth_readiness=" + string(latest.ReadinessState),
+		"evidence=" + string(latest.EvidenceKind),
+		"scope=" + string(latest.AuthorizationScopeState),
+	}
+	if latest.UnsupportedReason != "" {
+		parts = append(parts, "reason="+latest.UnsupportedReason)
+	}
+	return strings.Join(parts, " ")
+}
+
+func installationsForProvider(inventory providerinventory.Report, providerName string) []providerinventory.ProviderInstallation {
+	var out []providerinventory.ProviderInstallation
+	for _, installation := range inventory.Installations {
+		if installation.AdapterID == providerName {
+			out = append(out, installation)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].InstallationState != out[j].InstallationState {
+			return out[i].InstallationState == providerinventory.InstallationInstalled
+		}
+		return out[i].DiscoveryOrder < out[j].DiscoveryOrder
+	})
+	return out
 }
 
 func checkProviderCompatibility(cfg config.Config, host HostProfile) []Check {
@@ -2210,65 +2789,6 @@ func providerCLIName(provider string) string {
 		return strings.TrimSpace(registered.CLI)
 	}
 	return provider
-}
-
-func checkAntigravityOAuth(ctx context.Context, deps Deps, roleText, path string) Check {
-	result, err := deps.RunCommand(ctx, "", "agy", "models")
-	if err != nil {
-		detail := commandDetail(result)
-		if detail != "" {
-			detail = ": " + detail
-		}
-		return Check{
-			Name:    "provider antigravity",
-			Code:    "unauthenticated_provider",
-			Status:  StatusFail,
-			Message: fmt.Sprintf("configured for %s; CLI \"agy\" found at %s but agy models could not run: %v%s; run: agy login", roleText, path, err, detail),
-			Hard:    true,
-		}
-	}
-	if result.ExitCode != 0 {
-		detail := commandDetail(result)
-		if detail == "" {
-			detail = fmt.Sprintf("exit code %d", result.ExitCode)
-		}
-		return Check{
-			Name:    "provider antigravity",
-			Code:    "unauthenticated_provider",
-			Status:  StatusFail,
-			Message: fmt.Sprintf("configured for %s; CLI \"agy\" found at %s but agy models failed: %s; run: agy login", roleText, path, detail),
-			Hard:    true,
-		}
-	}
-	if antigravityAuthProbeLooksFailed(result.Stdout + "\n" + result.Stderr) {
-		detail := commandDetail(result)
-		return Check{
-			Name:    "provider antigravity",
-			Code:    "unauthenticated_provider",
-			Status:  StatusFail,
-			Message: fmt.Sprintf("configured for %s; CLI \"agy\" found at %s but agy models reported an authentication problem: %s; run: agy login", roleText, path, firstNonEmpty(detail, "authentication required")),
-			Hard:    true,
-		}
-	}
-	return Check{
-		Name:    "provider antigravity",
-		Code:    "provider_authenticated",
-		Status:  StatusOK,
-		Message: fmt.Sprintf("configured for %s; CLI \"agy\" found at %s; agy models OAuth probe succeeded", roleText, path),
-	}
-}
-
-func antigravityAuthProbeLooksFailed(text string) bool {
-	lower := strings.ToLower(text)
-	authSignal := strings.Contains(lower, "oauth") ||
-		strings.Contains(lower, "login") ||
-		strings.Contains(lower, "auth")
-	failureSignal := strings.Contains(lower, "error") ||
-		strings.Contains(lower, "failed") ||
-		strings.Contains(lower, "required") ||
-		strings.Contains(lower, "unauthorized") ||
-		strings.Contains(lower, "not logged")
-	return authSignal && failureSignal
 }
 
 func checkOrigin(ctx context.Context, deps Deps, repoPath string, gitPresent bool) (Check, bool) {
@@ -2463,7 +2983,7 @@ func checkVersionStatus(build BuildInfo, repoPath string, deps Deps) Check {
 	}
 	if legacyCount > 0 {
 		status = StatusWarn
-		parts = append(parts, fmt.Sprintf("migration scan found %d legacy surface(s); run: loopcoder doctor --repo . --fix", legacyCount))
+		parts = append(parts, fmt.Sprintf("migration scan found %d legacy surface(s); see migration status check for per-surface remediation", legacyCount))
 	} else {
 		parts = append(parts, "migration scan found no legacy surfaces")
 	}
@@ -3121,14 +3641,19 @@ func compareSemver(a, b semver) int {
 }
 
 func checkMigrationStatus(repoPath string, deps Deps) Check {
-	status := scanMigrationStatus(repoPath, deps)
-	legacyCount := migrationLegacyCount(status)
+	return checkMigrationStatusWithMode(repoPath, deps, false)
+}
 
-	if legacyCount > 0 {
+func checkMigrationStatusWithMode(repoPath string, deps Deps, afterFix bool) Check {
+	status := scanMigrationStatus(repoPath, deps)
+	surfaces := migrationLegacySurfaces(status, afterFix)
+
+	if len(surfaces) > 0 {
 		return Check{
-			Name:    "migration status",
-			Status:  StatusWarn,
-			Message: fmt.Sprintf("found %d legacy surface(s) requiring migration; run: loopcoder doctor --repo . --fix", legacyCount),
+			Name:           "migration status",
+			Status:         StatusWarn,
+			Message:        fmt.Sprintf("found %d legacy surface(s) requiring migration; see per-surface remediation below", len(surfaces)),
+			LegacySurfaces: surfaces,
 		}
 	}
 	return Check{
@@ -3148,7 +3673,99 @@ func scanMigrationStatus(repoPath string, deps Deps) upgrade.MigrationStatus {
 }
 
 func migrationLegacyCount(status upgrade.MigrationStatus) int {
+	return len(migrationLegacySurfaces(status, false))
+}
+
+func legacySurfaceSummary(afterFix bool) string {
+	if afterFix {
+		return "legacy surfaces remain after doctor --fix; follow per-surface remediation"
+	}
+	return "legacy surfaces require migration; follow per-surface remediation"
+}
+
+func migrationLegacySurfaces(status upgrade.MigrationStatus, afterFix bool) []LegacySurface {
+	surfaces := make([]LegacySurface, 0, migrationLegacyCountRaw(status))
+	appendDiagnosticSurfaces := func(diagnostics []migration.Diagnostic) {
+		for _, diagnostic := range diagnostics {
+			surfaces = append(surfaces, legacySurfaceFromDiagnostic(diagnostic, afterFix))
+		}
+	}
+	appendDiagnosticSurfaces(status.ConfigDiagnostics)
+	appendDiagnosticSurfaces(status.EnvDiagnostics)
+	appendDiagnosticSurfaces(status.HookDiagnostics)
+	for _, diagnostic := range status.OldSurfaceDiagnostics {
+		surfaces = append(surfaces, legacySurfaceFromOldSurface(diagnostic, afterFix))
+	}
+	sort.SliceStable(surfaces, func(i, j int) bool {
+		if surfaces[i].Surface != surfaces[j].Surface {
+			return surfaces[i].Surface < surfaces[j].Surface
+		}
+		return surfaces[i].Identifier < surfaces[j].Identifier
+	})
+	return surfaces
+}
+
+func migrationLegacyCountRaw(status upgrade.MigrationStatus) int {
 	return len(status.EnvDiagnostics) + len(status.HookDiagnostics) + len(status.OldSurfaceDiagnostics) + len(status.ConfigDiagnostics)
+}
+
+func legacySurfaceFromDiagnostic(diagnostic migration.Diagnostic, afterFix bool) LegacySurface {
+	surface := LegacySurface{
+		Surface:    string(diagnostic.Surface),
+		Identifier: diagnostic.Legacy,
+		Legacy:     diagnostic.Legacy,
+		Current:    diagnostic.Current,
+		Detail:     diagnostic.Detail,
+		Conflict:   diagnostic.Conflict,
+	}
+	switch diagnostic.Surface {
+	case migration.SurfaceEnv:
+		surface.Classification = "manual"
+		surface.Remediation = firstNonEmpty(diagnostic.FixCommand, fmt.Sprintf("set %s and unset %s in the shell environment", diagnostic.Current, diagnostic.Legacy))
+	case migration.SurfaceHookCommand:
+		surface.Identifier = fmt.Sprintf(".claude/settings.json command %q", diagnostic.Legacy)
+		surface.Location = ".claude/settings.json"
+		if afterFix {
+			surface.Classification = "manual"
+			surface.Remediation = "doctor --fix did not clear this hook command; inspect .claude/settings.json and replace the legacy command manually"
+		} else {
+			surface.Classification = "fix-with-flag"
+			surface.Remediation = "run: loopcoder doctor --repo . --fix"
+		}
+	case migration.SurfaceConfigKey:
+		surface.Identifier = fmt.Sprintf(".delivery.yml key %q", diagnostic.Legacy)
+		surface.Location = ".delivery.yml"
+		if afterFix {
+			surface.Classification = "manual"
+			surface.Remediation = "doctor --fix did not clear this config key; inspect .delivery.yml and migrate it to the current report key manually"
+		} else {
+			surface.Classification = "fix-with-flag"
+			surface.Remediation = "run: loopcoder doctor --repo . --fix"
+		}
+	default:
+		surface.Classification = "ignorable-during-transition-window"
+		surface.Remediation = firstNonEmpty(diagnostic.FixCommand, "accepted by compatibility aliases during the transition window")
+	}
+	return surface
+}
+
+func legacySurfaceFromOldSurface(diagnostic upgrade.OldSurfaceDiagnostic, afterFix bool) LegacySurface {
+	surface := LegacySurface{
+		Surface:    diagnostic.Surface,
+		Identifier: firstNonEmpty(diagnostic.Location, diagnostic.Legacy),
+		Legacy:     diagnostic.Legacy,
+		Current:    diagnostic.Current,
+		Location:   diagnostic.Location,
+		Detail:     diagnostic.Detail,
+	}
+	if afterFix {
+		surface.Classification = "manual"
+		surface.Remediation = fmt.Sprintf("doctor --fix did not clear this %s; inspect the reported path and repair it manually", diagnostic.Surface)
+		return surface
+	}
+	surface.Classification = "fix-with-flag"
+	surface.Remediation = "run: loopcoder doctor --repo . --fix"
+	return surface
 }
 
 func checkStaleState(repoPath string, deps Deps) Check {

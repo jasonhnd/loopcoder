@@ -1,0 +1,318 @@
+{
+  "schema_version": "loopcoder.run_status.v1",
+  "observability": {
+    "schema_version": "loopcoder.observability_render.v1",
+    "command": "status",
+    "mode": "canonical",
+    "correlation": {
+      "project_id": "proj_TEST",
+      "delivery_run_id": "run-golden",
+      "source": "status"
+    },
+    "items": [
+      {
+        "id": "run-golden",
+        "kind": "run-tree-node",
+        "status": "planned",
+        "duration": "",
+        "provider": "codex",
+        "model": "gpt-5.5",
+        "effort": "high",
+        "permission": "write",
+        "usage": {
+          "input_tokens": null,
+          "output_tokens": null,
+          "total_tokens": null
+        },
+        "confidence": "exact",
+        "freshness": "durable",
+        "source_refs": [
+          {
+            "table": "run_tree",
+            "record_id": "run-golden",
+            "project_id": "proj_TEST",
+            "delivery_run_id": "run-golden",
+            "provenance": "local-run-tree"
+          }
+        ],
+        "redaction": {
+          "applied": true,
+          "mode": "payload_hash_only",
+          "fields": [
+            "payload_json",
+            "provider_output",
+            "diagnostics",
+            "paths",
+            "secret_reference"
+          ],
+          "payload_exposed": false
+        },
+        "truncation": {
+          "applied": false,
+          "fields": []
+        }
+      },
+      {
+        "id": "job-864",
+        "kind": "worker-status",
+        "status": "succeeded",
+        "duration": "42s",
+        "provider": "codex",
+        "model": "gpt-5.5",
+        "effort": "high",
+        "permission": "write",
+        "usage": {
+          "input_tokens": 120,
+          "output_tokens": 34,
+          "total_tokens": 154
+        },
+        "confidence": "exact",
+        "freshness": "durable",
+        "source_refs": [
+          {
+            "table": "worker_attempts",
+            "record_id": "job-864",
+            "delivery_run_id": "run-golden",
+            "provenance": "local-run-status"
+          }
+        ],
+        "redaction": {
+          "applied": true,
+          "mode": "payload_hash_only",
+          "fields": [
+            "payload_json",
+            "provider_output",
+            "diagnostics",
+            "paths",
+            "secret_reference"
+          ],
+          "payload_exposed": false
+        },
+        "truncation": {
+          "applied": false,
+          "fields": []
+        }
+      },
+      {
+        "id": "job-865",
+        "kind": "worker-status",
+        "status": "succeeded",
+        "duration": "42s",
+        "provider": "codex",
+        "model": "gpt-5.5",
+        "effort": "high",
+        "permission": "write",
+        "usage": {
+          "input_tokens": 220,
+          "output_tokens": 44,
+          "total_tokens": 264
+        },
+        "confidence": "exact",
+        "freshness": "durable",
+        "source_refs": [
+          {
+            "table": "worker_attempts",
+            "record_id": "job-865",
+            "delivery_run_id": "run-golden",
+            "provenance": "local-run-status"
+          }
+        ],
+        "redaction": {
+          "applied": true,
+          "mode": "payload_hash_only",
+          "fields": [
+            "payload_json",
+            "provider_output",
+            "diagnostics",
+            "paths",
+            "secret_reference"
+          ],
+          "payload_exposed": false
+        },
+        "truncation": {
+          "applied": false,
+          "fields": []
+        }
+      }
+    ],
+    "evidence": [],
+    "redaction": {
+      "applied": true,
+      "mode": "payload_hash_only",
+      "fields": [
+        "payload_json",
+        "provider_output",
+        "diagnostics",
+        "paths",
+        "secret_reference"
+      ],
+      "payload_exposed": false
+    },
+    "truncation": {
+      "applied": false,
+      "fields": []
+    }
+  },
+  "run_id": "run-golden",
+  "run_note": "requested run",
+  "run_path": "$REPO/.loopcoder/runs/run-golden",
+  "project": {
+    "project_id": "proj_TEST",
+    "display_name": "repo",
+    "local_path": "",
+    "identity_source": "local-path"
+  },
+  "event_count": 2,
+  "verifier_record_count": 0,
+  "lifecycle_state": "planned",
+  "lifecycle_source": "lifecycle",
+  "lifecycle_events": 1,
+  "child_run_ids": [],
+  "inventory_refs": {
+    "schema_version": "loopcoder.inventory_refs.v1",
+    "inventory_fingerprint": "sha256:9d7bde586fe94b069adfc85e411fc5cccc7b167d7127aaab9fc915b40b13ba38",
+    "provider_installation_ids": [],
+    "account_profile_ids": [],
+    "auth_readiness_ids": [],
+    "model_catalog_snapshot_ids": [],
+    "model_capability_ids": [],
+    "quota_snapshot_ids": [],
+    "confidence": "unknown",
+    "gap_reasons": [
+      "inventory-not-bound-to-run"
+    ]
+  },
+  "quota_usage_refs": {
+    "schema_version": "loopcoder.quota_usage_refs.v1",
+    "quota_usage_fingerprint": "sha256:a480254e67cd298b83503aad42732e8600987e4baefae1a398f8c721e508eb57",
+    "quota_snapshot_ids": [],
+    "usage_record_ids": [
+      "usage_TEST",
+      "usage_TEST",
+      "usage_TEST",
+      "usage_TEST",
+      "usage_TEST",
+      "usage_TEST"
+    ],
+    "budget_policy_ids": [],
+    "budget_reservation_ids": [],
+    "availability_score_ids": [],
+    "circuit_breaker_ids": [],
+    "confidence": "estimated",
+    "hard_ineligible_reasons": [],
+    "gap_reasons": [
+      "loopcoder-local-ledger-not-provider-global"
+    ]
+  },
+  "run_tree": {
+    "root_run_id": "run-golden",
+    "selected_run_id": "run-golden",
+    "nodes": [
+      {
+        "project_id": "proj_TEST",
+        "run_id": "run-golden",
+        "child_run_ids": [],
+        "depth": 0,
+        "issue": 865,
+        "role": "worker",
+        "provider": "codex",
+        "model": "gpt-5.5",
+        "effort": "high",
+        "permission": "write",
+        "lifecycle_status": "planned",
+        "lifecycle_source": "lifecycle",
+        "started_at": "2026-07-14T00:00:00Z",
+        "updated_at": "2026-06-28T00:00:42Z",
+        "ended_at": "2026-06-28T00:00:42Z",
+        "report_summary": "implement issue #codex-golden"
+      }
+    ],
+    "summary": {
+      "run_count": 1,
+      "terminal_runs": 0,
+      "interrupted_runs": 1,
+      "failed_runs": 0,
+      "needs_human_runs": 0
+    }
+  },
+  "agent_tree": {
+    "schema_version": "loopcoder.agent_tree.v1",
+    "root_run_id": "run-golden",
+    "agent_federation_fingerprint": "",
+    "registrations": [],
+    "blocked": [],
+    "needs_human": []
+  },
+  "rows": [
+    {
+      "issue": "#864",
+      "worker_job": "job-864",
+      "pr": "not reported",
+      "worker_provider": "codex",
+      "worker_model": "gpt-5.5",
+      "worker_model_source": "parsed",
+      "worker_effort": "high",
+      "worker_permission": "write",
+      "worker_duration": "42s",
+      "worker_input_tokens": "120",
+      "worker_output_tokens": "34",
+      "worker_total_tokens": "154",
+      "worker_verified": "true",
+      "provider_pid": "not reported",
+      "provider_pgid": "not reported",
+      "provider_authority": "not reported",
+      "provider_verified": "not reported",
+      "provider_owner": "not reported",
+      "provider_generation": "not reported",
+      "provider_authority_note": "not reported",
+      "phase": "codex_exited",
+      "status": "succeeded",
+      "verifier_verdict": "not reported",
+      "verifier_provider": "not reported",
+      "verifier_model": "not reported",
+      "verifier_model_source": "not reported",
+      "verifier_effort": "not reported",
+      "verifier_permission": "not reported",
+      "verifier_duration": "not reported",
+      "verifier_input_tokens": "not reported",
+      "verifier_output_tokens": "not reported",
+      "verifier_total_tokens": "not reported",
+      "verifier_verified": "not reported"
+    },
+    {
+      "issue": "#865",
+      "worker_job": "job-865",
+      "pr": "not reported",
+      "worker_provider": "codex",
+      "worker_model": "gpt-5.5",
+      "worker_model_source": "parsed",
+      "worker_effort": "high",
+      "worker_permission": "write",
+      "worker_duration": "42s",
+      "worker_input_tokens": "220",
+      "worker_output_tokens": "44",
+      "worker_total_tokens": "264",
+      "worker_verified": "true",
+      "provider_pid": "not reported",
+      "provider_pgid": "not reported",
+      "provider_authority": "not reported",
+      "provider_verified": "not reported",
+      "provider_owner": "not reported",
+      "provider_generation": "not reported",
+      "provider_authority_note": "not reported",
+      "phase": "codex_exited",
+      "status": "succeeded",
+      "verifier_verdict": "not reported",
+      "verifier_provider": "not reported",
+      "verifier_model": "not reported",
+      "verifier_model_source": "not reported",
+      "verifier_effort": "not reported",
+      "verifier_permission": "not reported",
+      "verifier_duration": "not reported",
+      "verifier_input_tokens": "not reported",
+      "verifier_output_tokens": "not reported",
+      "verifier_total_tokens": "not reported",
+      "verifier_verified": "not reported"
+    }
+  ]
+}

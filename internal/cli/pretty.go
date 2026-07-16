@@ -18,17 +18,21 @@ type commandOutputMode struct {
 }
 
 func normalizeCommandOutputMode(command, format string, verbose bool, stderr io.Writer) (commandOutputMode, bool) {
+	return normalizeCommandOutputModeWithFormats(command, format, verbose, stderr, "text", "json")
+}
+
+func normalizeCommandOutputModeWithFormats(command, format string, verbose bool, stderr io.Writer, allowed ...string) (commandOutputMode, bool) {
 	format = strings.ToLower(strings.TrimSpace(format))
 	if format == "" {
 		format = "text"
 	}
-	switch format {
-	case "text", "json":
-		return commandOutputMode{Format: format, Verbose: verbose}, true
-	default:
-		fmt.Fprintf(stderr, "%s: invalid --format %q; want text or json\n", command, format)
-		return commandOutputMode{}, false
+	for _, candidate := range allowed {
+		if format == candidate {
+			return commandOutputMode{Format: format, Verbose: verbose}, true
+		}
 	}
+	fmt.Fprintf(stderr, "%s: invalid --format %q; want %s\n", command, format, strings.Join(allowed, ", "))
+	return commandOutputMode{}, false
 }
 
 func writeJSONLine(w io.Writer, value any) error {

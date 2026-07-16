@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/report"
@@ -21,6 +22,13 @@ import (
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 	"github.com/jasonhnd/loopcoder/internal/worker"
 )
+
+func TestDispatchWaveClassifiesProviderCallRefusalAsNeedsHuman(t *testing.T) {
+	err := fmt.Errorf("worker prelaunch: %w", agent.ProviderCallRefusedError{Err: errors.New("model-call-budget")})
+	if got := dispatchWaveFailureStatus(err, worker.Result{}); got != DispatchWaveStatusNeedsHuman {
+		t.Fatalf("status = %q, want %q", got, DispatchWaveStatusNeedsHuman)
+	}
+}
 
 func TestDispatchWaveExplicitIssueNumbers(t *testing.T) {
 	var calls []worker.Options
@@ -138,9 +146,33 @@ func TestDispatchWavePreflightSkip(t *testing.T) {
 	if len(report.Results) != 1 || report.Results[0].Status != DispatchWaveStatusSkipped {
 		t.Fatalf("results = %#v, want one skipped result", report.Results)
 	}
+	if report.Results[0].ProviderInvoked {
+		t.Fatal("preflight-skipped result reported a provider invocation")
+	}
 	if report.Results[0].PR != "https://github.com/owner/repo/pull/70" ||
 		!strings.Contains(report.Results[0].Error, "open PR #70") {
 		t.Fatalf("skip result missing PR/reason: %#v", report.Results[0])
+	}
+}
+
+func TestDispatchWavePreservesProviderFreeDeliveryOutcome(t *testing.T) {
+	result := dispatchWaveIssue(context.Background(), DispatchWaveOptions{
+		Reader:   fakeReader{views: map[int]gh.Issue{7: {Number: 7, Title: "Seven"}}},
+		RepoPath: t.TempDir(),
+		RunID:    "run-delivery-retry",
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			return worker.Result{
+				Issue:           7,
+				Status:          state.StatusSucceeded,
+				Outcome:         "pr_adopted",
+				ProviderOutcome: "provider_completed",
+				DeliveryOutcome: "pr_adopted",
+				Evidence:        []string{"reused prior provider work"},
+			}, nil
+		},
+	}, 7)
+	if result.ProviderInvoked || result.ProviderOutcome != "provider_completed" || result.DeliveryOutcome != "pr_adopted" || !reflect.DeepEqual(result.Evidence, []string{"reused prior provider work"}) {
+		t.Fatalf("result = %#v, want provider-free delivery metadata", result)
 	}
 }
 
@@ -178,6 +210,9 @@ func TestDispatchWavePartialFailure(t *testing.T) {
 	}
 	if report.Results[1].Status != DispatchWaveStatusFailed || report.Results[1].Error != "worker failed" {
 		t.Fatalf("issue #2 result = %#v, want failed worker error", report.Results[1])
+	}
+	if !report.Results[0].ProviderInvoked || !report.Results[1].ProviderInvoked {
+		t.Fatalf("provider invocation evidence missing: %#v", report.Results)
 	}
 	if report.Results[1].Report == nil || report.Results[1].Report.Model != "worker-model-2" {
 		t.Fatalf("issue #2 report = %#v, want preserved worker report", report.Results[1].Report)
@@ -539,7 +574,7 @@ func TestRenderDispatchWaveTextSurfacesPerWorkerReports(t *testing.T) {
 		"  branch: loop/issue-21",
 		"  pr: https://github.com/owner/repo/pull/21",
 		"  report: provider=claude model=claude-sonnet-4-5 (high) source=parsed permission=write duration=42s tokens input=2447 output=4461 total=6908 verified=true",
-		"  attempt: .loopcoder/runs/run-test-wave/workers/job-21.attempt.json",
+		"  attempt_id: job-21",
 		"- #22 succeeded",
 		"  report: provider=codex model=gpt-5.5 (xhigh) source=parsed permission=write duration=42s tokens input=not reported output=not reported total=102585 verified=true",
 		"- #23 skipped",
@@ -753,13 +788,14 @@ func readySetReport(numbers ...int) report.ReadySetReport {
 
 func waveWorkerResult(opts worker.Options) worker.Result {
 	return worker.Result{
-		OK:          true,
-		Issue:       opts.IssueNumber,
-		Branch:      fmt.Sprintf("loop/issue-%d", opts.IssueNumber),
-		RunID:       opts.RunID,
-		PR:          fmt.Sprintf("https://github.com/owner/repo/pull/%d", opts.IssueNumber),
-		AttemptPath: fmt.Sprintf(".loopcoder/runs/%s/workers/job-%d.attempt.json", opts.RunID, opts.IssueNumber),
-		Status:      "succeeded",
+		OK:              true,
+		ProviderInvoked: true,
+		Issue:           opts.IssueNumber,
+		Branch:          fmt.Sprintf("loop/issue-%d", opts.IssueNumber),
+		RunID:           opts.RunID,
+		PR:              fmt.Sprintf("https://github.com/owner/repo/pull/%d", opts.IssueNumber),
+		AttemptPath:     fmt.Sprintf(".loopcoder/runs/%s/workers/job-%d.attempt.json", opts.RunID, opts.IssueNumber),
+		Status:          "succeeded",
 	}
 }
 

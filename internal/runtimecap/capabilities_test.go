@@ -16,7 +16,7 @@ func TestDefaultContractInvariants(t *testing.T) {
 }
 
 func TestDefaultContractRepresentsExistingProviders(t *testing.T) {
-	if got, want := runtimecap.ProviderNames(), []string{"antigravity", "claude", "codex", "gemini"}; !reflect.DeepEqual(got, want) {
+	if got, want := runtimecap.ProviderNames(), []string{"antigravity", "claude", "codex", "gemini", "grok"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("ProviderNames = %#v, want %#v", got, want)
 	}
 
@@ -32,6 +32,7 @@ func TestDefaultContractRepresentsExistingProviders(t *testing.T) {
 		{provider: "claude", executable: "claude", readOnly: true, mcp: true, json: true, usage: true},
 		{provider: "gemini", executable: "gemini", readOnly: true, mcp: true, json: true, usage: true},
 		{provider: "antigravity", executable: "agy", readOnly: false, mcp: false, json: false, usage: false},
+		{provider: "grok", executable: "grok", readOnly: true, mcp: false, json: true, usage: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.provider, func(t *testing.T) {
@@ -47,6 +48,92 @@ func TestDefaultContractRepresentsExistingProviders(t *testing.T) {
 				t.Fatalf("provider capability = %#v", provider)
 			}
 		})
+	}
+}
+
+func TestDefaultContractDeclaresCredentialBlindAuthReadiness(t *testing.T) {
+	tests := []struct {
+		provider string
+		command  []string
+		parser   string
+		network  bool
+		envNames []string
+		paths    []string
+	}{
+		{
+			provider: "codex",
+			command:  []string{"codex", "login", "status"},
+			parser:   "codex-login-status",
+		},
+		{
+			provider: "claude",
+			command:  []string{"claude", "auth", "status", "--json"},
+			parser:   "claude-auth-status-json",
+		},
+		{
+			provider: "gemini",
+			envNames: []string{"GEMINI_API_KEY", "GOOGLE_API_KEY"},
+			paths:    []string{"~/.gemini/oauth_creds.json"},
+		},
+		{
+			provider: "antigravity",
+			command:  []string{"agy", "models"},
+			parser:   "agy-models",
+			network:  true,
+		},
+		{
+			provider: "grok",
+			command:  []string{"grok", "models"},
+			parser:   "grok-models",
+			network:  true,
+			envNames: []string{"XAI_API_KEY"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.provider, func(t *testing.T) {
+			provider, ok := runtimecap.LookupProvider(tt.provider)
+			if !ok {
+				t.Fatalf("LookupProvider(%q) returned false", tt.provider)
+			}
+			if !reflect.DeepEqual(provider.AuthProbeCommand, tt.command) {
+				t.Fatalf("AuthProbeCommand = %#v, want %#v", provider.AuthProbeCommand, tt.command)
+			}
+			if provider.AuthProbeParser != tt.parser {
+				t.Fatalf("AuthProbeParser = %q, want %q", provider.AuthProbeParser, tt.parser)
+			}
+			if provider.MayNetwork != tt.network {
+				t.Fatalf("MayNetwork = %v, want %v", provider.MayNetwork, tt.network)
+			}
+			if !reflect.DeepEqual(provider.AuthEnvironmentNames, tt.envNames) {
+				t.Fatalf("AuthEnvironmentNames = %#v, want %#v", provider.AuthEnvironmentNames, tt.envNames)
+			}
+			if !reflect.DeepEqual(provider.AuthArtifactPaths, tt.paths) {
+				t.Fatalf("AuthArtifactPaths = %#v, want %#v", provider.AuthArtifactPaths, tt.paths)
+			}
+		})
+	}
+}
+
+func TestDefaultContractDeclaresCatalogProbeProvenance(t *testing.T) {
+	antigravity, ok := runtimecap.LookupProvider("antigravity")
+	if !ok {
+		t.Fatal("LookupProvider(\"antigravity\") returned false")
+	}
+	if !reflect.DeepEqual(antigravity.CatalogProbeCommand, []string{"agy", "models"}) {
+		t.Fatalf("CatalogProbeCommand = %#v, want agy models", antigravity.CatalogProbeCommand)
+	}
+	if antigravity.CatalogProbeParser != "agy-models" || !antigravity.CatalogProbeMayNetwork {
+		t.Fatalf("catalog probe declaration = %#v, want agy-models network declared", antigravity)
+	}
+	grok, ok := runtimecap.LookupProvider("grok")
+	if !ok {
+		t.Fatal("LookupProvider(\"grok\") returned false")
+	}
+	if !reflect.DeepEqual(grok.CatalogProbeCommand, []string{"grok", "models"}) {
+		t.Fatalf("CatalogProbeCommand = %#v, want grok models", grok.CatalogProbeCommand)
+	}
+	if grok.CatalogProbeParser != "grok-models" || !grok.CatalogProbeMayNetwork {
+		t.Fatalf("grok catalog probe declaration = %#v, want grok-models with declared network", grok)
 	}
 }
 
@@ -71,6 +158,9 @@ func TestDefaultContractRepresentsExistingHosts(t *testing.T) {
 func TestContractReturnsCopies(t *testing.T) {
 	contract := runtimecap.DefaultContract()
 	contract.Providers[0].Name = "changed"
+	contract.Providers[0].AuthProbeCommand = append(contract.Providers[0].AuthProbeCommand, "changed")
+	contract.Providers[0].AuthArtifactPaths = append(contract.Providers[0].AuthArtifactPaths, "changed")
+	contract.Providers[0].AuthEnvironmentNames = append(contract.Providers[0].AuthEnvironmentNames, "changed")
 	contract.Providers[0].KnownLimitations = append(contract.Providers[0].KnownLimitations, "changed")
 	contract.Hosts[0].Name = "changed"
 	contract.Hosts[0].KnownLimitations = append(contract.Hosts[0].KnownLimitations, "changed")
@@ -81,6 +171,14 @@ func TestContractReturnsCopies(t *testing.T) {
 	}
 	if len(next.Hosts[0].KnownLimitations) > 0 && next.Hosts[0].KnownLimitations[len(next.Hosts[0].KnownLimitations)-1] == "changed" {
 		t.Fatalf("DefaultContract leaked mutation: %#v", next)
+	}
+	for _, provider := range next.Providers {
+		if provider.Name != "codex" {
+			continue
+		}
+		if len(provider.AuthProbeCommand) != 3 || provider.AuthProbeCommand[len(provider.AuthProbeCommand)-1] == "changed" {
+			t.Fatalf("DefaultContract leaked auth command mutation: %#v", provider)
+		}
 	}
 }
 
@@ -155,6 +253,9 @@ func TestInvariantViolationsRejectInvalidContract(t *testing.T) {
 		Providers: []runtimecap.ProviderRuntime{
 			{Name: "custom"},
 			{Name: "custom", Executable: "custom"},
+			{Name: "bad/path", Executable: "bad/path", AuthUnsupportedReason: "unsupported"},
+			{Name: "network", Executable: "network", MayNetwork: true, AuthUnsupportedReason: "unsupported"},
+			{Name: "catalog", Executable: "catalog", CatalogProbeMayNetwork: true, AuthUnsupportedReason: "unsupported"},
 		},
 		Hosts: []runtimecap.HostRuntime{
 			{Name: "host"},
@@ -164,6 +265,10 @@ func TestInvariantViolationsRejectInvalidContract(t *testing.T) {
 	for _, want := range []string{
 		`provider "custom" executable is empty`,
 		`provider "custom" is duplicated`,
+		`provider "bad/path" name contains a path separator`,
+		`provider "bad/path" executable "bad/path" must be a command name, not a path`,
+		`provider "network" declares network auth probing without an auth probe command`,
+		`provider "catalog" declares network catalog probing without a catalog probe command`,
 		`host "host" invocation style is empty`,
 		`host "host" must preserve stdout`,
 		`host "host" must preserve stderr`,

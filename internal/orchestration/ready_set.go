@@ -13,6 +13,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
+	"github.com/jasonhnd/loopcoder/internal/providerreconcile"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
@@ -228,6 +229,18 @@ func ComputeReadySet(ctx context.Context, opts Options) (report.ReadySetReport, 
 		}
 
 		if latest != nil {
+			if disposition := providerReconcileDisposition(ctx, opts, number, issueAttempts); disposition != nil {
+				blocked = append(blocked, report.BlockedIssue{
+					Issue:          number,
+					Title:          issue.Title,
+					Classification: disposition.Classification,
+					Reason:         disposition.Reason,
+					Dependencies:   dependencies,
+					OpenPRs:        prSummaries,
+					Attempts:       attemptSummaries,
+				})
+				continue
+			}
 			if disposition := localAttemptDisposition(*latest, opts.Thresholds, opts.ProcessAlive, opts.Now); disposition != nil {
 				blocked = append(blocked, report.BlockedIssue{
 					Issue:          number,
@@ -703,6 +716,29 @@ func localAttemptDisposition(attempt state.Attempt, thresholds config.Resilience
 	return &attemptDisposition{
 		Classification: "recovery-needed",
 		Reason:         fmt.Sprintf("latest attempt %s has status '%s' and needs recovery review", attempt.JobID, attempt.Status),
+	}
+}
+
+func providerReconcileDisposition(ctx context.Context, opts Options, issue int, attempts []state.Attempt) *attemptDisposition {
+	decision := providerreconcile.Check(ctx, providerreconcile.Options{
+		RepoPath: opts.RepoPath,
+		RunID:    opts.RunID,
+		Issue:    issue,
+		Attempts: attempts,
+		Now:      opts.Now,
+	})
+	if !decision.BlockRedispatch {
+		return nil
+	}
+	classification := "provider-reconciliation"
+	if decision.NeedsHuman {
+		classification = "needs-human"
+	} else if decision.Action == providerreconcile.ActionObserve || decision.Action == providerreconcile.ActionReconcile {
+		classification = "has-live-attempt"
+	}
+	return &attemptDisposition{
+		Classification: classification,
+		Reason:         decision.Summary() + "; receipt=" + decision.JSONLine(),
 	}
 }
 

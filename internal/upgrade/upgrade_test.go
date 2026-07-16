@@ -19,6 +19,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/migration"
+	"github.com/jasonhnd/loopcoder/internal/platform"
 )
 
 func TestResolveReleaseLatestAndPinned(t *testing.T) {
@@ -194,6 +195,144 @@ func TestRunAlreadyLatestSkipsDownloadWithOptionalV(t *testing.T) {
 	}
 	if result.AssetName != "" || result.VersionBinaryPath != "" || result.StableBinaryPath != "" {
 		t.Fatalf("already-latest result should not include install fields: %#v", result)
+	}
+}
+
+func TestRunUnsupportedPlatformFailsBeforeSideEffects(t *testing.T) {
+	tests := []struct {
+		name   string
+		goos   string
+		goarch string
+	}{
+		{name: "intel mac", goos: "darwin", goarch: "amd64"},
+		{name: "linux", goos: "linux", goarch: "amd64"},
+		{name: "wsl linux tuple", goos: "linux", goarch: "arm64"},
+		{name: "windows", goos: "windows", goarch: "amd64"},
+		{name: "unknown tuple", goos: "plan9", goarch: "riscv64"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := Run(context.Background(), Options{
+				RequestedVersion: "v0.8.0",
+				CurrentVersion:   "v0.7.0",
+				RuntimeGOOS:      tt.goos,
+				RuntimeGOARCH:    tt.goarch,
+			}, unsupportedUpgradeSideEffectDeps(t, tt.goos, tt.goarch))
+			if !errors.Is(err, platform.ErrUnsupportedPlatform) {
+				t.Fatalf("Run error = %v, want ErrUnsupportedPlatform", err)
+			}
+			var unsupported *platform.UnsupportedPlatformError
+			if !errors.As(err, &unsupported) {
+				t.Fatalf("Run error type = %T, want *platform.UnsupportedPlatformError", err)
+			}
+			if unsupported.ExitCode() != platform.UnsupportedExitCode {
+				t.Fatalf("ExitCode = %d, want %d", unsupported.ExitCode(), platform.UnsupportedExitCode)
+			}
+			if unsupported.Actual.GOOS != tt.goos || unsupported.Actual.GOARCH != tt.goarch {
+				t.Fatalf("Actual = %#v, want %s/%s", unsupported.Actual, tt.goos, tt.goarch)
+			}
+			if !reflect.DeepEqual(result, Result{}) {
+				t.Fatalf("result = %#v, want zero result before side effects", result)
+			}
+		})
+	}
+}
+
+func TestRunDarwinArm64SelectsOnlyDarwinArm64Asset(t *testing.T) {
+	archiveBytes := []byte("archive bytes")
+	binaryBytes := []byte("new loopcoder binary")
+	assetName := "loopcoder_0.8.0_darwin_arm64.tar.gz"
+	sum := sha256.Sum256(archiveBytes)
+	checksums := []byte(hex.EncodeToString(sum[:]) + "  " + assetName + "\n" +
+		strings.Repeat("1", 64) + "  loopcoder_0.8.0_darwin_amd64.tar.gz\n" +
+		strings.Repeat("2", 64) + "  loopcoder_0.8.0_linux_amd64.tar.gz\n" +
+		strings.Repeat("3", 64) + "  loopcoder_0.8.0_windows_amd64.zip\n")
+	signatureBundle := []byte("valid sigstore bundle")
+	releaseURL := "https://api.example.test/repos/owner/repo/releases/tags/v0.8.0"
+	assetURL := "https://download.example.test/" + assetName
+	sumsURL := "https://download.example.test/SHA256SUMS"
+	signatureURL := "https://download.example.test/SHA256SUMS.sigstore"
+	fsys := newFakeFS()
+	layout := home.New(filepath.Join("home", ".loopcoder"))
+
+	result, err := Run(context.Background(), Options{
+		RequestedVersion: "v0.8.0",
+		CurrentVersion:   "v0.7.0",
+		RuntimeGOOS:      platform.SupportedGOOS,
+		RuntimeGOARCH:    platform.SupportedGOARCH,
+	}, Deps{
+		Getenv: func(key string) string {
+			switch key {
+			case EnvAPIBaseURL:
+				return "https://api.example.test"
+			case EnvUpgradeRepo:
+				return "owner/repo"
+			default:
+				return ""
+			}
+		},
+		ExecutablePath: func() (string, error) {
+			return filepath.Join("old", "loopcoder"), nil
+		},
+		HomeLayout: func() (home.Layout, error) {
+			return layout, nil
+		},
+		HTTPGet: mapGetter(t, map[string][]byte{
+			releaseURL: releaseJSON(t, release{
+				TagName: "v0.8.0",
+				Assets: []releaseAsset{
+					{Name: "loopcoder_0.8.0_darwin_amd64.tar.gz", BrowserDownloadURL: "https://download.example.test/loopcoder_0.8.0_darwin_amd64.tar.gz"},
+					{Name: "loopcoder_0.8.0_linux_amd64.tar.gz", BrowserDownloadURL: "https://download.example.test/loopcoder_0.8.0_linux_amd64.tar.gz"},
+					{Name: "loopcoder_0.8.0_windows_amd64.zip", BrowserDownloadURL: "https://download.example.test/loopcoder_0.8.0_windows_amd64.zip"},
+					{Name: assetName, BrowserDownloadURL: assetURL},
+					{Name: checksumAssetName, BrowserDownloadURL: sumsURL},
+					{Name: checksumSignatureAssetName, BrowserDownloadURL: signatureURL},
+				},
+			}),
+			assetURL:     archiveBytes,
+			sumsURL:      checksums,
+			signatureURL: signatureBundle,
+		}),
+		VerifySignature: func(_ context.Context, artifact []byte, bundle []byte, identity string, issuer string) error {
+			if !reflect.DeepEqual(artifact, checksums) || !reflect.DeepEqual(bundle, signatureBundle) {
+				t.Fatalf("signature verifier inputs = %q/%q, want %q/%q", artifact, bundle, checksums, signatureBundle)
+			}
+			return nil
+		},
+		ExtractBinary: func(gotArchiveName string, data []byte, binaryName string) ([]byte, error) {
+			if gotArchiveName != assetName {
+				t.Fatalf("archiveName = %q, want %q", gotArchiveName, assetName)
+			}
+			if !reflect.DeepEqual(data, archiveBytes) {
+				t.Fatalf("archive bytes = %q, want darwin arm64 archive bytes", data)
+			}
+			if binaryName != "loopcoder" {
+				t.Fatalf("binaryName = %q, want loopcoder", binaryName)
+			}
+			return binaryBytes, nil
+		},
+		MkdirAll:  fsys.MkdirAll,
+		WriteFile: fsys.WriteFile,
+		Chmod:     fsys.Chmod,
+		Rename:    fsys.Rename,
+		Remove:    fsys.Remove,
+		RunCommand: func(context.Context, string, ...string) (CommandResult, error) {
+			return CommandResult{
+				Stdout: "loopcoder skill install complete\n" +
+					"  directory " + filepath.Join("home", ".claude", "skills", "loopcoder") + "\n" +
+					"  updated " + filepath.Join("home", ".claude", "skills", "loopcoder", "SKILL.md") + "\n" +
+					"  updated " + filepath.Join("home", ".claude", "skills", "loopcoder", "AGENTS.md") + "\n",
+			}, nil
+		},
+		RuntimeGOOS:   platform.SupportedGOOS,
+		RuntimeGOARCH: platform.SupportedGOARCH,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Platform != "darwin/arm64" || result.AssetName != assetName {
+		t.Fatalf("result selection = platform %q asset %q, want darwin/arm64 %q", result.Platform, result.AssetName, assetName)
 	}
 }
 
@@ -894,6 +1033,38 @@ func TestRunReports060MigrationStatusAfterUpgrade(t *testing.T) {
 	}
 }
 
+func TestScanMigrationStatusSortsLegacyStateEntries(t *testing.T) {
+	repo := t.TempDir()
+	writeTextFile(t, filepath.Join(repo, ".git", "HEAD"), "ref: refs/heads/main\n")
+	writeTextFile(t, filepath.Join(repo, ".delivery.yml"), "version: 1\n")
+	aPath := filepath.Join(repo, ".loopcoder", "runs", "run-a", "workers", "a.attempt.json")
+	bPath := filepath.Join(repo, ".loopcoder", "runs", "run-b", "workers", "b.attempt.json")
+	writeTextFile(t, bPath, fmt.Sprintf(`{"%s":{"role":"worker"}}`, migration.LegacyReportStateKey))
+	writeTextFile(t, aPath, fmt.Sprintf(`{"%s":{"role":"worker"}}`, migration.LegacyReportStateKey))
+
+	deps := DefaultDeps()
+	deps.Getwd = func() (string, error) { return repo, nil }
+	deps.Getenv = func(string) string { return "" }
+	deps.ReadDir = func(path string) ([]fs.DirEntry, error) {
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return nil, err
+		}
+		for i, j := 0, len(entries)-1; i < j; i, j = i+1, j-1 {
+			entries[i], entries[j] = entries[j], entries[i]
+		}
+		return entries, nil
+	}
+
+	status := ScanMigrationStatus(deps)
+	if len(status.OldSurfaceDiagnostics) != 2 {
+		t.Fatalf("OldSurfaceDiagnostics = %#v, want two state-key diagnostics", status.OldSurfaceDiagnostics)
+	}
+	if status.OldSurfaceDiagnostics[0].Location != aPath || status.OldSurfaceDiagnostics[1].Location != bPath {
+		t.Fatalf("diagnostic order = %#v, want a then b", status.OldSurfaceDiagnostics)
+	}
+}
+
 func TestParseSkillInstallOutputRequiresBothManagedFiles(t *testing.T) {
 	_, _, err := parseSkillInstallOutput("loopcoder skill install complete\n" +
 		"  directory /home/.claude/skills/loopcoder\n" +
@@ -1110,6 +1281,86 @@ func verifySignatureFixture(t *testing.T, wantArtifact []byte, wantBundle []byte
 			t.Fatalf("signature issuer = %q, want %q", issuer, defaultCosignIssuer)
 		}
 		return nil
+	}
+}
+
+func unsupportedUpgradeSideEffectDeps(t *testing.T, goos string, goarch string) Deps {
+	t.Helper()
+	fail := func(name string) {
+		t.Helper()
+		t.Fatalf("%s dependency should not be called on unsupported platform", name)
+	}
+	return Deps{
+		Getenv: func(string) string {
+			fail("Getenv")
+			return ""
+		},
+		HomeLayout: func() (home.Layout, error) {
+			fail("HomeLayout")
+			return home.Layout{}, nil
+		},
+		ExecutablePath: func() (string, error) {
+			fail("ExecutablePath")
+			return "", nil
+		},
+		Getwd: func() (string, error) {
+			fail("Getwd")
+			return "", nil
+		},
+		Stat: func(string) (fs.FileInfo, error) {
+			fail("Stat")
+			return nil, os.ErrNotExist
+		},
+		ReadFile: func(string) ([]byte, error) {
+			fail("ReadFile")
+			return nil, os.ErrNotExist
+		},
+		ReadDir: func(string) ([]fs.DirEntry, error) {
+			fail("ReadDir")
+			return nil, os.ErrNotExist
+		},
+		HTTPGet: func(context.Context, string) ([]byte, error) {
+			fail("HTTPGet")
+			return nil, errors.New("unexpected HTTPGet")
+		},
+		VerifySignature: func(context.Context, []byte, []byte, string, string) error {
+			fail("VerifySignature")
+			return nil
+		},
+		ExtractBinary: func(string, []byte, string) ([]byte, error) {
+			fail("ExtractBinary")
+			return nil, nil
+		},
+		MkdirAll: func(string, fs.FileMode) error {
+			fail("MkdirAll")
+			return nil
+		},
+		WriteFile: func(string, []byte, fs.FileMode) error {
+			fail("WriteFile")
+			return nil
+		},
+		Chmod: func(string, fs.FileMode) error {
+			fail("Chmod")
+			return nil
+		},
+		Rename: func(string, string) error {
+			fail("Rename")
+			return nil
+		},
+		Remove: func(string) error {
+			fail("Remove")
+			return nil
+		},
+		ScheduleReplace: func(string, string) error {
+			fail("ScheduleReplace")
+			return nil
+		},
+		RunCommand: func(context.Context, string, ...string) (CommandResult, error) {
+			fail("RunCommand")
+			return CommandResult{}, nil
+		},
+		RuntimeGOOS:   goos,
+		RuntimeGOARCH: goarch,
 	}
 }
 

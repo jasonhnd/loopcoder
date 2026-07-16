@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/jasonhnd/loopcoder/internal/gitutil"
 )
 
 func TestReporterRenameInventorySweep(t *testing.T) {
@@ -49,6 +51,7 @@ func gitRoot(t *testing.T) string {
 	t.Helper()
 	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
 	cmd.Dir = "."
+	cmd.Env = gitutil.CleanEnv(os.Environ())
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("git rev-parse --show-toplevel: %v", err)
@@ -60,6 +63,7 @@ func gitTrackedFiles(t *testing.T, root string) []string {
 	t.Helper()
 	cmd := exec.Command("git", "ls-files", "-z")
 	cmd.Dir = root
+	cmd.Env = gitutil.CleanEnv(os.Environ())
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("git ls-files -z: %v", err)

@@ -27,8 +27,23 @@ func runProviderCommand(ctx context.Context, cmd *exec.Cmd, inv Invocation, prov
 		Stderr:          inv.Stderr,
 		RunID:           inv.RunID,
 		Role:            inv.Role,
+		Guardian:        inv.Guardian,
 		LivenessMode:    supervisedexec.LivenessMode(inv.LivenessMode),
 		LivenessCommand: inv.LivenessCommand,
+		OnLaunch:        inv.OnProviderLaunch,
+	}
+	if inv.OnProviderStart != nil {
+		opts.OnStart = func(started supervisedexec.StartedProcess) error {
+			return inv.OnProviderStart(ProviderProcess{
+				PID:                   started.PID,
+				PGID:                  started.PGID,
+				ProcessBirthIdentity:  started.ProcessBirthIdentity,
+				ExecutableIdentity:    started.ExecutableIdentity,
+				ObservedAt:            started.ObservedAt,
+				IdentityAmbiguous:     started.IdentityAmbiguous,
+				IdentityAmbiguityNote: started.IdentityAmbiguityNote,
+			})
+		}
 	}
 	if inv.StallTimeout > 0 {
 		opts.OnStall = appendStallLine(inv.LogPath, provider)
@@ -87,6 +102,6 @@ func appendStallLine(logPath, provider string) func(time.Duration) {
 			return
 		}
 		defer file.Close()
-		fmt.Fprintf(file, "\n[loopcoder] %s provider silent for %s\n", provider, silentFor.Round(time.Second))
+		fmt.Fprintf(file, "\n[loopcoder] %s provider stalled for %s without meaningful provider log, worktree, or process-tree activity\n", provider, silentFor.Round(time.Second))
 	}
 }

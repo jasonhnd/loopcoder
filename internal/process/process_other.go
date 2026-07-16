@@ -10,3 +10,7 @@ func Alive(pid int) bool {
 func KillTree(pid int) error {
 	return nil
 }
+
+func KillGroup(pgid int) error {
+	return nil
+}

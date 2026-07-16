@@ -21,32 +21,10 @@ env:
 
 jobs:
   build:
-    name: build (${{ matrix.goos }}/${{ matrix.goarch }})
-    runs-on: ubuntu-latest
+    name: build (darwin/arm64)
+    runs-on: macos-15
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - goos: windows
-            goarch: amd64
-            format: zip
-          - goos: windows
-            goarch: arm64
-            format: zip
-          - goos: darwin
-            goarch: amd64
-            format: tar.gz
-          - goos: darwin
-            goarch: arm64
-            format: tar.gz
-          - goos: linux
-            goarch: amd64
-            format: tar.gz
-          - goos: linux
-            goarch: arm64
-            format: tar.gz
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
@@ -56,23 +34,38 @@ jobs:
           check-latest: false
           cache: true
 
+      - name: Assert darwin/arm64 Go host
+        run: |
+          set -euo pipefail
+          actual_goos="$(go env GOOS)"
+          actual_goarch="$(go env GOARCH)"
+          printf 'Go host tuple: %s/%s\n' "${actual_goos}" "${actual_goarch}"
+          test "${actual_goos}" = "darwin"
+          test "${actual_goarch}" = "arm64"
+
+      - name: Full Go race suite
+        run: go test -race -count=1 -timeout=20m ./...
+
       - name: Build archive
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          FORMAT: ${{ matrix.format }}
+          GOOS: darwin
+          GOARCH: arm64
+          FORMAT: tar.gz
           TAG_NAME: ${{ github.ref_name }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
 
+          test "$(go env GOOS)" = "darwin"
+          test "$(go env GOARCH)" = "arm64"
+          test "${GOOS}" = "darwin"
+          test "${GOARCH}" = "arm64"
+          test "${FORMAT}" = "tar.gz"
+
           version="${TAG_NAME#v}"
           build_date="$(git show -s --format=%cI "${COMMIT_SHA}")"
-          archive="loopcoder_${version}_${GOOS}_${GOARCH}.${FORMAT}"
+          archive="loopcoder_${version}_darwin_arm64.tar.gz"
           binary="loopcoder"
-          if [[ "${GOOS}" == "windows" ]]; then
-            binary="loopcoder.exe"
-          fi
 
           rm -rf dist
           mkdir -p dist/package
@@ -83,58 +76,79 @@ jobs:
             -o "dist/package/${binary}" \
             ./cmd/loopcoder
 
-          if [[ "${GOOS}" == "linux" && "${GOARCH}" == "amd64" ]]; then
-            version_output="$("./dist/package/${binary}" --version)"
-            echo "${version_output}"
-            if [[ "${version_output}" == *"version=dev"* ]]; then
-              echo "release binary still reports version=dev" >&2
-              exit 1
-            fi
-            if [[ "${version_output}" == *"commit=unknown"* || "${version_output}" == *"date=unknown"* ]]; then
-              echo "release binary still reports unknown commit/date" >&2
-              exit 1
-            fi
+          version_output="$("./dist/package/${binary}" --version)"
+          echo "${version_output}"
+          if [[ "${version_output}" == *"version=dev"* ]]; then
+            echo "release binary still reports version=dev" >&2
+            exit 1
+          fi
+          if [[ "${version_output}" == *"commit=unknown"* || "${version_output}" == *"date=unknown"* ]]; then
+            echo "release binary still reports unknown commit/date" >&2
+            exit 1
           fi
 
           cp LICENSE dist/package/LICENSE
 
-          if [[ "${FORMAT}" == "zip" ]]; then
-            (cd dist/package && zip -q -r "../${archive}" "${binary}" LICENSE)
-          else
-            tar -C dist/package -czf "dist/${archive}" "${binary}" LICENSE
-          fi
+          tar -C dist/package -czf "dist/${archive}" "${binary}" LICENSE
+          # Build stages files under dist/package before tarring; remove so only the archive remains.
+          rm -rf dist/package
+          bash scripts/stage-draft-release.sh validate-archives
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/loopcoder_*
+          name: release-darwin-arm64
+          path: dist/loopcoder_*_darwin_arm64.tar.gz
           if-no-files-found: error
 
   sign:
     name: sign candidate checksums
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     needs: build
     permissions:
       contents: read
       id-token: write
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+          cache: true
+
+      - name: Assert darwin/arm64 Go host
+        run: |
+          set -euo pipefail
+          actual_goos="$(go env GOOS)"
+          actual_goarch="$(go env GOARCH)"
+          printf 'Go host tuple: %s/%s\n' "${actual_goos}" "${actual_goarch}"
+          test "${actual_goos}" = "darwin"
+          test "${actual_goarch}" = "arm64"
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          pattern: release-*
+          name: release-darwin-arm64
           path: dist
-          merge-multiple: true
 
       - name: Generate checksums
+        env:
+          TAG_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
 
+          bash scripts/stage-draft-release.sh validate-archives
+
           cd dist
-          sha256sum loopcoder_* | sort -k2 > SHA256SUMS
+          version="${TAG_NAME#v}"
+          archive="loopcoder_${version}_darwin_arm64.tar.gz"
+          shasum -a 256 "${archive}" | awk '{print $1 "  " $2}' | sort -k2 > SHA256SUMS
           cat SHA256SUMS
 
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign and verify checksums
+        env:
+          TAG_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
 
@@ -149,6 +163,8 @@ jobs:
             --certificate-oidc-issuer "${issuer}"
 
           printf 'Signed SHA256SUMS with Sigstore issuer %s and identity %s\n' "${issuer}" "${identity}"
+          cd ..
+          bash scripts/stage-draft-release.sh validate-candidate
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -161,12 +177,27 @@ jobs:
 
   draft:
     name: create draft release
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     needs: sign
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+          cache: true
+
+      - name: Assert darwin/arm64 Go host
+        run: |
+          set -euo pipefail
+          actual_goos="$(go env GOOS)"
+          actual_goarch="$(go env GOARCH)"
+          printf 'Go host tuple: %s/%s\n' "${actual_goos}" "${actual_goarch}"
+          test "${actual_goos}" = "darwin"
+          test "${actual_goarch}" = "arm64"
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -181,25 +212,33 @@ jobs:
         run: |
           set -euo pipefail
 
-          # ubuntu-latest includes python3, which the helper uses for JSON parsing.
+          bash scripts/stage-draft-release.sh validate-candidate
           bash scripts/stage-draft-release.sh
 
   smoke:
-    name: smoke (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: smoke (darwin/arm64)
+    runs-on: macos-15
     needs: draft
     timeout-minutes: 45
     permissions:
       contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+          cache: true
+
+      - name: Assert darwin/arm64 Go host
+        run: |
+          set -euo pipefail
+          actual_goos="$(go env GOOS)"
+          actual_goarch="$(go env GOARCH)"
+          printf 'Go host tuple: %s/%s\n' "${actual_goos}" "${actual_goarch}"
+          test "${actual_goos}" = "darwin"
+          test "${actual_goarch}" = "arm64"
 
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
@@ -209,17 +248,32 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          ./scripts/release-smoke.ps1 -Version '${{ github.ref_name }}' -PreviousVersion '0.6.1'
+          ./scripts/release-smoke.ps1 -Version '${{ github.ref_name }}' -PreviousVersion '0.7.0'
 
   publish:
     name: publish final release
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     needs: smoke
     environment: release-publication
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+          cache: true
+
+      - name: Assert darwin/arm64 Go host
+        run: |
+          set -euo pipefail
+          actual_goos="$(go env GOOS)"
+          actual_goarch="$(go env GOARCH)"
+          printf 'Go host tuple: %s/%s\n' "${actual_goos}" "${actual_goarch}"
+          test "${actual_goos}" = "darwin"
+          test "${actual_goarch}" = "arm64"
 
       - name: Promote tested draft release
         env:
@@ -241,7 +295,7 @@ jobs:
 
   failed-draft:
     name: mark failed draft
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     needs:
       - draft
       - smoke
@@ -250,6 +304,21 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+          cache: true
+
+      - name: Assert darwin/arm64 Go host
+        run: |
+          set -euo pipefail
+          actual_goos="$(go env GOOS)"
+          actual_goarch="$(go env GOARCH)"
+          printf 'Go host tuple: %s/%s\n' "${actual_goos}" "${actual_goarch}"
+          test "${actual_goos}" = "darwin"
+          test "${actual_goarch}" = "arm64"
 
       - name: Keep failed candidate as draft evidence
         env:

@@ -1,17 +1,45 @@
 package orchestration
 
 import (
+	"bytes"
+	"encoding/json"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
+	"github.com/jasonhnd/loopcoder/internal/orchestrationcost"
 	reportpkg "github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 )
+
+func TestRenderTickCostIncludesNormalizedDecisionDetails(t *testing.T) {
+	cost, err := orchestrationcost.Build("run-cost-decisions", orchestrationcost.DefaultPolicy(), nil)
+	if err != nil {
+		t.Fatalf("Build cost: %v", err)
+	}
+	cost = orchestrationcost.ApplyBudgetDecision(cost, orchestrationcost.Decision{
+		Status: "allowed", Allowed: true, Reason: "within budget", Observed: "calls=0 tokens=0", Limit: "calls=8 tokens=500000", Evidence: []string{"budget-evidence"}, Remediation: "none",
+	})
+	cost = orchestrationcost.ApplyReleaseDecision(cost, orchestrationcost.Decision{
+		Status: "needs-human", Allowed: false, Reason: "overhead-ratio-exceeded", Observed: "10.01%", Limit: "10%", Evidence: []string{"release-evidence"}, Remediation: "reduce coordination calls",
+	})
+	buffer := bytes.NewBuffer(nil)
+	renderTickOrchestrationCost(buffer, cost)
+	text := buffer.String()
+	for _, want := range []string{
+		`budget_decision[0] status=allowed allowed=true reason="within budget" observed="calls=0 tokens=0" limit="calls=8 tokens=500000" remediation="none" evidence="budget-evidence"`,
+		`release_gate status=needs-human allowed=false reason="overhead-ratio-exceeded" observed="10.01%" limit="10%" remediation="reduce coordination calls" evidence="release-evidence"`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("cost text missing %q:\n%s", want, text)
+		}
+	}
+}
 
 func TestRenderTickTextGoldenBytes(t *testing.T) {
 	report := TickReport{
@@ -49,6 +77,20 @@ func TestRenderTickTextGoldenBytes(t *testing.T) {
 		"Stop reason: no-ready-work\n" +
 		"Started at: 2026-07-05T00:00:00Z\n" +
 		"Finished at: 2026-07-05T00:00:01Z\n" +
+		"\n" +
+		"Orchestration cost\n" +
+		"- status=allowed calls=0 tokens=0 overhead_ratio=0.00% external_host_tokens=unknown\n" +
+		"- role=planner calls=0 tokens=0 usage=exact waits=0 retries=0 duplicate_retries=0 delivery_only_retries=0 duplicate_suppressions=0 packet_bytes=0 duration_ms=0\n" +
+		"- role=worker calls=0 tokens=0 usage=exact waits=0 retries=0 duplicate_retries=0 delivery_only_retries=0 duplicate_suppressions=0 packet_bytes=0 duration_ms=0\n" +
+		"- role=verifier calls=0 tokens=0 usage=exact waits=0 retries=0 duplicate_retries=0 delivery_only_retries=0 duplicate_suppressions=0 packet_bytes=0 duration_ms=0\n" +
+		"- role=recovery calls=0 tokens=0 usage=exact waits=0 retries=0 duplicate_retries=0 delivery_only_retries=0 duplicate_suppressions=0 packet_bytes=0 duration_ms=0\n" +
+		"- role=delivery calls=0 tokens=0 usage=exact waits=0 retries=0 duplicate_retries=0 delivery_only_retries=0 duplicate_suppressions=0 packet_bytes=0 duration_ms=0\n" +
+		"- role=waiting calls=0 tokens=0 usage=exact waits=0 retries=0 duplicate_retries=0 delivery_only_retries=0 duplicate_suppressions=0 packet_bytes=0 duration_ms=0\n" +
+		"  reason: within orchestration cost policy\n" +
+		"  next_action: continue\n" +
+		"  evidence: roles=6\n" +
+		"  evidence: model_calls=0\n" +
+		"  evidence: external_host_usage=unknown\n" +
 		"\n" +
 		"Compile\n" +
 		"- created=1 updated=2 unchanged=3 closed=4 plan_approval_required=yes\n" +
@@ -203,8 +245,8 @@ func TestRenderDispatchWaveTextGoldenBytes(t *testing.T) {
 		"  branch: loop/issue-7\n" +
 		"  pr: https://github.com/owner/repo/pull/7\n" +
 		"  report: provider=codex model=gpt-5 (high) source=parsed permission=write duration=1.5s tokens input=10 output=20 total=30 verified=true\n" +
-		"  attempt: .loopcoder/runs/run-wave-golden/workers/job-7.attempt.json\n" +
-		"  recovery: .loopcoder/runs/run-wave-golden/recovery/job-7-context.md\n" +
+		"  attempt_id: job-7\n" +
+		"  recovery_id: job-7-context\n" +
 		"- #8 needs-human\n" +
 		"  error: guardrail frozen\n" +
 		"\n" +
@@ -224,13 +266,46 @@ func TestRenderDispatchWaveIssueCompletionGoldenBytes(t *testing.T) {
 	const want = "DISPATCH WAVE WORKER #7 succeeded\n" +
 		"branch: loop/issue-7\n" +
 		"pr: https://github.com/owner/repo/pull/7\n" +
-		"attempt: .loopcoder/runs/run-wave-golden/workers/job-7.attempt.json\n" +
-		"recovery: .loopcoder/runs/run-wave-golden/recovery/job-7-context.md\n" +
+		"attempt_id: job-7\n" +
+		"recovery_id: job-7-context\n" +
 		"worker report\n" +
 		"  provider codex\n" +
 		"\n"
 	if got := RenderDispatchWaveIssueCompletion(result, pretty); got != want {
 		t.Fatalf("RenderDispatchWaveIssueCompletion drifted:\n--- got ---\n%s--- want ---\n%s", got, want)
+	}
+}
+
+func TestMarshalTickJSONSanitizesDispatchAttemptPaths(t *testing.T) {
+	repo := t.TempDir()
+	report := TickReport{
+		Version: TickReportVersion,
+		RunID:   "run-render-paths",
+		Status:  TickStatusSucceeded,
+		DispatchWave: &DispatchWaveReport{
+			RunID: "run-render-paths",
+			Results: []DispatchWaveIssueResult{{
+				Issue:               7,
+				Status:              DispatchWaveStatusSucceeded,
+				AttemptPath:         filepath.Join(repo, ".loopcoder", "runs", "run-render-paths", "workers", "job-7.attempt.json"),
+				RecoveryContextPath: filepath.Join(repo, ".loopcoder", "runs", "run-render-paths", "recovery", "job-7-context.md"),
+			}},
+		},
+	}
+	data, err := MarshalTickJSON(report)
+	if err != nil {
+		t.Fatalf("MarshalTickJSON returned error: %v", err)
+	}
+	if !json.Valid(data) {
+		t.Fatalf("tick JSON is invalid:\n%s", string(data))
+	}
+	if strings.Contains(string(data), repo) || strings.Contains(string(data), ".attempt.json") || strings.Contains(string(data), "job-7-context.md") {
+		t.Fatalf("tick JSON leaked local path:\n%s", string(data))
+	}
+	for _, want := range []string{`"AttemptPath": "job-7"`, `"RecoveryContextPath": "job-7-context"`} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("tick JSON missing stable %q:\n%s", want, string(data))
+		}
 	}
 }
 

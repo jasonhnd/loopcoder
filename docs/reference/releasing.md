@@ -32,19 +32,26 @@ Before tagging a release:
 
 The release workflow builds each advertised archive exactly once, generates and
 signs one `SHA256SUMS` manifest, uploads those artifacts to a draft GitHub
-Release, and runs native smoke jobs on Ubuntu, macOS, and Windows before the
-release is public. The final publication job does not rebuild or re-upload
-archives; it only promotes the already-smoked draft release after the protected
-`release-publication` environment grants approval.
+Release, and runs the release's native smoke jobs before the release is public.
+For v0.8, [`../specs/0884-macos-arm64-only.md`](../specs/0884-macos-arm64-only.md)
+is binding: native implementation and release proof target `darwin/arm64`
+only. Unsupported OS/arch diagnostics may use credential-free fixtures, but
+they are not advertised as native support or required native smoke. Windows,
+Linux/Ubuntu, WSL, containers used as a LoopCoder runtime, Intel
+macOS, and Rosetta/amd64 macOS are unsupported in v0.8.0; users who need those
+hosts remain on v0.7.0 or contribute to a later approved platform roadmap. The
+final publication job does not rebuild or re-upload archives; it only promotes the
+already-smoked draft release after the protected `release-publication`
+environment grants approval.
 
 A failing smoke job must leave the release as a draft. The workflow appends the
 failed run URL to the draft notes so the candidate assets and diagnostic
 evidence remain available without presenting the release as final.
 
-The native smoke jobs run:
+The v0.8 native smoke job runs on the supported `darwin/arm64` host:
 
 ```powershell
-pwsh scripts/release-smoke.ps1 -Version 0.7.0
+pwsh scripts/release-smoke.ps1 -Version 0.8.0 -PreviousVersion 0.7.0
 ```
 
 The smoke script targets the staged draft release. It downloads the current
@@ -56,8 +63,18 @@ registry / `doctor --format json` / `migrate local-state --dry-run` /
 `report --format json` path, invokes the self-bootstrap acceptance smoke for
 nested run-tree observability, confirms the selected binary recognizes itself
 as already latest, and verifies upgrade from the previous release when
-`-PreviousVersion` is set. It is verification-only and must not create tags,
-publish releases, or upload assets.
+`-PreviousVersion` is set. For a v0.7.0 predecessor it also creates a real
+schema-9 database with that published binary, proves `migrate storage` planning
+is read-only, applies schema 9 through 30, checks idempotent replay and the
+verified owner-only backup, then proves the restored backup opens with v0.7.0.
+It is verification-only and must not create tags, publish releases, or upload
+assets.
+
+Provider live smoke, including Grok, is not part of required CI or default
+release smoke. It is an explicit operator diagnostic only, must be enabled by
+its environment/flag gate, and must not be used as evidence that provider
+credentials, subscription quota, browser/session state, or private
+configuration are required for release acceptance.
 
 ## Required GitHub Repository Settings
 
@@ -85,9 +102,40 @@ gh api \
 JSON
 ```
 
-Configure `main` to require pull requests and the documented checks. Adjust the
-check list to the exact check names shown by GitHub for the current workflow
-matrix:
+Configure `main` to require pull requests and the documented checks. For
+v0.8.0, pull-request CI emits exactly four stable contexts: `verify`, `test`,
+`race`, and `security`, all running on pinned `macos-15` with a fail-fast
+`darwin/arm64` Go tuple assertion. The pull-request `race` context runs the
+race detector for Go packages changed by that PR, or a small concurrent sentinel
+set when no Go package changed. The release `build` job reruns the complete
+`go test -race -count=1 -timeout=20m ./...` suite before it packages the tagged
+artifact. This keeps ordinary PR feedback bounded without weakening the final
+release race gate.
+
+This repository currently has one collaborator. GitHub does not allow a pull
+request author to approve their own pull request, so a positive branch-review
+count would make protected promotion impossible without adding a second trusted
+maintainer. Until that happens, `main` still requires a pull request and all
+four checks, but `required_approving_review_count` is `0`. The non-waivable
+human release approval is the separate `release-publication` environment gate,
+whose required reviewer is the repository owner. Do not disable that
+environment gate to compensate for the single-maintainer branch topology.
+
+Branch-protection changes are a human-controlled promotion boundary. Do not
+remove old required contexts from live protection until a fresh pull request has
+shown the four new contexts. Use this order so `main` is never left requiring
+permanently un-emitted contexts:
+
+1. Confirm a fresh pull request emits green `verify`, `test`, `race`, and
+   `security` contexts.
+2. Update `main` branch protection to require exactly those four contexts.
+3. Read back the effective GitHub branch-protection configuration and confirm
+   no legacy `go`, `staticcheck`, `govulncheck`, `audit`, native Ubuntu,
+   native Windows, or `macos-latest` contexts remain required.
+4. Only after that confirmation, continue with the human-controlled promotion
+   decision.
+
+The branch-protection update payload is:
 
 ```bash
 gh api \
@@ -100,18 +148,17 @@ gh api \
     "strict": true,
     "contexts": [
       "verify",
-      "go",
-      "staticcheck",
-      "govulncheck",
-      "audit",
-      "native (ubuntu-latest)",
-      "native (macos-latest)",
-      "native (windows-latest)"
+      "test",
+      "race",
+      "security"
     ]
   },
   "enforce_admins": true,
   "required_pull_request_reviews": {
-    "required_approving_review_count": 1
+    "dismiss_stale_reviews": false,
+    "require_code_owner_reviews": false,
+    "require_last_push_approval": false,
+    "required_approving_review_count": 0
   },
   "restrictions": null
 }
@@ -125,29 +172,45 @@ gh api "repos/OWNER/REPO/branches/main/protection"
 gh api "repos/OWNER/REPO/environments/release-publication"
 ```
 
-## v0.7.0 Self-Bootstrap Acceptance
+The branch-protection readback must show strict `verify`, `test`, `race`, and
+`security` checks, pull-request review protection enabled with approval count
+`0`, and admin enforcement enabled. The environment readback must independently
+show the repository owner as a required reviewer. If a second trusted
+maintainer is added later, raise the branch approval count in a separate,
+reviewed repository-policy change.
 
-Before tagging v0.7.0, run the self-bootstrap acceptance path in
+## v0.8.0 Self-Bootstrap Acceptance
+
+Before tagging v0.8.0, run the self-bootstrap acceptance path in
 [`self-bootstrap.md`](self-bootstrap.md). At minimum, the release record must
 include:
 
-- the scripted smoke result from `pwsh scripts/self-bootstrap-smoke.ps1`;
+- the scripted smoke result from `pwsh scripts/self-bootstrap-smoke.ps1
+  -Version 0.8.0 -Binary <staged-binary>`;
+- the staged candidate binary path, SHA-256, version stamp, and proof that the
+  same archive is later eligible for publication;
+- native `darwin/arm64` host evidence;
 - project registry evidence for the loopcoder checkout;
 - proof that `$LOOPCODER_HOME/data/loopcoder.db`,
   `$LOOPCODER_HOME/projects/<project_id>/`, `$LOOPCODER_HOME/logs/`, and
   `$LOOPCODER_HOME/tmp/` exist outside the repository;
 - doctor JSON showing storage, project registry, provider compatibility, and
   nested-run health;
-- status and report JSON showing at least one parent/child run tree;
-- issue-to-PR evidence for the v0.7.0 implementation issues;
+- status and report human/JSON output showing the same parent/child run tree;
+- zero paid provider calls and no private credential dependency;
+- issue-to-PR-to-candidate-SHA evidence for the v0.8.0 implementation issues;
 - the normal consumer artifact smoke,
-  `pwsh scripts/release-smoke.ps1 -Version 0.7.0`, after release assets exist.
+  `pwsh scripts/release-smoke.ps1 -Version 0.8.0 -PreviousVersion 0.7.0`;
+- schema-9 planning, owner-only backup, atomic schema-30 application,
+  idempotent replay, and a copied backup opened by v0.7.0;
 - the completed go/no-go report from
-  [`v0.7.0-go-no-go.md`](v0.7.0-go-no-go.md), attached to the release
-  readiness PR or issue.
+  [`v0.8.0-go-no-go.md`](v0.8.0-go-no-go.md), attached to the release
+  readiness issue.
 
 This acceptance path is verification-only. It must not force production
 auto-merge, fake success without PR evidence, or depend on paid provider
 services that are not available to the operator.
 
-Historical changelog entries and accepted specs are release history. Do not terminology-sweep old release entries or shipped specs merely because current naming changed.
+Historical changelog entries, release notes, go/no-go records, and accepted
+specs are release history. Do not terminology-sweep old release evidence merely
+because the current platform or naming changed.

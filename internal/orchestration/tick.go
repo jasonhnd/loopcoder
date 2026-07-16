@@ -13,18 +13,22 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
+	"github.com/jasonhnd/loopcoder/internal/orchestrationcost"
+	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
+	"github.com/jasonhnd/loopcoder/internal/waitstate"
 	"github.com/jasonhnd/loopcoder/internal/worker"
 )
 
@@ -54,6 +58,8 @@ const (
 	TickStopAttemptLoadFailed         = "attempt-load-failed"
 	TickStopDispatchWaveFailed        = "dispatch-wave-failed"
 	TickStopNoReviewablePRsDispatched = "no-reviewable-prs-dispatched"
+	TickStopOrchestrationCostBudget   = "orchestration-cost-budget"
+	TickStopOrchestrationCostPersist  = "orchestration-cost-persist-failed"
 
 	tickPendingPromotionEvent  = "tick.pending_promotion"
 	tickStatusPendingPromotion = "pending-promotion"
@@ -85,8 +91,14 @@ type TickOptions struct {
 	ThrottleLimit          int
 	Thresholds             config.ResilienceWorker
 	Budget                 config.GuardrailBudget
+	CostPolicy             orchestrationcost.Policy
+	CostEvents             []orchestrationcost.Event
 	CircuitBreaker         config.GuardrailCircuitBreaker
+	Progress               progress.Recorder
 	AdditionalRiskRedLines []RiskRedLine
+	WaitForChecks          bool
+	WaitPolicy             waitstate.Policy
+	WaitClock              waitstate.Clock
 	ProcessAlive           ProcessAliveFunc
 	Clock                  func() time.Time
 	Stderr                 io.Writer
@@ -109,30 +121,31 @@ type TickOptions struct {
 // dispatch and verifier loopreview reports remain surfaced on their own
 // report entries.
 type TickReport struct {
-	Version          int                       `json:"version"`
-	Repo             string                    `json:"repo"`
-	RepoPath         string                    `json:"repo_path"`
-	BaseBranch       string                    `json:"base_branch"`
-	PreProdBranch    string                    `json:"pre_prod_branch"`
-	RunID            string                    `json:"run_id"`
-	Status           string                    `json:"status"`
-	StopReason       string                    `json:"stop_reason"`
-	StartedAt        string                    `json:"started_at"`
-	FinishedAt       string                    `json:"finished_at"`
-	Compile          compiler.Report           `json:"compile"`
-	ReadySet         report.ReadySetReport     `json:"ready_set"`
-	DispatchWave     *DispatchWaveReport       `json:"dispatch_wave,omitempty"`
-	Recoveries       []TickRecoveryResult      `json:"recoveries,omitempty"`
-	Reviews          []TickReviewResult        `json:"reviews"`
-	RiskGates        []TickRiskGateResult      `json:"risk_gates"`
-	PreProdMerges    []TickPreProdMergeResult  `json:"pre_prod_merges"`
-	PreProdHealth    []TickPreProdHealthResult `json:"pre_prod_health"`
-	PreProdReverts   []TickPreProdRevertResult `json:"pre_prod_reverts"`
-	PendingPromotion []TickPendingPromotion    `json:"pending_promotion,omitempty"`
-	NeedsHuman       []TickIssue               `json:"needs_human"`
-	Failures         []TickIssue               `json:"failures"`
-	StatePush        *TickStatePush            `json:"state_push,omitempty"`
-	Summary          TickSummary               `json:"summary"`
+	Version           int                       `json:"version"`
+	Repo              string                    `json:"repo"`
+	RepoPath          string                    `json:"repo_path"`
+	BaseBranch        string                    `json:"base_branch"`
+	PreProdBranch     string                    `json:"pre_prod_branch"`
+	RunID             string                    `json:"run_id"`
+	Status            string                    `json:"status"`
+	StopReason        string                    `json:"stop_reason"`
+	StartedAt         string                    `json:"started_at"`
+	FinishedAt        string                    `json:"finished_at"`
+	Compile           compiler.Report           `json:"compile"`
+	ReadySet          report.ReadySetReport     `json:"ready_set"`
+	DispatchWave      *DispatchWaveReport       `json:"dispatch_wave,omitempty"`
+	Recoveries        []TickRecoveryResult      `json:"recoveries,omitempty"`
+	Reviews           []TickReviewResult        `json:"reviews"`
+	RiskGates         []TickRiskGateResult      `json:"risk_gates"`
+	PreProdMerges     []TickPreProdMergeResult  `json:"pre_prod_merges"`
+	PreProdHealth     []TickPreProdHealthResult `json:"pre_prod_health"`
+	PreProdReverts    []TickPreProdRevertResult `json:"pre_prod_reverts"`
+	PendingPromotion  []TickPendingPromotion    `json:"pending_promotion,omitempty"`
+	NeedsHuman        []TickIssue               `json:"needs_human"`
+	Failures          []TickIssue               `json:"failures"`
+	StatePush         *TickStatePush            `json:"state_push,omitempty"`
+	OrchestrationCost orchestrationcost.Report  `json:"orchestration_cost"`
+	Summary           TickSummary               `json:"summary"`
 }
 
 type TickReviewResult struct {
@@ -190,6 +203,7 @@ type TickRiskGateResult struct {
 	ChangedFiles       []string                  `json:"changed_files"`
 	Checks             []gh.Check                `json:"checks"`
 	RedLines           []RiskRedLine             `json:"red_lines"`
+	Wait               *waitstate.Report         `json:"wait,omitempty"`
 	Error              string                    `json:"error,omitempty"`
 	ConfiguredEvidence []config.EvidenceArtifact `json:"configured_evidence,omitempty"`
 }
@@ -304,6 +318,27 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 		NeedsHuman:     []TickIssue{},
 		Failures:       []TickIssue{},
 	}
+	costRunLock, lockErr := orchestrationcost.AcquireRunLock(opts.RepoPath, opts.RunID, 0)
+	if lockErr != nil {
+		return TickReport{}, fmt.Errorf("acquire orchestration cost run lock: %w", lockErr)
+	}
+	defer costRunLock.Release()
+	costEvents := append([]orchestrationcost.Event(nil), opts.CostEvents...)
+	persistedCost, foundPersistedCost, loadCostErr := orchestrationcost.Load(opts.RepoPath, opts.RunID)
+	if loadCostErr != nil {
+		return TickReport{}, loadCostErr
+	}
+	if foundPersistedCost {
+		costEvents = append(append([]orchestrationcost.Event(nil), persistedCost.Events...), costEvents...)
+	}
+	costReport, costErr := orchestrationcost.Build(opts.RunID, opts.CostPolicy, costEvents)
+	if costErr != nil {
+		return TickReport{}, costErr
+	}
+	if foundPersistedCost {
+		costReport = orchestrationcost.RestoreDecisionState(costReport, persistedCost.BudgetDecisions, persistedCost.ReleaseGate)
+	}
+	tickReport.OrchestrationCost = costReport
 	finish := func(status, stopReason string) (TickReport, error) {
 		finished := opts.Clock().UTC()
 		tickReport.Status = status
@@ -311,14 +346,29 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 		tickReport.FinishedAt = state.FormatTimestamp(finished)
 		attachTickConfiguredEvidence(&tickReport, opts.ConfiguredEvidence)
 		tickReport.PendingPromotion = loadTickPendingPromotionLedger(opts.RepoPath, opts.PreProdBranch)
+		if err := orchestrationcost.Write(tickReport.RepoPath, tickReport.OrchestrationCost); err != nil {
+			tickReport.OrchestrationCost = orchestrationcost.ApplyBudgetDecision(tickReport.OrchestrationCost, orchestrationcost.PersistenceFailure(err))
+			tickReport.Failures = append(tickReport.Failures, TickIssue{Step: "orchestration-cost", Detail: err.Error()})
+			tickReport.Status = TickStatusFailed
+			tickReport.StopReason = TickStopOrchestrationCostPersist
+		}
 		return normalizeTickReport(tickReport), nil
 	}
 
+	plannerStarted := time.Now()
 	compiled, err := opts.Compile(ctx, compiler.Options{
 		RepoPath: opts.RepoPath,
 		Writer:   opts.IssueWriter,
 		Now:      started,
 	})
+	plannerEvent := orchestrationcost.DeterministicEvent(
+		"planner:compile",
+		orchestrationcost.RolePlanner,
+		orchestrationcost.ActivityPhase,
+		"compile is deterministic Go orchestration",
+	)
+	plannerEvent.DurationMS = time.Since(plannerStarted).Milliseconds()
+	recordTickCostEvent(&tickReport, plannerEvent)
 	tickReport.Compile = compiled
 	tickReport.Repo = firstNonEmpty(compiled.Repo, tickReport.Repo)
 	if err != nil {
@@ -367,6 +417,70 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 		return finish(TickStatusNeedsHuman, TickStopGuardrailFrozen)
 	}
 	if len(readySet.Ready) == 0 {
+		if candidate, ok := restoredReleaseCandidate(readySet, tickReport.OrchestrationCost); ok {
+			if tickReport.OrchestrationCost.Status == orchestrationcost.StatusNeedsHuman {
+				tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+					Step:   "orchestration-cost-release",
+					Issue:  candidate.Issue,
+					PR:     candidate.PR,
+					Detail: formatCostDecision(*tickReport.OrchestrationCost.ReleaseGate),
+				})
+				return finish(TickStatusNeedsHuman, TickStopOrchestrationCostBudget)
+			}
+			prNumber, parsed := parseTickPRNumber(candidate.PR)
+			if !parsed {
+				tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{Step: "orchestration-cost-release", Issue: candidate.Issue, PR: candidate.PR, Detail: "could not parse restored release-gated pull request number"})
+				return finish(TickStatusNeedsHuman, TickStopOrchestrationCostBudget)
+			}
+			runTickRiskGateAndPreProdMerge(ctx, opts, &tickReport, candidate, prNumber)
+			pushTickState(ctx, opts, &tickReport)
+			if len(tickReport.Failures) > 0 {
+				if hasStatePushFailure(tickReport.Failures) {
+					return finish(TickStatusFailed, TickStopStatePushFailed)
+				}
+				for _, failure := range tickReport.Failures {
+					if failure.Step == "orchestration-cost" {
+						return finish(TickStatusFailed, TickStopOrchestrationCostPersist)
+					}
+				}
+				return finish(TickStatusFailed, TickStopReviewFailed)
+			}
+			if len(tickReport.NeedsHuman) > 0 {
+				return finish(TickStatusNeedsHuman, tickNeedsHumanStopReason(tickReport.NeedsHuman))
+			}
+			return finish(TickStatusSucceeded, TickStopCompleted)
+		}
+		if candidate, ok := restoredVerificationCandidate(readySet, tickReport.OrchestrationCost); ok {
+			if strings.TrimSpace(opts.VerifierProvider) == "" {
+				tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{Step: "loopreview", Issue: candidate.Issue, PR: candidate.PR, Detail: "verifier provider is required to resume the budget-blocked pull request"})
+				return finish(TickStatusNeedsHuman, TickStopVerifierProviderMissing)
+			}
+			runTickRestoredVerification(ctx, opts, &tickReport, candidate)
+			pushTickState(ctx, opts, &tickReport)
+			if len(tickReport.Failures) > 0 {
+				if hasStatePushFailure(tickReport.Failures) {
+					return finish(TickStatusFailed, TickStopStatePushFailed)
+				}
+				for _, failure := range tickReport.Failures {
+					if failure.Step == "orchestration-cost" {
+						return finish(TickStatusFailed, TickStopOrchestrationCostPersist)
+					}
+				}
+				return finish(TickStatusFailed, TickStopReviewFailed)
+			}
+			if len(tickReport.NeedsHuman) > 0 {
+				return finish(TickStatusNeedsHuman, tickNeedsHumanStopReason(tickReport.NeedsHuman))
+			}
+			return finish(TickStatusSucceeded, TickStopCompleted)
+		}
+		if tickReport.OrchestrationCost.Status == orchestrationcost.StatusNeedsHuman {
+			detail := tickReport.OrchestrationCost.Reason
+			if tickReport.OrchestrationCost.ReleaseGate != nil {
+				detail = formatCostDecision(*tickReport.OrchestrationCost.ReleaseGate)
+			}
+			tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{Step: "orchestration-cost-release", Detail: detail})
+			return finish(TickStatusNeedsHuman, TickStopOrchestrationCostBudget)
+		}
 		return finish(TickStatusNoReadyWork, TickStopNoReadyWork)
 	}
 	if strings.TrimSpace(opts.VerifierProvider) == "" {
@@ -376,18 +490,23 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 		})
 		return finish(TickStatusNeedsHuman, TickStopVerifierProviderMissing)
 	}
-
+	var costMu sync.Mutex
+	workerReservations := map[int]string{}
+	workerResultsRecorded := map[int]bool{}
 	wave, err := opts.DispatchWave(ctx, DispatchWaveOptions{
-		Reader:          opts.Reader,
-		RepoPath:        opts.RepoPath,
-		BaseBranch:      opts.BaseBranch,
-		RunID:           opts.RunID,
-		ReadySet:        &readySet,
-		Provider:        opts.WorkerProvider,
-		Model:           opts.WorkerModel,
-		Effort:          opts.WorkerEffort,
-		ConfigFromBase:  opts.ConfigFromBase,
-		ThrottleLimit:   opts.ThrottleLimit,
+		Reader:         opts.Reader,
+		RepoPath:       opts.RepoPath,
+		BaseBranch:     opts.BaseBranch,
+		RunID:          opts.RunID,
+		ReadySet:       &readySet,
+		Provider:       opts.WorkerProvider,
+		Model:          opts.WorkerModel,
+		Effort:         opts.WorkerEffort,
+		ConfigFromBase: opts.ConfigFromBase,
+		// Exact token usage is only known when a provider returns. Cost-budgeted
+		// dispatch therefore advances one provider at a time so each completed
+		// report can release the next conservative budget slot.
+		ThrottleLimit:   1,
 		Thresholds:      opts.Thresholds,
 		Budget:          opts.Budget,
 		CircuitBreaker:  opts.CircuitBreaker,
@@ -397,8 +516,37 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 		ComputeReadySet: opts.ComputeReadySet,
 		Dispatch:        opts.Dispatch,
 		LoadAttempts:    opts.LoadAttempts,
+		BeforeProviderCall: func(issue int) error {
+			costMu.Lock()
+			defer costMu.Unlock()
+			decision := orchestrationcost.CheckBeforeModelCall(tickReport.OrchestrationCost, 1)
+			tickReport.OrchestrationCost = orchestrationcost.ApplyBudgetDecision(tickReport.OrchestrationCost, decision)
+			if !decision.Allowed {
+				if err := persistTickCostReport(&tickReport); err != nil {
+					return err
+				}
+				return errors.New(formatCostDecision(decision))
+			}
+			eventID := nextTickCostEventID(tickReport.OrchestrationCost.Events, workerCostEventID(issue))
+			if err := upsertTickCostEvent(&tickReport, orchestrationcost.EventFromReport(
+				eventID, orchestrationcost.RoleWorker, true, nil,
+				fmt.Sprintf("issue=%d", issue), "provider-call-reserved",
+			)); err != nil {
+				return err
+			}
+			workerReservations[issue] = eventID
+			return nil
+		},
+		OnIssueComplete: func(completed DispatchWaveIssueComplete) error {
+			costMu.Lock()
+			defer costMu.Unlock()
+			err := recordDispatchWaveResultCost(&tickReport, completed.Result, workerReservations)
+			workerResultsRecorded[completed.Result.Issue] = true
+			return err
+		},
 	})
 	tickReport.DispatchWave = &wave
+	recordDispatchWaveCost(&tickReport, wave, workerReservations, workerResultsRecorded)
 	tickReport.Repo = firstNonEmpty(wave.Repo, tickReport.Repo)
 	if err != nil {
 		tickReport.Failures = append(tickReport.Failures, TickIssue{Step: "dispatch-wave", Detail: err.Error()})
@@ -409,17 +557,36 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 	for _, result := range wave.Results {
 		switch result.Status {
 		case DispatchWaveStatusNeedsHuman:
+			step := "dispatch-wave"
+			if tickReport.OrchestrationCost.Status == orchestrationcost.StatusNeedsHuman {
+				step = "orchestration-cost"
+			}
 			tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
-				Step:   "dispatch-wave",
+				Step:   step,
 				Issue:  result.Issue,
 				PR:     result.PR,
 				Detail: result.Error,
 			})
 		case DispatchWaveStatusFailed:
+			if tickReport.OrchestrationCost.Status == orchestrationcost.StatusNeedsHuman {
+				tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
+					Step:   "orchestration-cost",
+					Issue:  result.Issue,
+					PR:     result.PR,
+					Detail: firstNonEmpty(result.Error, tickReport.OrchestrationCost.Reason),
+				})
+				continue
+			}
 			runTickRecoverDispatchFailure(ctx, opts, &tickReport, result)
 		}
 	}
 	if len(tickReport.NeedsHuman) > 0 {
+		if tickReport.OrchestrationCost.Status == orchestrationcost.StatusNeedsHuman {
+			markPendingVerifierCandidates(&tickReport, wave.Results)
+			if err := persistTickCostReport(&tickReport); err != nil {
+				return finish(TickStatusFailed, TickStopOrchestrationCostPersist)
+			}
+		}
 		pushTickState(ctx, opts, &tickReport)
 		if hasStatePushFailure(tickReport.Failures) {
 			return finish(TickStatusFailed, TickStopStatePushFailed)
@@ -427,7 +594,11 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 		if len(tickReport.Failures) > 0 {
 			return finish(TickStatusFailed, TickStopDispatchFailed)
 		}
-		return finish(TickStatusNeedsHuman, TickStopGuardrailNeedsHuman)
+		stopReason := TickStopGuardrailNeedsHuman
+		if tickNeedsHumanStopReason(tickReport.NeedsHuman) == TickStopOrchestrationCostBudget {
+			stopReason = TickStopOrchestrationCostBudget
+		}
+		return finish(TickStatusNeedsHuman, stopReason)
 	}
 	if len(tickReport.Failures) > 0 {
 		pushTickState(ctx, opts, &tickReport)
@@ -452,6 +623,7 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 		return finish(TickStatusNoReadyWork, TickStopNoReviewablePRsDispatched)
 	}
 
+reviewLoop:
 	for _, item := range reviewable {
 		review := TickReviewResult{
 			Issue:    item.Issue,
@@ -472,33 +644,39 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 			continue
 		}
 		review.PRNumber = prNumber
-		result, err := opts.Loopreview(ctx, loopreview.Options{
-			RepoPath:       opts.RepoPath,
-			PRNumber:       prNumber,
-			Provider:       opts.VerifierProvider,
-			Model:          opts.VerifierModel,
-			Effort:         opts.VerifierEffort,
-			BaseBranch:     opts.BaseBranch,
-			ConfigFromBase: opts.ConfigFromBase,
-			Timeout:        opts.VerifierTimeout,
-			Stderr:         opts.Stderr,
-		})
+		result, err := runTickCostedLoopreview(ctx, opts, &tickReport, prNumber,
+			fmt.Sprintf("verifier:pr-%d", prNumber), orchestrationcost.RoleVerifier, true,
+			fmt.Sprintf("pr=%d", prNumber),
+		)
 		if err != nil {
 			review.Verdict = loopreview.VerdictNeedsHuman
 			review.Error = err.Error()
 			tickReport.Reviews = append(tickReport.Reviews, review)
+			step := "loopreview"
+			if tickReport.OrchestrationCost.Status == orchestrationcost.StatusNeedsHuman {
+				step = "orchestration-cost"
+			}
 			tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
-				Step:   "loopreview",
+				Step:   step,
 				Issue:  item.Issue,
 				PR:     item.PR,
 				Detail: err.Error(),
 			})
+			if step == "orchestration-cost" {
+				break
+			}
 			continue
 		}
 		review = tickReviewResultFromLoopreview(item.Issue, item.PR, prNumber, result)
 		tickReport.Reviews = append(tickReport.Reviews, review)
 		switch result.Verdict.Verdict {
 		case loopreview.VerdictPass:
+			releaseDecision := orchestrationcost.BindReleaseDecision(orchestrationcost.CheckReleaseGate(tickReport.OrchestrationCost), prNumber)
+			tickReport.OrchestrationCost = orchestrationcost.ApplyReleaseDecision(tickReport.OrchestrationCost, releaseDecision)
+			if !releaseDecision.Allowed {
+				tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{Step: "orchestration-cost-release", Issue: item.Issue, PR: item.PR, Detail: formatCostDecision(releaseDecision)})
+				break reviewLoop
+			}
 			runTickRiskGateAndPreProdMerge(ctx, opts, &tickReport, item, prNumber)
 		case loopreview.VerdictFail:
 			runTickRecoverReviewFailure(ctx, opts, &tickReport, item, result)
@@ -516,6 +694,11 @@ func Tick(ctx context.Context, opts TickOptions) (TickReport, error) {
 	if len(tickReport.Failures) > 0 {
 		if hasStatePushFailure(tickReport.Failures) {
 			return finish(TickStatusFailed, TickStopStatePushFailed)
+		}
+		for _, failure := range tickReport.Failures {
+			if failure.Step == "orchestration-cost" {
+				return finish(TickStatusFailed, TickStopOrchestrationCostPersist)
+			}
 		}
 		return finish(TickStatusFailed, TickStopReviewFailed)
 	}
@@ -557,35 +740,41 @@ func withTickDefaults(opts TickOptions) TickOptions {
 			recoverDeps := recovery.DefaultDeps()
 			recoverDeps.Dispatch = func(ctx context.Context, dispatchOpts recovery.DispatchOptions) (recovery.DispatchResult, error) {
 				result, err := opts.Dispatch(ctx, worker.Options{
-					RepoPath:        dispatchOpts.RepoPath,
-					IssueNumber:     dispatchOpts.IssueNumber,
-					IssueTitle:      dispatchOpts.IssueTitle,
-					IssueBody:       dispatchOpts.IssueBody,
-					BaseBranch:      dispatchOpts.BaseBranch,
-					Branch:          dispatchOpts.Branch,
-					RunID:           dispatchOpts.RunID,
-					Attempt:         dispatchOpts.Attempt,
-					RecoveryContext: dispatchOpts.RecoveryContext,
-					Provider:        dispatchOpts.Provider,
-					Model:           dispatchOpts.Model,
-					Effort:          dispatchOpts.Effort,
-					ConfigFromBase:  dispatchOpts.ConfigFromBase,
-					Stderr:          dispatchOpts.Stderr,
+					RepoPath:           dispatchOpts.RepoPath,
+					IssueNumber:        dispatchOpts.IssueNumber,
+					IssueTitle:         dispatchOpts.IssueTitle,
+					IssueBody:          dispatchOpts.IssueBody,
+					BaseBranch:         dispatchOpts.BaseBranch,
+					Branch:             dispatchOpts.Branch,
+					RunID:              dispatchOpts.RunID,
+					Attempt:            dispatchOpts.Attempt,
+					RecoveryContext:    dispatchOpts.RecoveryContext,
+					Provider:           dispatchOpts.Provider,
+					Model:              dispatchOpts.Model,
+					Effort:             dispatchOpts.Effort,
+					ConfigFromBase:     dispatchOpts.ConfigFromBase,
+					Stderr:             dispatchOpts.Stderr,
+					BeforeProviderCall: dispatchOpts.BeforeProviderCall,
 				})
 				return recovery.DispatchResult{
-					OK:          result.OK,
-					Issue:       result.Issue,
-					Branch:      result.Branch,
-					RunID:       result.RunID,
-					PR:          result.PR,
-					Summary:     result.Summary,
-					AttemptPath: result.AttemptPath,
-					Status:      result.Status,
-					ExitCode:    result.ExitCode,
-					LogBytes:    result.LogBytes,
-					Reason:      result.Reason,
-					NextAction:  result.NextAction,
-					Report:      result.Report,
+					OK:              result.OK,
+					ProviderInvoked: result.ProviderInvoked,
+					Issue:           result.Issue,
+					Branch:          result.Branch,
+					RunID:           result.RunID,
+					PR:              result.PR,
+					Summary:         result.Summary,
+					AttemptPath:     result.AttemptPath,
+					Status:          result.Status,
+					Outcome:         result.Outcome,
+					ProviderOutcome: result.ProviderOutcome,
+					DeliveryOutcome: result.DeliveryOutcome,
+					Evidence:        result.Evidence,
+					ExitCode:        result.ExitCode,
+					LogBytes:        result.LogBytes,
+					Reason:          result.Reason,
+					NextAction:      result.NextAction,
+					Report:          result.Report,
 				}, err
 			}
 			recoverDeps.Review = func(ctx context.Context, reviewOpts loopreview.Options) (loopreview.Result, error) {
@@ -608,7 +797,285 @@ func withTickDefaults(opts TickOptions) TickOptions {
 	if opts.ThrottleLimit <= 0 {
 		opts.ThrottleLimit = lcdefaults.DispatchWaveThrottleLimit
 	}
+	if opts.CostPolicy == (orchestrationcost.Policy{}) {
+		opts.CostPolicy = orchestrationcost.DefaultPolicy()
+	}
 	return opts
+}
+
+func recordTickCostEvent(tickReport *TickReport, event orchestrationcost.Event) {
+	event.EventID = nextTickCostEventID(tickReport.OrchestrationCost.Events, event.EventID)
+	events := append(append([]orchestrationcost.Event(nil), tickReport.OrchestrationCost.Events...), event)
+	_ = replaceTickCostEvents(tickReport, events)
+}
+
+func upsertTickCostEvent(tickReport *TickReport, event orchestrationcost.Event) error {
+	if err := upsertTickCostEventInMemory(tickReport, event); err != nil {
+		return err
+	}
+	return persistTickCostReport(tickReport)
+}
+
+func upsertTickCostEventInMemory(tickReport *TickReport, event orchestrationcost.Event) error {
+	events := append([]orchestrationcost.Event(nil), tickReport.OrchestrationCost.Events...)
+	replaced := false
+	for i := range events {
+		if events[i].EventID == event.EventID {
+			events[i] = event
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		events = append(events, event)
+	}
+	return replaceTickCostEventsInMemory(tickReport, events)
+}
+
+func removeTickCostEvent(tickReport *TickReport, eventID string) error {
+	events := make([]orchestrationcost.Event, 0, len(tickReport.OrchestrationCost.Events))
+	for _, event := range tickReport.OrchestrationCost.Events {
+		if event.EventID != eventID {
+			events = append(events, event)
+		}
+	}
+	return replaceTickCostEvents(tickReport, events)
+}
+
+func replaceTickCostEvents(tickReport *TickReport, events []orchestrationcost.Event) error {
+	if err := replaceTickCostEventsInMemory(tickReport, events); err != nil {
+		return err
+	}
+	return persistTickCostReport(tickReport)
+}
+
+func replaceTickCostEventsInMemory(tickReport *TickReport, events []orchestrationcost.Event) error {
+	previous := tickReport.OrchestrationCost
+	next, err := orchestrationcost.Build(previous.RunID, previous.Policy, events)
+	if err != nil {
+		tickReport.OrchestrationCost = orchestrationcost.ApplyBudgetDecision(previous, orchestrationcost.AccountingFailure(err))
+		tickReport.Failures = append(tickReport.Failures, TickIssue{Step: "orchestration-cost", Detail: err.Error()})
+		return err
+	}
+	next = orchestrationcost.RestoreDecisionState(next, previous.BudgetDecisions, previous.ReleaseGate)
+	tickReport.OrchestrationCost = next
+	return nil
+}
+
+func persistTickCostReport(tickReport *TickReport) error {
+	if err := orchestrationcost.Write(tickReport.RepoPath, tickReport.OrchestrationCost); err != nil {
+		next := tickReport.OrchestrationCost
+		tickReport.OrchestrationCost = orchestrationcost.ApplyBudgetDecision(next, orchestrationcost.PersistenceFailure(err))
+		tickReport.Failures = append(tickReport.Failures, TickIssue{Step: "orchestration-cost", Detail: err.Error()})
+		return err
+	}
+	return nil
+}
+
+func nextTickCostEventID(events []orchestrationcost.Event, base string) string {
+	base = strings.TrimSpace(base)
+	seen := make(map[string]bool, len(events))
+	for _, event := range events {
+		seen[event.EventID] = true
+	}
+	if !seen[base] {
+		return base
+	}
+	for ordinal := 2; ; ordinal++ {
+		candidate := fmt.Sprintf("%s:%d", base, ordinal)
+		if !seen[candidate] {
+			return candidate
+		}
+	}
+}
+
+func workerCostEventID(issue int) string {
+	return fmt.Sprintf("worker:issue-%d", issue)
+}
+
+func recordDispatchWaveCost(tickReport *TickReport, wave DispatchWaveReport, currentReservations map[int]string, recorded map[int]bool) {
+	for _, result := range wave.Results {
+		if recorded[result.Issue] {
+			continue
+		}
+		_ = recordDispatchWaveResultCost(tickReport, result, currentReservations)
+	}
+}
+
+func recordDispatchWaveResultCost(tickReport *TickReport, result DispatchWaveIssueResult, currentReservations map[int]string) error {
+	eventID := currentReservations[result.Issue]
+	delete(currentReservations, result.Issue)
+	if !result.ProviderInvoked {
+		if eventID != "" {
+			if err := removeTickCostEvent(tickReport, eventID); err != nil {
+				return err
+			}
+		}
+		if strings.TrimSpace(result.ProviderOutcome) == "" || strings.TrimSpace(result.DeliveryOutcome) == "" {
+			return nil
+		}
+		deliveryEvent := orchestrationcost.DeterministicEvent(
+			nextTickCostEventID(tickReport.OrchestrationCost.Events, fmt.Sprintf("delivery:issue-%d:retry", result.Issue)),
+			orchestrationcost.RoleDelivery,
+			orchestrationcost.ActivityDeliveryRetry,
+			append([]string{
+				fmt.Sprintf("issue=%d", result.Issue),
+				fmt.Sprintf("outcome=%s", result.Outcome),
+				fmt.Sprintf("provider_outcome=%s", result.ProviderOutcome),
+				fmt.Sprintf("delivery_outcome=%s", result.DeliveryOutcome),
+			}, result.Evidence...)...,
+		)
+		deliveryEvent.Retries = 1
+		deliveryEvent.DeliveryOnlyRetries = 1
+		return upsertTickCostEvent(tickReport, deliveryEvent)
+	}
+	if eventID == "" {
+		eventID = nextTickCostEventID(tickReport.OrchestrationCost.Events, workerCostEventID(result.Issue))
+	}
+	return upsertTickCostEvent(tickReport, orchestrationcost.EventFromReport(
+		eventID, orchestrationcost.RoleWorker, true, result.Report,
+		providerCallEvidence(result.Report, fmt.Sprintf("issue=%d", result.Issue), fmt.Sprintf("status=%s", result.Status))...,
+	))
+}
+
+func providerCallEvidence(record *reporter.Report, evidence ...string) []string {
+	result := append([]string(nil), evidence...)
+	if record == nil {
+		result = append(result, "provider-call-reserved")
+	}
+	return result
+}
+
+func recordRecoveryCost(tickReport *TickReport, issue int, result recovery.Result, providerCallsRecorded bool) {
+	recorded := false
+	reviewRecorded := false
+	if !providerCallsRecorded {
+		for _, attempt := range result.RecoveryAttempts {
+			if attempt.DispatchResult != nil && attempt.DispatchResult.ProviderInvoked {
+				recorded = true
+				recordTickCostEvent(tickReport, orchestrationcost.EventFromReport(
+					fmt.Sprintf("recovery:issue-%d:attempt-%d:worker", issue, attempt.Attempt), orchestrationcost.RoleRecovery, false, attempt.DispatchResult.Report,
+					providerCallEvidence(attempt.DispatchResult.Report, fmt.Sprintf("strategy=%s", attempt.Strategy), fmt.Sprintf("status=%s", attempt.Status))...,
+				))
+			}
+			if attempt.Review != nil && attempt.Review.Report != nil {
+				recorded = true
+				reviewRecorded = true
+				recordTickCostEvent(tickReport, orchestrationcost.EventFromReport(
+					fmt.Sprintf("recovery:issue-%d:attempt-%d:verifier", issue, attempt.Attempt), orchestrationcost.RoleRecovery, false, attempt.Review.Report,
+					fmt.Sprintf("strategy=%s", attempt.Strategy), "recovery verifier call",
+				))
+			}
+		}
+		if !recorded && result.DispatchResult != nil && result.DispatchResult.ProviderInvoked {
+			recordTickCostEvent(tickReport, orchestrationcost.EventFromReport(
+				fmt.Sprintf("recovery:issue-%d:worker", issue), orchestrationcost.RoleRecovery, false, result.DispatchResult.Report,
+				providerCallEvidence(result.DispatchResult.Report, "recovery worker call")...,
+			))
+		}
+		if !reviewRecorded && result.ReviewResult != nil && result.ReviewResult.ProviderInvoked {
+			recordTickCostEvent(tickReport, orchestrationcost.EventFromReport(
+				fmt.Sprintf("recovery:issue-%d:verifier", issue), orchestrationcost.RoleRecovery, false, result.ReviewResult.Verdict.Report,
+				providerCallEvidence(result.ReviewResult.Verdict.Report, "recovery verifier call")...,
+			))
+		}
+	}
+	retryEvent := orchestrationcost.DeterministicEvent(
+		fmt.Sprintf("recovery:issue-%d:retries", issue), orchestrationcost.RoleRecovery, orchestrationcost.ActivityRecoveryRetry,
+		"recovery retry ledger",
+	)
+	retryEvent.Retries = len(result.RecoveryAttempts)
+	for _, attempt := range result.RecoveryAttempts {
+		if attempt.Strategy == recovery.AttemptStrategySameConfig {
+			retryEvent.DuplicateRetries++
+		}
+	}
+	recordTickCostEvent(tickReport, retryEvent)
+}
+
+func recordRiskGateWaitCost(tickReport *TickReport, prNumber int, wait *waitstate.Report) error {
+	if wait == nil {
+		return nil
+	}
+	event := orchestrationcost.DeterministicEvent(
+		fmt.Sprintf("waiting:github-ci:pr-%d", prNumber), orchestrationcost.RoleWaiting, orchestrationcost.ActivityCIPoll,
+		fmt.Sprintf("polls=%d", wait.Polls), fmt.Sprintf("receipts=%d", wait.Receipts), fmt.Sprintf("stop_reason=%s", wait.StopReason),
+	)
+	if wait.Polls > 1 {
+		event.Retries = wait.Polls - 1
+	}
+	event.DuplicateSuppressions = wait.DuplicateSuppressions
+	event.ContextPacketBytes = len(wait.LastPacket)
+	event.DurationMS = wait.DurationMS
+	event.EventID = nextTickCostEventID(tickReport.OrchestrationCost.Events, event.EventID)
+	return upsertTickCostEvent(tickReport, event)
+}
+
+func formatCostDecision(decision orchestrationcost.Decision) string {
+	return fmt.Sprintf("%s: observed=%s limit=%s; %s", decision.Reason, decision.Observed, decision.Limit, decision.Remediation)
+}
+
+func runTickCostedLoopreview(
+	ctx context.Context,
+	opts TickOptions,
+	tickReport *TickReport,
+	prNumber int,
+	eventID string,
+	role orchestrationcost.Role,
+	useful bool,
+	evidence ...string,
+) (loopreview.Result, error) {
+	reserved := false
+	reservationEventID := ""
+	result, err := opts.Loopreview(ctx, loopreview.Options{
+		RepoPath:       opts.RepoPath,
+		PRNumber:       prNumber,
+		Provider:       opts.VerifierProvider,
+		Model:          opts.VerifierModel,
+		Effort:         opts.VerifierEffort,
+		BaseBranch:     opts.BaseBranch,
+		ConfigFromBase: opts.ConfigFromBase,
+		Timeout:        opts.VerifierTimeout,
+		Stderr:         opts.Stderr,
+		BeforeProviderCall: func() error {
+			decision := orchestrationcost.BindDecisionToPR(orchestrationcost.CheckBeforeModelCall(tickReport.OrchestrationCost, 1), prNumber)
+			tickReport.OrchestrationCost = orchestrationcost.ApplyBudgetDecision(tickReport.OrchestrationCost, decision)
+			if !decision.Allowed {
+				if err := persistTickCostReport(tickReport); err != nil {
+					return err
+				}
+				return errors.New(formatCostDecision(decision))
+			}
+			reservationEventID = nextTickCostEventID(tickReport.OrchestrationCost.Events, eventID)
+			pendingEvidence := append(append([]string(nil), evidence...), "provider-call-reserved")
+			if err := upsertTickCostEvent(tickReport, orchestrationcost.EventFromReport(reservationEventID, role, useful, nil, pendingEvidence...)); err != nil {
+				return err
+			}
+			reserved = true
+			return nil
+		},
+	})
+	if result.ProviderInvoked {
+		if reservationEventID == "" {
+			reservationEventID = nextTickCostEventID(tickReport.OrchestrationCost.Events, eventID)
+		}
+		costErr := upsertTickCostEventInMemory(tickReport, orchestrationcost.EventFromReport(
+			reservationEventID, role, useful, result.Verdict.Report,
+			providerCallEvidence(result.Verdict.Report, evidence...)...,
+		))
+		if costErr == nil {
+			tickReport.OrchestrationCost = orchestrationcost.MarkBudgetDecisionConsumed(tickReport.OrchestrationCost, prNumber)
+			costErr = persistTickCostReport(tickReport)
+		}
+		if costErr != nil && err == nil {
+			err = costErr
+		}
+	} else if reserved {
+		if costErr := removeTickCostEvent(tickReport, reservationEventID); costErr != nil && err == nil {
+			err = costErr
+		}
+	}
+	return result, err
 }
 
 func runTickRecoverDispatchFailure(ctx context.Context, opts TickOptions, tickReport *TickReport, result DispatchWaveIssueResult) {
@@ -669,6 +1136,9 @@ type tickRecoveryRequest struct {
 }
 
 func runTickRecoverFailure(ctx context.Context, opts TickOptions, tickReport *TickReport, request tickRecoveryRequest) {
+	providerCallsRecorded := false
+	pendingProviderEventID := ""
+	var activeBudgetRefusal *orchestrationcost.Decision
 	result, err := opts.Recover(ctx, recovery.Options{
 		RepoPath:         opts.RepoPath,
 		IssueNumber:      request.IssueNumber,
@@ -690,9 +1160,59 @@ func runTickRecoverFailure(ctx context.Context, opts TickOptions, tickReport *Ti
 		ConfigFromBase:   opts.ConfigFromBase,
 		Budget:           opts.Budget,
 		CircuitBreaker:   opts.CircuitBreaker,
+		Progress:         opts.Progress,
 		Now:              opts.Clock(),
 		Stderr:           opts.Stderr,
+		BeforeProviderCall: func(kind string) error {
+			callDecision := orchestrationcost.CheckBeforeModelCall(tickReport.OrchestrationCost, 1)
+			tickReport.OrchestrationCost = orchestrationcost.ApplyBudgetDecision(tickReport.OrchestrationCost, callDecision)
+			if !callDecision.Allowed {
+				decisionCopy := callDecision
+				activeBudgetRefusal = &decisionCopy
+				if err := persistTickCostReport(tickReport); err != nil {
+					return err
+				}
+				return errors.New(formatCostDecision(callDecision))
+			}
+			pendingProviderEventID = nextTickCostEventID(
+				tickReport.OrchestrationCost.Events,
+				fmt.Sprintf("recovery:issue-%d:%s", request.IssueNumber, kind),
+			)
+			return upsertTickCostEvent(tickReport, orchestrationcost.EventFromReport(
+				pendingProviderEventID, orchestrationcost.RoleRecovery, false, nil,
+				fmt.Sprintf("provider_kind=%s", kind), "provider-call-reserved",
+			))
+		},
+		AfterProviderCall: func(kind string, invoked bool, providerReport *reporter.Report) {
+			if !invoked {
+				if pendingProviderEventID != "" {
+					_ = removeTickCostEvent(tickReport, pendingProviderEventID)
+					pendingProviderEventID = ""
+				}
+				return
+			}
+			providerCallsRecorded = true
+			if pendingProviderEventID == "" {
+				pendingProviderEventID = nextTickCostEventID(
+					tickReport.OrchestrationCost.Events,
+					fmt.Sprintf("recovery:issue-%d:%s", request.IssueNumber, kind),
+				)
+			}
+			_ = upsertTickCostEvent(tickReport, orchestrationcost.EventFromReport(
+				pendingProviderEventID,
+				orchestrationcost.RoleRecovery,
+				false,
+				providerReport,
+				providerCallEvidence(providerReport, fmt.Sprintf("provider_kind=%s", kind))...,
+			))
+			pendingProviderEventID = ""
+		},
 	})
+	recordRecoveryCost(tickReport, request.IssueNumber, result, providerCallsRecorded)
+	if activeBudgetRefusal != nil {
+		tickReport.OrchestrationCost = orchestrationcost.ReapplyBudgetDecision(tickReport.OrchestrationCost, *activeBudgetRefusal)
+		_ = persistTickCostReport(tickReport)
+	}
 	recoveryReport := TickRecoveryResult{
 		Issue:    request.IssueNumber,
 		PR:       request.PR,
@@ -757,17 +1277,10 @@ func runTickRecoveredPR(ctx context.Context, opts TickOptions, tickReport *TickR
 		return
 	}
 	if reviewResult == nil {
-		result, err := opts.Loopreview(ctx, loopreview.Options{
-			RepoPath:       opts.RepoPath,
-			PRNumber:       prNumber,
-			Provider:       opts.VerifierProvider,
-			Model:          opts.VerifierModel,
-			Effort:         opts.VerifierEffort,
-			BaseBranch:     opts.BaseBranch,
-			ConfigFromBase: opts.ConfigFromBase,
-			Timeout:        opts.VerifierTimeout,
-			Stderr:         opts.Stderr,
-		})
+		result, err := runTickCostedLoopreview(ctx, opts, tickReport, prNumber,
+			fmt.Sprintf("recovery:%d:post-review", issueNumber), orchestrationcost.RoleRecovery, false,
+			"recovered PR verifier call", fmt.Sprintf("pr=%d", prNumber),
+		)
 		if err != nil {
 			tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
 				Step:   "recover",
@@ -790,6 +1303,12 @@ func runTickRecoveredPR(ctx context.Context, opts TickOptions, tickReport *TickR
 		})
 		return
 	}
+	releaseDecision := orchestrationcost.BindReleaseDecision(orchestrationcost.CheckReleaseGate(tickReport.OrchestrationCost), prNumber)
+	tickReport.OrchestrationCost = orchestrationcost.ApplyReleaseDecision(tickReport.OrchestrationCost, releaseDecision)
+	if !releaseDecision.Allowed {
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{Step: "orchestration-cost-release", Issue: issueNumber, PR: dispatchResult.PR, Detail: formatCostDecision(releaseDecision)})
+		return
+	}
 	runTickRiskGateAndPreProdMerge(ctx, opts, tickReport, tickReviewCandidate{Issue: issueNumber, PR: dispatchResult.PR}, prNumber)
 }
 
@@ -803,17 +1322,10 @@ func runTickAdoptedPR(ctx context.Context, opts TickOptions, tickReport *TickRep
 		return
 	}
 	pr := firstNonEmpty(adopted.URL, fmt.Sprintf("#%d", adopted.Number))
-	result, err := opts.Loopreview(ctx, loopreview.Options{
-		RepoPath:       opts.RepoPath,
-		PRNumber:       adopted.Number,
-		Provider:       opts.VerifierProvider,
-		Model:          opts.VerifierModel,
-		Effort:         opts.VerifierEffort,
-		BaseBranch:     opts.BaseBranch,
-		ConfigFromBase: opts.ConfigFromBase,
-		Timeout:        opts.VerifierTimeout,
-		Stderr:         opts.Stderr,
-	})
+	result, err := runTickCostedLoopreview(ctx, opts, tickReport, adopted.Number,
+		fmt.Sprintf("recovery:%d:adopt-review", issueNumber), orchestrationcost.RoleRecovery, false,
+		"adopted PR verifier call", fmt.Sprintf("pr=%d", adopted.Number),
+	)
 	if err != nil {
 		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
 			Step:   "recover",
@@ -832,6 +1344,12 @@ func runTickAdoptedPR(ctx context.Context, opts TickOptions, tickReport *TickRep
 			PR:     pr,
 			Detail: firstNonEmpty(review.Reason, review.Evidence, review.Error, "adopted PR did not pass loopreview"),
 		})
+		return
+	}
+	releaseDecision := orchestrationcost.BindReleaseDecision(orchestrationcost.CheckReleaseGate(tickReport.OrchestrationCost), adopted.Number)
+	tickReport.OrchestrationCost = orchestrationcost.ApplyReleaseDecision(tickReport.OrchestrationCost, releaseDecision)
+	if !releaseDecision.Allowed {
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{Step: "orchestration-cost-release", Issue: issueNumber, PR: pr, Detail: formatCostDecision(releaseDecision)})
 		return
 	}
 	runTickRiskGateAndPreProdMerge(ctx, opts, tickReport, tickReviewCandidate{Issue: issueNumber, PR: pr}, adopted.Number)
@@ -937,12 +1455,26 @@ func runTickRiskGateAndPreProdMerge(ctx context.Context, opts TickOptions, tickR
 		return
 	}
 
+	riskGateRecordID := fmt.Sprintf("pr-%d", prNumber)
+	emitCIProgress(ctx, opts.Progress, opts.Clock(), opts.RunID, item.Issue, item.PR, "risk-gate", riskGateRecordID, progress.KnownWaitingCI, progress.KnownWaitingCI, "waiting for PR checks", false)
 	decision, err := opts.RiskGate(ctx, RiskGateOptions{
 		Reader:             gateReader,
 		PRNumber:           prNumber,
 		RequiredChecks:     opts.RequiredChecks,
 		AdditionalRedLines: opts.AdditionalRiskRedLines,
+		WaitForChecks:      opts.WaitForChecks,
+		WaitPolicy:         opts.WaitPolicy,
+		WaitClock:          opts.WaitClock,
+		WaitReceipt: func(ctx context.Context, receipt waitstate.Receipt) error {
+			at, parseErr := time.Parse(time.RFC3339Nano, receipt.OccurredAt)
+			if parseErr != nil {
+				at = opts.Clock().UTC()
+			}
+			emitCIProgress(ctx, opts.Progress, at, opts.RunID, item.Issue, item.PR, "risk-gate", riskGateRecordID, progress.KnownWaitingCI, progress.KnownWaitingCI, "waiting for PR checks", false)
+			return nil
+		},
 	})
+	waitCostErr := recordRiskGateWaitCost(tickReport, prNumber, decision.Wait)
 	gateResult := TickRiskGateResult{
 		Issue:          item.Issue,
 		PR:             item.PR,
@@ -952,10 +1484,19 @@ func runTickRiskGateAndPreProdMerge(ctx context.Context, opts TickOptions, tickR
 		ChangedFiles:   append([]string(nil), decision.ChangedFiles...),
 		Checks:         append([]gh.Check(nil), decision.Checks...),
 		RedLines:       append([]RiskRedLine(nil), decision.RedLines...),
+		Wait:           decision.Wait,
+	}
+	if waitCostErr != nil {
+		gateResult.Status = RiskGateStatusNeedsHuman
+		gateResult.Error = waitCostErr.Error()
+		emitCIProgress(ctx, opts.Progress, opts.Clock(), opts.RunID, item.Issue, item.PR, "risk-gate", riskGateRecordID, RiskGateStatusNeedsHuman, progress.KnownBlocked, "orchestration cost persistence failed: "+waitCostErr.Error(), true)
+		tickReport.RiskGates = append(tickReport.RiskGates, gateResult)
+		return
 	}
 	if err != nil {
 		gateResult.Status = RiskGateStatusNeedsHuman
 		gateResult.Error = err.Error()
+		emitCIProgress(ctx, opts.Progress, opts.Clock(), opts.RunID, item.Issue, item.PR, "risk-gate", riskGateRecordID, RiskGateStatusNeedsHuman, progress.KnownBlocked, "risk gate check read failed: "+err.Error(), true)
 		tickReport.RiskGates = append(tickReport.RiskGates, gateResult)
 		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
 			Step:   "risk-gate",
@@ -967,6 +1508,7 @@ func runTickRiskGateAndPreProdMerge(ctx context.Context, opts TickOptions, tickR
 	}
 	tickReport.RiskGates = append(tickReport.RiskGates, gateResult)
 	if decision.Status != RiskGateStatusClean || len(decision.RedLines) > 0 {
+		emitCIProgress(ctx, opts.Progress, opts.Clock(), opts.RunID, item.Issue, item.PR, "risk-gate", riskGateRecordID, RiskGateStatusNeedsHuman, progress.KnownBlocked, "risk gate requires human review", true)
 		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
 			Step:   "risk-gate",
 			Issue:  item.Issue,
@@ -975,6 +1517,7 @@ func runTickRiskGateAndPreProdMerge(ctx context.Context, opts TickOptions, tickR
 		})
 		return
 	}
+	emitCIProgress(ctx, opts.Progress, opts.Clock(), opts.RunID, item.Issue, item.PR, "risk-gate", riskGateRecordID, RiskGateStatusClean, progress.KnownTerminal, "risk gate checks are clean", true)
 
 	if detail := preProdBranchProblem(opts.PreProdBranch, opts.BaseBranch); detail != "" {
 		tickReport.PreProdMerges = append(tickReport.PreProdMerges, TickPreProdMergeResult{
@@ -1013,7 +1556,14 @@ func runTickRiskGateAndPreProdMerge(ctx context.Context, opts TickOptions, tickR
 	}
 
 	priorStableCommit := readTickPriorStableCommit(ctx, opts, opts.PreProdBranch)
+	deliveryStarted := time.Now()
 	merged, err := opts.PreProdWriter.MergeToPreProd(ctx, prNumber, opts.PreProdBranch)
+	deliveryEvent := orchestrationcost.DeterministicEvent(
+		fmt.Sprintf("delivery:pre-prod-merge:%d", prNumber), orchestrationcost.RoleDelivery, orchestrationcost.ActivityPhase,
+		"pre-prod merge is deterministic delivery",
+	)
+	deliveryEvent.DurationMS = time.Since(deliveryStarted).Milliseconds()
+	recordTickCostEvent(tickReport, deliveryEvent)
 	mergeResult := TickPreProdMergeResult{
 		Issue:             item.Issue,
 		PR:                item.PR,
@@ -1039,6 +1589,16 @@ func runTickRiskGateAndPreProdMerge(ctx context.Context, opts TickOptions, tickR
 	mergeResult.SHA = merged.SHA
 	mergeResult.URL = merged.URL
 	tickReport.PreProdMerges = append(tickReport.PreProdMerges, mergeResult)
+	consumedCost, consumeErr := orchestrationcost.MarkReleaseConsumed(tickReport.OrchestrationCost, prNumber)
+	if consumeErr != nil {
+		tickReport.OrchestrationCost = orchestrationcost.ApplyBudgetDecision(tickReport.OrchestrationCost, orchestrationcost.AccountingFailure(consumeErr))
+		tickReport.Failures = append(tickReport.Failures, TickIssue{Step: "orchestration-cost", Issue: item.Issue, PR: item.PR, Detail: consumeErr.Error()})
+		return
+	}
+	tickReport.OrchestrationCost = consumedCost
+	if err := persistTickCostReport(tickReport); err != nil {
+		return
+	}
 	runTickPreProdKeepsGreen(ctx, opts, tickReport, item, prNumber, mergeResult)
 }
 
@@ -1082,6 +1642,8 @@ func runTickPreProdKeepsGreen(ctx context.Context, opts TickOptions, tickReport 
 		return
 	}
 
+	preProdRecordID := firstNonEmpty(mergeResult.SHA, opts.PreProdBranch)
+	emitCIProgress(ctx, opts.Progress, opts.Clock(), opts.RunID, item.Issue, item.PR, "pre-prod-health", preProdRecordID, progress.KnownWaitingCI, progress.KnownWaitingCI, "waiting for pre-prod branch checks", false)
 	branchChecks, err := healthReader.BranchChecks(ctx, opts.PreProdBranch)
 	health := TickPreProdHealthResult{
 		Issue:          item.Issue,
@@ -1097,6 +1659,7 @@ func runTickPreProdKeepsGreen(ctx context.Context, opts TickOptions, tickReport 
 	if err != nil {
 		health.Status = PreProdHealthStatusUnknown
 		health.Error = err.Error()
+		emitCIProgress(ctx, opts.Progress, opts.Clock(), opts.RunID, item.Issue, item.PR, "pre-prod-health", preProdRecordID, PreProdHealthStatusUnknown, progress.KnownBlocked, "pre-prod branch check read failed: "+err.Error(), true)
 		tickReport.PreProdHealth = append(tickReport.PreProdHealth, health)
 		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{
 			Step:   "pre-prod-health",
@@ -1107,6 +1670,7 @@ func runTickPreProdKeepsGreen(ctx context.Context, opts TickOptions, tickReport 
 		return
 	}
 	health.Status, health.Problems = preProdHealthStatus(health.RequiredChecks, health.Checks)
+	emitCIProgress(ctx, opts.Progress, opts.Clock(), opts.RunID, item.Issue, item.PR, "pre-prod-health", preProdRecordID, health.Status, knownPreProdHealthState(health.Status), preProdHealthProgressSummary(health), health.Status != PreProdHealthStatusPending)
 	tickReport.PreProdHealth = append(tickReport.PreProdHealth, health)
 	switch health.Status {
 	case PreProdHealthStatusGreen:
@@ -1136,6 +1700,36 @@ func runTickPreProdKeepsGreen(ctx context.Context, opts TickOptions, tickReport 
 			PR:     item.PR,
 			Detail: detail,
 		})
+	}
+}
+
+func knownPreProdHealthState(status string) string {
+	switch status {
+	case PreProdHealthStatusPending:
+		return progress.KnownWaitingCI
+	case PreProdHealthStatusGreen:
+		return progress.KnownTerminal
+	default:
+		return progress.KnownBlocked
+	}
+}
+
+func preProdHealthProgressSummary(health TickPreProdHealthResult) string {
+	switch health.Status {
+	case PreProdHealthStatusGreen:
+		return "pre-prod branch checks are green"
+	case PreProdHealthStatusRed:
+		return "pre-prod branch checks are red"
+	case PreProdHealthStatusPending:
+		return "pre-prod branch checks are still pending"
+	default:
+		if strings.TrimSpace(health.Error) != "" {
+			return "pre-prod branch check status is unknown: " + health.Error
+		}
+		if len(health.Problems) > 0 {
+			return "pre-prod branch check status is unknown: " + strings.Join(health.Problems, ", ")
+		}
+		return "pre-prod branch check status is unknown"
 	}
 }
 
@@ -1300,6 +1894,9 @@ func formatRiskRedLines(lines []RiskRedLine) string {
 
 func tickNeedsHumanStopReason(items []TickIssue) string {
 	for _, item := range items {
+		if item.Step == "orchestration-cost" || item.Step == "orchestration-cost-release" {
+			return TickStopOrchestrationCostBudget
+		}
 		if item.Step == "recover" {
 			return TickStopRecoverNeedsHuman
 		}
@@ -1794,6 +2391,117 @@ func reviewablePRs(results []DispatchWaveIssueResult) []tickReviewCandidate {
 		return out[i].PR < out[j].PR
 	})
 	return out
+}
+
+func markPendingVerifierCandidates(tickReport *TickReport, results []DispatchWaveIssueResult) {
+	if tickReport == nil {
+		return
+	}
+	var refusal *orchestrationcost.Decision
+	for i := len(tickReport.OrchestrationCost.BudgetDecisions) - 1; i >= 0; i-- {
+		decision := tickReport.OrchestrationCost.BudgetDecisions[i]
+		if !decision.Allowed {
+			copy := decision
+			refusal = &copy
+			break
+		}
+	}
+	if refusal == nil {
+		return
+	}
+	existing := map[int]bool{}
+	for _, decision := range tickReport.OrchestrationCost.BudgetDecisions {
+		if !decision.Allowed && !decision.Consumed && decision.PRNumber > 0 {
+			existing[decision.PRNumber] = true
+		}
+	}
+	for _, item := range reviewablePRs(results) {
+		prNumber, ok := parseTickPRNumber(item.PR)
+		if !ok || existing[prNumber] {
+			continue
+		}
+		decision := *refusal
+		decision.PRNumber = prNumber
+		decision.Consumed = false
+		decision.Evidence = append(append([]string(nil), refusal.Evidence...), fmt.Sprintf("pending-verifier-pr=%d", prNumber))
+		tickReport.OrchestrationCost = orchestrationcost.ApplyBudgetDecision(tickReport.OrchestrationCost, decision)
+		existing[prNumber] = true
+	}
+}
+
+func restoredReleaseCandidate(readySet report.ReadySetReport, cost orchestrationcost.Report) (tickReviewCandidate, bool) {
+	if cost.ReleaseGate == nil || cost.ReleaseGate.Consumed || cost.ReleaseGate.PRNumber <= 0 {
+		return tickReviewCandidate{}, false
+	}
+	prNumber := cost.ReleaseGate.PRNumber
+	for _, blocked := range readySet.Blocked {
+		for _, pr := range blocked.OpenPRs {
+			if pr.Number != prNumber {
+				continue
+			}
+			return tickReviewCandidate{Issue: blocked.Issue, PR: firstNonEmpty(pr.URL, fmt.Sprintf("#%d", pr.Number))}, true
+		}
+	}
+	return tickReviewCandidate{}, false
+}
+
+func restoredVerificationCandidate(readySet report.ReadySetReport, cost orchestrationcost.Report) (tickReviewCandidate, bool) {
+	prNumber := 0
+	for i := len(cost.BudgetDecisions) - 1; i >= 0; i-- {
+		decision := cost.BudgetDecisions[i]
+		if decision.Allowed || decision.Consumed || decision.PRNumber <= 0 {
+			continue
+		}
+		prNumber = decision.PRNumber
+		break
+	}
+	if prNumber <= 0 {
+		return tickReviewCandidate{}, false
+	}
+	for _, blocked := range readySet.Blocked {
+		for _, pr := range blocked.OpenPRs {
+			if pr.Number == prNumber {
+				return tickReviewCandidate{Issue: blocked.Issue, PR: firstNonEmpty(pr.URL, fmt.Sprintf("#%d", pr.Number))}, true
+			}
+		}
+	}
+	return tickReviewCandidate{}, false
+}
+
+func runTickRestoredVerification(ctx context.Context, opts TickOptions, tickReport *TickReport, item tickReviewCandidate) {
+	prNumber, ok := parseTickPRNumber(item.PR)
+	if !ok {
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{Step: "loopreview", Issue: item.Issue, PR: item.PR, Detail: "could not parse restored verifier pull request number"})
+		return
+	}
+	result, err := runTickCostedLoopreview(ctx, opts, tickReport, prNumber,
+		fmt.Sprintf("verifier:pr-%d", prNumber), orchestrationcost.RoleVerifier, true,
+		fmt.Sprintf("pr=%d", prNumber), "resumed budget-blocked verifier call",
+	)
+	if err != nil {
+		step := "loopreview"
+		if tickReport.OrchestrationCost.Status == orchestrationcost.StatusNeedsHuman {
+			step = "orchestration-cost"
+		}
+		tickReport.Reviews = append(tickReport.Reviews, TickReviewResult{Issue: item.Issue, PR: item.PR, PRNumber: prNumber, Verdict: loopreview.VerdictNeedsHuman, Findings: []loopreview.Finding{}, Error: err.Error()})
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{Step: step, Issue: item.Issue, PR: item.PR, Detail: err.Error()})
+		return
+	}
+	tickReport.Reviews = append(tickReport.Reviews, tickReviewResultFromLoopreview(item.Issue, item.PR, prNumber, result))
+	switch result.Verdict.Verdict {
+	case loopreview.VerdictPass:
+		decision := orchestrationcost.BindReleaseDecision(orchestrationcost.CheckReleaseGate(tickReport.OrchestrationCost), prNumber)
+		tickReport.OrchestrationCost = orchestrationcost.ApplyReleaseDecision(tickReport.OrchestrationCost, decision)
+		if !decision.Allowed {
+			tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{Step: "orchestration-cost-release", Issue: item.Issue, PR: item.PR, Detail: formatCostDecision(decision)})
+			return
+		}
+		runTickRiskGateAndPreProdMerge(ctx, opts, tickReport, item, prNumber)
+	case loopreview.VerdictFail:
+		runTickRecoverReviewFailure(ctx, opts, tickReport, item, result)
+	default:
+		tickReport.NeedsHuman = append(tickReport.NeedsHuman, TickIssue{Step: "loopreview", Issue: item.Issue, PR: item.PR, Detail: firstNonEmpty(result.Verdict.Reason, result.Verdict.Evidence, "verifier returned needs-human")})
+	}
 }
 
 var tickPRNumberPattern = regexp.MustCompile(`(?i)(?:/pull/|#)([1-9]\d*)\s*$`)

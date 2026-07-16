@@ -159,6 +159,140 @@ func TestPlanDoesNotRemoveEligibleFiles(t *testing.T) {
 	}
 }
 
+func TestCleanupRetainsPreservedAttemptManifest(t *testing.T) {
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-60 * 24 * time.Hour)
+	policy := DefaultPolicy()
+	policy.MinimumRunDirectories = 0
+	runID := "run-20260501T000000Z-issue-6"
+	writeRun(t, repo, runID, "needs-human", nil, old)
+	manifestPath := filepath.Join(repo, ".loopcoder", "runs", runID, "recovery", "job-test-preserved.json")
+	writeFile(t, manifestPath, `{"version":1,"run_id":"`+runID+`","job_id":"job-test","scratch_path":"/tmp/loopcoder-owned","worktree_path":"/tmp/loopcoder-owned/wt"}`, old)
+	touch(t, filepath.Dir(manifestPath), old)
+	touch(t, filepath.Join(repo, ".loopcoder", "runs", runID), old)
+
+	first, err := Cleanup(Options{
+		RepoPath:     repo,
+		Now:          now,
+		Policy:       policy,
+		Apply:        true,
+		ProcessAlive: func(int) bool { return false },
+	})
+	if err != nil {
+		t.Fatalf("Cleanup returned error: %v", err)
+	}
+	second, err := Cleanup(Options{
+		RepoPath:     repo,
+		Now:          now,
+		Policy:       policy,
+		Apply:        true,
+		ProcessAlive: func(int) bool { return false },
+	})
+	if err != nil {
+		t.Fatalf("second Cleanup returned error: %v", err)
+	}
+
+	assertExists(t, filepath.Join(repo, ".loopcoder", "runs", runID))
+	assertRetained(t, first, KindRun, runID, "preserved attempt manifest")
+	assertRetained(t, second, KindRun, runID, "preserved attempt manifest")
+	if len(first.Removed) != 0 || len(second.Removed) != 0 {
+		t.Fatalf("cleanup removed preserved run: first=%#v second=%#v", first.Removed, second.Removed)
+	}
+}
+
+func TestCleanupRetainsMalformedPreservationManifest(t *testing.T) {
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-60 * 24 * time.Hour)
+	policy := DefaultPolicy()
+	policy.MinimumRunDirectories = 0
+	runID := "run-20260501T000000Z-issue-7"
+	writeRun(t, repo, runID, "failed", nil, old)
+	manifestPath := filepath.Join(repo, ".loopcoder", "runs", runID, "recovery", "job-test-preserved.json")
+	writeFile(t, manifestPath, `{bad`, old)
+	touch(t, filepath.Dir(manifestPath), old)
+	touch(t, filepath.Join(repo, ".loopcoder", "runs", runID), old)
+
+	result, err := Cleanup(Options{
+		RepoPath:     repo,
+		Now:          now,
+		Policy:       policy,
+		Apply:        true,
+		ProcessAlive: func(int) bool { return false },
+	})
+	if err != nil {
+		t.Fatalf("Cleanup returned error: %v", err)
+	}
+
+	assertExists(t, filepath.Join(repo, ".loopcoder", "runs", runID))
+	assertRetained(t, result, KindRun, runID, "malformed")
+	if !diagnosticsContain(result, "parse preservation record") {
+		t.Fatalf("diagnostics = %#v, want malformed preservation diagnostic", result.Diagnostics)
+	}
+}
+
+func TestCleanupRetainsPreservationDecisionWithoutManifest(t *testing.T) {
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-60 * 24 * time.Hour)
+	policy := DefaultPolicy()
+	policy.MinimumRunDirectories = 0
+	runID := "run-20260501T000000Z-issue-8"
+	writeRun(t, repo, runID, "failed", nil, old)
+	attemptPath := filepath.Join(repo, ".loopcoder", "runs", runID, "workers", "job-test.attempt.json")
+	var record map[string]any
+	if err := json.Unmarshal(readFile(t, attemptPath), &record); err != nil {
+		t.Fatalf("parse attempt: %v", err)
+	}
+	record["artifact_decision"] = map[string]any{
+		"state":                  "preserve-selected",
+		"generation":             1,
+		"owner_id":               "worker:" + runID + ":job-test:1",
+		"scratch_path":           filepath.Join(repo, "registered-tmp", "attempt"),
+		"worktree_path":          filepath.Join(repo, "registered-tmp", "attempt", "wt"),
+		"partial_artifact_paths": []string{attemptPath},
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("marshal attempt: %v", err)
+	}
+	if err := os.WriteFile(attemptPath, data, 0o600); err != nil {
+		t.Fatalf("write attempt: %v", err)
+	}
+	touch(t, attemptPath, old)
+	touch(t, filepath.Dir(attemptPath), old)
+	touch(t, filepath.Join(repo, ".loopcoder", "runs", runID), old)
+
+	first, err := Cleanup(Options{
+		RepoPath:     repo,
+		Now:          now,
+		Policy:       policy,
+		Apply:        true,
+		ProcessAlive: func(int) bool { return false },
+	})
+	if err != nil {
+		t.Fatalf("Cleanup returned error: %v", err)
+	}
+	second, err := Cleanup(Options{
+		RepoPath:     repo,
+		Now:          now,
+		Policy:       policy,
+		Apply:        true,
+		ProcessAlive: func(int) bool { return false },
+	})
+	if err != nil {
+		t.Fatalf("second Cleanup returned error: %v", err)
+	}
+
+	assertExists(t, filepath.Join(repo, ".loopcoder", "runs", runID))
+	assertRetained(t, first, KindRun, runID, "preserved artifact decision")
+	assertRetained(t, second, KindRun, runID, "preserved artifact decision")
+	if len(first.Removed) != 0 || len(second.Removed) != 0 {
+		t.Fatalf("cleanup removed preserve-selected run: first=%#v second=%#v", first.Removed, second.Removed)
+	}
+}
+
 func TestCleanupDoesNotFollowSymlinkEscape(t *testing.T) {
 	repo := t.TempDir()
 	outside := filepath.Join(t.TempDir(), "outside.log")

@@ -151,6 +151,12 @@ var staticRegistry = Registry{
 				},
 			},
 		},
+		{
+			Name:        "grok",
+			DisplayName: "Grok Build",
+			Vendor:      "xAI",
+			CLI:         "grok",
+		},
 	},
 }
 
@@ -237,6 +243,9 @@ func (r Registry) ValidateSelection(selection Selection, opts ValidationOptions)
 	if result.Selection.Model == "" {
 		result.Selection.Model = provider.DefaultModel
 	}
+	if result.Selection.Model == "" {
+		return result
+	}
 	model, ok := provider.LookupModel(result.Selection.Model)
 	if !ok {
 		result.Diagnostics = append(result.Diagnostics, diagnostic(severity, ReasonUnknownModel, result.Selection, fmt.Sprintf("model is not listed for provider %q", provider.Name)))
@@ -271,7 +280,7 @@ func (r Registry) InvariantViolations() []string {
 
 		seenModels := map[string]bool{}
 		defaultModel, defaultModelOK := provider.LookupModel(provider.DefaultModel)
-		if provider.DefaultModel == "" || !defaultModelOK {
+		if provider.DefaultModel != "" && !defaultModelOK {
 			violations = append(violations, fmt.Sprintf("provider %q default model %q is not listed", provider.Name, provider.DefaultModel))
 		}
 		for _, model := range provider.Models {
@@ -306,6 +315,9 @@ func (r Registry) InvariantViolations() []string {
 		}
 		if defaultModelOK && provider.DefaultDepth != defaultModel.DefaultDepth {
 			violations = append(violations, fmt.Sprintf("provider %q default depth %q does not match default model depth %q", provider.Name, provider.DefaultDepth, defaultModel.DefaultDepth))
+		}
+		if provider.DefaultModel == "" && provider.DefaultDepth != "" {
+			violations = append(violations, fmt.Sprintf("provider %q default depth %q is set without a default model", provider.Name, provider.DefaultDepth))
 		}
 	}
 	sort.Strings(violations)

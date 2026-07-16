@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,22 +12,33 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/audit"
+	"github.com/jasonhnd/loopcoder/internal/budget"
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+	"github.com/jasonhnd/loopcoder/internal/detachedrun"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
+	"github.com/jasonhnd/loopcoder/internal/home"
+	"github.com/jasonhnd/loopcoder/internal/hostprofile"
+	"github.com/jasonhnd/loopcoder/internal/inspect"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	localmigrate "github.com/jasonhnd/loopcoder/internal/migrate"
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/models"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
+	"github.com/jasonhnd/loopcoder/internal/orchestrationcost"
 	"github.com/jasonhnd/loopcoder/internal/perception"
+	"github.com/jasonhnd/loopcoder/internal/platform"
 	"github.com/jasonhnd/loopcoder/internal/process"
+	"github.com/jasonhnd/loopcoder/internal/progress"
+	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/relay"
@@ -35,9 +47,11 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/reportquery"
 	"github.com/jasonhnd/loopcoder/internal/runstatus"
+	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 	"github.com/jasonhnd/loopcoder/internal/scaffold"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/upgrade"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 	"github.com/jasonhnd/loopcoder/internal/verify"
@@ -56,34 +70,50 @@ type BuildInfo struct {
 }
 
 type Deps struct {
-	NewGitHubReader   func(repoPath string) orchestration.GitHubReader
-	NewIssueWriter    func(repoPath string) compiler.IssueWriter
-	NewPreProdWriter  func(repoPath string) orchestration.PreProdWriter
-	NewPromoteWriter  func(repoPath string) orchestration.PromotionWriter
-	ProcessAlive      func(pid int) bool
-	Now               func() time.Time
-	IsTerminal        func(w io.Writer) bool
-	Stdin             io.Reader
-	BuildInfo         BuildInfo
-	ComputeReadySet   func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
-	Tick              func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
-	Discover          func(ctx context.Context, opts perception.Options) (perception.Report, error)
-	Compile           func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
-	Dispatch          func(ctx context.Context, opts worker.Options) (worker.Result, error)
-	Loopreview        func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
-	Promote           func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
-	Recover           func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
-	Verify            func(ctx context.Context, opts verify.Options) verify.Result
-	Audit             func(ctx context.Context, opts audit.Options) (audit.Result, error)
-	Doctor            func(ctx context.Context, opts doctor.Options) doctor.Report
-	Init              func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
-	Upgrade           func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
-	MigrateLocalState func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error)
-	SkillInstall      func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
-	StatePush         func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
-	StatePull         func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
-	LeaseAcquire      func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
-	LeaseRelease      func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	NewGitHubReader             func(repoPath string) orchestration.GitHubReader
+	NewIssueWriter              func(repoPath string) compiler.IssueWriter
+	NewPreProdWriter            func(repoPath string) orchestration.PreProdWriter
+	NewPromoteWriter            func(repoPath string) orchestration.PromotionWriter
+	ProcessAlive                func(pid int) bool
+	Now                         func() time.Time
+	RuntimeGOOS                 string
+	RuntimeGOARCH               string
+	IsTerminal                  func(w io.Writer) bool
+	TerminalWidth               func(w io.Writer) int
+	Stdin                       io.Reader
+	BuildInfo                   BuildInfo
+	ComputeReadySet             func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
+	Tick                        func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
+	Discover                    func(ctx context.Context, opts perception.Options) (perception.Report, error)
+	Compile                     func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
+	Dispatch                    func(ctx context.Context, opts worker.Options) (worker.Result, error)
+	Loopreview                  func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
+	Promote                     func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
+	Recover                     func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
+	Verify                      func(ctx context.Context, opts verify.Options) verify.Result
+	Audit                       func(ctx context.Context, opts audit.Options) (audit.Result, error)
+	Doctor                      func(ctx context.Context, opts doctor.Options) doctor.Report
+	ProviderInventory           func(ctx context.Context, opts providerinventory.Options) (providerinventory.Report, error)
+	ProviderInventoryRefresh    func(ctx context.Context, report providerinventory.Report, now time.Time) error
+	ProviderQuotaRefresh        func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.RefreshResult, error)
+	ProviderQuotaStatus         func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error)
+	Init                        func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
+	Upgrade                     func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
+	MigrateLocalState           func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error)
+	MigrateStorage              func(ctx context.Context, opts storage.SchemaMigrationOptions) (storage.SchemaMigrationResult, error)
+	SkillInstall                func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
+	StatePush                   func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
+	StatePull                   func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
+	LeaseAcquire                func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	LeaseRelease                func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	StartDetachedDispatch       func(ctx context.Context, args []string, logPath string) (int, error)
+	KillProcessTree             func(pid int) error
+	KillProcessGroup            func(pgid int) error
+	ProcessAuthority            func(pid int, observedAt time.Time) (string, error)
+	VerifyProcessAuthority      func(pid int, authority string) error
+	DetachedSupervisorCadence   time.Duration
+	DetachedStorageBusyTimeout  time.Duration
+	DetachedStorageWriteTxRetry storage.WriteTxRetryOptions
 }
 
 var commands = []Command{
@@ -91,6 +121,9 @@ var commands = []Command{
 	{Name: "version", Summary: "print version and build information"},
 	{Name: "models", Summary: "list static provider model and depth registry entries"},
 	{Name: "projects", Summary: "manage the machine-local project registry"},
+	{Name: "providers", Summary: "refresh bounded provider CLI installation inventory"},
+	{Name: "delivery", Summary: "plan and gate v0.8 DeliveryRun approvals"},
+	{Name: "budget", Summary: "exercise local quota usage budget accounting"},
 	{Name: "audit", Summary: "run a read-only repository security audit"},
 	{Name: "doctor", Summary: "run read-only preflight checks"},
 	{Name: "init", Summary: "scaffold loopcoder files in the current repository"},
@@ -100,7 +133,7 @@ var commands = []Command{
 	{Name: "trigger", Summary: "run automation triggers for tick"},
 	{Name: "promote", Summary: "promote pre-prod to main"},
 	{Name: "upgrade", Summary: "self-update from GitHub Releases"},
-	{Name: "migrate", Summary: "import legacy repo-local state into local storage"},
+	{Name: "migrate", Summary: "plan storage upgrades or import legacy repo-local state"},
 	{Name: "skill", Summary: "install bundled playbook skill files"},
 	{Name: "dispatch", Summary: "dispatch one issue worker"},
 	{Name: "nested", Summary: "submit and execute a nested child plan"},
@@ -108,10 +141,12 @@ var commands = []Command{
 	{Name: "report", Summary: "list local reporter records"},
 	{Name: "ready-set", Summary: "classify ready and blocked work"},
 	{Name: "status", Summary: "render local delivery run status"},
+	{Name: "attach", Summary: "attach to durable detached run progress"},
 	{Name: "resume", Summary: "reconcile a local run"},
 	{Name: "state", Summary: "publish or pull durable run state"},
 	{Name: "lease", Summary: "manage the conductor lease"},
 	{Name: "recover", Summary: "recover or retry a worker attempt"},
+	{Name: "cancel", Summary: "request cancellation for a detached run"},
 	{Name: "loopreview", Summary: "run an independent read-only PR verifier"},
 	{Name: "verify-local", Summary: "run local verification gates"},
 	{Name: "dispatch-wave", Summary: "dispatch one ready issue wave"},
@@ -138,6 +173,13 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	return RunWithDeps(args, stdout, stderr, DefaultDeps())
 }
 
+func normalizeCLINow(now func() time.Time) func() time.Time {
+	if now != nil {
+		return now
+	}
+	return DefaultDeps().Now
+}
+
 func RunWithBuildInfo(args []string, stdout, stderr io.Writer, build BuildInfo) int {
 	deps := DefaultDeps()
 	deps.BuildInfo = build
@@ -145,6 +187,7 @@ func RunWithBuildInfo(args []string, stdout, stderr io.Writer, build BuildInfo) 
 }
 
 func DefaultDeps() Deps {
+	quotaLifecycle := newDefaultProviderQuotaLifecycle()
 	return Deps{
 		NewGitHubReader: func(repoPath string) orchestration.GitHubReader {
 			return gh.New(repoPath)
@@ -158,10 +201,12 @@ func DefaultDeps() Deps {
 		NewPromoteWriter: func(repoPath string) orchestration.PromotionWriter {
 			return gh.New(repoPath)
 		},
-		ProcessAlive: process.Alive,
-		Now:          time.Now,
-		IsTerminal:   isTerminalWriter,
-		Stdin:        os.Stdin,
+		ProcessAlive:  process.Alive,
+		Now:           time.Now,
+		RuntimeGOOS:   runtime.GOOS,
+		RuntimeGOARCH: runtime.GOARCH,
+		IsTerminal:    isTerminalWriter,
+		Stdin:         os.Stdin,
 		ComputeReadySet: func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error) {
 			return orchestration.ComputeReadySet(ctx, opts)
 		},
@@ -192,6 +237,23 @@ func DefaultDeps() Deps {
 		Doctor: func(ctx context.Context, opts doctor.Options) doctor.Report {
 			return doctor.Run(ctx, opts, doctor.DefaultDeps())
 		},
+		ProviderInventory: func(ctx context.Context, opts providerinventory.Options) (providerinventory.Report, error) {
+			return providerinventory.Discover(ctx, opts, providerinventory.DefaultDeps())
+		},
+		ProviderInventoryRefresh: func(ctx context.Context, report providerinventory.Report, now time.Time) error {
+			store, err := providerinventory.OpenDefaultStore(ctx, providerinventory.DefaultDeps(), func() time.Time { return now })
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			return providerinventory.Refresh(ctx, store, report, now)
+		},
+		ProviderQuotaRefresh: func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.RefreshResult, error) {
+			return quotaLifecycle.Refresh(ctx, req)
+		},
+		ProviderQuotaStatus: func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error) {
+			return quotaLifecycle.Status(ctx, req)
+		},
 		Init: func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error) {
 			return scaffold.Init(ctx, opts, scaffold.DefaultDeps())
 		},
@@ -200,6 +262,16 @@ func DefaultDeps() Deps {
 		},
 		MigrateLocalState: func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error) {
 			return localmigrate.LocalState(ctx, opts, localmigrate.DefaultDeps())
+		},
+		MigrateStorage: func(ctx context.Context, opts storage.SchemaMigrationOptions) (storage.SchemaMigrationResult, error) {
+			if strings.TrimSpace(opts.Path) == "" {
+				layout, err := home.Resolve(home.DefaultDeps())
+				if err != nil {
+					return storage.SchemaMigrationResult{}, err
+				}
+				opts.Path = layout.DatabasePath()
+			}
+			return storage.RunSchemaMigration(ctx, opts)
 		},
 		SkillInstall: func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error) {
 			return InstallSkill(ctx, opts, DefaultSkillInstallDeps())
@@ -216,7 +288,109 @@ func DefaultDeps() Deps {
 		LeaseRelease: func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error) {
 			return statebranch.Release(ctx, opts, statebranch.DefaultDeps())
 		},
+		StartDetachedDispatch:  startDetachedDispatchProcess,
+		KillProcessTree:        process.KillTree,
+		KillProcessGroup:       process.KillGroup,
+		ProcessAuthority:       process.Authority,
+		VerifyProcessAuthority: process.VerifyAuthority,
 	}
+}
+
+type defaultProviderQuotaLifecycle struct {
+	mu      sync.Mutex
+	store   storage.Store
+	manager *providerinventory.RefreshManager
+	closed  bool
+	active  sync.WaitGroup
+}
+
+func newDefaultProviderQuotaLifecycle() *defaultProviderQuotaLifecycle {
+	return &defaultProviderQuotaLifecycle{}
+}
+
+func (l *defaultProviderQuotaLifecycle) managerFor(ctx context.Context, now func() time.Time) (*providerinventory.RefreshManager, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return nil, errors.New("provider quota lifecycle is closed")
+	}
+	if l.manager != nil {
+		return l.manager, nil
+	}
+	store, err := providerinventory.OpenDefaultStore(ctx, providerinventory.DefaultDeps(), now)
+	if err != nil {
+		return nil, err
+	}
+	l.store = store
+	l.manager = providerinventory.NewRefreshManager(store, providerinventory.DefaultDeps())
+	return l.manager, nil
+}
+
+func (l *defaultProviderQuotaLifecycle) begin() (func(), error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return nil, errors.New("provider quota lifecycle is closed")
+	}
+	l.active.Add(1)
+	return l.active.Done, nil
+}
+
+func (l *defaultProviderQuotaLifecycle) Close() error {
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return nil
+	}
+	l.closed = true
+	l.mu.Unlock()
+
+	l.active.Wait()
+
+	l.mu.Lock()
+	manager := l.manager
+	store := l.store
+	l.manager = nil
+	l.store = nil
+	l.mu.Unlock()
+
+	if manager != nil {
+		manager.Wait()
+	}
+	if store != nil {
+		return store.Close()
+	}
+	return nil
+}
+
+func (l *defaultProviderQuotaLifecycle) Refresh(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.RefreshResult, error) {
+	done, err := l.begin()
+	if err != nil {
+		return providerinventory.RefreshResult{}, err
+	}
+	defer done()
+	now := normalizeCLINow(req.Now)
+	manager, err := l.managerFor(ctx, now)
+	if err != nil {
+		return providerinventory.RefreshResult{}, err
+	}
+	req.Now = now
+	return manager.Refresh(ctx, req)
+}
+
+func (l *defaultProviderQuotaLifecycle) Status(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error) {
+	done, err := l.begin()
+	if err != nil {
+		return providerinventory.QuotaRefreshStatus{}, err
+	}
+	defer done()
+	now := normalizeCLINow(req.Now)
+	manager, err := l.managerFor(ctx, now)
+	if err != nil {
+		return providerinventory.QuotaRefreshStatus{}, err
+	}
+	req.Now = now
+	return manager.Status(ctx, req)
 }
 
 func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
@@ -233,18 +407,31 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 0
 	}
 
+	for _, arg := range args[1:] {
+		if isHelp(arg) {
+			if command, ok := findCommand(args[0]); ok {
+				PrintCommandHelp(stdout, command)
+				return 0
+			}
+		}
+	}
+	if args[0] == "version" {
+		return runVersion(args[1:], stdout, stderr, deps)
+	}
+
+	if err := platform.Check(cliPlatformTuple(deps), platform.StartupPhase); err != nil {
+		return renderUnsupportedPlatform(err, args, stdout, stderr)
+	}
+
+	if args[0] == "supervise" {
+		return runDetachedCommandSupervisor(args[1:], stdout, stderr, deps)
+	}
+
 	command, ok := findCommand(args[0])
 	if !ok {
 		fmt.Fprintf(stderr, "unknown command %q\n\n", args[0])
 		PrintRootHelp(stderr)
 		return 2
-	}
-
-	for _, arg := range args[1:] {
-		if isHelp(arg) {
-			PrintCommandHelp(stdout, command)
-			return 0
-		}
 	}
 
 	if command.Name == "ready-set" {
@@ -253,20 +440,29 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if command.Name == "status" {
 		return runStatus(args[1:], stdout, stderr, deps)
 	}
+	if command.Name == "attach" {
+		return runAttach(args[1:], stdout, stderr, deps)
+	}
 	if command.Name == "report" {
-		return runReport(args[1:], stdout, stderr)
+		return runReport(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "attest" {
 		return runAttest(args[1:], stdout, stderr, deps)
-	}
-	if command.Name == "version" {
-		return runVersion(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "models" {
 		return runModels(args[1:], stdout, stderr)
 	}
 	if command.Name == "projects" {
 		return runProjects(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "providers" {
+		return runProviders(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "delivery" {
+		return runDelivery(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "budget" {
+		return runBudget(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "audit" {
 		return runAudit(args[1:], stdout, stderr, deps)
@@ -322,6 +518,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if command.Name == "recover" {
 		return runRecover(args[1:], stdout, stderr, deps)
 	}
+	if command.Name == "cancel" {
+		return runCancel(args[1:], stdout, stderr, deps)
+	}
 	if command.Name == "loopreview" {
 		return runLoopreview(args[1:], stdout, stderr, deps)
 	}
@@ -343,6 +542,86 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	fmt.Fprintf(stderr, "%s: not yet implemented; see docs/specs/0089-go-migration.md\n", command.Name)
 	return 1
+}
+
+func cliPlatformTuple(deps Deps) platform.Tuple {
+	goos := strings.TrimSpace(deps.RuntimeGOOS)
+	if goos == "" {
+		goos = runtime.GOOS
+	}
+	goarch := strings.TrimSpace(deps.RuntimeGOARCH)
+	if goarch == "" {
+		goarch = runtime.GOARCH
+	}
+	return platform.Tuple{GOOS: goos, GOARCH: goarch}
+}
+
+func renderUnsupportedPlatform(err error, args []string, stdout, stderr io.Writer) int {
+	var unsupported *platform.UnsupportedPlatformError
+	if !errors.As(err, &unsupported) {
+		fmt.Fprintf(stderr, "%v\n", err)
+		return 1
+	}
+	if requestedMachineDiagnostic(args) {
+		data, marshalErr := json.Marshal(unsupported.Diagnostic())
+		if marshalErr != nil {
+			fmt.Fprintf(stderr, "unsupported platform: marshal diagnostic: %v\n", marshalErr)
+			return 1
+		}
+		if _, writeErr := stdout.Write(append(data, '\n')); writeErr != nil {
+			fmt.Fprintf(stderr, "unsupported platform: write diagnostic: %v\n", writeErr)
+			return 1
+		}
+		return unsupported.ExitCode()
+	}
+	fmt.Fprintln(stderr, platform.HumanFirstLine)
+	fmt.Fprintf(stderr, "Actual platform: %s/%s.\n", unsupported.Actual.GOOS, unsupported.Actual.GOARCH)
+	fmt.Fprintln(stderr, platform.CompatibilityGuidance)
+	return unsupported.ExitCode()
+}
+
+func requestedMachineDiagnostic(args []string) bool {
+	for i := 1; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		if arg == "" {
+			continue
+		}
+		name, value, hasValue := splitFlagAssignment(arg)
+		if isFormatFlagName(name) {
+			if !hasValue {
+				if i+1 >= len(args) {
+					return false
+				}
+				value = args[i+1]
+			}
+			return isMachineFormat(value)
+		}
+	}
+	return false
+}
+
+func splitFlagAssignment(arg string) (name, value string, hasValue bool) {
+	if !strings.HasPrefix(arg, "-") {
+		return arg, "", false
+	}
+	trimmed := strings.TrimLeft(arg, "-")
+	if before, after, ok := strings.Cut(trimmed, "="); ok {
+		return before, after, true
+	}
+	return trimmed, "", false
+}
+
+func isFormatFlagName(name string) bool {
+	return name == "format" || name == "Format"
+}
+
+func isMachineFormat(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "json", "jsonl", "both":
+		return true
+	default:
+		return false
+	}
 }
 
 // PrintRootHelp writes root command help.
@@ -385,6 +664,18 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		printProjectsHelp(w)
 		return
 	}
+	if command.Name == "providers" {
+		printProvidersHelp(w)
+		return
+	}
+	if command.Name == "delivery" {
+		printDeliveryHelp(w)
+		return
+	}
+	if command.Name == "budget" {
+		printBudgetHelp(w)
+		return
+	}
 	if command.Name == "nested" {
 		printNestedHelp(w)
 		return
@@ -402,6 +693,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --issue-number int          GitHub issue number (required)")
 		fmt.Fprintln(w, "  --issue-title string        GitHub issue title (required)")
 		fmt.Fprintln(w, "  --issue-body string         GitHub issue body")
+		fmt.Fprintln(w, "  --issue-body-file string    path to GitHub issue body text")
 		fmt.Fprintln(w, "  --base-branch string        base branch to fetch and branch from (default \"main\")")
 		fmt.Fprintln(w, "  --branch string             worker branch (default loop/issue-<issue-number>)")
 		fmt.Fprintln(w, "  --run-id string             run id (default generated)")
@@ -410,10 +702,13 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --provider string           worker provider (default \"codex\")")
 		fmt.Fprintln(w, "  --model string              optional worker model override for this run")
 		fmt.Fprintln(w, "  --effort string             optional worker reasoning effort override for this run")
+		fmt.Fprintln(w, "  --timeout duration          optional worker hard-cap override for this dispatch")
 		fmt.Fprintln(w, "  --strict                    reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base          read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintln(w, "  --keep-worktree             preserve the scratch worktree and logs")
-		fmt.Fprintln(w, "  --format string             output format: text or json (default \"text\")")
+		fmt.Fprintln(w, "  --detach                    launch a bounded detached supervisor and return a run record")
+		fmt.Fprintln(w, "  --foreground                run in the foreground instead of detached supervision")
+		fmt.Fprintln(w, "  --format string             output format: text, json, or jsonl (default \"text\")")
 		fmt.Fprintln(w, "  --verbose                   include raw canonical records in text output")
 		fmt.Fprintln(w, "  --pretty                    force emoji pretty report on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty                 suppress pretty report on stderr (LOOPCODER_NO_PRETTY)")
@@ -445,10 +740,28 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --fix                  apply explicit storage permission repair, migrations, and stale local state cleanup")
 	}
 	if command.Name == "status" {
-		fmt.Fprintln(w, "  --repo string     repository path (default \".\")")
-		fmt.Fprintln(w, "  --run string      run id; omit to inspect the latest local run")
-		fmt.Fprintln(w, "  --run-id string   alias for --run")
-		fmt.Fprintln(w, "  --format string   output format: text or json (default \"text\")")
+		fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
+		fmt.Fprintln(w, "  --run string           run id; omit to inspect the latest local run")
+		fmt.Fprintln(w, "  --run-id string        alias for --run")
+		fmt.Fprintln(w, "  --receipts             render durable progress receipts for the run")
+		fmt.Fprintln(w, "  --replay               alias for --receipts")
+		fmt.Fprintln(w, "  --follow               follow durable progress receipts from --cursor")
+		fmt.Fprintln(w, "  --cursor string        opaque receipt cursor to resume after")
+		fmt.Fprintln(w, "  --correlation string   filter progress receipts by correlation id")
+		fmt.Fprintln(w, "  --task string          filter progress receipts by task id")
+		fmt.Fprintln(w, "  --limit int            maximum progress receipts per read (default 500)")
+		fmt.Fprintln(w, "  --poll duration        follow poll interval (default 250ms)")
+		fmt.Fprintln(w, "  --follow-for duration  optional bounded follow duration for tests/scripts")
+		fmt.Fprintln(w, "  --format string        output format: text, json, or jsonl (default \"text\")")
+	}
+	if command.Name == "attach" {
+		fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
+		fmt.Fprintln(w, "  --run string           run id to attach")
+		fmt.Fprintln(w, "  --run-id string        alias for --run")
+		fmt.Fprintln(w, "  --cursor string        opaque receipt cursor to resume after")
+		fmt.Fprintln(w, "  --poll duration        follow poll interval (default 250ms)")
+		fmt.Fprintln(w, "  --follow-for duration  optional bounded follow duration for tests/scripts")
+		fmt.Fprintln(w, "  --format string        output format: text or jsonl (default \"text\")")
 	}
 	if command.Name == "report" {
 		fmt.Fprintln(w, "  --repo string      repository path (default \".\")")
@@ -457,7 +770,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --issue int        filter by issue number")
 		fmt.Fprintln(w, "  --role string      filter by role: worker, verifier, or conductor")
 		fmt.Fprintln(w, "  --limit int        maximum reports to list (default 20)")
-		fmt.Fprintln(w, "  --format string    output format: text or json (default \"text\")")
+		fmt.Fprintln(w, "  --format string    output format: text, json, or jsonl (default \"text\")")
 		fmt.Fprintln(w, "  --verbose          include raw canonical records in text output")
 	}
 	if command.Name == "models" {
@@ -465,7 +778,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	}
 	if command.Name == "audit" {
 		fmt.Fprintln(w, "  --repo string                 repository path (default \".\")")
-		fmt.Fprintln(w, "  --format string               output format: text or json (default \"text\")")
+		fmt.Fprintln(w, "  --format string               output format: text, json, or jsonl (default \"text\")")
 		fmt.Fprintln(w, "  --verbose                     include raw audit details in text output")
 		fmt.Fprintln(w, "  --layer string                audit layer to run; repeatable or comma-separated (default \"sast\")")
 		fmt.Fprintln(w, "  --layers string               alias for --layer")
@@ -486,6 +799,8 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --force                     overwrite existing .delivery.yml and ROADMAP.md")
 		fmt.Fprintln(w, "  --repo string               repository path (default \".\")")
 		fmt.Fprintln(w, "  --gate string               generated promotion gate: human-merge or auto (default \"human-merge\")")
+		fmt.Fprintln(w, "  --yes                       apply the planned setup without an interactive prompt")
+		fmt.Fprintln(w, "  --format string             output format: text or json (default \"text\")")
 		fmt.Fprintln(w, "  --worker-model string       optional first-run worker model to persist")
 		fmt.Fprintln(w, "  --worker-effort string      optional first-run worker reasoning effort to persist")
 		fmt.Fprintln(w, "  --verifier-model string     optional first-run verifier model to persist")
@@ -512,6 +827,9 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --strict                         reject invalid model/depth selections instead of warning")
 		fmt.Fprintf(w, "  --throttle-limit int             maximum concurrent dispatches (default %d)\n", lcdefaults.DispatchWaveThrottleLimit)
 		fmt.Fprintln(w, "  --config-from-base               read .delivery.yml from base branch when absent from working tree")
+		fmt.Fprintln(w, "  --detach                         launch a bounded detached supervisor and return a run record")
+		fmt.Fprintln(w, "  --foreground                     run in the foreground instead of detached supervision")
+		fmt.Fprintln(w, "  --format string                  output format: text, json, or jsonl (default \"json\")")
 		fmt.Fprintln(w, "  --pretty                         force emoji pretty reports on stderr (LOOPCODER_PRETTY; default is stderr, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty                      suppress pretty reports on stderr (LOOPCODER_NO_PRETTY)")
 	}
@@ -543,13 +861,16 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
 		fmt.Fprintf(w, "  --base-branch string   base branch for dependency reasoning (default %q)\n", lcdefaults.BaseBranch)
 		fmt.Fprintln(w, "  --run-id string        local run id to inspect (default latest local run when present)")
-		fmt.Fprintln(w, "  --format string        output format: text, json, or both (default \"text\")")
+		fmt.Fprintln(w, "  --format string        output format: text, json, jsonl, or both (default \"text\")")
 		fmt.Fprintln(w, "  --include-closed       include closed issues as diagnostic non-ready entries")
 		fmt.Fprintln(w, "  --config-from-base     read .delivery.yml from base branch when absent from working tree")
 	}
 	if command.Name == "status" {
-		fmt.Fprintln(w, "  --repo string   repository path (default \".\")")
-		fmt.Fprintln(w, "  --run string    local run id to inspect (default latest modified local run)")
+		fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
+		fmt.Fprintln(w, "  --run string           local run id to inspect (default latest modified local run)")
+		fmt.Fprintln(w, "  --receipts             render durable progress receipts for the run")
+		fmt.Fprintln(w, "  --follow               follow durable progress receipts")
+		fmt.Fprintln(w, "  --format string        output format: text, json, or jsonl (default \"text\")")
 	}
 	if command.Name == "report" {
 		fmt.Fprintln(w, "  --repo string      repository path (default \".\")")
@@ -557,13 +878,13 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --issue int        filter by GitHub issue number")
 		fmt.Fprintln(w, "  --role string      filter by role: worker, verifier, or conductor")
 		fmt.Fprintln(w, "  --limit int        maximum reports to render (default 20)")
-		fmt.Fprintln(w, "  --format string    output format: text or json (default \"text\")")
+		fmt.Fprintln(w, "  --format string    output format: text, json, or jsonl (default \"text\")")
 	}
 	if command.Name == "resume" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
 		fmt.Fprintf(w, "  --base-branch string   base branch for branch and dependency reasoning (default %q)\n", lcdefaults.BaseBranch)
 		fmt.Fprintln(w, "  --run-id string        local run id to inspect (default latest local run when present)")
-		fmt.Fprintln(w, "  --format string        output format: text, json, or both (default \"text\")")
+		fmt.Fprintln(w, "  --format string        output format: text, json, jsonl, or both (default \"text\")")
 		fmt.Fprintln(w, "  --config-from-base     read .delivery.yml from base branch when absent from working tree")
 	}
 	if command.Name == "recover" {
@@ -586,6 +907,14 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --verifier-timeout duration     verifier timeout for recovered PRs (default 10m0s)")
 		fmt.Fprintln(w, "  --strict                        reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base              read .delivery.yml from base branch when absent from working tree")
+		fmt.Fprintln(w, "  --detached                      reconcile detached supervisor state by --run-id without retrying worker dispatch")
+		fmt.Fprintln(w, "  --format string                 output format: text, json, or jsonl (default \"text\")")
+	}
+	if command.Name == "cancel" {
+		fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
+		fmt.Fprintln(w, "  --run string           run id to cancel")
+		fmt.Fprintln(w, "  --run-id string        alias for --run")
+		fmt.Fprintln(w, "  --format string        output format: text or json (default \"text\")")
 	}
 	if command.Name == "loopreview" {
 		fmt.Fprintln(w, "  --repo string          repository path (required)")
@@ -625,10 +954,13 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --provider string          optional worker provider pass-through")
 		fmt.Fprintln(w, "  --model string             optional worker model override for this wave")
 		fmt.Fprintln(w, "  --effort string            optional worker reasoning effort override for this wave")
+		fmt.Fprintln(w, "  --timeout duration         optional worker hard-cap override for this wave")
 		fmt.Fprintln(w, "  --strict                   reject invalid model/depth selections instead of warning")
 		fmt.Fprintln(w, "  --config-from-base         read .delivery.yml from base branch when absent from working tree")
 		fmt.Fprintf(w, "  --throttle-limit int       maximum concurrent dispatches (default %d)\n", lcdefaults.DispatchWaveThrottleLimit)
-		fmt.Fprintln(w, "  --format string            output format: text or json (default \"text\")")
+		fmt.Fprintln(w, "  --detach                   launch a bounded detached supervisor and return a run record")
+		fmt.Fprintln(w, "  --foreground               run in the foreground instead of detached supervision")
+		fmt.Fprintln(w, "  --format string            output format: text, json, or jsonl (default \"text\")")
 		fmt.Fprintln(w, "  --verbose                  include raw wave report details in text output")
 		fmt.Fprintln(w, "  --pretty                   force emoji pretty reports on stdout (LOOPCODER_PRETTY; default is stdout, plain on non-TTY)")
 		fmt.Fprintln(w, "  --no-pretty                suppress pretty reports on stdout (LOOPCODER_NO_PRETTY)")
@@ -797,11 +1129,21 @@ func renderModelProviders(w io.Writer, providers []models.Provider) error {
 		if _, err := fmt.Fprintf(w, "cli: %s\n", provider.CLI); err != nil {
 			return err
 		}
-		if _, err := fmt.Fprintf(w, "default: %s / %s\n", provider.DefaultModel, renderedDefaultDepth(provider.DefaultDepth)); err != nil {
+		defaultModel := provider.DefaultModel
+		if defaultModel == "" {
+			defaultModel = "(provider default)"
+		}
+		if _, err := fmt.Fprintf(w, "default: %s / %s\n", defaultModel, renderedDefaultDepth(provider.DefaultDepth)); err != nil {
 			return err
 		}
 		if _, err := fmt.Fprintln(w, "models:"); err != nil {
 			return err
+		}
+		if len(provider.Models) == 0 {
+			if _, err := fmt.Fprintln(w, "  (dynamic inventory required)"); err != nil {
+				return err
+			}
+			continue
 		}
 		for _, model := range provider.Models {
 			if _, err := fmt.Fprintf(w, "  - %s\n", model.Name); err != nil {
@@ -828,6 +1170,8 @@ func runProjects(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return runProjectsList(args[1:], stdout, stderr, deps)
 	case "show":
 		return runProjectsShow(args[1:], stdout, stderr, deps)
+	case "inspect":
+		return runProjectsInspect(args[1:], stdout, stderr, deps)
 	case "remove":
 		return runProjectsRemove(args[1:], stdout, stderr, deps)
 	default:
@@ -842,12 +1186,28 @@ func printProjectsHelp(w io.Writer) {
 	fmt.Fprintln(w, "  loopcoder projects register --repo <path> [--format text|json]")
 	fmt.Fprintln(w, "  loopcoder projects list [--format text|json]")
 	fmt.Fprintln(w, "  loopcoder projects show --repo <path> [--format text|json]")
+	fmt.Fprintln(w, "  loopcoder projects inspect [--project-id <id>] [--run-id <id>] [--format text|json]")
 	fmt.Fprintln(w, "  loopcoder projects remove --repo <path> [--format text|json]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Register, inspect, list active projects, and detach projects from the machine-local registry.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
 	fmt.Fprintln(w, "  --repo string     repository path (default \".\" where applicable)")
+	fmt.Fprintln(w, "  --db string       storage database path for inspect (default $LOOPCODER_HOME/data/loopcoder.db)")
+	fmt.Fprintln(w, "  --project-id string")
+	fmt.Fprintln(w, "                    project id filter for inspect")
+	fmt.Fprintln(w, "  --run-id string   delivery run id filter for inspect")
+	fmt.Fprintln(w, "  --limit int       delivery runs per project for inspect (default 20, max 200)")
+	fmt.Fprintln(w, "  --offset int      delivery run offset for inspect")
+	fmt.Fprintln(w, "  --project-limit int")
+	fmt.Fprintln(w, "                    projects to list for inspect (default 50, max 200)")
+	fmt.Fprintln(w, "  --project-offset int")
+	fmt.Fprintln(w, "                    project offset for inspect")
+	fmt.Fprintln(w, "  --task-limit int  tasks per run for inspect (default 50, max 200)")
+	fmt.Fprintln(w, "  --attempt-limit int")
+	fmt.Fprintln(w, "                    attempts per task for inspect (default 20, max 200)")
+	fmt.Fprintln(w, "  --include-detached")
+	fmt.Fprintln(w, "                    include detached registry rows in inspect")
 	fmt.Fprintln(w, "  --format string   output format: text or json (default \"text\")")
 	fmt.Fprintln(w, "  --help            show command help")
 }
@@ -943,6 +1303,130 @@ func runProjectsShow(args []string, stdout, stderr io.Writer, deps Deps) int {
 	return 0
 }
 
+func runProjectsInspect(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.Now == nil {
+		deps.Now = DefaultDeps().Now
+	}
+	fs := flag.NewFlagSet("projects inspect", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var opts inspect.Options
+	format := "text"
+	var formatAlias string
+	fs.StringVar(&opts.DatabasePath, "db", "", "storage database path")
+	fs.StringVar(&opts.ProjectID, "project-id", "", "project id")
+	fs.StringVar(&opts.RunID, "run-id", "", "delivery run id")
+	fs.StringVar(&opts.RunID, "run", "", "delivery run id")
+	fs.BoolVar(&opts.IncludeDetached, "include-detached", false, "include detached projects")
+	fs.IntVar(&opts.ProjectLimit, "project-limit", inspect.DefaultProjectLimit, "project limit")
+	fs.IntVar(&opts.ProjectOffset, "project-offset", 0, "project offset")
+	fs.IntVar(&opts.RunLimit, "limit", inspect.DefaultRunLimit, "delivery run limit")
+	fs.IntVar(&opts.RunOffset, "offset", 0, "delivery run offset")
+	fs.IntVar(&opts.TaskLimit, "task-limit", inspect.DefaultTaskLimit, "task limit")
+	fs.IntVar(&opts.AttemptLimit, "attempt-limit", inspect.DefaultAttemptLimit, "attempt limit")
+	fs.DurationVar(&opts.StaleAfter, "stale-after", 0, "stale progress threshold")
+	fs.StringVar(&format, "format", "text", "output format")
+	fs.StringVar(&formatAlias, "Format", "", "output format")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if formatAlias != "" {
+		format = formatAlias
+	}
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format == "" {
+		format = "text"
+	}
+	if format != "text" && format != "json" {
+		fmt.Fprintf(stderr, "projects inspect: invalid --format %q; want text or json\n", format)
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "projects inspect: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	opts.Now = deps.Now
+	report, err := inspect.Load(context.Background(), opts)
+	if err != nil {
+		fmt.Fprintf(stderr, "projects inspect: %v\n", err)
+		return 1
+	}
+	if format == "json" {
+		return writeProjectJSON(stdout, stderr, "projects inspect", report)
+	}
+	if err := renderProjectsInspectText(stdout, report); err != nil {
+		fmt.Fprintf(stderr, "projects inspect: write output: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func renderProjectsInspectText(w io.Writer, report inspect.Report) error {
+	fmt.Fprintf(w, "PROJECT INSPECTION\nstatus: %s\nread_only: true\ndatabase: %s\n", report.Status, report.DatabasePath)
+	if len(report.Projects) == 0 {
+		fmt.Fprintln(w, "projects: 0")
+		renderInspectDiagnostics(w, "diagnostics", report.Diagnostics, "  ")
+		return nil
+	}
+	fmt.Fprintf(w, "projects: %d", len(report.Projects))
+	if report.Pagination.ProjectHasMore {
+		fmt.Fprint(w, " (more available)")
+	}
+	fmt.Fprintln(w)
+	for _, project := range report.Projects {
+		fmt.Fprintf(w, "- %s %s identity=%s checkout=%s path=%s\n", project.ProjectID, project.DisplayName, project.IdentitySource, project.CheckoutStatus, project.LocalPath)
+		if project.RunCount == 0 {
+			fmt.Fprintln(w, "  runs: 0")
+		} else {
+			fmt.Fprintf(w, "  runs: %d", project.RunCount)
+			if project.RunHasMore {
+				fmt.Fprint(w, " (more available)")
+			}
+			fmt.Fprintln(w)
+		}
+		renderInspectDiagnostics(w, "diagnostics", project.Diagnostics, "  ")
+		for _, run := range project.Runs {
+			fmt.Fprintf(w, "  - run %s state=%s tasks=%d attempts=%d blocker=%s next=%s progress=%s\n",
+				run.DeliveryRunID,
+				displayText(run.State),
+				run.TaskCount,
+				run.AttemptCount,
+				displayText(run.Blocker),
+				displayText(run.NextAction),
+				displayText(run.LastDurableProgress.At),
+			)
+			renderInspectDiagnostics(w, "diagnostics", run.Diagnostics, "    ")
+			for _, task := range run.Tasks {
+				fmt.Fprintf(w, "    - task %s state=%s attempts=%d blocker=%s next=%s progress=%s\n",
+					task.TaskKey,
+					displayText(task.State),
+					task.AttemptCount,
+					displayText(task.Blocker),
+					displayText(task.NextAction),
+					displayText(task.LastDurableProgress.At),
+				)
+				renderInspectDiagnostics(w, "diagnostics", task.Diagnostics, "      ")
+				for _, attempt := range task.Attempts {
+					fmt.Fprintf(w, "      - attempt %d %s state=%s progress=%s\n", attempt.AttemptOrdinal, attempt.AttemptID, displayText(attempt.State), displayText(attempt.LastDurableProgress.At))
+					renderInspectDiagnostics(w, "diagnostics", attempt.Diagnostics, "        ")
+				}
+			}
+		}
+	}
+	renderInspectDiagnostics(w, "diagnostics", report.Diagnostics, "")
+	return nil
+}
+
+func renderInspectDiagnostics(w io.Writer, label string, diagnostics []inspect.Diagnostic, indent string) {
+	if len(diagnostics) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "%s%s:\n", indent, label)
+	for _, diagnostic := range diagnostics {
+		fmt.Fprintf(w, "%s  - %s %s: %s\n", indent, diagnostic.Severity, diagnostic.Code, diagnostic.Message)
+	}
+}
+
 func runProjectsRemove(args []string, stdout, stderr io.Writer, deps Deps) int {
 	repoPath, format, ok := parseProjectsRepoFormat("projects remove", args, stderr, true)
 	if !ok {
@@ -1024,6 +1508,8 @@ func runMigrate(args []string, stdout, stderr io.Writer, deps Deps) int {
 	switch args[0] {
 	case "local-state":
 		return runMigrateLocalState(args[1:], stdout, stderr, deps)
+	case "storage":
+		return runMigrateStorage(args[1:], stdout, stderr, deps)
 	default:
 		fmt.Fprintf(stderr, "migrate: unknown subcommand %q\n\n", args[0])
 		printMigrateHelp(stderr)
@@ -1034,17 +1520,104 @@ func runMigrate(args []string, stdout, stderr io.Writer, deps Deps) int {
 func printMigrateHelp(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  loopcoder migrate local-state --repo <path> [--dry-run] [--format text|json]")
+	fmt.Fprintln(w, "  loopcoder migrate storage [--database <path>] [--apply] [--format text|json]")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Import legacy repo-local .loopcoder records into machine-local storage.")
+	fmt.Fprintln(w, "Plan or apply machine-local storage changes.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Subcommands:")
 	fmt.Fprintln(w, "  local-state   import v0.6.x repo-local run, relay, recovery, and report records")
+	fmt.Fprintln(w, "  storage       plan or apply the v0.7-to-v0.8 SQLite schema migration")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
 	fmt.Fprintln(w, "  --repo        repository path for local-state (default \".\")")
 	fmt.Fprintln(w, "  --dry-run     scan without writing machine-local storage")
-	fmt.Fprintln(w, "  --format      output format for local-state: text or json (default \"text\")")
+	fmt.Fprintln(w, "  --database    SQLite path for storage (default LOOPCODER_HOME/data/loopcoder.db)")
+	fmt.Fprintln(w, "  --apply       apply the storage plan; omitted means read-only planning")
+	fmt.Fprintln(w, "  --format      output format: text or json (default \"text\")")
 	fmt.Fprintln(w, "  --help        show command help")
+}
+
+func runMigrateStorage(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.MigrateStorage == nil {
+		deps.MigrateStorage = DefaultDeps().MigrateStorage
+	}
+	fs := flag.NewFlagSet("migrate storage", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	databasePath := ""
+	format := "text"
+	apply := false
+	fs.StringVar(&databasePath, "database", "", "SQLite database path")
+	fs.StringVar(&format, "format", "text", "output format")
+	fs.BoolVar(&apply, "apply", false, "apply the planned schema migration")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "migrate storage: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format != "text" && format != "json" {
+		fmt.Fprintf(stderr, "migrate storage: invalid --format %q; want text or json\n", format)
+		return 2
+	}
+
+	result, err := deps.MigrateStorage(context.Background(), storage.SchemaMigrationOptions{
+		Path:  databasePath,
+		Apply: apply,
+		Now:   deps.Now,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "migrate storage: %v\n", err)
+		return 1
+	}
+	if format == "json" {
+		return writeProjectJSON(stdout, stderr, "migrate storage", result)
+	}
+	if _, err := io.WriteString(stdout, renderMigrateStorageText(result)); err != nil {
+		fmt.Fprintf(stderr, "migrate storage: write output: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func renderMigrateStorageText(result storage.SchemaMigrationResult) string {
+	var out strings.Builder
+	fmt.Fprintln(&out, "STORAGE SCHEMA MIGRATION")
+	fmt.Fprintf(&out, "status: %s\n", result.Status)
+	fmt.Fprintf(&out, "mode: %s\n", map[bool]string{true: "apply", false: "plan"}[result.Applied])
+	fmt.Fprintf(&out, "database: %s\n", result.Plan.DatabasePath)
+	fmt.Fprintf(&out, "source_schema: %d\n", result.Plan.SourceSchemaVersion)
+	fmt.Fprintf(&out, "target_schema: %d\n", result.Plan.TargetSchemaVersion)
+	fmt.Fprintf(&out, "plan_status: %s\n", result.Plan.Status)
+	fmt.Fprintf(&out, "plan_fingerprint: %s\n", result.Plan.PlanFingerprint)
+	fmt.Fprintf(&out, "backup_required: %t\n", result.Plan.BackupRequired)
+	if len(result.Plan.Steps) > 0 {
+		fmt.Fprintln(&out, "steps:")
+		for _, step := range result.Plan.Steps {
+			fmt.Fprintf(&out, "  - %d: %s\n", step.Version, step.Name)
+		}
+	}
+	if result.Backup != nil {
+		fmt.Fprintf(&out, "backup: %s\n", result.Backup.Path)
+		fmt.Fprintf(&out, "backup_sha256: %s\n", result.Backup.SHA256)
+		fmt.Fprintf(&out, "backup_verified: %t\n", result.Backup.Verified)
+	}
+	fmt.Fprintf(&out, "rollback_supported: %t\n", result.Rollback.Supported)
+	if result.Rollback.Strategy != "" {
+		fmt.Fprintf(&out, "rollback_strategy: %s\n", result.Rollback.Strategy)
+	}
+	if len(result.Rollback.Limitations) > 0 {
+		fmt.Fprintln(&out, "rollback_limitations:")
+		for _, limitation := range result.Rollback.Limitations {
+			fmt.Fprintf(&out, "  - %s\n", limitation)
+		}
+	}
+	if result.Health != nil {
+		fmt.Fprintf(&out, "health: %s\n", result.Health.Message)
+	}
+	return out.String()
 }
 
 func runMigrateLocalState(args []string, stdout, stderr io.Writer, deps Deps) int {
@@ -1251,6 +1824,512 @@ func parseRelayRepo(name string, args []string, stderr io.Writer) (string, bool)
 	return repoPath, true
 }
 
+func printProvidersHelp(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  loopcoder providers refresh [flags]")
+	fmt.Fprintln(w, "  loopcoder providers status [flags]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Refresh bounded provider CLI installation inventory and show cached quota status.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
+	fmt.Fprintln(w, "  --base-branch string   base branch for .delivery.yml fallback (default \"main\")")
+	fmt.Fprintln(w, "  --format string        output format: text or json (default \"text\")")
+	fmt.Fprintln(w, "  --help                 show help")
+}
+
+func printBudgetHelp(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  loopcoder budget smoke [flags]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Run a local-only reserve/commit/release accounting smoke test.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --repo string              repository path (default \".\")")
+	fmt.Fprintln(w, "  --project-id string        project id override (default: registry project or smoke id)")
+	fmt.Fprintln(w, "  --quantity-kind string     total-tokens, requests, wall-ms, concurrency, or local-policy (default \"total-tokens\")")
+	fmt.Fprintln(w, "  --ceiling int              hard project ceiling (default 100)")
+	fmt.Fprintln(w, "  --reserve int              amount to reserve (default 40)")
+	fmt.Fprintln(w, "  --commit int               amount to commit (default 25)")
+	fmt.Fprintln(w, "  --release int              amount to release; 0 releases the remaining reservation")
+	fmt.Fprintln(w, "  --idempotency-key string   stable smoke idempotency key (default \"budget-smoke\")")
+	fmt.Fprintln(w, "  --format string            output format: text or json (default \"text\")")
+	fmt.Fprintln(w, "  --help                     show help")
+}
+
+func runProviders(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.ProviderInventory == nil {
+		deps.ProviderInventory = DefaultDeps().ProviderInventory
+	}
+	if deps.ProviderInventoryRefresh == nil {
+		deps.ProviderInventoryRefresh = DefaultDeps().ProviderInventoryRefresh
+	}
+	if deps.Now == nil {
+		deps.Now = DefaultDeps().Now
+	}
+	subcommand := "refresh"
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		subcommand = strings.TrimSpace(args[0])
+		args = args[1:]
+	}
+	if subcommand != "refresh" {
+		if subcommand == "status" {
+			return runProvidersStatus(args, stdout, stderr, deps)
+		}
+		fmt.Fprintf(stderr, "providers: unsupported subcommand %q (want refresh or status)\n", subcommand)
+		return 2
+	}
+
+	fs := flag.NewFlagSet("providers refresh", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	repoPath := "."
+	baseBranch := lcdefaults.BaseBranch
+	format := "text"
+	fs.StringVar(&repoPath, "repo", ".", "repository path")
+	fs.StringVar(&baseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
+	fs.StringVar(&format, "format", "text", "output format")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "providers refresh: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format == "" {
+		format = "text"
+	}
+	if format != "text" && format != "json" {
+		fmt.Fprintf(stderr, "providers refresh: invalid --format %q; want text or json\n", format)
+		return 2
+	}
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "providers refresh: %v\n", err)
+		return 2
+	}
+	cfg, err := loadDeliveryConfig(resolvedRepo, baseBranch, false)
+	if err != nil {
+		fmt.Fprintf(stderr, "providers refresh: %v\n", err)
+		return 1
+	}
+	now := deps.Now()
+	if deps.ProviderQuotaRefresh != nil {
+		result, err := deps.ProviderQuotaRefresh(context.Background(), providerinventory.RefreshRequest{
+			RepoPath: resolvedRepo,
+			Config:   cfg,
+			Trigger:  providerinventory.RefreshTriggerExplicit,
+			Now:      func() time.Time { return now },
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "providers refresh: %v\n", err)
+			return 1
+		}
+		if format == "json" {
+			encoder := json.NewEncoder(stdout)
+			encoder.SetIndent("", "  ")
+			if err := encoder.Encode(result.Report); err != nil {
+				fmt.Fprintf(stderr, "providers refresh: write output: %v\n", err)
+				return 1
+			}
+			return 0
+		}
+		renderProviderRefreshText(stdout, result)
+		return 0
+	}
+	report, err := deps.ProviderInventory(context.Background(), providerinventory.Options{
+		RepoPath: resolvedRepo,
+		Config:   cfg,
+		Now:      func() time.Time { return now },
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "providers refresh: %v\n", err)
+		return 1
+	}
+	if err := deps.ProviderInventoryRefresh(context.Background(), report, now); err != nil {
+		fmt.Fprintf(stderr, "providers refresh: persist inventory: %v\n", err)
+		return 1
+	}
+	if format == "json" {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(report); err != nil {
+			fmt.Fprintf(stderr, "providers refresh: write output: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	fmt.Fprintf(stdout, "Provider inventory refreshed: %d installation(s), %d probe result(s), %d account profile(s), %d auth readiness record(s), %d model catalog snapshot(s), %d model capability record(s), confidence=%s, fingerprint=%s\n", len(report.Installations), len(report.ProbeResults), len(report.AccountProfiles), len(report.AuthReadiness), len(report.ModelCatalogSnapshots), len(report.ModelCapabilities), report.Confidence, report.InventoryFingerprint)
+	for _, installation := range report.Installations {
+		fmt.Fprintf(stdout, "- %s %s at %s state=%s confidence=%s freshness=%s usable_for_invocation=%s captured_at=%s\n",
+			installation.AdapterID,
+			installation.ExecutableName,
+			installation.CanonicalPathRedacted,
+			installation.InstallationState,
+			installation.Confidence,
+			installation.FreshnessState,
+			installation.UsableForInvocation,
+			installation.CapturedAt,
+		)
+	}
+	if len(report.Installations) == 0 {
+		fmt.Fprintln(stdout, "- no provider CLI installations discovered")
+	}
+	for _, probe := range report.ProbeResults {
+		if probe.ProbeKind != "install" || probe.Outcome != providerinventory.OutcomeNotInstalled {
+			continue
+		}
+		executableName := strings.TrimSpace(probe.Source.ExecutableName)
+		if executableName == "" {
+			executableName = "provider-cli"
+		}
+		fmt.Fprintf(stdout, "- %s %s state=not-installed confidence=%s freshness=%s gaps=%s\n",
+			probe.AdapterID,
+			executableName,
+			probe.Confidence,
+			probe.FreshnessState,
+			strings.Join(probe.GapReasons, ","),
+		)
+	}
+	for _, probe := range report.ProbeResults {
+		if probe.ProbeKind != "native-federation" {
+			continue
+		}
+		state := "unsupported"
+		if probe.Outcome == providerinventory.OutcomeInstalled {
+			state = "supported"
+		}
+		fmt.Fprintf(stdout, "- %s native-federation state=%s confidence=%s freshness=%s terminal_error_code=%s gaps=%s\n",
+			probe.AdapterID,
+			state,
+			probe.Confidence,
+			probe.FreshnessState,
+			probe.TerminalErrorCode,
+			strings.Join(probe.GapReasons, ","),
+		)
+	}
+	fmt.Fprintln(stdout, "Installation evidence does not prove authentication, account readiness, model authorization, quota, or usable capacity.")
+	return 0
+}
+
+func runProvidersStatus(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.ProviderQuotaStatus == nil {
+		deps.ProviderQuotaStatus = DefaultDeps().ProviderQuotaStatus
+	}
+	if deps.Now == nil {
+		deps.Now = DefaultDeps().Now
+	}
+	fs := flag.NewFlagSet("providers status", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	repoPath := "."
+	baseBranch := lcdefaults.BaseBranch
+	format := "text"
+	fs.StringVar(&repoPath, "repo", ".", "repository path")
+	fs.StringVar(&baseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
+	fs.StringVar(&format, "format", "text", "output format")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "providers status: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format == "" {
+		format = "text"
+	}
+	if format != "text" && format != "json" {
+		fmt.Fprintf(stderr, "providers status: invalid --format %q; want text or json\n", format)
+		return 2
+	}
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "providers status: %v\n", err)
+		return 2
+	}
+	cfg, err := loadDeliveryConfig(resolvedRepo, baseBranch, false)
+	if err != nil {
+		fmt.Fprintf(stderr, "providers status: %v\n", err)
+		return 1
+	}
+	now := deps.Now()
+	status, err := deps.ProviderQuotaStatus(context.Background(), providerinventory.RefreshRequest{
+		RepoPath: resolvedRepo,
+		Config:   cfg,
+		Now:      func() time.Time { return now },
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "providers status: %v\n", err)
+		return 1
+	}
+	if format == "json" {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(status); err != nil {
+			fmt.Fprintf(stderr, "providers status: write output: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	renderProviderQuotaStatusText(stdout, status)
+	return 0
+}
+
+func renderProviderRefreshText(stdout io.Writer, result providerinventory.RefreshResult) {
+	report := result.Report
+	fmt.Fprintf(stdout, "Provider inventory refreshed: %d installation(s), %d probe result(s), %d account profile(s), %d auth readiness record(s), %d model catalog snapshot(s), %d model capability record(s), confidence=%s, fingerprint=%s\n", len(report.Installations), len(report.ProbeResults), len(report.AccountProfiles), len(report.AuthReadiness), len(report.ModelCatalogSnapshots), len(report.ModelCapabilities), report.Confidence, report.InventoryFingerprint)
+	renderProviderQuotaStatusText(stdout, result.Status)
+	fmt.Fprintln(stdout, "Installation evidence does not prove authentication, account readiness, model authorization, quota, or usable capacity.")
+}
+
+func renderProviderQuotaStatusText(stdout io.Writer, status providerinventory.QuotaRefreshStatus) {
+	fmt.Fprintf(stdout, "Provider quota status: %d provider(s)\n", len(status.Providers))
+	for _, provider := range status.Providers {
+		age := "unknown"
+		if provider.AgeMS != nil {
+			age = fmt.Sprintf("%dms", *provider.AgeMS)
+		}
+		errCode := provider.TerminalErrorCode
+		if errCode == "" {
+			errCode = "none"
+		}
+		fmt.Fprintf(stdout, "- %s confidence=%s freshness=%s age=%s source=%s in_flight=%t next_refresh_at=%s error=%s\n",
+			provider.AdapterID,
+			provider.Confidence,
+			provider.FreshnessState,
+			age,
+			provider.SourceKind,
+			provider.InFlight,
+			provider.NextRefreshAt,
+			errCode,
+		)
+	}
+}
+
+func runBudget(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.Now == nil {
+		deps.Now = DefaultDeps().Now
+	}
+	subcommand := "smoke"
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		subcommand = strings.TrimSpace(args[0])
+		args = args[1:]
+	}
+	if subcommand != "smoke" {
+		fmt.Fprintf(stderr, "budget: unsupported subcommand %q (want smoke)\n", subcommand)
+		return 2
+	}
+
+	fs := flag.NewFlagSet("budget smoke", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	repoPath := "."
+	projectID := ""
+	quantityValue := string(providerinventory.QuantityTotalTokens)
+	format := "text"
+	ceiling := int64(100)
+	reserveValue := int64(40)
+	commitValue := int64(25)
+	releaseValue := int64(0)
+	idempotencyKey := "budget-smoke"
+	policyModeValue := string(budget.PolicyHard)
+	overflowBehaviorValue := string(budget.OverflowWarnOnly)
+	fs.StringVar(&repoPath, "repo", ".", "repository path")
+	fs.StringVar(&projectID, "project-id", "", "project id override")
+	fs.StringVar(&quantityValue, "quantity-kind", string(providerinventory.QuantityTotalTokens), "quantity kind")
+	fs.Int64Var(&ceiling, "ceiling", 100, "hard project ceiling")
+	fs.Int64Var(&reserveValue, "reserve", 40, "reserve amount")
+	fs.Int64Var(&commitValue, "commit", 25, "commit amount")
+	fs.Int64Var(&releaseValue, "release", 0, "release amount")
+	fs.StringVar(&idempotencyKey, "idempotency-key", "budget-smoke", "idempotency key")
+	fs.StringVar(&policyModeValue, "policy-mode", string(budget.PolicyHard), "policy mode: hard or soft")
+	fs.StringVar(&overflowBehaviorValue, "overflow-behavior", string(budget.OverflowWarnOnly), "soft overflow behavior: warn-only or requires-approval")
+	fs.StringVar(&format, "format", "text", "output format")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "budget smoke: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format != "text" && format != "json" {
+		fmt.Fprintf(stderr, "budget smoke: invalid --format %q; want text or json\n", format)
+		return 2
+	}
+	if ceiling < 0 || reserveValue < 0 || commitValue < 0 || releaseValue < 0 {
+		fmt.Fprintln(stderr, "budget smoke: amounts must be non-negative")
+		return 2
+	}
+	policyMode := budget.PolicyMode(strings.ToLower(strings.TrimSpace(policyModeValue)))
+	if policyMode != budget.PolicyHard && policyMode != budget.PolicySoft {
+		fmt.Fprintf(stderr, "budget smoke: invalid --policy-mode %q; want hard or soft\n", policyModeValue)
+		return 2
+	}
+	overflowBehavior := budget.SoftOverflowBehavior(strings.ToLower(strings.TrimSpace(overflowBehaviorValue)))
+	if policyMode == budget.PolicyHard {
+		overflowBehavior = ""
+	} else if overflowBehavior != budget.OverflowWarnOnly && overflowBehavior != budget.OverflowRequiresApproval {
+		fmt.Fprintf(stderr, "budget smoke: invalid --overflow-behavior %q; want warn-only or requires-approval\n", overflowBehaviorValue)
+		return 2
+	}
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "budget smoke: %v\n", err)
+		return 2
+	}
+	if strings.TrimSpace(projectID) == "" {
+		if project, err := registry.Resolve(context.Background(), registry.Options{RepoPath: resolvedRepo}, registry.DefaultDeps()); err == nil {
+			projectID = project.ProjectID
+		}
+	}
+	if strings.TrimSpace(projectID) == "" {
+		projectID = "proj_budget_smoke"
+	}
+	now := deps.Now().UTC()
+	store, err := providerinventory.OpenDefaultStore(context.Background(), providerinventory.DefaultDeps(), func() time.Time { return now })
+	if err != nil {
+		fmt.Fprintf(stderr, "budget smoke: open storage: %v\n", err)
+		return 1
+	}
+	defer store.Close()
+
+	quantity := providerinventory.QuantityKind(strings.TrimSpace(quantityValue))
+	actor := budget.Actor{ActorID: "loopcoder-cli", Role: "operator"}
+	host := budget.Host{HostID: runtime.GOOS + "/" + runtime.GOARCH, Provider: "loopcoder"}
+	projectScope := budget.Scope{ScopeKind: budget.ScopeProject, ProjectID: projectID}
+	machineScope := budget.Scope{ScopeKind: budget.ScopeMachine}
+	machinePolicy, err := budget.UpsertPolicy(context.Background(), store, budget.PolicyInput{
+		Scope:            machineScope,
+		QuantityKind:     quantity,
+		WindowKind:       providerinventory.WindowUnbounded,
+		PolicyMode:       policyMode,
+		OverflowBehavior: overflowBehavior,
+		CeilingValue:     ceiling,
+		PolicyVersion:    "cli-smoke-v1",
+		Ordinal:          "machine",
+		Actor:            actor,
+		Host:             host,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "budget smoke: upsert machine policy: %v\n", err)
+		return 1
+	}
+	projectPolicy, err := budget.UpsertPolicy(context.Background(), store, budget.PolicyInput{
+		Scope:            projectScope,
+		QuantityKind:     quantity,
+		WindowKind:       providerinventory.WindowUnbounded,
+		PolicyMode:       policyMode,
+		OverflowBehavior: overflowBehavior,
+		CeilingValue:     ceiling,
+		PolicyVersion:    "cli-smoke-v1",
+		Ordinal:          "project",
+		Actor:            actor,
+		Host:             host,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "budget smoke: upsert project policy: %v\n", err)
+		return 1
+	}
+	reserved, err := budget.Reserve(context.Background(), store, budget.ReserveRequest{
+		ScopeChain:            []budget.Scope{machineScope, projectScope},
+		QuantityKind:          quantity,
+		WindowKind:            providerinventory.WindowUnbounded,
+		RequestedValue:        reserveValue,
+		LeaseExpiresAt:        now.Add(time.Hour),
+		IdempotencyKey:        idempotencyKey + ":reserve",
+		RequirementConfidence: providerinventory.ConfidenceExact,
+		Actor:                 actor,
+		Host:                  host,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "budget smoke: reserve: %v\n", err)
+		return 1
+	}
+	committed, err := budget.Commit(context.Background(), store, budget.MutationRequest{
+		ReservationID:  reserved.Reservation.BudgetReservationID,
+		IdempotencyKey: idempotencyKey + ":commit",
+		Generation:     reserved.Reservation.Generation,
+		Value:          commitValue,
+		Actor:          actor,
+		Host:           host,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "budget smoke: commit: %v\n", err)
+		return 1
+	}
+	released, err := budget.Release(context.Background(), store, budget.MutationRequest{
+		ReservationID:  committed.Reservation.BudgetReservationID,
+		IdempotencyKey: idempotencyKey + ":release",
+		Generation:     committed.Reservation.Generation,
+		Value:          releaseValue,
+		Actor:          actor,
+		Host:           host,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "budget smoke: release: %v\n", err)
+		return 1
+	}
+	summaries, err := budget.Summaries(context.Background(), store, projectID)
+	if err != nil {
+		fmt.Fprintf(stderr, "budget smoke: summaries: %v\n", err)
+		return 1
+	}
+	payload := struct {
+		OK            bool             `json:"ok"`
+		PolicyIDs     []string         `json:"budget_policy_ids"`
+		Reserved      budget.Result    `json:"reserved"`
+		Committed     budget.Result    `json:"committed"`
+		Released      budget.Result    `json:"released"`
+		BudgetSummary []budget.Summary `json:"budget_summary"`
+	}{
+		OK:            true,
+		PolicyIDs:     []string{machinePolicy.BudgetPolicyID, projectPolicy.BudgetPolicyID},
+		Reserved:      reserved,
+		Committed:     committed,
+		Released:      released,
+		BudgetSummary: summaries,
+	}
+	if format == "json" {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(payload); err != nil {
+			fmt.Fprintf(stderr, "budget smoke: write output: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	fmt.Fprintf(stdout, "Budget smoke ok: reserved=%d committed=%d released=%d reservation=%s policies=%s\n",
+		reserveValue, commitValue, released.Reservation.ReleasedValue, released.Reservation.BudgetReservationID, strings.Join(payload.PolicyIDs, ","))
+	warnings := budgetSmokeWarnings(payload.Reserved.Reservation.GapReasons, payload.Committed.Reservation.GapReasons, payload.Released.Reservation.GapReasons, payload.BudgetSummary)
+	for _, warning := range warnings {
+		fmt.Fprintf(stdout, "Budget warning: %s\n", warning)
+	}
+	return 0
+}
+
+func budgetSmokeWarnings(reserveReasons, commitReasons, releaseReasons []string, summaries []budget.Summary) []string {
+	seen := map[string]bool{}
+	var warnings []string
+	add := func(values []string) {
+		for _, value := range values {
+			value = strings.TrimSpace(value)
+			if value == "" || seen[value] {
+				continue
+			}
+			seen[value] = true
+			warnings = append(warnings, value)
+		}
+	}
+	add(reserveReasons)
+	add(commitReasons)
+	add(releaseReasons)
+	for _, summary := range summaries {
+		add(summary.GapReasons)
+	}
+	sort.Strings(warnings)
+	return warnings
+}
+
 func runDoctor(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if deps.Doctor == nil {
 		deps.Doctor = DefaultDeps().Doctor
@@ -1329,6 +2408,12 @@ func runInit(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if deps.Init == nil {
 		deps.Init = DefaultDeps().Init
 	}
+	if deps.Now == nil {
+		deps.Now = DefaultDeps().Now
+	}
+	if deps.Stdin == nil {
+		deps.Stdin = DefaultDeps().Stdin
+	}
 
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -1341,6 +2426,8 @@ func runInit(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var workerEffortAlias string
 	var verifierModelAlias string
 	var verifierEffortAlias string
+	var yes bool
+	var format string
 
 	fs.BoolVar(&opts.Force, "force", false, "overwrite existing files")
 	fs.BoolVar(&forceAlias, "Force", false, "overwrite existing files")
@@ -1356,6 +2443,8 @@ func runInit(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&verifierModelAlias, "VerifierModel", "", "verifier model")
 	fs.StringVar(&opts.VerifierEffort, "verifier-effort", "", "verifier reasoning effort")
 	fs.StringVar(&verifierEffortAlias, "VerifierEffort", "", "verifier reasoning effort")
+	fs.BoolVar(&yes, "yes", false, "apply without prompting")
+	fs.StringVar(&format, "format", "text", "output format: text or json")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -1385,6 +2474,14 @@ func runInit(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "init: unexpected argument %q\n", fs.Arg(0))
 		return 2
 	}
+	format = strings.TrimSpace(format)
+	if format == "" {
+		format = "text"
+	}
+	if format != "text" && format != "json" {
+		fmt.Fprintf(stderr, "init: invalid --format %q; want text or json\n", format)
+		return 2
+	}
 
 	resolvedRepo, err := resolveRepo(opts.RepoPath)
 	if err != nil {
@@ -1392,11 +2489,55 @@ func runInit(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 2
 	}
 	opts.RepoPath = resolvedRepo
+	opts.Now = deps.Now
 
-	result, err := deps.Init(context.Background(), opts)
+	preview, err := scaffold.Preview(context.Background(), opts, scaffold.DefaultDeps())
 	if err != nil {
 		fmt.Fprintf(stderr, "init: %v\n", err)
 		return 1
+	}
+	if preview.Outcome == scaffold.OutcomeBlocked {
+		if format == "json" {
+			if code := writeProjectJSON(stdout, stderr, "init", preview); code != 0 {
+				return code
+			}
+			return 1
+		}
+		renderInitResult(stdout, stderr, preview)
+		return 1
+	}
+	if !yes {
+		if format == "json" {
+			preview.Outcome = scaffold.OutcomeDeclined
+			return writeProjectJSON(stdout, stderr, "init", preview)
+		}
+		renderInitResult(stdout, stderr, preview)
+		if !confirmInit(deps.Stdin, stdout) {
+			preview.Outcome = scaffold.OutcomeDeclined
+			fmt.Fprintln(stdout, "loopcoder init declined; no changes applied")
+			return 0
+		}
+	}
+
+	opts.Apply = true
+	result, err := deps.Init(context.Background(), opts)
+	if err != nil {
+		var blocked *scaffold.BlockedError
+		if errors.As(err, &blocked) {
+			if format == "json" {
+				if code := writeProjectJSON(stdout, stderr, "init", result); code != 0 {
+					return code
+				}
+				return 1
+			}
+			renderInitResult(stdout, stderr, result)
+			return 1
+		}
+		fmt.Fprintf(stderr, "init: %v\n", err)
+		return 1
+	}
+	if format == "json" {
+		return writeProjectJSON(stdout, stderr, "init", result)
 	}
 	renderInitResult(stdout, stderr, result)
 	return 0
@@ -1610,6 +2751,12 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var prettyAlias bool
 	var noPretty bool
 	var noPrettyAlias bool
+	var detach bool
+	var detachAlias bool
+	var foreground bool
+	var foregroundAlias bool
+	outputFormat := "json"
+	var outputFormatAlias string
 
 	fs.StringVar(&repoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -1643,6 +2790,12 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable reports on stderr")
 	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable reports on stderr")
 	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable reports on stderr")
+	fs.BoolVar(&detach, "detach", false, "launch detached supervisor")
+	fs.BoolVar(&detachAlias, "Detach", false, "launch detached supervisor")
+	fs.BoolVar(&foreground, "foreground", false, "run in the foreground instead of detached supervision")
+	fs.BoolVar(&foregroundAlias, "Foreground", false, "run in the foreground instead of detached supervision")
+	fs.StringVar(&outputFormat, "format", "json", "output format")
+	fs.StringVar(&outputFormatAlias, "Format", "", "output format")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -1689,6 +2842,18 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	strict = strict || strictAlias
 	pretty = pretty || prettyAlias
 	noPretty = noPretty || noPrettyAlias
+	detach = detach || detachAlias
+	foreground = foreground || foregroundAlias
+	if outputFormatAlias != "" {
+		outputFormat = outputFormatAlias
+	}
+	outputFormat = strings.ToLower(strings.TrimSpace(outputFormat))
+	switch outputFormat {
+	case "text", "json", "jsonl":
+	default:
+		fmt.Fprintf(stderr, "tick: invalid --format %q; want text, json, or jsonl\n", outputFormat)
+		return 2
+	}
 
 	if fs.NArg() != 0 {
 		fmt.Fprintf(stderr, "tick: unexpected argument %q\n", fs.Arg(0))
@@ -1704,6 +2869,10 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if verifierTimeout <= 0 {
 		fmt.Fprintln(stderr, "tick: --verifier-timeout must be positive")
+		return 2
+	}
+	if detach && foreground {
+		fmt.Fprintln(stderr, "tick: choose only one of --detach or --foreground")
 		return 2
 	}
 
@@ -1777,6 +2946,29 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "[loopcoder] warning: %s\n", warning)
 	}
 
+	if !detach && !foreground {
+		defaultDetached, err := shouldDefaultDetachedForHost(cfg, stdout, stderr, deps)
+		if err != nil {
+			fmt.Fprintf(stderr, "tick: %v\n", err)
+			return 2
+		}
+		detach = defaultDetached
+	}
+	if detach {
+		if strings.TrimSpace(runID) == "" {
+			runID = state.RunIDForWave(deps.Now())
+		}
+		childArgs := childArgsWithDetachedForeground(args, runID)
+		return runDetachedCommand(resolvedRepo, runID, "tick", outputFormat, childArgs, stdout, stderr, deps)
+	}
+
+	progressRecorder, stopProgress := progressSupervisorForRegisteredRepo(context.Background(), resolvedRepo, runID, deps.Now, stderr)
+	defer func() {
+		if err := stopProgress(); err != nil {
+			fmt.Fprintf(stderr, "tick: progress receipt shutdown: %v\n", err)
+		}
+	}()
+
 	tickReport, err := deps.Tick(context.Background(), orchestration.TickOptions{
 		Reader:             deps.NewGitHubReader(resolvedRepo),
 		IssueWriter:        deps.NewIssueWriter(resolvedRepo),
@@ -1798,9 +2990,12 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		AdditionalRiskRedLines: orchestration.DomainRedLines(
 			cfg.Domain.RedLines,
 		),
+		WaitForChecks:   true,
 		Thresholds:      cfg.Resilience.Worker,
 		Budget:          cfg.Guardrails.Budget,
+		CostPolicy:      orchestrationCostPolicy(cfg.Orchestration.CostBudget),
 		CircuitBreaker:  cfg.Guardrails.CircuitBreaker,
+		Progress:        progressRecorder,
 		ProcessAlive:    deps.ProcessAlive,
 		Clock:           deps.Now,
 		Stderr:          stderr,
@@ -1816,14 +3011,9 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "tick: %v\n", err)
 		return 1
 	}
-	data, err := orchestration.MarshalTickJSON(tickReport)
-	if err != nil {
-		fmt.Fprintf(stderr, "tick: %v\n", err)
-		return 1
-	}
 	var ownRelayRecords []relaygate.Record
 	prettyMode := reporter.PrettyModePlain
-	renderPretty := shouldRenderPretty(noPretty)
+	renderPretty := outputFormat != "jsonl" && shouldRenderPretty(noPretty)
 	if renderPretty {
 		prettyMode = prettyModeForTarget(stderr, deps, pretty)
 		ownRelayRecords, err = writeTickRelayRecords(resolvedRepo, tickReport, prettyMode, preExistingRelayNonces)
@@ -1832,13 +3022,47 @@ func runTick(args []string, stdout, stderr io.Writer, deps Deps) int {
 			return 1
 		}
 	}
-	if _, err := stdout.Write(data); err != nil {
-		fmt.Fprintf(stderr, "tick: write output: %v\n", err)
-		return 1
-	}
-	if _, err := stderr.Write([]byte(orchestration.RenderTickText(tickReport))); err != nil {
-		fmt.Fprintf(stderr, "tick: write summary: %v\n", err)
-		return 1
+	switch outputFormat {
+	case "json":
+		data, err := orchestration.MarshalTickJSON(tickReport)
+		if err != nil {
+			fmt.Fprintf(stderr, "tick: %v\n", err)
+			return 1
+		}
+		if _, err := stdout.Write(data); err != nil {
+			fmt.Fprintf(stderr, "tick: write output: %v\n", err)
+			return 1
+		}
+		if _, err := stderr.Write([]byte(orchestration.RenderTickText(tickReport))); err != nil {
+			fmt.Fprintf(stderr, "tick: write summary: %v\n", err)
+			return 1
+		}
+		if _, err := fmt.Fprintln(stderr); err != nil {
+			fmt.Fprintf(stderr, "tick: write summary: %v\n", err)
+			return 1
+		}
+		if err := renderCanonicalHuman(stderr, orchestration.TickObservabilityDocument(tickReport), deps); err != nil {
+			fmt.Fprintf(stderr, "tick: write observability summary: %v\n", err)
+			return 1
+		}
+	case "jsonl":
+		if err := renderCanonicalMachine(stdout, orchestration.TickObservabilityDocument(tickReport), "jsonl"); err != nil {
+			fmt.Fprintf(stderr, "tick: write output: %v\n", err)
+			return 1
+		}
+	case "text":
+		if _, err := stdout.Write([]byte(orchestration.RenderTickText(tickReport))); err != nil {
+			fmt.Fprintf(stderr, "tick: write output: %v\n", err)
+			return 1
+		}
+		if _, err := fmt.Fprintln(stdout); err != nil {
+			fmt.Fprintf(stderr, "tick: write output: %v\n", err)
+			return 1
+		}
+		if err := renderCanonicalHuman(stdout, orchestration.TickObservabilityDocument(tickReport), deps); err != nil {
+			fmt.Fprintf(stderr, "tick: write output: %v\n", err)
+			return 1
+		}
 	}
 	if renderPretty {
 		if err := renderTickPrettyReports(stderr, tickReport, prettyMode); err != nil {
@@ -2139,12 +3363,14 @@ func tickOptionsFromConfig(repoPath string, stderr io.Writer, deps Deps, cfg con
 		VerifierTimeout:    loopreview.DefaultVerifierTimeout,
 		ThrottleLimit:      lcdefaults.DispatchWaveThrottleLimit,
 		RequiredChecks:     cfg.CI.Checks,
+		WaitForChecks:      true,
 		ConfiguredEvidence: cfg.Evidence.Artifacts(),
 		AdditionalRiskRedLines: orchestration.DomainRedLines(
 			cfg.Domain.RedLines,
 		),
 		Thresholds:      cfg.Resilience.Worker,
 		Budget:          cfg.Guardrails.Budget,
+		CostPolicy:      orchestrationCostPolicy(cfg.Orchestration.CostBudget),
 		CircuitBreaker:  cfg.Guardrails.CircuitBreaker,
 		ProcessAlive:    deps.ProcessAlive,
 		Clock:           deps.Now,
@@ -2157,6 +3383,14 @@ func tickOptionsFromConfig(repoPath string, stderr io.Writer, deps Deps, cfg con
 		PreProdWriter:   deps.NewPreProdWriter(repoPath),
 		StatePush:       deps.StatePush,
 	}, true
+}
+
+func orchestrationCostPolicy(budget config.OrchestrationCostBudget) orchestrationcost.Policy {
+	return orchestrationcost.Policy{
+		MaxModelCalls:      budget.MaxModelCalls,
+		MaxTokens:          budget.MaxTokens,
+		MaxOverheadPercent: budget.MaxOverheadPercent,
+	}
 }
 
 func renderTriggerPrettyReports(w io.Writer, report orchestration.TriggerReport, mode reporter.PrettyMode) error {
@@ -2251,11 +3485,15 @@ func writeAutonomousRelayRecord(repoPath, runID, role string, prNumber int, reco
 		options.PR = formatPRNumber(prNumber)
 	}
 	pretty := prettyReport(record, options)
-	nonce := relaygate.Nonce(runID, prNumber, role)
+	relayRole, ok := relaygate.NormalizeRole(strings.TrimSpace(role))
+	if !ok {
+		return relaygate.Record{}, false, fmt.Errorf("unsupported relay role %q", role)
+	}
+	nonce := relaygate.Nonce(runID, prNumber, relayRole)
 	if _, err := relaygate.Write(relaygate.WriteOptions{
 		RepoPath: repoPath,
 		RunID:    runID,
-		Role:     role,
+		Role:     relayRole,
 		PRNumber: prNumber,
 		Block:    pretty,
 		Report:   &record,
@@ -2435,7 +3673,53 @@ func renderTickPrettyReports(w io.Writer, report orchestration.TickReport, mode 
 }
 
 func renderInitResult(stdout, stderr io.Writer, result scaffold.Result) {
-	fmt.Fprintln(stdout, "loopcoder init complete")
+	switch result.Outcome {
+	case scaffold.OutcomePlanned:
+		fmt.Fprintln(stdout, "loopcoder init plan")
+	case scaffold.OutcomeBlocked:
+		fmt.Fprintln(stdout, "loopcoder init blocked")
+	case scaffold.OutcomeDeclined:
+		fmt.Fprintln(stdout, "loopcoder init declined")
+	case scaffold.OutcomeAlreadyConfigured:
+		fmt.Fprintln(stdout, "loopcoder init already configured")
+	default:
+		fmt.Fprintln(stdout, "loopcoder init complete")
+	}
+	if result.Project != nil {
+		fmt.Fprintf(stdout, "  project %s (%s)\n", result.Project.ProjectID, result.Project.DisplayName)
+		fmt.Fprintf(stdout, "  path %s\n", result.Project.LocalPath)
+	}
+	if result.Registry != nil {
+		fmt.Fprintf(stdout, "  registry %s %s\n", result.Registry.Status, result.Registry.DatabasePath)
+	}
+	if result.Blocked != nil {
+		fmt.Fprintf(stdout, "  blocked %s: %s\n", result.Blocked.Code, result.Blocked.Message)
+	}
+	for _, conflict := range result.Conflicts {
+		fmt.Fprintf(stdout, "  conflict project %s path=%s identity=%s\n", conflict.ProjectID, conflict.LocalPath, conflict.IdentitySource)
+	}
+	if result.Dirty != nil && result.Dirty.Dirty {
+		fmt.Fprintln(stdout, "  dirty repository warning: uncommitted changes detected")
+		if strings.TrimSpace(result.Dirty.Porcelain) != "" {
+			for _, line := range strings.Split(result.Dirty.Porcelain, "\n") {
+				fmt.Fprintf(stdout, "    %s\n", line)
+			}
+		}
+	}
+	if len(result.Mutations) > 0 {
+		label := "planned mutations"
+		if result.Applied {
+			label = "completed mutations"
+		}
+		fmt.Fprintf(stdout, "  %s:\n", label)
+		for _, mutation := range result.Mutations {
+			target := mutation.Path
+			if target == "" {
+				target = mutation.Name
+			}
+			fmt.Fprintf(stdout, "    - %s %s %s\n", mutation.Action, mutation.Name, target)
+		}
+	}
 	for _, file := range result.Files {
 		switch file.Status {
 		case scaffold.FileCreated:
@@ -2464,6 +3748,20 @@ func renderInitResult(stdout, stderr io.Writer, result scaffold.Result) {
 	for _, warning := range result.Warnings {
 		fmt.Fprintf(stderr, "[loopcoder] warning: %s\n", warning)
 	}
+}
+
+func confirmInit(stdin io.Reader, stdout io.Writer) bool {
+	if stdin == nil {
+		return false
+	}
+	fmt.Fprint(stdout, "Apply these setup changes? [y/N] ")
+	reader := bufio.NewReader(stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil && strings.TrimSpace(line) == "" {
+		return false
+	}
+	answer := strings.ToLower(strings.TrimSpace(line))
+	return answer == "y" || answer == "yes"
 }
 
 func runUpgrade(args []string, stdout, stderr io.Writer, deps Deps) int {
@@ -3186,6 +4484,8 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var issueNumberAlias int
 	var issueTitleAlias string
 	var issueBodyAlias string
+	var issueBodyFile string
+	var issueBodyFileAlias string
 	var baseBranchAlias string
 	var branchAlias string
 	var runIDAlias string
@@ -3194,6 +4494,7 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var providerAlias string
 	var modelAlias string
 	var effortAlias string
+	var timeoutAlias time.Duration
 	var configFromBaseAlias bool
 	var keepWorktreeAlias bool
 	var strict bool
@@ -3202,6 +4503,13 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var prettyAlias bool
 	var noPretty bool
 	var noPrettyAlias bool
+	var detach bool
+	var detachAlias bool
+	var foreground bool
+	var foregroundAlias bool
+	var supervisorRun bool
+	var supervisorOwner string
+	var supervisorGeneration int64
 	format := "text"
 	var formatAlias string
 	var verbose bool
@@ -3215,6 +4523,8 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&issueTitleAlias, "IssueTitle", "", "issue title")
 	fs.StringVar(&opts.IssueBody, "issue-body", "", "issue body")
 	fs.StringVar(&issueBodyAlias, "IssueBody", "", "issue body")
+	fs.StringVar(&issueBodyFile, "issue-body-file", "", "path to issue body text")
+	fs.StringVar(&issueBodyFileAlias, "IssueBodyFile", "", "path to issue body text")
 	fs.StringVar(&opts.BaseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
 	fs.StringVar(&baseBranchAlias, "BaseBranch", "", "base branch")
 	fs.StringVar(&opts.Branch, "branch", "", "branch")
@@ -3231,12 +4541,21 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&modelAlias, "Model", "", "model")
 	fs.StringVar(&opts.Effort, "effort", "", "effort")
 	fs.StringVar(&effortAlias, "Effort", "", "effort")
+	fs.DurationVar(&opts.Timeout, "timeout", 0, "worker hard-cap override")
+	fs.DurationVar(&timeoutAlias, "Timeout", 0, "worker hard-cap override")
 	fs.BoolVar(&strict, "strict", false, "reject invalid model/depth selections instead of warning")
 	fs.BoolVar(&strictAlias, "Strict", false, "reject invalid model/depth selections instead of warning")
 	fs.BoolVar(&opts.ConfigFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&opts.KeepWorktree, "keep-worktree", false, "keep worktree")
 	fs.BoolVar(&keepWorktreeAlias, "KeepWorktree", false, "keep worktree")
+	fs.BoolVar(&detach, "detach", false, "launch detached supervisor")
+	fs.BoolVar(&detachAlias, "Detach", false, "launch detached supervisor")
+	fs.BoolVar(&foreground, "foreground", false, "run in the foreground instead of detached supervision")
+	fs.BoolVar(&foregroundAlias, "Foreground", false, "run in the foreground instead of detached supervision")
+	fs.BoolVar(&supervisorRun, "supervisor-run", false, "run as detached supervisor child")
+	fs.StringVar(&supervisorOwner, "supervisor-owner", "", "detached supervisor owner")
+	fs.Int64Var(&supervisorGeneration, "supervisor-generation", 0, "detached supervisor generation")
 	fs.BoolVar(&pretty, "pretty", false, "render human-readable report on stderr")
 	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable report on stderr")
 	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable report on stderr")
@@ -3260,6 +4579,18 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if issueBodyAlias != "" {
 		opts.IssueBody = issueBodyAlias
+	}
+	if issueBodyFileAlias != "" {
+		issueBodyFile = issueBodyFileAlias
+	}
+	if strings.TrimSpace(issueBodyFile) != "" {
+		// #nosec G304 -- --issue-body-file is an explicit local CLI input used to keep issue text out of child argv.
+		data, err := os.ReadFile(issueBodyFile)
+		if err != nil {
+			fmt.Fprintf(stderr, "dispatch: read --issue-body-file: %v\n", err)
+			return 2
+		}
+		opts.IssueBody = string(data)
 	}
 	if baseBranchAlias != "" {
 		opts.BaseBranch = baseBranchAlias
@@ -3285,8 +4616,13 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if effortAlias != "" {
 		opts.Effort = effortAlias
 	}
+	if timeoutAlias != 0 {
+		opts.Timeout = timeoutAlias
+	}
 	opts.ConfigFromBase = opts.ConfigFromBase || configFromBaseAlias
 	opts.KeepWorktree = opts.KeepWorktree || keepWorktreeAlias
+	detach = detach || detachAlias
+	foreground = foreground || foregroundAlias
 	strict = strict || strictAlias
 	pretty = pretty || prettyAlias
 	noPretty = noPretty || noPrettyAlias
@@ -3294,12 +4630,12 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		format = formatAlias
 	}
 	verbose = verbose || verboseAlias
-	outputMode, ok := normalizeCommandOutputMode("dispatch", format, verbose, stderr)
+	outputMode, ok := normalizeCommandOutputModeWithFormats("dispatch", format, verbose, stderr, "text", "json", "jsonl")
 	if !ok {
 		return 2
 	}
 	opts.Stderr = stderr
-	if outputMode.Format == "json" {
+	if outputMode.Format == "json" || outputMode.Format == "jsonl" {
 		opts.Stderr = io.Discard
 	}
 
@@ -3313,6 +4649,18 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if strings.TrimSpace(opts.IssueTitle) == "" {
 		fmt.Fprintln(stderr, "dispatch: --issue-title is required")
+		return 2
+	}
+	if opts.Timeout < 0 {
+		fmt.Fprintln(stderr, "dispatch: --timeout must not be negative")
+		return 2
+	}
+	if detach && supervisorRun {
+		fmt.Fprintln(stderr, "dispatch: --detach cannot be combined with --supervisor-run")
+		return 2
+	}
+	if detach && foreground {
+		fmt.Fprintln(stderr, "dispatch: choose only one of --detach or --foreground")
 		return 2
 	}
 
@@ -3353,14 +4701,64 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 	opts.Model = selection.Model
 	opts.Effort = selection.Effort
 
-	result, err := deps.Dispatch(context.Background(), opts)
-	if err != nil {
-		fmt.Fprintf(stderr, "dispatch: %v\n", err)
+	if !detach && !foreground && !supervisorRun {
+		defaultDetached, err := shouldDefaultDetachedForHost(cfg, stdout, stderr, deps)
+		if err != nil {
+			fmt.Fprintf(stderr, "dispatch: %v\n", err)
+			return 2
+		}
+		detach = defaultDetached
+	}
+	if detach && strings.TrimSpace(opts.RunID) == "" {
+		opts.RunID = state.RunIDForIssue(opts.IssueNumber, deps.Now())
+	}
+
+	if err := replayCurrentHostProgressBeforeDispatch(context.Background(), opts.RepoPath, opts.RunID, stderr, deps); err != nil {
+		fmt.Fprintf(stderr, "dispatch: replay host progress: %v\n", err)
 		return 1
 	}
+
+	if detach {
+		return runDetachedDispatch(opts, outputMode.Format, stdout, stderr, deps)
+	}
+	if supervisorRun {
+		return runDispatchSupervisor(opts, detachedrun.Fence{RunID: opts.RunID, Owner: supervisorOwner, Generation: supervisorGeneration}, deps)
+	}
+
+	result, err := deps.Dispatch(context.Background(), opts)
+	if err != nil {
+		if result.Report == nil {
+			fmt.Fprintf(stderr, "dispatch: %v\n", err)
+			return 1
+		}
+		if strings.TrimSpace(result.Reason) == "" {
+			result.Reason = err.Error()
+		}
+		if strings.TrimSpace(result.NextAction) == "" {
+			result.NextAction = "retry or recover the failed dispatch phase"
+		}
+		fmt.Fprintf(stderr, "dispatch: %v\n", err)
+	}
 	if result.Report == nil {
-		fmt.Fprintln(stderr, "dispatch: dispatch report is missing")
-		return 1
+		if result.Reconciliation == nil {
+			fmt.Fprintln(stderr, "dispatch: dispatch report is missing")
+			return 1
+		}
+		if outputMode.Format == "json" {
+			if err := renderDispatchJSON(stdout, result); err != nil {
+				fmt.Fprintf(stderr, "dispatch: %v\n", err)
+				return 1
+			}
+		} else if outputMode.Format == "jsonl" {
+			if _, err := fmt.Fprintln(stdout, result.Reconciliation.JSONLine()); err != nil {
+				fmt.Fprintf(stderr, "dispatch: write output: %v\n", err)
+				return 1
+			}
+		} else {
+			fmt.Fprintln(stdout, result.Reconciliation.JSONLine())
+			fmt.Fprintf(stderr, "dispatch: %s\n", result.Reason)
+		}
+		return dispatchResultExitCode(result)
 	}
 	if result.Report != nil {
 		mode := prettyModeForTarget(stderr, deps, pretty)
@@ -3379,10 +4777,21 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 				fmt.Fprintf(stderr, "dispatch: write pretty report: %v\n", err)
 				return 1
 			}
+			if err := renderCanonicalHuman(stderr, dispatchObservability(result), deps); err != nil {
+				fmt.Fprintf(stderr, "dispatch: write observability summary: %v\n", err)
+				return 1
+			}
 		}
 	}
 	if outputMode.Format == "json" {
 		if err := renderDispatchJSON(stdout, result); err != nil {
+			fmt.Fprintf(stderr, "dispatch: %v\n", err)
+			return 1
+		}
+		return dispatchResultExitCode(result)
+	}
+	if outputMode.Format == "jsonl" {
+		if err := renderCanonicalMachine(stdout, dispatchObservability(result), "jsonl"); err != nil {
 			fmt.Fprintf(stderr, "dispatch: %v\n", err)
 			return 1
 		}
@@ -3510,7 +4919,12 @@ func prNumberFromPR(pr string) int {
 
 func renderDispatch(w io.Writer, result worker.Result) error {
 	if result.Report == nil {
-		return errors.New("dispatch report is missing")
+		data, err := worker.MarshalResult(dispatchResultForOutput(result))
+		if err != nil {
+			return err
+		}
+		_, err = w.Write(append(data, '\n'))
+		return err
 	}
 	if err := result.Report.Validate(); err != nil {
 		return fmt.Errorf("validate dispatch report: %w", err)
@@ -3519,7 +4933,7 @@ func renderDispatch(w io.Writer, result worker.Result) error {
 	if err != nil {
 		return fmt.Errorf("render dispatch report JSON: %w", err)
 	}
-	data, err := worker.MarshalResult(result)
+	data, err := worker.MarshalResult(dispatchResultForOutput(result))
 	if err != nil {
 		return err
 	}
@@ -3537,17 +4951,12 @@ func renderDispatch(w io.Writer, result worker.Result) error {
 
 func renderDispatchJSON(w io.Writer, result worker.Result) error {
 	if result.Report == nil {
-		return errors.New("dispatch report is missing")
+		return renderCanonicalJSONLine(w, dispatchJSONPayload(result))
 	}
 	if err := result.Report.Validate(); err != nil {
 		return fmt.Errorf("validate dispatch report: %w", err)
 	}
-	data, err := worker.MarshalResult(result)
-	if err != nil {
-		return err
-	}
-	_, err = w.Write(append(data, '\n'))
-	return err
+	return renderCanonicalJSONLine(w, dispatchJSONPayload(result))
 }
 
 func runAttest(args []string, stdout, stderr io.Writer, deps Deps) int {
@@ -3953,6 +5362,8 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var modelAlias string
 	var effort string
 	var effortAlias string
+	var timeout time.Duration
+	var timeoutAlias time.Duration
 	var configFromBase bool
 	var configFromBaseAlias bool
 	var strict bool
@@ -3963,6 +5374,10 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var prettyAlias bool
 	var noPretty bool
 	var noPrettyAlias bool
+	var detach bool
+	var detachAlias bool
+	var foreground bool
+	var foregroundAlias bool
 	format := "text"
 	var formatAlias string
 	var verbose bool
@@ -3986,6 +5401,8 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&modelAlias, "Model", "", "model")
 	fs.StringVar(&effort, "effort", "", "effort")
 	fs.StringVar(&effortAlias, "Effort", "", "effort")
+	fs.DurationVar(&timeout, "timeout", 0, "worker hard-cap override")
+	fs.DurationVar(&timeoutAlias, "Timeout", 0, "worker hard-cap override")
 	fs.BoolVar(&strict, "strict", false, "reject invalid model/depth selections instead of warning")
 	fs.BoolVar(&strictAlias, "Strict", false, "reject invalid model/depth selections instead of warning")
 	fs.BoolVar(&configFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
@@ -3996,6 +5413,10 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.BoolVar(&prettyAlias, "Pretty", false, "render human-readable report on stderr")
 	fs.BoolVar(&noPretty, "no-pretty", false, "suppress human-readable report on stderr")
 	fs.BoolVar(&noPrettyAlias, "NoPretty", false, "suppress human-readable report on stderr")
+	fs.BoolVar(&detach, "detach", false, "launch detached supervisor")
+	fs.BoolVar(&detachAlias, "Detach", false, "launch detached supervisor")
+	fs.BoolVar(&foreground, "foreground", false, "run in the foreground instead of detached supervision")
+	fs.BoolVar(&foregroundAlias, "Foreground", false, "run in the foreground instead of detached supervision")
 	fs.StringVar(&format, "format", "text", "output format")
 	fs.StringVar(&formatAlias, "Format", "", "output format")
 	fs.BoolVar(&verbose, "verbose", false, "include raw verifier JSON and report header")
@@ -4029,6 +5450,9 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if effortAlias != "" {
 		effort = effortAlias
 	}
+	if timeoutAlias != 0 {
+		timeout = timeoutAlias
+	}
 	configFromBase = configFromBase || configFromBaseAlias
 	strict = strict || strictAlias
 	if throttleLimitAlias != 0 {
@@ -4036,11 +5460,13 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	pretty = pretty || prettyAlias
 	noPretty = noPretty || noPrettyAlias
+	detach = detach || detachAlias
+	foreground = foreground || foregroundAlias
 	if formatAlias != "" {
 		format = formatAlias
 	}
 	verbose = verbose || verboseAlias
-	outputMode, ok := normalizeCommandOutputMode("dispatch-wave", format, verbose, stderr)
+	outputMode, ok := normalizeCommandOutputModeWithFormats("dispatch-wave", format, verbose, stderr, "text", "json", "jsonl")
 	if !ok {
 		return 2
 	}
@@ -4051,6 +5477,14 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if throttleLimit <= 0 {
 		fmt.Fprintln(stderr, "dispatch-wave: --throttle-limit must be greater than zero")
+		return 2
+	}
+	if timeout < 0 {
+		fmt.Fprintln(stderr, "dispatch-wave: --timeout must not be negative")
+		return 2
+	}
+	if detach && foreground {
+		fmt.Fprintln(stderr, "dispatch-wave: choose only one of --detach or --foreground")
 		return 2
 	}
 
@@ -4136,6 +5570,30 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	model = selection.Model
 	effort = selection.Effort
 
+	if !detach && !foreground {
+		defaultDetached, err := shouldDefaultDetachedForHost(cfg, stdout, stderr, deps)
+		if err != nil {
+			fmt.Fprintf(stderr, "dispatch-wave: %v\n", err)
+			return 2
+		}
+		detach = defaultDetached
+	}
+	if detach {
+		if strings.TrimSpace(runID) == "" {
+			runID = state.RunIDForWave(deps.Now())
+		}
+		childArgs := childArgsWithDetachedForeground(args, runID)
+		if fromReadySet && readySet != nil {
+			readySetPath, err := persistDetachedReadySetInput(resolvedRepo, runID, *readySet, deps)
+			if err != nil {
+				fmt.Fprintf(stderr, "dispatch-wave: persist detached ready-set input: %v\n", err)
+				return 1
+			}
+			childArgs = childArgsReplacingReadySetStdin(childArgs, readySetPath)
+		}
+		return runDetachedCommand(resolvedRepo, runID, "dispatch-wave", outputMode.Format, childArgs, stdout, stderr, deps)
+	}
+
 	prettyMode := prettyModeForTarget(stdout, deps, pretty)
 	renderPretty := outputMode.Format == "text" && shouldRenderPretty(noPretty)
 	writeWaveRelayRecord := func(runID string, result orchestration.DispatchWaveIssueResult) error {
@@ -4203,6 +5661,7 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 		Provider:        provider,
 		Model:           model,
 		Effort:          effort,
+		Timeout:         timeout,
 		ConfigFromBase:  configFromBase,
 		ThrottleLimit:   throttleLimit,
 		Thresholds:      cfg.Resilience.Worker,
@@ -4218,9 +5677,18 @@ func runDispatchWave(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if dispatchWaveReportHasContent(waveReport) {
 		var writeErr error
 		if outputMode.Format == "json" {
-			writeErr = writeJSONLine(stdout, waveReport)
+			writeErr = writeJSONLine(stdout, orchestration.SanitizeDispatchWaveReportForOutput(waveReport))
+		} else if outputMode.Format == "jsonl" {
+			writeErr = renderCanonicalMachine(stdout, orchestration.DispatchWaveObservabilityDocument(waveReport), "jsonl")
 		} else {
-			_, writeErr = stdout.Write([]byte(orchestration.RenderDispatchWaveText(waveReport)))
+			if _, writeErr = stdout.Write([]byte(orchestration.RenderDispatchWaveText(waveReport))); writeErr == nil {
+				if !renderPretty {
+					_, writeErr = fmt.Fprintln(stdout)
+				}
+			}
+			if writeErr == nil && !renderPretty {
+				writeErr = renderCanonicalHuman(stdout, orchestration.DispatchWaveObservabilityDocument(waveReport), deps)
+			}
 		}
 		if writeErr != nil {
 			fmt.Fprintf(stderr, "dispatch-wave: write output: %v\n", writeErr)
@@ -4282,6 +5750,13 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var verifierTimeoutAlias time.Duration
 	var strict bool
 	var strictAlias bool
+	var detached bool
+	var detachedAlias bool
+	var supervisorOwner string
+	var supervisorGeneration int64
+	var supervisorLease string
+	format := "text"
+	var formatAlias string
 
 	fs.StringVar(&opts.RepoPath, "repo", "", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -4307,6 +5782,13 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs.StringVar(&effortAlias, "Effort", "", "effort")
 	fs.BoolVar(&strict, "strict", false, "reject invalid model/depth selections instead of warning")
 	fs.BoolVar(&strictAlias, "Strict", false, "reject invalid model/depth selections instead of warning")
+	fs.BoolVar(&detached, "detached", false, "reconcile a detached run supervisor by run id")
+	fs.BoolVar(&detachedAlias, "Detached", false, "reconcile a detached run supervisor by run id")
+	fs.StringVar(&supervisorOwner, "supervisor-owner", "", "expected detached supervisor owner")
+	fs.Int64Var(&supervisorGeneration, "supervisor-generation", 0, "expected detached supervisor generation")
+	fs.StringVar(&supervisorLease, "supervisor-lease", "", "expected detached supervisor lease expiry")
+	fs.StringVar(&format, "format", "text", "output format")
+	fs.StringVar(&formatAlias, "Format", "", "output format")
 	fs.BoolVar(&opts.ConfigFromBase, "config-from-base", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.BoolVar(&configFromBaseAlias, "ConfigFromBase", false, "read .delivery.yml from base branch when absent from working tree")
 	fs.StringVar(&opts.UpgradedModel, "upgraded-model", "", "upgraded model")
@@ -4378,7 +5860,20 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 		opts.VerifierTimeout = verifierTimeoutAlias
 	}
 	strict = strict || strictAlias
+	detached = detached || detachedAlias
+	if formatAlias != "" {
+		format = formatAlias
+	}
+	switch format {
+	case "text", "json", "jsonl":
+	default:
+		fmt.Fprintf(stderr, "recover: invalid --format %q; want text, json, or jsonl\n", format)
+		return 2
+	}
 	opts.Stderr = stderr
+	if format == "json" || format == "jsonl" {
+		opts.Stderr = io.Discard
+	}
 
 	backoffSeconds, err := parseBackoffSeconds(backoffSecondsValue)
 	if err != nil {
@@ -4390,6 +5885,18 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if strings.TrimSpace(opts.RepoPath) == "" {
 		fmt.Fprintln(stderr, "recover: --repo is required")
 		return 2
+	}
+	if detached {
+		if strings.TrimSpace(opts.RunID) == "" {
+			fmt.Fprintln(stderr, "recover: --run-id is required")
+			return 2
+		}
+		resolvedRepo, err := resolveRepo(opts.RepoPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "recover: %v\n", err)
+			return 2
+		}
+		return runDetachedRecover(resolvedRepo, opts.RunID, format, detachedrun.Fence{RunID: opts.RunID, Owner: supervisorOwner, Generation: supervisorGeneration}, supervisorLease, stdout, stderr, deps)
 	}
 	if opts.IssueNumber <= 0 {
 		fmt.Fprintln(stderr, "recover: --issue-number is required")
@@ -4457,9 +5964,39 @@ func runRecover(args []string, stdout, stderr io.Writer, deps Deps) int {
 	opts.CircuitBreaker = cfg.Guardrails.CircuitBreaker
 
 	result, err := deps.Recover(context.Background(), opts)
-	if result.Report != "" {
+	if format == "json" {
+		outputResult := recoveryResultForOutput(result)
+		payload := struct {
+			SchemaVersion string `json:"schema_version"`
+			Observability any    `json:"observability"`
+			Action        string `json:"action"`
+			Dispatch      any    `json:"dispatch_result,omitempty"`
+			Review        any    `json:"review_result,omitempty"`
+			Attempts      any    `json:"recovery_attempts,omitempty"`
+		}{
+			SchemaVersion: "loopcoder.recover_result.v1",
+			Observability: recoveryObservability(opts, result),
+			Action:        string(result.Action),
+			Dispatch:      outputResult.DispatchResult,
+			Review:        result.ReviewResult,
+			Attempts:      outputResult.RecoveryAttempts,
+		}
+		if err := renderCanonicalJSONLine(stdout, payload); err != nil {
+			fmt.Fprintf(stderr, "recover: write output: %v\n", err)
+			return 1
+		}
+	} else if format == "jsonl" {
+		if err := renderCanonicalMachine(stdout, recoveryObservability(opts, result), "jsonl"); err != nil {
+			fmt.Fprintf(stderr, "recover: write output: %v\n", err)
+			return 1
+		}
+	} else if result.Report != "" {
 		if _, writeErr := stdout.Write([]byte(result.Report)); writeErr != nil {
 			fmt.Fprintf(stderr, "recover: write output: %v\n", writeErr)
+			return 1
+		}
+		if err := renderCanonicalHuman(stdout, recoveryObservability(opts, result), deps); err != nil {
+			fmt.Fprintf(stderr, "recover: write output: %v\n", err)
 			return 1
 		}
 	}
@@ -4745,35 +6282,37 @@ func recoverWithDispatch(dispatch func(ctx context.Context, opts worker.Options)
 		recoverDeps := recovery.DefaultDeps()
 		recoverDeps.Dispatch = func(ctx context.Context, dispatchOpts recovery.DispatchOptions) (recovery.DispatchResult, error) {
 			result, err := dispatch(ctx, worker.Options{
-				RepoPath:        dispatchOpts.RepoPath,
-				IssueNumber:     dispatchOpts.IssueNumber,
-				IssueTitle:      dispatchOpts.IssueTitle,
-				IssueBody:       dispatchOpts.IssueBody,
-				BaseBranch:      dispatchOpts.BaseBranch,
-				Branch:          dispatchOpts.Branch,
-				RunID:           dispatchOpts.RunID,
-				Attempt:         dispatchOpts.Attempt,
-				RecoveryContext: dispatchOpts.RecoveryContext,
-				Provider:        dispatchOpts.Provider,
-				Model:           dispatchOpts.Model,
-				Effort:          dispatchOpts.Effort,
-				ConfigFromBase:  dispatchOpts.ConfigFromBase,
-				Stderr:          dispatchOpts.Stderr,
+				RepoPath:           dispatchOpts.RepoPath,
+				IssueNumber:        dispatchOpts.IssueNumber,
+				IssueTitle:         dispatchOpts.IssueTitle,
+				IssueBody:          dispatchOpts.IssueBody,
+				BaseBranch:         dispatchOpts.BaseBranch,
+				Branch:             dispatchOpts.Branch,
+				RunID:              dispatchOpts.RunID,
+				Attempt:            dispatchOpts.Attempt,
+				RecoveryContext:    dispatchOpts.RecoveryContext,
+				Provider:           dispatchOpts.Provider,
+				Model:              dispatchOpts.Model,
+				Effort:             dispatchOpts.Effort,
+				ConfigFromBase:     dispatchOpts.ConfigFromBase,
+				Stderr:             dispatchOpts.Stderr,
+				BeforeProviderCall: dispatchOpts.BeforeProviderCall,
 			})
 			return recovery.DispatchResult{
-				OK:          result.OK,
-				Issue:       result.Issue,
-				Branch:      result.Branch,
-				RunID:       result.RunID,
-				PR:          result.PR,
-				Summary:     result.Summary,
-				AttemptPath: result.AttemptPath,
-				Status:      result.Status,
-				ExitCode:    result.ExitCode,
-				LogBytes:    result.LogBytes,
-				Reason:      result.Reason,
-				NextAction:  result.NextAction,
-				Report:      result.Report,
+				OK:              result.OK,
+				ProviderInvoked: result.ProviderInvoked,
+				Issue:           result.Issue,
+				Branch:          result.Branch,
+				RunID:           result.RunID,
+				PR:              result.PR,
+				Summary:         result.Summary,
+				AttemptPath:     result.AttemptPath,
+				Status:          result.Status,
+				ExitCode:        result.ExitCode,
+				LogBytes:        result.LogBytes,
+				Reason:          result.Reason,
+				NextAction:      result.NextAction,
+				Report:          result.Report,
 			}, err
 		}
 		recoverDeps.Review = review
@@ -4838,7 +6377,7 @@ func readReadySetJSON(r io.Reader) (*report.ReadySetReport, error) {
 	return &readySet, nil
 }
 
-func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
+func runStatus(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
@@ -4848,6 +6387,18 @@ func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
 	var runIDAlias string
 	format := "text"
 	var formatAlias string
+	var receipts bool
+	var replay bool
+	var follow bool
+	var cursor string
+	var correlationID string
+	var taskID string
+	var supervisorOwner string
+	var supervisorGeneration int64
+	var supervisorLease string
+	var limit int
+	var pollInterval time.Duration
+	var followFor time.Duration
 
 	fs.StringVar(&repoPath, "repo", ".", "repository path")
 	fs.StringVar(&repoAlias, "Repo", "", "repository path")
@@ -4857,6 +6408,18 @@ func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
 	fs.StringVar(&runIDAlias, "RunId", "", "run id")
 	fs.StringVar(&format, "format", "text", "output format")
 	fs.StringVar(&formatAlias, "Format", "", "output format")
+	fs.BoolVar(&receipts, "receipts", false, "render durable progress receipts")
+	fs.BoolVar(&replay, "replay", false, "render durable progress receipt replay")
+	fs.BoolVar(&follow, "follow", false, "follow durable progress receipts")
+	fs.StringVar(&cursor, "cursor", "", "opaque progress receipt cursor")
+	fs.StringVar(&correlationID, "correlation", "", "progress receipt correlation id")
+	fs.StringVar(&taskID, "task", "", "progress receipt task id")
+	fs.StringVar(&supervisorOwner, "supervisor-owner", "", "expected detached supervisor owner")
+	fs.Int64Var(&supervisorGeneration, "supervisor-generation", 0, "expected detached supervisor generation")
+	fs.StringVar(&supervisorLease, "supervisor-lease", "", "expected detached supervisor lease expiry")
+	fs.IntVar(&limit, "limit", 500, "maximum progress receipts per read")
+	fs.DurationVar(&pollInterval, "poll", progress.DefaultFollowPollInterval, "follow poll interval")
+	fs.DurationVar(&followFor, "follow-for", 0, "optional bounded follow duration")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -4870,10 +6433,15 @@ func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
 	if formatAlias != "" {
 		format = formatAlias
 	}
+	receiptMode := receipts || replay || follow || cursor != "" || correlationID != "" || taskID != ""
 	switch format {
-	case "text", "json":
+	case "text", "json", "jsonl":
 	default:
-		fmt.Fprintf(stderr, "status: invalid --format %q; want text or json\n", format)
+		fmt.Fprintf(stderr, "status: invalid --format %q; want text, json, or jsonl\n", format)
+		return 2
+	}
+	if follow && format == "json" {
+		fmt.Fprintf(stderr, "status: --follow with machine output requires --format jsonl\n")
 		return 2
 	}
 
@@ -4881,6 +6449,22 @@ func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "status: %v\n", err)
 		return 2
+	}
+	if receiptMode {
+		return runStatusProgressReceipts(statusProgressOptions{
+			RepoPath:      resolvedRepo,
+			RunID:         runID,
+			Format:        format,
+			Follow:        follow,
+			Cursor:        progress.Cursor(cursor),
+			CorrelationID: correlationID,
+			TaskID:        taskID,
+			Fence:         detachedrun.Fence{RunID: runID, Owner: supervisorOwner, Generation: supervisorGeneration},
+			ExpectedLease: supervisorLease,
+			Limit:         limit,
+			PollInterval:  pollInterval,
+			FollowFor:     followFor,
+		}, stdout, stderr, deps)
 	}
 
 	report, err := runstatus.Load(runstatus.Options{
@@ -4903,14 +6487,126 @@ func runStatus(args []string, stdout, stderr io.Writer, _ Deps) int {
 		}
 		return 0
 	}
+	if format == "jsonl" {
+		if err := renderCanonicalMachine(stdout, runstatus.ObservabilityDocument(report), "jsonl"); err != nil {
+			fmt.Fprintf(stderr, "status: write output: %v\n", err)
+			return 1
+		}
+		return 0
+	}
 	if _, err := stdout.Write([]byte(runstatus.Render(report))); err != nil {
+		fmt.Fprintf(stderr, "status: write output: %v\n", err)
+		return 1
+	}
+	if _, err := fmt.Fprintln(stdout); err != nil {
+		fmt.Fprintf(stderr, "status: write output: %v\n", err)
+		return 1
+	}
+	if err := renderCanonicalHuman(stdout, runstatus.ObservabilityDocument(report), deps); err != nil {
 		fmt.Fprintf(stderr, "status: write output: %v\n", err)
 		return 1
 	}
 	return 0
 }
 
-func runReport(args []string, stdout, stderr io.Writer) int {
+type statusProgressOptions struct {
+	RepoPath      string
+	RunID         string
+	Format        string
+	Follow        bool
+	Cursor        progress.Cursor
+	CorrelationID string
+	TaskID        string
+	Fence         detachedrun.Fence
+	ExpectedLease string
+	Limit         int
+	PollInterval  time.Duration
+	FollowFor     time.Duration
+}
+
+func runStatusProgressReceipts(opts statusProgressOptions, stdout, stderr io.Writer, deps Deps) int {
+	now := deps.Now
+	if now == nil {
+		now = time.Now
+	}
+	ctx := context.Background()
+	roots, err := runtimepath.Resolve(ctx, opts.RepoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "status: resolve progress receipt roots: %v\n", err)
+		return 1
+	}
+	if !roots.Registered || strings.TrimSpace(roots.ProjectID) == "" {
+		fmt.Fprintf(stderr, "status: progress receipts require a registered project\n")
+		return 1
+	}
+	runID := strings.TrimSpace(opts.RunID)
+	if runID == "" {
+		latest, err := state.LatestRunID(opts.RepoPath)
+		if err != nil || strings.TrimSpace(latest) == "" {
+			fmt.Fprintf(stderr, "status: progress receipts require --run when no latest local run exists\n")
+			return 1
+		}
+		runID = latest
+	}
+	store, err := storage.Open(ctx, storage.Options{Path: roots.DatabasePath, Now: now})
+	if err != nil {
+		fmt.Fprintf(stderr, "status: open progress receipt store: %v\n", err)
+		return 1
+	}
+	defer store.Close()
+	if err := validateDetachedStatusFence(ctx, store, runID, opts.Fence, opts.ExpectedLease); err != nil {
+		fmt.Fprintf(stderr, "status: %v\n", err)
+		return 1
+	}
+
+	filter := progress.ReadFilter{
+		ProjectID:     roots.ProjectID,
+		DeliveryRunID: runID,
+		CorrelationID: opts.CorrelationID,
+		TaskID:        opts.TaskID,
+		Limit:         opts.Limit,
+		After:         opts.Cursor,
+	}
+	render := func(batch progress.ReceiptBatch) error {
+		for _, diagnostic := range batch.Diagnostics {
+			fmt.Fprintf(stderr, "status: warning: %s storage_order=%d: %s\n", diagnostic.Code, diagnostic.StorageOrder, diagnostic.Message)
+		}
+		switch opts.Format {
+		case "json":
+			return progress.RenderJSON(stdout, batch)
+		case "jsonl":
+			return progress.RenderJSONL(stdout, batch.Views)
+		default:
+			return progress.RenderHuman(stdout, batch.Views)
+		}
+	}
+	if opts.Follow {
+		followCtx := ctx
+		if opts.FollowFor > 0 {
+			var cancel context.CancelFunc
+			followCtx, cancel = context.WithTimeout(ctx, opts.FollowFor)
+			defer cancel()
+		}
+		err = progress.FollowReceipts(followCtx, store, progress.FollowOptions{ReadFilter: filter, PollInterval: opts.PollInterval}, now, render)
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			fmt.Fprintf(stderr, "status: follow progress receipts: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	batch, err := progress.ReadReceipts(ctx, store, filter, now().UTC())
+	if err != nil {
+		fmt.Fprintf(stderr, "status: read progress receipts: %v\n", err)
+		return 1
+	}
+	if err := render(batch); err != nil {
+		fmt.Fprintf(stderr, "status: write output: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func runReport(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs := flag.NewFlagSet("report", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
@@ -4979,9 +6675,9 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 	}
 	verbose = verbose || verboseAlias
 	switch format {
-	case "text", "json":
+	case "text", "json", "jsonl":
 	default:
-		fmt.Fprintf(stderr, "report: invalid --format %q; want text or json\n", format)
+		fmt.Fprintf(stderr, "report: invalid --format %q; want text, json, or jsonl\n", format)
 		return 2
 	}
 	reportRole := reporter.Role(strings.TrimSpace(role))
@@ -5038,7 +6734,22 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
+	if format == "jsonl" {
+		if err := renderCanonicalMachine(stdout, reportquery.ObservabilityDocument(records), "jsonl"); err != nil {
+			fmt.Fprintf(stderr, "report: write output: %v\n", err)
+			return 1
+		}
+		return 0
+	}
 	if _, err := stdout.Write([]byte(reportquery.RenderTextWithOptions(records, reportquery.RenderOptions{Verbose: verbose}))); err != nil {
+		fmt.Fprintf(stderr, "report: write output: %v\n", err)
+		return 1
+	}
+	if _, err := fmt.Fprintln(stdout); err != nil {
+		fmt.Fprintf(stderr, "report: write output: %v\n", err)
+		return 1
+	}
+	if err := renderCanonicalHuman(stdout, reportquery.ObservabilityDocument(records), deps); err != nil {
 		fmt.Fprintf(stderr, "report: write output: %v\n", err)
 		return 1
 	}
@@ -5112,9 +6823,9 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 2
 	}
 	switch outputFormat {
-	case "text", "json", "both":
+	case "text", "json", "jsonl", "both":
 	default:
-		fmt.Fprintf(stderr, "resume: invalid --format %q; want text, json, or both\n", outputFormat)
+		fmt.Fprintf(stderr, "resume: invalid --format %q; want text, json, jsonl, or both\n", outputFormat)
 		return 2
 	}
 
@@ -5169,9 +6880,21 @@ func runResume(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	if outputFormat == "text" || outputFormat == "both" {
 		fmt.Fprint(stdout, report.RenderResumeText(resumeReport))
+		fmt.Fprintln(stdout)
+		if err := renderCanonicalHuman(stdout, report.ObservabilityDocument(resumeReport), deps); err != nil {
+			fmt.Fprintf(stderr, "resume: write output: %v\n", err)
+			return 1
+		}
 	}
 	if outputFormat == "both" {
 		fmt.Fprintln(stdout)
+	}
+	if outputFormat == "jsonl" {
+		if err := renderCanonicalMachine(stdout, report.ObservabilityDocument(resumeReport), "jsonl"); err != nil {
+			fmt.Fprintf(stderr, "resume: write output: %v\n", err)
+			return 1
+		}
+		return 0
 	}
 	if outputFormat == "json" || outputFormat == "both" {
 		data, err := report.MarshalResumeJSON(resumeReport)
@@ -5216,6 +6939,66 @@ func latestRunIDWithNote(repoPath string) (string, string, error) {
 		return "", "no run directories found", nil
 	}
 	return runID, "latest modified run selected", nil
+}
+
+func shouldDefaultDetachedForHost(cfg config.Config, stdout, stderr io.Writer, deps Deps) (bool, error) {
+	isTerminal := deps.IsTerminal
+	if isTerminal == nil {
+		isTerminal = isTerminalWriter
+	}
+	if isTerminal(stdout) || isTerminal(stderr) {
+		return false, nil
+	}
+	if strings.TrimSpace(os.Getenv(hostprofile.EnvName)) == "" && strings.TrimSpace(cfg.Host.Profile) == "" {
+		return false, nil
+	}
+	resolved, err := hostprofile.Resolve(hostprofile.Options{
+		Profile: cfg.Host.Profile,
+		Getenv:  os.Getenv,
+	})
+	if err != nil {
+		return false, err
+	}
+	return resolved.Source != hostprofile.SourceFallback, nil
+}
+
+func childArgsWithDetachedForeground(args []string, runID string) []string {
+	out := append([]string(nil), args...)
+	out = append(out, "--foreground")
+	if strings.TrimSpace(runID) != "" && !hasFlag(out, "run-id", "RunId") {
+		out = append(out, "--run-id", runID)
+	}
+	return out
+}
+
+func childArgsReplacingReadySetStdin(args []string, readySetPath string) []string {
+	if strings.TrimSpace(readySetPath) == "" {
+		return args
+	}
+	out := make([]string, 0, len(args)+2)
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--from-ready-set" || arg == "-from-ready-set" || arg == "--FromReadySet" || arg == "-FromReadySet" ||
+			strings.HasPrefix(arg, "--from-ready-set=") || strings.HasPrefix(arg, "-from-ready-set=") ||
+			strings.HasPrefix(arg, "--FromReadySet=") || strings.HasPrefix(arg, "-FromReadySet=") {
+			continue
+		}
+		out = append(out, arg)
+	}
+	out = append(out, "--ready-set-path", readySetPath)
+	return out
+}
+
+func hasFlag(args []string, names ...string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		for _, name := range names {
+			if arg == "--"+name || arg == "-"+name || strings.HasPrefix(arg, "--"+name+"=") || strings.HasPrefix(arg, "-"+name+"=") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func resolveRepo(repoPath string) (string, error) {

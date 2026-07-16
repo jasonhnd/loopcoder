@@ -2,6 +2,7 @@ package recovery
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,9 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/guardrails"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
+	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -44,6 +47,11 @@ func TestScrubRedactsSecretPatterns(t *testing.T) {
 			name: "api key",
 			in:   "key sk-12345678901234567890",
 			want: "key [REDACTED_API_KEY]",
+		},
+		{
+			name: "aws access key",
+			in:   "key " + "AKIA" + strings.Repeat("A", 16),
+			want: "key [REDACTED_AWS_ACCESS_KEY]",
 		},
 		{
 			name: "bearer token",
@@ -151,6 +159,7 @@ func TestRecoverAdoptsExistingPRBeforeRetry(t *testing.T) {
 	}
 	var slept bool
 	var dispatched bool
+	var providerGateCalled bool
 	maxBudgetAttempts := 1
 
 	result, err := Run(context.Background(), Options{
@@ -161,6 +170,10 @@ func TestRecoverAdoptsExistingPRBeforeRetry(t *testing.T) {
 		MaxAttempts:    3,
 		BackoffSeconds: []int{0},
 		Budget:         config.GuardrailBudget{MaxTotalAttempts: &maxBudgetAttempts},
+		BeforeProviderCall: func(string) error {
+			providerGateCalled = true
+			return errors.New("budget exhausted")
+		},
 	}, Deps{
 		GitHub: func(string) PullRequestReader { return fakeGitHub },
 		LoadAttempts: func(string, string) ([]state.Attempt, error) {
@@ -179,7 +192,10 @@ func TestRecoverAdoptsExistingPRBeforeRetry(t *testing.T) {
 			slept = true
 			return nil
 		},
-		Dispatch: func(context.Context, DispatchOptions) (DispatchResult, error) {
+		Dispatch: func(_ context.Context, dispatchOpts DispatchOptions) (DispatchResult, error) {
+			if err := dispatchOpts.BeforeProviderCall(); err != nil {
+				return DispatchResult{}, agent.ProviderCallRefusedError{Err: err}
+			}
 			dispatched = true
 			return DispatchResult{}, nil
 		},
@@ -190,8 +206,8 @@ func TestRecoverAdoptsExistingPRBeforeRetry(t *testing.T) {
 	if result.Action != ActionAdopt {
 		t.Fatalf("Action = %q, want %q", result.Action, ActionAdopt)
 	}
-	if slept || dispatched {
-		t.Fatalf("adopt path slept=%v dispatched=%v, want both false", slept, dispatched)
+	if slept || dispatched || providerGateCalled {
+		t.Fatalf("adopt path slept=%v dispatched=%v provider_gate=%v, want all false", slept, dispatched, providerGateCalled)
 	}
 	for _, want := range []string{
 		"ADOPT EXISTING PR; NO RETRY",
@@ -252,7 +268,10 @@ func TestRecoverAdoptsExistingPRBeforeCircuitBreaker(t *testing.T) {
 			slept = true
 			return nil
 		},
-		Dispatch: func(context.Context, DispatchOptions) (DispatchResult, error) {
+		Dispatch: func(_ context.Context, dispatchOpts DispatchOptions) (DispatchResult, error) {
+			if err := dispatchOpts.BeforeProviderCall(); err != nil {
+				return DispatchResult{}, agent.ProviderCallRefusedError{Err: err}
+			}
 			dispatched = true
 			return DispatchResult{}, nil
 		},
@@ -340,6 +359,40 @@ func TestRecoverBudgetBlocksRetryBeforeSleepOrDispatch(t *testing.T) {
 	}
 	if _, err := os.Stat(guardrails.LedgerPath(repo, "run-test", 103)); err != nil {
 		t.Fatalf("budget ledger was not written: %v", err)
+	}
+}
+
+func TestRecoverRunEmitsRecoveryProgressAndTerminalBlocked(t *testing.T) {
+	repo := t.TempDir()
+	recorder := &recordingRecoveryProgressRecorder{}
+	result, err := Run(context.Background(), Options{
+		RepoPath:       repo,
+		IssueNumber:    103,
+		IssueTitle:     "Implement recover",
+		RunID:          "run-test",
+		MaxAttempts:    1,
+		Now:            fixedRecoverTime(),
+		SkipAdoptPR:    true,
+		Progress:       recorder,
+		BackoffSeconds: []int{0},
+	}, Deps{
+		GitHub: func(string) PullRequestReader { return &recoverFakeGitHub{} },
+		LoadAttempts: func(string, string) ([]state.Attempt, error) {
+			return []state.Attempt{{Issue: 103, Attempt: 1, JobID: "job-103-1", Status: "failed"}}, nil
+		},
+		Dispatch: func(context.Context, DispatchOptions) (DispatchResult, error) {
+			t.Fatal("dispatch should not run after max-attempts block")
+			return DispatchResult{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Action != ActionBlocked {
+		t.Fatalf("Action = %q, want blocked", result.Action)
+	}
+	if !recorder.hasKnown(progress.KnownRecoveryInProgress) || !recorder.hasTerminal(progress.KnownBlocked) {
+		t.Fatalf("recovery progress observations = %#v", recorder.observations)
 	}
 }
 
@@ -569,6 +622,50 @@ func TestRecoverRetriesWithBackoffAndDispatchOptions(t *testing.T) {
 		result.DispatchResult.Report.Usage.TotalTokens == nil ||
 		*result.DispatchResult.Report.Usage.TotalTokens != 321 {
 		t.Fatalf("retry report not preserved: %#v", result.DispatchResult.Report)
+	}
+}
+
+func TestRecoverProviderCallGateBlocksBeforeDispatch(t *testing.T) {
+	repo := t.TempDir()
+	dispatched := false
+	gateCalls := 0
+
+	result, err := Run(context.Background(), Options{
+		RepoPath:       repo,
+		IssueNumber:    103,
+		IssueTitle:     "Implement recover",
+		RunID:          "run-test",
+		MaxAttempts:    2,
+		BackoffSeconds: []int{0},
+		Provider:       "codex",
+		BeforeProviderCall: func(kind string) error {
+			gateCalls++
+			if kind != "worker" {
+				t.Fatalf("provider kind = %q, want worker", kind)
+			}
+			return errors.New("model-call-budget exhausted")
+		},
+	}, Deps{
+		GitHub: func(string) PullRequestReader { return &recoverFakeGitHub{} },
+		LoadAttempts: func(string, string) ([]state.Attempt, error) {
+			return []state.Attempt{recoverAttempt(repo, 1, "job-103-1", "failed", "first error")}, nil
+		},
+		Dispatch: func(_ context.Context, dispatchOpts DispatchOptions) (DispatchResult, error) {
+			if err := dispatchOpts.BeforeProviderCall(); err != nil {
+				return DispatchResult{}, agent.ProviderCallRefusedError{Err: err}
+			}
+			dispatched = true
+			return DispatchResult{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Action != ActionBlocked || gateCalls != 1 || dispatched {
+		t.Fatalf("result=%#v gateCalls=%d dispatched=%v", result, gateCalls, dispatched)
+	}
+	if !strings.Contains(result.Report, "BLOCKED: orchestration cost budget: model-call-budget exhausted") {
+		t.Fatalf("blocked report missing cost evidence:\n%s", result.Report)
 	}
 }
 
@@ -808,6 +905,9 @@ func TestRecoverLoopReviewPassStopsMidLoop(t *testing.T) {
 	attempts := []state.Attempt{recoverAttempt(repo, 1, "job-103-1", "failed", "first error")}
 	dispatchCalls := 0
 	reviewCalls := 0
+	callbackOrder := []string{}
+	workerReport := recoverReport(103, 321)
+	verifierReport := recoverReport(103, 123)
 
 	result, err := Run(context.Background(), Options{
 		RepoPath:         repo,
@@ -818,34 +918,60 @@ func TestRecoverLoopReviewPassStopsMidLoop(t *testing.T) {
 		BackoffSeconds:   []int{0},
 		Provider:         "codex",
 		VerifierProvider: "claude",
+		BeforeProviderCall: func(kind string) error {
+			callbackOrder = append(callbackOrder, "before-"+kind)
+			return nil
+		},
+		AfterProviderCall: func(kind string, invoked bool, report *reporter.Report) {
+			callbackOrder = append(callbackOrder, "after-"+kind)
+			if !invoked {
+				t.Fatalf("%s callback did not report provider invocation", kind)
+			}
+			if kind == "worker" && report != workerReport {
+				t.Fatalf("worker callback report = %#v, want %#v", report, workerReport)
+			}
+			if kind == "verifier" && report != verifierReport {
+				t.Fatalf("verifier callback report = %#v, want %#v", report, verifierReport)
+			}
+		},
 	}, Deps{
 		GitHub: func(string) PullRequestReader { return &recoverFakeGitHub{} },
 		LoadAttempts: func(string, string) ([]state.Attempt, error) {
 			return append([]state.Attempt(nil), attempts...), nil
 		},
 		Dispatch: func(_ context.Context, opts DispatchOptions) (DispatchResult, error) {
+			if err := opts.BeforeProviderCall(); err != nil {
+				return DispatchResult{}, agent.ProviderCallRefusedError{Err: err}
+			}
 			dispatchCalls++
 			attempts = append(attempts, recoverAttempt(repo, opts.Attempt, fmt.Sprintf("job-103-%d", opts.Attempt), "succeeded", ""))
 			return DispatchResult{
-				OK:     true,
-				Issue:  opts.IssueNumber,
-				Branch: opts.Branch,
-				RunID:  opts.RunID,
-				PR:     "https://github.com/owner/repo/pull/102",
-				Status: "succeeded",
+				OK:              true,
+				ProviderInvoked: true,
+				Issue:           opts.IssueNumber,
+				Branch:          opts.Branch,
+				RunID:           opts.RunID,
+				PR:              "https://github.com/owner/repo/pull/102",
+				Status:          "succeeded",
+				Report:          workerReport,
 			}, nil
 		},
 		Review: func(_ context.Context, opts loopreview.Options) (loopreview.Result, error) {
+			if err := opts.BeforeProviderCall(); err != nil {
+				return loopreview.Result{}, agent.ProviderCallRefusedError{Err: err}
+			}
 			reviewCalls++
 			if opts.PRNumber != 102 || opts.Timeout <= 0 {
 				t.Fatalf("review opts = %#v", opts)
 			}
 			return loopreview.Result{
+				ProviderInvoked: true,
 				Verdict: loopreview.Verdict{
 					Verdict:         loopreview.VerdictPass,
 					Evidence:        "review passed",
 					Findings:        []loopreview.Finding{},
 					SpecConformance: loopreview.SpecConformancePass,
+					Report:          verifierReport,
 				},
 				ExitCode: 0,
 			}, nil
@@ -859,6 +985,9 @@ func TestRecoverLoopReviewPassStopsMidLoop(t *testing.T) {
 	}
 	if dispatchCalls != 1 || reviewCalls != 1 {
 		t.Fatalf("calls dispatch=%d review=%d, want one each", dispatchCalls, reviewCalls)
+	}
+	if got, want := strings.Join(callbackOrder, ","), "before-worker,after-worker,before-verifier,after-verifier"; got != want {
+		t.Fatalf("callback order = %q, want %q", got, want)
 	}
 	if result.DispatchResult == nil || result.DispatchResult.PR != "https://github.com/owner/repo/pull/102" {
 		t.Fatalf("dispatch result = %#v", result.DispatchResult)
@@ -1081,6 +1210,39 @@ func recoverAttempt(repo string, attemptNumber int, jobID, status, errText strin
 
 func fixedRecoverTime() time.Time {
 	return time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC)
+}
+
+type recordingRecoveryProgressRecorder struct {
+	observations []progress.Observation
+}
+
+func (r *recordingRecoveryProgressRecorder) Emit(_ context.Context, observation progress.Observation) (progress.EmitResult, error) {
+	r.observations = append(r.observations, observation)
+	return progress.EmitResult{Emitted: true}, nil
+}
+
+func (r *recordingRecoveryProgressRecorder) Terminal(_ context.Context, observation progress.Observation) (progress.EmitResult, error) {
+	observation.Terminal = true
+	r.observations = append(r.observations, observation)
+	return progress.EmitResult{Emitted: true}, nil
+}
+
+func (r *recordingRecoveryProgressRecorder) hasKnown(known string) bool {
+	for _, observation := range r.observations {
+		if observation.KnownState == known {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *recordingRecoveryProgressRecorder) hasTerminal(known string) bool {
+	for _, observation := range r.observations {
+		if observation.Terminal && observation.KnownState == known {
+			return true
+		}
+	}
+	return false
 }
 
 func recoverReport(issue int, totalTokens int64) *reporter.Report {

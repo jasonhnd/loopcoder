@@ -12,13 +12,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/budget"
 	"github.com/jasonhnd/loopcoder/internal/claudehooks"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/localcleanup"
 	"github.com/jasonhnd/loopcoder/internal/migration"
+	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/registry"
+	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/runtimecap"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
+	"github.com/jasonhnd/loopcoder/internal/usageledger"
 )
 
 func TestRunReportsHealthyPreflight(t *testing.T) {
@@ -198,6 +203,25 @@ func TestRenderJSONIncludesStableDoctorFields(t *testing.T) {
 			Source             string `json:"source"`
 			SupportsJSONOutput bool   `json:"supports_json_output"`
 		} `json:"host_profile"`
+		HostNegotiation struct {
+			SchemaVersion string `json:"schema_version"`
+			Outputs       struct {
+				Format             string `json:"format"`
+				StableJSON         bool   `json:"stable_json"`
+				CredentialBlind    bool   `json:"credential_blind"`
+				IncludesLocalPaths bool   `json:"includes_local_paths"`
+			} `json:"outputs"`
+			Compatibility struct {
+				Outcome        string `json:"outcome"`
+				Code           string `json:"code"`
+				SelectedSchema string `json:"selected_schema"`
+			} `json:"compatibility"`
+			Invocation struct {
+				DiscoveryOnly   bool `json:"discovery_only"`
+				ProviderLaunch  bool `json:"provider_launch"`
+				MachineJSONOnly bool `json:"machine_json_only"`
+			} `json:"invocation"`
+		} `json:"host_capability_negotiation"`
 		Runtime struct {
 			Database struct {
 				Status Status `json:"status"`
@@ -241,6 +265,19 @@ func TestRenderJSONIncludesStableDoctorFields(t *testing.T) {
 	if payload.Host.Name != "generic-local" || payload.Host.Source != "fallback" || !payload.Host.SupportsJSONOutput {
 		t.Fatalf("host_profile = %#v, want generic fallback", payload.Host)
 	}
+	if payload.HostNegotiation.SchemaVersion != runtimecap.HostNegotiationSchemaVersion ||
+		payload.HostNegotiation.Outputs.Format != "json" ||
+		!payload.HostNegotiation.Outputs.StableJSON ||
+		!payload.HostNegotiation.Outputs.CredentialBlind ||
+		payload.HostNegotiation.Outputs.IncludesLocalPaths ||
+		payload.HostNegotiation.Compatibility.Outcome != string(runtimecap.HostNegotiationSupported) ||
+		payload.HostNegotiation.Compatibility.Code != "supported" ||
+		payload.HostNegotiation.Compatibility.SelectedSchema != runtimecap.HostNegotiationSchemaVersion ||
+		!payload.HostNegotiation.Invocation.DiscoveryOnly ||
+		payload.HostNegotiation.Invocation.ProviderLaunch ||
+		!payload.HostNegotiation.Invocation.MachineJSONOnly {
+		t.Fatalf("host_capability_negotiation = %#v", payload.HostNegotiation)
+	}
 	if payload.Runtime.Database.Status != "" || payload.Runtime.ProjectRegistry.Status != "" || payload.Runtime.Migration.Status != "" || payload.Runtime.NestedRuns.Status != "" {
 		t.Fatalf("runtime should be empty for manually constructed report: %#v", payload.Runtime)
 	}
@@ -252,6 +289,159 @@ func TestRenderJSONIncludesStableDoctorFields(t *testing.T) {
 	}
 	if payload.Checks[1].Name != "tracked .loopcoder" || payload.Checks[1].FixCommand == "" || !payload.Checks[1].Hard {
 		t.Fatalf("tracked check = %#v", payload.Checks[1])
+	}
+}
+
+func TestRenderJSONIncludesQuotaUsageBudgetFallbackContract(t *testing.T) {
+	now := time.Unix(0, 0).UTC().Add(803 * time.Hour)
+	repo := t.TempDir()
+	runID := state.RunIDForIssue(730, now)
+	report := doctorUsageReport(730, now)
+	if _, err := state.WriteAttempt(repo, runID, state.AttemptRecord{
+		Version:        1,
+		JobID:          "job-730-1",
+		Issue:          730,
+		Attempt:        1,
+		Provider:       "codex",
+		PID:            123,
+		Phase:          "codex_exited",
+		Status:         "succeeded",
+		StartedAt:      report.StartedAt,
+		HeartbeatAt:    report.EndedAt,
+		LastProgressAt: report.EndedAt,
+		Report:         &report,
+	}); err != nil {
+		t.Fatalf("WriteAttempt: %v", err)
+	}
+
+	budget, check := buildQuotaUsageBudget(context.Background(), repo, "proj_test", providerinventory.Report{}, now)
+	if check.Status != StatusOK {
+		t.Fatalf("quota usage check = %#v, want OK", check)
+	}
+	var out bytes.Buffer
+	if err := RenderJSON(&out, WithMetadata(Report{QuotaUsageBudget: budget, Checks: []Check{check}}, repo, BuildInfo{Version: "0.8.0", Commit: "abc123", Date: now.Format(time.RFC3339Nano)})); err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+
+	var payload struct {
+		QuotaUsageBudget struct {
+			SchemaVersion         string                       `json:"schema_version"`
+			GeneratedAt           string                       `json:"generated_at"`
+			QuotaUsageFingerprint string                       `json:"quota_usage_fingerprint"`
+			Confidence            providerinventory.Confidence `json:"confidence"`
+			UsageSummary          []struct {
+				AdapterID      string                         `json:"adapter_id"`
+				QuantityKind   providerinventory.QuantityKind `json:"quantity_kind"`
+				TotalValue     int64                          `json:"total_value"`
+				Confidence     providerinventory.Confidence   `json:"confidence"`
+				UsageRecordIDs []string                       `json:"usage_record_ids"`
+			} `json:"usage_summary"`
+			GapReasons []string `json:"gap_reasons"`
+		} `json:"quota_usage_budget"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, out.String())
+	}
+	if payload.QuotaUsageBudget.SchemaVersion != "loopcoder.quota_usage_budget_json.v1" || payload.QuotaUsageBudget.GeneratedAt == "" {
+		t.Fatalf("quota usage metadata = %#v", payload.QuotaUsageBudget)
+	}
+	if !strings.HasPrefix(payload.QuotaUsageBudget.QuotaUsageFingerprint, "sha256:") {
+		t.Fatalf("fingerprint = %q", payload.QuotaUsageBudget.QuotaUsageFingerprint)
+	}
+	if payload.QuotaUsageBudget.Confidence != providerinventory.ConfidenceEstimated {
+		t.Fatalf("confidence = %q, want estimated fallback", payload.QuotaUsageBudget.Confidence)
+	}
+	for _, want := range []string{"persisted-ledger-empty", "derived-from-reports-fallback", "loopcoder-local-ledger-not-provider-global"} {
+		if !containsString(payload.QuotaUsageBudget.GapReasons, want) {
+			t.Fatalf("gap reasons = %#v, missing %q", payload.QuotaUsageBudget.GapReasons, want)
+		}
+	}
+	if len(payload.QuotaUsageBudget.UsageSummary) == 0 {
+		t.Fatalf("usage summary empty:\n%s", out.String())
+	}
+	foundTotal := false
+	for _, summary := range payload.QuotaUsageBudget.UsageSummary {
+		if summary.AdapterID == "codex" && summary.QuantityKind == providerinventory.QuantityTotalTokens && summary.TotalValue == 7300 {
+			foundTotal = true
+			if summary.Confidence != providerinventory.ConfidenceEstimated || len(summary.UsageRecordIDs) == 0 {
+				t.Fatalf("total summary = %#v", summary)
+			}
+		}
+	}
+	if !foundTotal {
+		t.Fatalf("total token summary missing: %#v", payload.QuotaUsageBudget.UsageSummary)
+	}
+}
+
+func TestRenderJSONIncludesBudgetSummaryContract(t *testing.T) {
+	now := time.Unix(0, 0).UTC().Add(804 * time.Hour)
+	report := usageledger.QuotaUsageBudget{
+		SchemaVersion:         usageledger.QuotaUsageBudgetSchema,
+		GeneratedAt:           now.Format(time.RFC3339Nano),
+		QuotaUsageFingerprint: "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+		Confidence:            providerinventory.ConfidenceEstimated,
+		QuotaSources:          []providerinventory.QuotaTelemetrySource{},
+		QuotaSnapshots:        []providerinventory.QuotaSnapshot{},
+		UsageSummary:          []usageledger.UsageSummary{},
+		BudgetSummary: []any{budget.Summary{
+			BudgetPolicyID:       "bpol_test",
+			Scope:                budget.Scope{ScopeKind: budget.ScopeProject, ProjectID: "proj_test"},
+			ScopeKey:             `{"scope_kind":"project","project_id":"proj_test"}`,
+			QuantityKind:         providerinventory.QuantityTotalTokens,
+			Unit:                 "token",
+			WindowKind:           providerinventory.WindowUnbounded,
+			PolicyMode:           budget.PolicyHard,
+			CeilingValue:         100,
+			ReservedValue:        40,
+			CommittedValue:       25,
+			AvailableValue:       35,
+			EffectiveCeiling:     100,
+			Confidence:           providerinventory.ConfidenceExact,
+			PolicyVersion:        "test-v1",
+			ActiveReservationIDs: []string{"bres_test"},
+			Denial:               "ErrBudgetExhausted",
+			ApprovalID:           "approval_test",
+			GapReasons:           []string{"operator-configured-budget-policy"},
+		}},
+		AvailabilityScores: []any{},
+		CircuitBreakers:    []any{},
+		GapReasons:         []string{"operator-configured-budget-policy"},
+	}
+	var out bytes.Buffer
+	if err := RenderJSON(&out, WithMetadata(Report{QuotaUsageBudget: report}, t.TempDir(), BuildInfo{Version: "0.8.0", Commit: "abc123", Date: now.Format(time.RFC3339Nano)})); err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+	var payload struct {
+		QuotaUsageBudget struct {
+			BudgetSummary []struct {
+				BudgetPolicyID       string                         `json:"budget_policy_id"`
+				QuantityKind         providerinventory.QuantityKind `json:"quantity_kind"`
+				CeilingValue         int64                          `json:"ceiling_value"`
+				ReservedValue        int64                          `json:"reserved_value"`
+				CommittedValue       int64                          `json:"committed_value"`
+				AvailableValue       int64                          `json:"available_value"`
+				EffectiveCeiling     int64                          `json:"effective_ceiling"`
+				Confidence           providerinventory.Confidence   `json:"confidence"`
+				PolicyVersion        string                         `json:"policy_version"`
+				ActiveReservationIDs []string                       `json:"active_reservation_ids"`
+				Denial               string                         `json:"denial"`
+				ApprovalID           string                         `json:"approval_id"`
+				GapReasons           []string                       `json:"gap_reasons"`
+			} `json:"budget_summary"`
+		} `json:"quota_usage_budget"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, out.String())
+	}
+	if len(payload.QuotaUsageBudget.BudgetSummary) != 1 {
+		t.Fatalf("budget summary = %#v", payload.QuotaUsageBudget.BudgetSummary)
+	}
+	got := payload.QuotaUsageBudget.BudgetSummary[0]
+	if got.BudgetPolicyID != "bpol_test" || got.AvailableValue != 35 || got.ReservedValue != 40 || got.CommittedValue != 25 || got.Denial != "ErrBudgetExhausted" || got.ApprovalID != "approval_test" {
+		t.Fatalf("budget summary = %#v, want accounting and provenance fields", got)
+	}
+	if got.Confidence != providerinventory.ConfidenceExact || len(got.ActiveReservationIDs) != 1 || !containsString(got.GapReasons, "operator-configured-budget-policy") {
+		t.Fatalf("budget summary confidence/provenance = %#v", got)
 	}
 }
 
@@ -728,7 +918,7 @@ func TestRunWarnsWhenProviderCLIMissing(t *testing.T) {
 	if check.Status != StatusWarn {
 		t.Fatalf("provider codex status = %s, want warn", check.Status)
 	}
-	if !strings.Contains(check.Message, "not found on PATH") {
+	if !strings.Contains(check.Message, "not found through bounded provider inventory probes") {
 		t.Fatalf("provider codex message = %q", check.Message)
 	}
 }
@@ -773,13 +963,10 @@ func TestRunFailsForInvalidModelSelectionInStrictMode(t *testing.T) {
 	}
 }
 
-func TestRunChecksAntigravityProviderWithAgyModels(t *testing.T) {
+func TestRunChecksAntigravityProviderInstallOnly(t *testing.T) {
 	env := healthyDoctorEnv()
 	env.cfg.Adapters.Worker = "antigravity"
 	env.paths["agy"] = "/bin/agy"
-	env.commands[cmdKey("agy", "models")] = CommandResult{
-		Stdout: "Gemini 3.1 Pro\n",
-	}
 
 	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
 
@@ -790,9 +977,158 @@ func TestRunChecksAntigravityProviderWithAgyModels(t *testing.T) {
 	if check.Status != StatusOK {
 		t.Fatalf("provider antigravity status = %s, want ok (%s)", check.Status, check.Message)
 	}
-	for _, want := range []string{`CLI "agy" found at /bin/agy`, "agy models OAuth probe succeeded"} {
+	for _, want := range []string{`CLI "agy" discovered`, "usable_for_invocation=unknown", "auth_readiness=unknown evidence=not-run", "model authorization, quota, and invocation approval remain separate"} {
 		if !strings.Contains(check.Message, want) {
 			t.Fatalf("provider antigravity message = %q, want containing %q", check.Message, want)
+		}
+	}
+}
+
+func TestRunReportsGrokAttributionAndTruthfulGaps(t *testing.T) {
+	env := healthyDoctorEnv()
+	env.cfg.Adapters.Worker = "grok"
+	env.paths["grok"] = "/bin/grok"
+	secretCanary := "xai_" + strings.Repeat("s", 24)
+	env.providerReport = func(cfg config.Config) providerinventory.Report {
+		report := env.providerInventory(cfg)
+		report.GapReasons = append(report.GapReasons, "provider-grok-native-federation-unsupported")
+		report.QuotaTelemetrySources = append(report.QuotaTelemetrySources, providerinventory.QuotaTelemetrySource{
+			SchemaVersion:       providerinventory.QuotaTelemetrySourceSchema,
+			RecordVersion:       1,
+			QuotaSourceID:       "qsrc_grok_fixture",
+			AdapterID:           "grok",
+			SourceKind:          providerinventory.QuotaSourceOfficialCLIError,
+			SourceKey:           "grok-acp-billing",
+			SourceSchemaVersion: "grok.acp.billing.v1",
+			UnsupportedReason:   "quota collection requires explicit telemetry grant",
+			GapReasons:          []string{"quota-collection-not-granted"},
+		})
+		report.QuotaSnapshots = append(report.QuotaSnapshots, providerinventory.QuotaSnapshot{
+			SchemaVersion:       providerinventory.QuotaSnapshotSchema,
+			RecordVersion:       1,
+			QuotaSnapshotID:     "qsnap_grok_grant_required",
+			QuotaSourceID:       "qsrc_grok_fixture",
+			SourceKind:          providerinventory.QuotaSourceOfficialCLIError,
+			AdapterID:           "grok",
+			ScopeKey:            "provider:grok",
+			QuantityKind:        providerinventory.QuantityRequests,
+			Unit:                "request",
+			WindowKind:          providerinventory.WindowUnknown,
+			ResetSemantics:      providerinventory.ResetUnknown,
+			Confidence:          providerinventory.ConfidenceUnavailable,
+			FreshnessState:      providerinventory.FreshnessNotApplicable,
+			TerminalErrorCode:   "ErrQuotaCollectionGrantRequired",
+			GapReasons:          []string{"quota-collection-not-granted"},
+			RedactedDiagnostics: "grok quota unavailable without explicit telemetry grant",
+		})
+		return report
+	}
+
+	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
+	if got := report.ExitCode(); got != 0 {
+		t.Fatalf("ExitCode = %d, want 0", got)
+	}
+	providerCheck := requireCheck(t, report, "provider grok")
+	if providerCheck.Status != StatusOK || !strings.Contains(providerCheck.Message, `CLI "grok" discovered`) {
+		t.Fatalf("provider grok check = %#v", providerCheck)
+	}
+	quotaCheck := requireCheck(t, report, "quota telemetry")
+	if quotaCheck.Status != StatusOK || !strings.Contains(quotaCheck.Message, "grok") || !strings.Contains(quotaCheck.Message, "quota-collection-not-granted") {
+		t.Fatalf("quota telemetry check = %#v", quotaCheck)
+	}
+	nestedCheck := requireCheck(t, report, "provider compatibility grok nested-subagents")
+	if nestedCheck.Status != StatusInfo || nestedCheck.Hard || !strings.Contains(nestedCheck.Message, "native subagents") {
+		t.Fatalf("grok nested compatibility check = %#v", nestedCheck)
+	}
+	var human bytes.Buffer
+	if err := Render(&human, report); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	for _, want := range []string{"provider grok", "quota-collection-not-granted", "provider compatibility grok nested-subagents"} {
+		if !strings.Contains(human.String(), want) {
+			t.Fatalf("doctor text missing %q:\n%s", want, human.String())
+		}
+	}
+	if strings.Contains(human.String(), secretCanary) {
+		t.Fatalf("doctor text leaked secret canary:\n%s", human.String())
+	}
+
+	var out bytes.Buffer
+	if err := RenderJSON(&out, report); err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+	var payload struct {
+		ProviderInventory struct {
+			GapReasons     []string `json:"gap_reasons"`
+			QuotaSnapshots []struct {
+				AdapterID         string   `json:"adapter_id"`
+				TerminalErrorCode string   `json:"terminal_error_code"`
+				GapReasons        []string `json:"gap_reasons"`
+			} `json:"quota_snapshots"`
+		} `json:"provider_inventory"`
+		ProviderCompatibility []struct {
+			Provider string `json:"provider"`
+			Host     string `json:"host"`
+			Role     string `json:"role"`
+			Support  string `json:"support"`
+			Status   Status `json:"status"`
+		} `json:"provider_compatibility"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, out.String())
+	}
+	if !containsString(payload.ProviderInventory.GapReasons, "provider-grok-native-federation-unsupported") {
+		t.Fatalf("provider inventory gaps = %#v", payload.ProviderInventory.GapReasons)
+	}
+	foundQuota := false
+	for _, snapshot := range payload.ProviderInventory.QuotaSnapshots {
+		if snapshot.AdapterID == "grok" {
+			foundQuota = true
+			if snapshot.TerminalErrorCode != "ErrQuotaCollectionGrantRequired" || !containsString(snapshot.GapReasons, "quota-collection-not-granted") {
+				t.Fatalf("grok quota snapshot = %#v", snapshot)
+			}
+		}
+	}
+	if !foundQuota {
+		t.Fatalf("Grok quota snapshot missing from JSON: %#v", payload.ProviderInventory.QuotaSnapshots)
+	}
+	foundCompat := false
+	for _, entry := range payload.ProviderCompatibility {
+		if entry.Provider == "grok" && entry.Host == "claude-code" && entry.Role == "worker" {
+			foundCompat = true
+			if entry.Support != "supported" || entry.Status != StatusOK {
+				t.Fatalf("grok worker compatibility = %#v", entry)
+			}
+		}
+	}
+	if !foundCompat {
+		t.Fatalf("Grok worker compatibility missing from JSON")
+	}
+	if strings.Contains(out.String(), secretCanary) {
+		t.Fatalf("doctor JSON leaked secret canary: %s", out.String())
+	}
+}
+
+func TestQuotaTelemetryHumanLineNamesConflictSetIDs(t *testing.T) {
+	check := checkQuotaTelemetry(providerinventory.Report{
+		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
+			QuotaSourceID:  "qsrc_fixture",
+			AdapterID:      "codex",
+			ScopeKey:       "provider:codex/account:acct_fixture",
+			Unit:           "request",
+			ResetSemantics: providerinventory.ResetUnknown,
+			Confidence:     providerinventory.ConfidenceUnknown,
+			FreshnessState: providerinventory.FreshnessFresh,
+			ConflictSet:    []string{"qsnap_conflict_a", "qsnap_conflict_b"},
+			GapReasons:     []string{"provider-disagreement"},
+		}},
+	})
+	if check.Status != StatusOK || check.Code != "quota_telemetry_honest" {
+		t.Fatalf("quota telemetry check = %#v, want ok honest", check)
+	}
+	for _, want := range []string{"conflict_set=qsnap_conflict_a,qsnap_conflict_b", "provider-disagreement"} {
+		if !strings.Contains(check.Message, want) {
+			t.Fatalf("quota telemetry message = %q, want containing %q", check.Message, want)
 		}
 	}
 }
@@ -813,38 +1149,38 @@ func TestRunFailsAntigravityProviderWhenAgyMissing(t *testing.T) {
 	if check.Code != "missing_executable" {
 		t.Fatalf("provider antigravity code = %q, want missing_executable", check.Code)
 	}
-	for _, want := range []string{`CLI "agy" was not found on PATH`, "run: agy login"} {
+	for _, want := range []string{`CLI "agy" was not found through bounded provider inventory probes`, "install Google Antigravity CLI"} {
 		if !strings.Contains(check.Message, want) {
 			t.Fatalf("provider antigravity message = %q, want containing %q", check.Message, want)
 		}
 	}
 }
 
-func TestRunFailsAntigravityProviderWhenAgyModelsFails(t *testing.T) {
+func TestRunDoesNotTreatAntigravityInstallAsAuthReadiness(t *testing.T) {
 	env := healthyDoctorEnv()
 	env.cfg.Adapters.Verifier = "antigravity"
 	env.paths["agy"] = "/bin/agy"
-	env.commands[cmdKey("agy", "models")] = CommandResult{
-		Stderr:   "OAuth login required\n",
-		ExitCode: 1,
-	}
 
 	report := Run(context.Background(), Options{RepoPath: "/repo"}, env.deps())
 
 	if got := report.ExitCode(); got != 1 {
-		t.Fatalf("ExitCode = %d, want 1", got)
+		t.Fatalf("ExitCode = %d, want 1 from compatibility hard fail", got)
 	}
 	check := requireCheck(t, report, "provider antigravity")
-	if check.Status != StatusFail || !check.Hard {
-		t.Fatalf("provider antigravity check = %#v, want hard fail", check)
+	if check.Status != StatusOK || check.Hard {
+		t.Fatalf("provider antigravity check = %#v, want install-only ok", check)
 	}
-	if check.Code != "unauthenticated_provider" {
-		t.Fatalf("provider antigravity code = %q, want unauthenticated_provider", check.Code)
+	if check.Code != "provider_installed" {
+		t.Fatalf("provider antigravity code = %q, want provider_installed", check.Code)
 	}
-	for _, want := range []string{"agy models failed", "OAuth login required", "run: agy login"} {
+	for _, want := range []string{"usable_for_invocation=unknown", "auth_readiness=unknown evidence=not-run", "model authorization, quota, and invocation approval remain separate"} {
 		if !strings.Contains(check.Message, want) {
 			t.Fatalf("provider antigravity message = %q, want containing %q", check.Message, want)
 		}
+	}
+	compatibility := requireCheck(t, report, "provider compatibility antigravity verifier")
+	if compatibility.Status != StatusFail || !compatibility.Hard || compatibility.Code != "unsupported_read_only_mode" {
+		t.Fatalf("provider compatibility antigravity verifier = %#v, want hard read-only failure", compatibility)
 	}
 	auditProvider := requireCheck(t, report, "audit llm provider")
 	if auditProvider.Status != StatusOK || !strings.Contains(auditProvider.Message, `CLI "agy" resolves`) {
@@ -1146,11 +1482,66 @@ func TestCheckMigrationStatusWarnsForLegacySurfaces(t *testing.T) {
 	if check.Status != StatusWarn {
 		t.Fatalf("status = %s, want warn (%s)", check.Status, check.Message)
 	}
-	for _, want := range []string{"legacy surface(s)", "run: loopcoder doctor --repo . --fix"} {
+	for _, want := range []string{"legacy surface(s)", "per-surface remediation"} {
 		if !strings.Contains(check.Message, want) {
 			t.Fatalf("message = %q, want containing %q", check.Message, want)
 		}
 	}
+	if len(check.LegacySurfaces) != 3 {
+		t.Fatalf("LegacySurfaces = %#v, want env plus two config surfaces", check.LegacySurfaces)
+	}
+	assertLegacySurface(t, check.LegacySurfaces, migration.LegacyReporterScopeEnv, "manual", "set LOOPCODER_CONDUCTOR_REPORTER_SCOPE")
+	assertLegacySurface(t, check.LegacySurfaces, `.delivery.yml key "`+migration.LegacyReportConfigRoot+`"`, "fix-with-flag", "loopcoder doctor --repo . --fix")
+}
+
+func TestCheckMigrationStatusEnumeratesHookStateAndStateKeySurfaces(t *testing.T) {
+	repo := t.TempDir()
+	writeDoctorTextFile(t, filepath.Join(repo, ".git", "HEAD"), "ref: refs/heads/main\n")
+	writeDoctorTextFile(t, filepath.Join(repo, ".delivery.yml"), "version: 1\n")
+	writeDoctorTextFile(t, filepath.Join(repo, ".loopcoder", "hooks", migration.LegacyReporterHookName, "session-a.json"), `{"ok":true}`)
+	statePath := filepath.Join(repo, ".loopcoder", "runs", "run-b", "workers", "job.attempt.json")
+	writeDoctorTextFile(t, statePath, fmt.Sprintf(`{"status":"succeeded","%s":{"role":"worker"}}`, migration.LegacyReportStateKey))
+
+	check := checkMigrationStatus(repo, Deps{
+		Getenv:   func(string) string { return "" },
+		ReadFile: os.ReadFile,
+	})
+
+	if check.Status != StatusWarn {
+		t.Fatalf("status = %s, want warn (%s)", check.Status, check.Message)
+	}
+	if len(check.LegacySurfaces) != 2 {
+		t.Fatalf("LegacySurfaces = %#v, want hook-state and state-key", check.LegacySurfaces)
+	}
+	assertLegacySurface(t, check.LegacySurfaces, filepath.Join(repo, ".loopcoder", "hooks", migration.LegacyReporterHookName), "fix-with-flag", "loopcoder doctor --repo . --fix")
+	assertLegacySurface(t, check.LegacySurfaces, statePath, "fix-with-flag", "loopcoder doctor --repo . --fix")
+}
+
+func TestCheckMigrationStatusAfterFixDoesNotPointAtDoctorFix(t *testing.T) {
+	repo := t.TempDir()
+	writeDoctorTextFile(t, filepath.Join(repo, ".git", "HEAD"), "ref: refs/heads/main\n")
+	writeDoctorTextFile(t, filepath.Join(repo, ".delivery.yml"), "version: 1\n")
+
+	check := checkMigrationStatusWithMode(repo, Deps{
+		Getenv: func(key string) string {
+			if key == migration.LegacyReporterScopeEnv {
+				return "auto"
+			}
+			return ""
+		},
+		ReadFile: os.ReadFile,
+	}, true)
+
+	if check.Status != StatusWarn {
+		t.Fatalf("status = %s, want warn (%s)", check.Status, check.Message)
+	}
+	if len(check.LegacySurfaces) != 1 {
+		t.Fatalf("LegacySurfaces = %#v, want env surface", check.LegacySurfaces)
+	}
+	if strings.Contains(check.LegacySurfaces[0].Remediation, "loopcoder doctor --repo . --fix") {
+		t.Fatalf("after-fix remediation points at doctor --fix: %#v", check.LegacySurfaces[0])
+	}
+	assertLegacySurface(t, check.LegacySurfaces, migration.LegacyReporterScopeEnv, "manual", "unset LOOPCODER_CONDUCTOR_ATTEST_SCOPE")
 }
 
 func TestCheckStorageHealthReportsHealthyDatabase(t *testing.T) {
@@ -1442,6 +1833,27 @@ func TestCheckVersionStatusWarnsBeforeBreakingBoundary(t *testing.T) {
 	}
 }
 
+func TestCheckVersionStatusPointsLegacySurfacesAtMigrationStatus(t *testing.T) {
+	repo := t.TempDir()
+	writeDoctorTextFile(t, filepath.Join(repo, ".git", "HEAD"), "ref: refs/heads/main\n")
+	writeDoctorTextFile(t, filepath.Join(repo, ".delivery.yml"), "version: 1\n"+migration.LegacyReportConfigRoot+":\n  channel: chat\n")
+
+	check := checkVersionStatus(BuildInfo{Version: "0.7.0"}, repo, Deps{
+		Getenv:   func(string) string { return "" },
+		ReadFile: os.ReadFile,
+	})
+
+	if check.Status != StatusWarn {
+		t.Fatalf("status = %s, want warn (%s)", check.Status, check.Message)
+	}
+	if strings.Contains(check.Message, "loopcoder doctor --repo . --fix") {
+		t.Fatalf("version status points at doctor --fix: %q", check.Message)
+	}
+	if !strings.Contains(check.Message, "see migration status check") {
+		t.Fatalf("message = %q, want migration status pointer", check.Message)
+	}
+}
+
 func TestCheckStaleStateWarnsForCleanupEligibleItems(t *testing.T) {
 	check := checkStaleState("/repo", Deps{
 		CleanupPlan: func(opts localcleanup.Options) (localcleanup.Result, error) {
@@ -1657,6 +2069,93 @@ func TestRenderPrintsOneMarkedLinePerCheck(t *testing.T) {
 	}
 }
 
+func TestRenderPrintsLegacySurfaceDetails(t *testing.T) {
+	report := Report{Checks: []Check{{
+		Name:    "migration status",
+		Status:  StatusWarn,
+		Message: "found 1 legacy surface(s) requiring migration; see per-surface remediation below",
+		LegacySurfaces: []LegacySurface{{
+			Surface:        "hook-state",
+			Identifier:     ".loopcoder/hooks/conductor-attest",
+			Classification: "fix-with-flag",
+			Remediation:    "run: loopcoder doctor --repo . --fix",
+		}},
+	}}}
+	var output bytes.Buffer
+
+	if err := Render(&output, report); err != nil {
+		t.Fatalf("Render returned error: %v", err)
+	}
+	for _, want := range []string{
+		"[warn] migration status:",
+		"identifier=.loopcoder/hooks/conductor-attest",
+		"classification=fix-with-flag",
+		"remediation=run: loopcoder doctor --repo . --fix",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("output = %q, want containing %q", output.String(), want)
+		}
+	}
+}
+
+func TestRenderJSONIncludesLegacySurfaceDetails(t *testing.T) {
+	report := WithMetadata(Report{
+		Runtime: RuntimeHealth{Migration: RuntimeMigration{
+			Status:         StatusWarn,
+			LegacySurfaces: 1,
+			Surfaces: []LegacySurface{{
+				Surface:        "state-key",
+				Identifier:     filepath.Join(".loopcoder", "runs", "run-1", "workers", "job.attempt.json"),
+				Classification: "fix-with-flag",
+				Remediation:    "run: loopcoder doctor --repo . --fix",
+				Legacy:         migration.LegacyReportStateKey,
+				Current:        migration.ReportStateKey,
+				Location:       filepath.Join(".loopcoder", "runs", "run-1", "workers", "job.attempt.json"),
+			}},
+		}},
+		Checks: []Check{{
+			Name:    "migration status",
+			Status:  StatusWarn,
+			Message: "found 1 legacy surface(s) requiring migration; see per-surface remediation below",
+			LegacySurfaces: []LegacySurface{{
+				Surface:        "state-key",
+				Identifier:     filepath.Join(".loopcoder", "runs", "run-1", "workers", "job.attempt.json"),
+				Classification: "fix-with-flag",
+				Remediation:    "run: loopcoder doctor --repo . --fix",
+				Legacy:         migration.LegacyReportStateKey,
+				Current:        migration.ReportStateKey,
+			}},
+		}},
+	}, "/repo", BuildInfo{Version: "0.7.0"})
+	var out bytes.Buffer
+
+	if err := RenderJSON(&out, report); err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+	var payload struct {
+		Runtime struct {
+			Migration struct {
+				Surfaces []LegacySurface `json:"surfaces"`
+			} `json:"migration"`
+		} `json:"runtime"`
+		Checks []struct {
+			LegacySurfaces []LegacySurface `json:"legacy_surfaces"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, out.String())
+	}
+	if len(payload.Runtime.Migration.Surfaces) != 1 || len(payload.Checks[0].LegacySurfaces) != 1 {
+		t.Fatalf("legacy surfaces missing from JSON: %s", out.String())
+	}
+	if got := payload.Runtime.Migration.Surfaces[0].Identifier; got != ".loopcoder/runs/run-1/workers/job.attempt.json" {
+		t.Fatalf("runtime surface identifier = %q", got)
+	}
+	if payload.Checks[0].LegacySurfaces[0].Classification != "fix-with-flag" {
+		t.Fatalf("check surface = %#v", payload.Checks[0].LegacySurfaces[0])
+	}
+}
+
 func TestExecRunCommandCapturesOutputAndNonZeroExit(t *testing.T) {
 	withTestCommandCap(t, 2*time.Second)
 
@@ -1851,6 +2350,7 @@ type fakeDoctorEnv struct {
 	projectShow    func(context.Context, registry.Options) (registry.ShowResult, error)
 	projectDupes   func(context.Context, registry.Options) ([]registry.DuplicatePhysicalIdentity, error)
 	projectRepair  func(context.Context, registry.Options) ([]registry.DuplicatePhysicalIdentity, error)
+	providerReport func(config.Config) providerinventory.Report
 }
 
 func (f *fakeDoctorEnv) deps() Deps {
@@ -1941,6 +2441,15 @@ func (f *fakeDoctorEnv) deps() Deps {
 			}
 			return nil, nil
 		},
+		ProviderInventory: func(_ context.Context, opts providerinventory.Options) (providerinventory.Report, error) {
+			if f.providerReport != nil {
+				return f.providerReport(opts.Config), nil
+			}
+			return f.providerInventory(opts.Config), nil
+		},
+		Now: func() time.Time {
+			return time.Unix(0, 0).UTC().Add(807 * time.Hour)
+		},
 	}
 	deps.ReadFile = func(path string) ([]byte, error) {
 		clean := filepath.Clean(path)
@@ -1973,6 +2482,126 @@ func (f *fakeDoctorEnv) deps() Deps {
 		return f.file, nil
 	}
 	return deps
+}
+
+func (f *fakeDoctorEnv) providerInventory(cfg config.Config) providerinventory.Report {
+	now := "2026-07-12T00:00:00Z"
+	providers := []struct {
+		id      string
+		cli     string
+		display string
+	}{
+		{id: "codex", cli: "codex", display: "Codex"},
+		{id: "claude", cli: "claude", display: "Claude"},
+		{id: "gemini", cli: "gemini", display: "Gemini"},
+		{id: "antigravity", cli: "agy", display: "Antigravity"},
+	}
+	configured := []string{strings.TrimSpace(cfg.Adapters.Worker), strings.TrimSpace(cfg.Adapters.Verifier)}
+	for _, name := range configured {
+		if name == "" || fakeProviderKnown(providers, name) {
+			continue
+		}
+		providers = append(providers, struct {
+			id      string
+			cli     string
+			display string
+		}{id: name, cli: name, display: name})
+	}
+	var installations []providerinventory.ProviderInstallation
+	var probes []providerinventory.ProbeResult
+	for _, provider := range providers {
+		path, ok := f.paths[provider.cli]
+		probeID := "probe_" + provider.id
+		if !ok {
+			probes = append(probes, providerinventory.ProbeResult{
+				SchemaVersion:     providerinventory.ProbeResultSchema,
+				ProbeResultID:     probeID,
+				AdapterID:         provider.id,
+				Outcome:           providerinventory.OutcomeNotInstalled,
+				ProbeMethod:       providerinventory.ProbeMethodLookPath,
+				Confidence:        providerinventory.ConfidenceUnavailable,
+				FreshnessState:    providerinventory.FreshnessNotApplicable,
+				CapturedAt:        now,
+				CreatedAt:         now,
+				UpdatedAt:         now,
+				NetworkPermission: providerinventory.NetworkNotNeeded,
+				EnvironmentKeys:   []string{},
+				GapReasons:        []string{"executable-not-found"},
+			})
+			continue
+		}
+		installationID := "pinst_" + provider.id
+		probes = append(probes, providerinventory.ProbeResult{
+			SchemaVersion:            providerinventory.ProbeResultSchema,
+			ProbeResultID:            probeID,
+			AdapterID:                provider.id,
+			ProviderInstallationID:   &installationID,
+			Outcome:                  providerinventory.OutcomeInstalled,
+			ProbeMethod:              providerinventory.ProbeMethodFixedCommand,
+			Confidence:               providerinventory.ConfidenceExact,
+			FreshnessState:           providerinventory.FreshnessFresh,
+			CapturedAt:               now,
+			CreatedAt:                now,
+			UpdatedAt:                now,
+			NetworkPermission:        providerinventory.NetworkNotNeeded,
+			EnvironmentKeys:          []string{},
+			GapReasons:               []string{},
+			TimeoutMS:                5000,
+			StdoutLimitBytes:         providerinventory.StdoutLimitBytes,
+			StderrLimitBytes:         providerinventory.StderrLimitBytes,
+			CombinedOutputLimitBytes: providerinventory.CombinedLimitBytes,
+		})
+		installations = append(installations, providerinventory.ProviderInstallation{
+			SchemaVersion:          providerinventory.ProviderInstallationSchema,
+			RecordVersion:          1,
+			Scope:                  "machine",
+			ProviderInstallationID: installationID,
+			AdapterID:              provider.id,
+			ProviderDisplayName:    provider.display,
+			ExecutableName:         provider.cli,
+			CanonicalPathRedacted:  filepath.ToSlash(filepath.Join("...", filepath.Base(filepath.Dir(path)), filepath.Base(path))),
+			DiscoverySource:        providerinventory.DiscoveryPath,
+			DiscoveryOrder:         len(installations),
+			Platform:               "test",
+			VersionConfidence:      providerinventory.ConfidenceExact,
+			LatestProbeResultID:    probeID,
+			InstallationState:      providerinventory.InstallationInstalled,
+			UsableForInvocation:    "unknown",
+			KnownLimitations:       []string{},
+			CreatedAt:              now,
+			UpdatedAt:              now,
+			CapturedAt:             now,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			Confidence:             providerinventory.ConfidenceExact,
+			GapReasons:             []string{},
+		})
+	}
+	return providerinventory.Report{
+		SchemaVersion:         providerinventory.ProviderInventoryJSONSchema,
+		GeneratedAt:           now,
+		InventoryFingerprint:  "sha256:test",
+		Confidence:            providerinventory.ConfidenceExact,
+		Installations:         installations,
+		ProbeResults:          probes,
+		AccountProfiles:       []providerinventory.AccountProfile{},
+		AuthReadiness:         []providerinventory.AuthReadiness{},
+		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{},
+		ModelCapabilities:     []providerinventory.ModelCapability{},
+		GapReasons:            []string{},
+	}
+}
+
+func fakeProviderKnown(providers []struct {
+	id      string
+	cli     string
+	display string
+}, name string) bool {
+	for _, provider := range providers {
+		if provider.id == name {
+			return true
+		}
+	}
+	return false
 }
 
 func writeDoctorTextFile(t *testing.T, path string, content string) {
@@ -2014,6 +2643,23 @@ func requireCheck(t *testing.T, report Report, name string) Check {
 	return check
 }
 
+func assertLegacySurface(t *testing.T, surfaces []LegacySurface, identifier string, classification string, remediationContains string) {
+	t.Helper()
+	for _, surface := range surfaces {
+		if surface.Identifier != identifier {
+			continue
+		}
+		if surface.Classification != classification {
+			t.Fatalf("surface %q classification = %q, want %q (%#v)", identifier, surface.Classification, classification, surface)
+		}
+		if !strings.Contains(surface.Remediation, remediationContains) {
+			t.Fatalf("surface %q remediation = %q, want containing %q", identifier, surface.Remediation, remediationContains)
+		}
+		return
+	}
+	t.Fatalf("surface %q not found in %#v", identifier, surfaces)
+}
+
 func containsString(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
@@ -2021,4 +2667,27 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func doctorUsageReport(issue int, start time.Time) reporter.Report {
+	total := int64(issue * 10)
+	return reporter.Report{
+		WorkID:      state.RunIDForIssue(issue, start),
+		Issue:       issue,
+		Role:        reporter.RoleWorker,
+		Provider:    "codex",
+		Model:       "gpt-fixture",
+		ModelSource: reporter.ModelSourceParsed,
+		Effort:      "high",
+		Permission:  reporter.PermissionWrite,
+		Action:      "implement issue #" + fmt.Sprint(issue),
+		ExitCode:    0,
+		StartedAt:   start.UTC().Format(time.RFC3339Nano),
+		EndedAt:     start.Add(42 * time.Second).UTC().Format(time.RFC3339Nano),
+		DurationMS:  int64((42 * time.Second).Milliseconds()),
+		Usage: reporter.Usage{
+			TotalTokens: &total,
+		},
+		Verified: true,
+	}
 }

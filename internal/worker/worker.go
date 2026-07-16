@@ -2,12 +2,14 @@ package worker
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -17,11 +19,15 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/lockfile"
 	"github.com/jasonhnd/loopcoder/internal/mcp"
+	"github.com/jasonhnd/loopcoder/internal/pathid"
+	"github.com/jasonhnd/loopcoder/internal/progress"
+	"github.com/jasonhnd/loopcoder/internal/providerreconcile"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 	"github.com/jasonhnd/loopcoder/internal/skills"
 	"github.com/jasonhnd/loopcoder/internal/state"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
@@ -30,6 +36,8 @@ const (
 	WorkerHardCap      = lcdefaults.WorkerHardCap
 	WorkerStallTimeout = lcdefaults.WorkerStallTimeout
 )
+
+const scratchOwnerFile = ".loopcoder-attempt.json"
 
 type Options struct {
 	RepoPath        string
@@ -45,26 +53,52 @@ type Options struct {
 	Provider        string
 	Model           string
 	Effort          string
+	Timeout         time.Duration
 	ConfigFromBase  bool
 	KeepWorktree    bool
 	Stderr          io.Writer
+	// BeforeProviderCall runs after provider-free adoption/reconciliation and
+	// immediately before the provider runner. Callers use it to durably reserve
+	// a budget slot; returning an error prevents the provider launch.
+	BeforeProviderCall func() error
 }
 
 type Result struct {
-	OK          bool             `json:"ok"`
-	Issue       int              `json:"issue"`
-	Branch      string           `json:"branch"`
-	RunID       string           `json:"run_id"`
-	PR          string           `json:"pr"`
-	Summary     string           `json:"summary"`
-	AttemptPath string           `json:"attempt_path"`
-	Status      string           `json:"status"`
-	ExitCode    int              `json:"exit_code"`
-	LogBytes    int64            `json:"log_bytes"`
-	Reason      string           `json:"reason,omitempty"`
-	NextAction  string           `json:"next_action,omitempty"`
-	Report      *reporter.Report `json:"report,omitempty"`
+	OK              bool                       `json:"ok"`
+	ProviderInvoked bool                       `json:"provider_invoked,omitempty"`
+	Issue           int                        `json:"issue"`
+	Branch          string                     `json:"branch"`
+	RunID           string                     `json:"run_id"`
+	PR              string                     `json:"pr"`
+	Summary         string                     `json:"summary"`
+	AttemptPath     string                     `json:"attempt_path"`
+	Status          string                     `json:"status"`
+	Outcome         string                     `json:"outcome,omitempty"`
+	ProviderOutcome string                     `json:"provider_outcome,omitempty"`
+	DeliveryOutcome string                     `json:"delivery_outcome,omitempty"`
+	Evidence        []string                   `json:"evidence,omitempty"`
+	ExitCode        int                        `json:"exit_code"`
+	LogBytes        int64                      `json:"log_bytes"`
+	Reason          string                     `json:"reason,omitempty"`
+	NextAction      string                     `json:"next_action,omitempty"`
+	Reconciliation  *providerreconcile.Receipt `json:"provider_reconciliation,omitempty"`
+	Report          *reporter.Report           `json:"report,omitempty"`
 }
+
+type Outcome string
+
+const (
+	OutcomeProviderFailed     Outcome = "provider_failed"
+	OutcomeProviderCompleted  Outcome = "provider_completed"
+	OutcomeNoChangesExpected  Outcome = "no_changes_expected"
+	OutcomeNoChangesInvalid   Outcome = "no_changes_invalid"
+	OutcomePushAlreadyApplied Outcome = "push_already_applied"
+	OutcomePushConflict       Outcome = "push_conflict"
+	OutcomePRCreated          Outcome = "pr_created"
+	OutcomePRAdopted          Outcome = "pr_adopted"
+	OutcomeDeliveryFailed     Outcome = "delivery_failed"
+	OutcomeNeedsHuman         Outcome = "needs_human"
+)
 
 type GitClient interface {
 	FetchOriginBase(ctx context.Context, repoPath, baseBranch string) error
@@ -90,15 +124,22 @@ type Lock interface {
 }
 
 type Deps struct {
-	Git         GitClient
-	GitHub      func(repoPath string) GitHubClient
-	AgentLookup func(provider string) (agent.Runner, error)
-	AcquireLock func(repoPath string, timeout time.Duration) (Lock, error)
-	Now         func() time.Time
-	PID         func() int
-	MkdirTemp   func(dir, pattern string) (string, error)
-	RemoveAll   func(path string) error
-	RepoSkills  func(repoPath string, domainSkills config.DomainSkills) (string, error)
+	Git                GitClient
+	GitHub             func(repoPath string) GitHubClient
+	AgentLookup        func(provider string) (agent.Runner, error)
+	AcquireLock        func(repoPath string, timeout time.Duration) (Lock, error)
+	Now                func() time.Time
+	PID                func() int
+	MkdirTemp          func(dir, pattern string) (string, error)
+	MkdirAll           func(path string, perm os.FileMode) error
+	WriteFile          func(path string, data []byte, perm os.FileMode) error
+	Stat               func(path string) (os.FileInfo, error)
+	RemoveAll          func(path string) error
+	RepoSkills         func(repoPath string, domainSkills config.DomainSkills) (string, error)
+	OpenProgressStore  func(context.Context, storage.Options) (storage.Store, error)
+	OpenStore          func(context.Context, storage.Options) (storage.Store, error)
+	ProgressClock      progress.Clock
+	ProgressMaxSilence time.Duration
 }
 
 func DefaultDeps() Deps {
@@ -111,10 +152,14 @@ func DefaultDeps() Deps {
 		AcquireLock: func(repoPath string, timeout time.Duration) (Lock, error) {
 			return lockfile.Acquire(repoPath, timeout)
 		},
-		Now:       time.Now,
-		PID:       os.Getpid,
-		MkdirTemp: os.MkdirTemp,
-		RemoveAll: os.RemoveAll,
+		Now:               time.Now,
+		PID:               os.Getpid,
+		MkdirTemp:         os.MkdirTemp,
+		MkdirAll:          os.MkdirAll,
+		WriteFile:         os.WriteFile,
+		Stat:              os.Stat,
+		RemoveAll:         os.RemoveAll,
+		OpenProgressStore: storage.Open,
 		RepoSkills: func(repoPath string, domainSkills config.DomainSkills) (string, error) {
 			return skills.BuildPromptSection(skills.PromptSectionOptions{
 				RepoPath:            repoPath,
@@ -124,6 +169,7 @@ func DefaultDeps() Deps {
 				BudgetBytes:         domainSkills.PromptBudgetBytes,
 			})
 		},
+		OpenStore: storage.Open,
 	}
 }
 
@@ -135,19 +181,28 @@ type dispatchContext struct {
 	github   GitHubClient
 	agentRun agent.Runner
 
-	scratch      string
-	worktreePath string
-	promptPath   string
-	summaryPath  string
-	logPath      string
-	runtimeRoots runtimepath.Roots
-	jobID        string
-	attemptPath  string
-	tracker      *attemptTracker
+	scratch                string
+	worktreePath           string
+	promptPath             string
+	summaryPath            string
+	logPath                string
+	runtimeRoots           runtimepath.Roots
+	ownershipStore         storage.Store
+	ownershipLease         *storage.AgentOwnershipLease
+	providerAuthorityFence *storage.ProviderExecutionAuthorityFence
+	providerAuthority      storage.ProviderExecutionAuthority
+	jobID                  string
+	attemptPath            string
+	tracker                *attemptTracker
 
 	domainPolicy      domainWorkerPolicy
+	progressRecorder  *progressRecorder
 	activePhase       string
 	dispatchSucceeded bool
+	providerInvoked   bool
+	providerRefused   bool
+	preserveArtifacts bool
+	preserveReason    string
 	cleanupStatus     string
 	failureStatus     string
 }
@@ -156,6 +211,17 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 	dispatch, err := prepareDispatch(ctx, opts, deps)
 	if err != nil {
 		return Result{}, err
+	}
+	defer func() {
+		result.ProviderInvoked = dispatch.providerInvoked
+	}()
+	if adopted, ok, err := adoptExistingBranchPRPreflight(ctx, dispatch); err != nil {
+		fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: preflight branch PR lookup failed; continuing provider execution: %v\n", err)
+	} else if ok {
+		return adopted, nil
+	}
+	if decision := reconcileBeforeProviderLaunch(ctx, dispatch); decision.BlockRedispatch {
+		return providerReconciliationResult(dispatch, decision), nil
 	}
 	if err := prepareWorktree(ctx, dispatch); err != nil {
 		writeRecovery(ctx, dispatch, err)
@@ -169,16 +235,25 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 	if err != nil {
 		return Result{}, err
 	}
+	if dispatch.opts.BeforeProviderCall != nil {
+		if err := dispatch.opts.BeforeProviderCall(); err != nil {
+			dispatch.providerRefused = true
+			dispatch.dispatchSucceeded = true
+			dispatch.cleanupStatus = state.StatusSkipped
+			return Result{}, fmt.Errorf("before provider call: %w", agent.ProviderCallRefusedError{Err: err})
+		}
+	}
 	agentResult, agentErr := runAgent(ctx, dispatch, invocation)
 	if agentResult.Hung {
 		result, err = handleHungOrPartialWork(ctx, dispatch, agentResult)
 		return result, err
 	}
 	if agentErr != nil {
-		return Result{}, fmt.Errorf("%s exec failed: %w", dispatch.opts.Provider, agentErr)
+		return providerFailureResult(dispatch, agentResult, fmt.Sprintf("%s exec failed: %v", dispatch.opts.Provider, agentErr)), fmt.Errorf("%s exec failed: %w", dispatch.opts.Provider, agentErr)
 	}
 	if agentResult.ExitCode != 0 {
-		return Result{}, fmt.Errorf("%s exec failed (exit %d). See %s", dispatch.opts.Provider, agentResult.ExitCode, dispatch.logPath)
+		err := fmt.Errorf("%s exec failed (exit %d). See %s", dispatch.opts.Provider, agentResult.ExitCode, dispatch.logPath)
+		return providerFailureResult(dispatch, agentResult, err.Error()), err
 	}
 	return commitAndOpenPR(ctx, dispatch, agentResult)
 }
@@ -270,6 +345,9 @@ func prepareWorktree(ctx context.Context, dispatch *dispatchContext) error {
 	dispatch.summaryPath = filepath.Join(scratch, "summary.txt")
 	dispatch.logPath = filepath.Join(scratch, "codex.log")
 	dispatch.jobID = fmt.Sprintf("job-%d-%d", dispatch.opts.IssueNumber, dispatch.deps.PID())
+	if err := writeScratchOwner(dispatch); err != nil {
+		return err
+	}
 	if dispatch.runtimeRoots.Registered {
 		logDir := filepath.Join(dispatch.runtimeRoots.LogsRoot, dispatch.opts.RunID)
 		if err := os.MkdirAll(logDir, 0o700); err != nil {
@@ -293,10 +371,28 @@ func prepareWorktree(ctx context.Context, dispatch *dispatchContext) error {
 		warnings:    dispatch.warnings,
 		attemptPath: dispatch.attemptPath,
 	})
+	recorder, err := newProgressRecorder(ctx, dispatch.opts, dispatch.deps, dispatch.runtimeRoots, dispatch.jobID, dispatch.warnings, func(ctx context.Context) error {
+		return validateWorkerOwnership(ctx, dispatch)
+	})
+	if err != nil {
+		return err
+	}
+	dispatch.progressRecorder = recorder
+	dispatch.tracker.progress = recorder
 	dispatch.activePhase = "worktree_created"
 	dispatch.cleanupStatus = "succeeded"
 	dispatch.failureStatus = "failed"
 
+	if err := acquireWorkerOwnership(ctx, dispatch); err != nil {
+		return err
+	}
+	ownershipPrepared := false
+	defer func() {
+		if !ownershipPrepared {
+			releaseWorkerOwnership(dispatch)
+			closeWorkerOwnershipStore(dispatch)
+		}
+	}()
 	if err := dispatch.deps.Git.FetchOriginBase(ctx, dispatch.repoPath, dispatch.opts.BaseBranch); err != nil {
 		return fmt.Errorf("git fetch origin %s: %w", dispatch.opts.BaseBranch, err)
 	}
@@ -304,10 +400,14 @@ func prepareWorktree(ctx context.Context, dispatch *dispatchContext) error {
 		return err
 	}
 	dispatch.tracker.transition(dispatch.activePhase, "running", nil, nil)
+	ownershipPrepared = true
 	return nil
 }
 
 func buildInvocation(ctx context.Context, dispatch *dispatchContext) (agent.Invocation, error) {
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return agent.Invocation{}, err
+	}
 	dispatch.activePhase = "prompt_written"
 	cfg, err := config.LoadForRepo(ctx, dispatch.repoPath, config.LoadOptions{
 		BaseBranch:     dispatch.opts.BaseBranch,
@@ -335,13 +435,17 @@ func buildInvocation(ctx context.Context, dispatch *dispatchContext) (agent.Invo
 	}
 	dispatch.tracker.transition(dispatch.activePhase, "running", nil, nil)
 
-	dispatch.activePhase = "codex_started"
-	dispatch.tracker.transition(dispatch.activePhase, "running", nil, nil)
+	dispatch.activePhase = "codex_launching"
+	dispatch.tracker.snapshot(dispatch.activePhase, state.StatusLaunching)
 	mcpServers, err := mcp.ServersForInvocation(cfg.MCP, mcp.RoleWorker, false)
 	if err != nil {
 		return agent.Invocation{}, err
 	}
 	resilience := cfg.Resilience
+	hardCap := config.DurationSeconds(resilience.Worker.HardCapSeconds, WorkerHardCap)
+	if dispatch.opts.Timeout > 0 {
+		hardCap = dispatch.opts.Timeout
+	}
 	domainPolicy, err := resolveDomainWorkerPolicy(cfg)
 	if err != nil {
 		return agent.Invocation{}, err
@@ -354,19 +458,62 @@ func buildInvocation(ctx context.Context, dispatch *dispatchContext) (agent.Invo
 		Stderr:          dispatch.warnings,
 		Model:           dispatch.opts.Model,
 		Effort:          dispatch.opts.Effort,
-		HardCap:         config.DurationSeconds(resilience.Worker.HardCapSeconds, WorkerHardCap),
+		HardCap:         hardCap,
 		StallTimeout:    config.DurationSeconds(resilience.Worker.StallTimeoutSeconds, WorkerStallTimeout),
 		LivenessMode:    domainPolicy.AgentLivenessMode(),
 		LivenessCommand: domainPolicy.LivenessCommand,
+		Guardian:        providerGuardianOptions(dispatch),
 		RunID:           dispatch.opts.RunID,
 		ProviderKey:     dispatch.opts.ProviderKey,
 		Role:            "worker",
 		MCPServers:      mcpServers,
+		OnProviderLaunch: func(int) {
+			dispatch.providerInvoked = true
+		},
+		OnProviderStart: func(started agent.ProviderProcess) error {
+			dispatch.providerInvoked = true
+			if err := persistProviderExecutionAuthority(ctx, dispatch, started); err != nil {
+				return err
+			}
+			dispatch.tracker.setPID(started.PID)
+			dispatch.activePhase = "codex_started"
+			dispatch.tracker.transition(dispatch.activePhase, state.StatusRunning, nil, nil)
+			return nil
+		},
 	}, nil
 }
 
+func providerGuardianOptions(dispatch *dispatchContext) supervisedexec.GuardianOptions {
+	if dispatch == nil || dispatch.ownershipLease == nil || dispatch.runtimeRoots.DatabasePath == "" || dispatch.runtimeRoots.ProjectID == "" {
+		return supervisedexec.GuardianOptions{}
+	}
+	return supervisedexec.GuardianOptions{
+		Enabled:         true,
+		StorePath:       dispatch.runtimeRoots.DatabasePath,
+		DiagnosticPath:  filepath.Join(dispatch.runtimeRoots.LogsRoot, dispatch.opts.RunID, dispatch.jobID+"-guardian.jsonl"),
+		ProjectID:       dispatch.runtimeRoots.ProjectID,
+		RunID:           dispatch.opts.RunID,
+		AttemptID:       dispatch.jobID,
+		OwnerID:         dispatch.ownershipLease.OwnerID,
+		ClaimGeneration: dispatch.ownershipLease.ClaimGeneration,
+		ProviderAuthority: func() (storage.ProviderExecutionAuthority, bool) {
+			return dispatch.providerAuthority, dispatch.providerAuthority.ProviderPID > 0
+		},
+	}
+}
+
 func runAgent(ctx context.Context, dispatch *dispatchContext, invocation agent.Invocation) (agent.Result, error) {
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return agent.Result{}, err
+	}
 	agentResult, agentErr := dispatch.agentRun.Run(ctx, invocation)
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return agentResult, err
+	}
+	if dispatch.activePhase == "codex_launching" {
+		dispatch.activePhase = "codex_started"
+		dispatch.tracker.transition(dispatch.activePhase, state.StatusRunning, nil, nil)
+	}
 	dispatch.activePhase = "codex_exited"
 	var exitCodePtr *int
 	if agentResult.ExitCode >= 0 {
@@ -378,6 +525,9 @@ func runAgent(ctx context.Context, dispatch *dispatchContext, invocation agent.I
 }
 
 func handleHungOrPartialWork(ctx context.Context, dispatch *dispatchContext, agentResult agent.Result) (Result, error) {
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return hungResult(dispatch, agentResult), err
+	}
 	dispatch.failureStatus = "hung"
 	hungErr := workerHungError(dispatch.opts.Provider, agentResult.HungReason, dispatch.logPath)
 	// The deferred failure handler records the "hung" transition (phase +
@@ -414,6 +564,9 @@ func handleHungOrPartialWork(ctx context.Context, dispatch *dispatchContext, age
 		github:       dispatch.github,
 		now:          dispatch.deps.Now,
 		warnings:     dispatch.warnings,
+		validateOwnership: func(ctx context.Context) error {
+			return validateWorkerOwnership(ctx, dispatch)
+		},
 	})
 	if harvestErr != nil {
 		return hungResult(dispatch, agentResult), fmt.Errorf("%s; harvest failed: %w", hungErr, harvestErr)
@@ -430,7 +583,9 @@ func handleHungOrPartialWork(ctx context.Context, dispatch *dispatchContext, age
 			"mode":   harvest.Mode,
 		})
 		dispatch.dispatchSucceeded = true
+		dispatch.preserveReason = "harvested hung/killed worker needs human review"
 		dispatch.cleanupStatus = "needs-human"
+		selectArtifactPreservation(dispatch, dispatch.preserveReason, nil)
 		return Result{
 			OK:          true,
 			Issue:       dispatch.opts.IssueNumber,
@@ -451,6 +606,9 @@ func handleHungOrPartialWork(ctx context.Context, dispatch *dispatchContext, age
 }
 
 func commitAndOpenPR(ctx context.Context, dispatch *dispatchContext, agentResult agent.Result) (Result, error) {
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return Result{}, err
+	}
 	reportRecord := buildWorkerReport(dispatch.opts, agentResult)
 	reportRecord.Worktree = dispatch.worktreePath
 	dispatch.tracker.setReport(reportRecord)
@@ -468,62 +626,140 @@ func commitAndOpenPR(ctx context.Context, dispatch *dispatchContext, agentResult
 	if trimmed := strings.TrimSpace(agentResult.Summary); trimmed != "" {
 		summary = trimmed
 	}
+	if adopted, ok, err := adoptExistingBranchPR(ctx, dispatch, &reportRecord, summary, OutcomePRAdopted, "existing branch PR found before finalization"); err != nil {
+		return finalizationFailureResult(dispatch, &reportRecord, summary, OutcomeDeliveryFailed, "failed to query existing branch PRs", []string{err.Error()}), fmt.Errorf("query existing branch PRs: %w", err)
+	} else if ok {
+		return adopted, nil
+	}
 
 	dispatch.activePhase = "dirty_checked"
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return Result{}, err
+	}
 	dirty, err := dispatch.deps.Git.StatusPorcelain(ctx, dispatch.worktreePath)
 	if err != nil {
 		return Result{}, fmt.Errorf("git status --porcelain: %w", err)
 	}
 	if strings.TrimSpace(dirty) == "" {
-		return Result{}, fmt.Errorf("codex made no file changes for issue #%d (nothing to commit)", dispatch.opts.IssueNumber)
+		outcome := OutcomeNoChangesInvalid
+		status := state.StatusFailed
+		ok := false
+		nextAction := "inspect the worker report and recover with implementation changes"
+		if noChangesExpected(summary) {
+			outcome = OutcomeNoChangesExpected
+			status = state.StatusSucceeded
+			ok = true
+			nextAction = "no action required; worker reported a valid no-op"
+			dispatch.dispatchSucceeded = true
+		}
+		evidence := []string{
+			"provider_completed",
+			"git status --porcelain returned no file changes",
+			"summary=" + summary,
+		}
+		result := finalizationResult(dispatch, &reportRecord, summary, finalizationResultOptions{
+			OK:              ok,
+			Status:          status,
+			Outcome:         outcome,
+			DeliveryOutcome: outcome,
+			Evidence:        evidence,
+			NextAction:      nextAction,
+			PR:              "",
+		})
+		if ok {
+			dispatch.tracker.transition(dispatch.activePhase, status, dispatch.tracker.exitCode, nil)
+			return result, nil
+		}
+		err := fmt.Errorf("%s: %s", outcome, "provider completed but produced no file changes")
+		return result, err
 	}
 	dispatch.tracker.transition(dispatch.activePhase, "running", dispatch.tracker.exitCode, nil)
 
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return Result{}, err
+	}
 	if err := dispatch.deps.Git.AddAll(ctx, dispatch.worktreePath); err != nil {
 		return Result{}, fmt.Errorf("git add -A: %w", err)
 	}
 	dispatch.activePhase = "committed"
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return Result{}, err
+	}
 	if err := dispatch.deps.Git.Commit(ctx, dispatch.worktreePath, buildCommitMessage(dispatch.opts.IssueTitle, dispatch.opts.IssueNumber)); err != nil {
 		return Result{}, fmt.Errorf("git commit: %w", err)
 	}
 	dispatch.tracker.transition(dispatch.activePhase, "running", dispatch.tracker.exitCode, nil)
 
 	dispatch.activePhase = "pushed"
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return Result{}, err
+	}
 	if err := dispatch.deps.Git.PushUpstream(ctx, dispatch.worktreePath, dispatch.opts.Branch); err != nil {
-		return Result{}, fmt.Errorf("git push -u origin %s: %w", dispatch.opts.Branch, err)
+		if adopted, ok, adoptErr := adoptExistingBranchPR(ctx, dispatch, &reportRecord, summary, OutcomePushAlreadyApplied, "push failed but branch PR already exists"); adoptErr != nil {
+			return finalizationFailureResult(dispatch, &reportRecord, summary, OutcomeDeliveryFailed, "push failed and existing branch PR lookup failed", []string{err.Error(), adoptErr.Error()}), fmt.Errorf("git push -u origin %s: %w; PR lookup: %v", dispatch.opts.Branch, err, adoptErr)
+		} else if ok {
+			return adopted, nil
+		}
+		outcome := OutcomeDeliveryFailed
+		status := state.StatusFailed
+		nextAction := "retry delivery finalization after resolving the push failure"
+		if isPushConflict(err) {
+			outcome = OutcomePushConflict
+			status = state.StatusNeedsHuman
+			nextAction = "inspect the remote branch before retrying delivery; do not overwrite unrelated work"
+			dispatch.failureStatus = state.StatusNeedsHuman
+		}
+		result := finalizationResult(dispatch, &reportRecord, summary, finalizationResultOptions{
+			OK:              false,
+			Status:          status,
+			Outcome:         outcome,
+			DeliveryOutcome: outcome,
+			Evidence:        []string{"provider_completed", "git push failed: " + err.Error()},
+			NextAction:      nextAction,
+		})
+		return result, fmt.Errorf("%s: git push -u origin %s: %w", outcome, dispatch.opts.Branch, err)
 	}
 	dispatch.tracker.transition(dispatch.activePhase, "running", dispatch.tracker.exitCode, nil)
 
 	dispatch.activePhase = "pr_opened"
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return Result{}, err
+	}
+	if adopted, ok, err := adoptExistingBranchPR(ctx, dispatch, &reportRecord, summary, OutcomePRAdopted, "existing branch PR found before PR creation"); err != nil {
+		return finalizationFailureResult(dispatch, &reportRecord, summary, OutcomeDeliveryFailed, "failed to query existing branch PRs before PR creation", []string{err.Error()}), fmt.Errorf("query existing branch PRs before PR creation: %w", err)
+	} else if ok {
+		return adopted, nil
+	}
 	body := buildPRBody(dispatch.opts.IssueNumber, summary)
 	prURL, err := dispatch.github.CreatePR(ctx, dispatch.opts.Branch, dispatch.opts.BaseBranch, dispatch.opts.IssueTitle, body)
 	if err != nil {
-		return Result{}, fmt.Errorf("gh pr create: %w", err)
+		if adopted, ok, adoptErr := adoptExistingBranchPR(ctx, dispatch, &reportRecord, summary, OutcomePRAdopted, "PR creation failed but branch PR already exists"); adoptErr != nil {
+			return finalizationFailureResult(dispatch, &reportRecord, summary, OutcomeDeliveryFailed, "PR creation failed and existing branch PR lookup failed", []string{err.Error(), adoptErr.Error()}), fmt.Errorf("gh pr create: %w; PR lookup: %v", err, adoptErr)
+		} else if ok {
+			return adopted, nil
+		}
+		result := finalizationFailureResult(dispatch, &reportRecord, summary, OutcomeDeliveryFailed, "GitHub PR creation failed after provider completed", []string{"provider_completed", "gh pr create failed: " + err.Error()})
+		return result, fmt.Errorf("%s: gh pr create: %w", OutcomeDeliveryFailed, err)
 	}
 	dispatch.tracker.transition(dispatch.activePhase, "succeeded", dispatch.tracker.exitCode, nil)
 	dispatch.dispatchSucceeded = true
 
-	exitCode := 0
-	logBytes := fileSize(dispatch.logPath)
-	return Result{
-		OK:          true,
-		Issue:       dispatch.opts.IssueNumber,
-		Branch:      dispatch.opts.Branch,
-		RunID:       dispatch.opts.RunID,
-		PR:          prURL,
-		Summary:     summary,
-		AttemptPath: dispatch.attemptPath,
-		Status:      "succeeded",
-		ExitCode:    exitCode,
-		LogBytes:    logBytes,
-		Report:      &reportRecord,
-	}, nil
+	return finalizationResult(dispatch, &reportRecord, summary, finalizationResultOptions{
+		OK:              true,
+		Status:          state.StatusSucceeded,
+		Outcome:         OutcomePRCreated,
+		DeliveryOutcome: OutcomePRCreated,
+		Evidence:        []string{"provider_completed", "pushed branch " + dispatch.opts.Branch, "created PR " + prURL},
+		NextAction:      "review the pull request",
+		PR:              prURL,
+	}), nil
 }
 
 func writeRecovery(ctx context.Context, dispatch *dispatchContext, failure error) {
 	if dispatch == nil || dispatch.tracker == nil || failure == nil {
 		return
 	}
+	selectArtifactPreservation(dispatch, dispatch.failureStatus+" attempt", nil)
 	failurePhase := dispatch.activePhase
 	if failurePhase == "" {
 		failurePhase = dispatch.tracker.phase
@@ -533,6 +769,7 @@ func writeRecovery(ctx context.Context, dispatch *dispatchContext, failure error
 	}
 	errText := failure.Error()
 	dispatch.tracker.transition(failurePhase, dispatch.failureStatus, dispatch.tracker.exitCode, &errText)
+	var preservationErrors []string
 	if briefErr := writeRecoveryBrief(ctx, recoveryBriefOptions{
 		repoPath:     dispatch.repoPath,
 		runID:        dispatch.opts.RunID,
@@ -551,39 +788,82 @@ func writeRecovery(ctx context.Context, dispatch *dispatchContext, failure error
 		github:       dispatch.github,
 		warnings:     dispatch.warnings,
 	}); briefErr != nil {
-		fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to write recovery brief for %s: %v\n", dispatch.jobID, briefErr)
+		msg := fmt.Sprintf("failed to write recovery brief for %s: %v", dispatch.jobID, briefErr)
+		preservationErrors = append(preservationErrors, msg)
+		fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: %s\n", msg)
 	}
-	fmt.Fprintf(dispatch.warnings, "[loopcoder] preserved %s attempt artifacts: %s\n", dispatch.failureStatus, dispatch.scratch)
+	preserveAttemptArtifacts(dispatch, dispatch.failureStatus+" attempt", preservationErrors)
 }
 
 func cleanup(ctx context.Context, dispatch *dispatchContext, failure error) {
 	if dispatch == nil || dispatch.tracker == nil {
 		return
 	}
-	if dispatch.dispatchSucceeded {
-		dispatch.tracker.transition("cleanup", dispatch.cleanupStatus, dispatch.tracker.exitCode, nil)
-		if dispatch.opts.KeepWorktree {
-			fmt.Fprintf(dispatch.warnings, "[loopcoder] kept worktree: %s   (scratch: %s)\n", dispatch.worktreePath, dispatch.scratch)
+	defer closeWorkerOwnershipStore(dispatch)
+	defer func() {
+		if !dispatch.providerRefused || strings.TrimSpace(dispatch.attemptPath) == "" {
 			return
 		}
+		if err := os.Remove(dispatch.attemptPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: remove provider-refused attempt %s: %v\n", dispatch.attemptPath, err)
+		}
+	}()
+	if dispatch.progressRecorder != nil {
+		defer dispatch.progressRecorder.Stop()
+	}
+	if dispatch.dispatchSucceeded {
+		if dispatch.opts.KeepWorktree || dispatch.preserveArtifacts {
+			if !dispatch.preserveArtifacts {
+				selectArtifactPreservation(dispatch, "keep-worktree requested", nil)
+			}
+			dispatch.tracker.transition("cleanup", dispatch.cleanupStatus, dispatch.tracker.exitCode, nil)
+			reason := dispatch.preserveReason
+			if reason == "" {
+				reason = "keep-worktree requested"
+			}
+			preserveAttemptArtifacts(dispatch, reason, nil)
+			completeProviderExecutionAuthority(dispatch, dispatch.cleanupStatus)
+			releaseWorkerOwnership(dispatch)
+			return
+		}
+		if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+			fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: refused cleanup without active ownership fence for %s: %v\n", dispatch.worktreePath, err)
+			selectArtifactPreservation(dispatch, "cleanup ownership refused", []string{err.Error()})
+			preserveAttemptArtifacts(dispatch, "cleanup ownership refused", []string{err.Error()})
+			completeProviderExecutionAuthority(dispatch, state.StatusNeedsHuman)
+			return
+		}
+		selectArtifactCleanup(dispatch, "successful attempt cleanup")
+		dispatch.tracker.transition("cleanup", dispatch.cleanupStatus, dispatch.tracker.exitCode, nil)
+		var cleanupErrors []string
 		if cleanupErr := dispatch.deps.Git.WorktreeRemove(context.Background(), dispatch.repoPath, dispatch.worktreePath); cleanupErr != nil {
 			fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to remove worktree %s: %v\n", dispatch.worktreePath, cleanupErr)
+			cleanupErrors = append(cleanupErrors, fmt.Sprintf("remove worktree %s: %v", dispatch.worktreePath, cleanupErr))
 		}
 		if cleanupErr := dispatch.deps.Git.BranchDelete(context.Background(), dispatch.repoPath, dispatch.opts.Branch); cleanupErr != nil {
 			fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to delete local branch %s: %v\n", dispatch.opts.Branch, cleanupErr)
+			cleanupErrors = append(cleanupErrors, fmt.Sprintf("delete local branch %s: %v", dispatch.opts.Branch, cleanupErr))
 		}
-		if cleanupErr := dispatch.deps.RemoveAll(dispatch.scratch); cleanupErr != nil {
+		if cleanupErr := removeOwnedScratch(dispatch); cleanupErr != nil {
 			fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to remove scratch directory %s: %v\n", dispatch.scratch, cleanupErr)
+			cleanupErrors = append(cleanupErrors, fmt.Sprintf("remove scratch %s: %v", dispatch.scratch, cleanupErr))
 		}
+		completeArtifactCleanup(dispatch, cleanupErrors)
+		completeProviderExecutionAuthority(dispatch, dispatch.cleanupStatus)
+		releaseWorkerOwnership(dispatch)
 		return
 	}
 	if failure == nil {
+		completeProviderExecutionAuthority(dispatch, dispatch.cleanupStatus)
+		releaseWorkerOwnership(dispatch)
 		return
 	}
 	if dispatch.failureStatus == state.StatusFailed {
 		dispatch.failureStatus = state.FailureStatus(failure)
 	}
 	writeRecovery(ctx, dispatch, failure)
+	completeProviderExecutionAuthority(dispatch, dispatch.failureStatus)
+	releaseWorkerOwnership(dispatch)
 }
 
 func hungResult(dispatch *dispatchContext, agentResult agent.Result) Result {
@@ -663,7 +943,7 @@ func buildWorkerReport(opts Options, result agent.Result) reporter.Report {
 		ModelSource: reporter.ModelSourceForProvider(opts.Provider),
 		Effort:      firstNonEmpty(opts.Effort, result.Effort),
 		Permission:  reporter.PermissionWrite,
-		Action:      fmt.Sprintf("implement issue #%d", opts.IssueNumber),
+		Action:      providerAttributedAction(fmt.Sprintf("implement issue #%d", opts.IssueNumber), opts.RunID, result),
 		ExitCode:    result.ExitCode,
 		StartedAt:   result.StartedAt,
 		EndedAt:     result.EndedAt,
@@ -671,6 +951,26 @@ func buildWorkerReport(opts Options, result agent.Result) reporter.Report {
 		Usage:       result.Usage,
 		Verified:    true,
 	}
+}
+
+func providerAttributedAction(action, attempt string, result agent.Result) string {
+	var parts []string
+	if strings.TrimSpace(result.AdapterVersion) != "" {
+		parts = append(parts, "adapter="+strings.TrimSpace(result.AdapterVersion))
+	}
+	if strings.TrimSpace(result.ExternalSessionRef) == "" && len(parts) == 0 {
+		return action
+	}
+	if strings.TrimSpace(attempt) != "" {
+		parts = append(parts, "attempt="+strings.TrimSpace(attempt))
+	}
+	if strings.TrimSpace(result.ExternalSessionRef) != "" {
+		parts = append(parts, "session="+strings.TrimSpace(result.ExternalSessionRef))
+	}
+	if len(parts) == 0 {
+		return action
+	}
+	return action + " [" + strings.Join(parts, " ") + "]"
 }
 
 func buildCommitMessage(title string, issueNumber int) string {
@@ -681,20 +981,726 @@ func buildPRBody(issueNumber int, summary string) string {
 	return fmt.Sprintf("Closes #%d\n\n%s", issueNumber, summary)
 }
 
+type finalizationResultOptions struct {
+	OK              bool
+	Status          string
+	Outcome         Outcome
+	DeliveryOutcome Outcome
+	Evidence        []string
+	NextAction      string
+	PR              string
+}
+
+func providerFailureResult(dispatch *dispatchContext, agentResult agent.Result, reason string) Result {
+	return Result{
+		OK:              false,
+		Issue:           dispatch.opts.IssueNumber,
+		Branch:          dispatch.opts.Branch,
+		RunID:           dispatch.opts.RunID,
+		AttemptPath:     dispatch.attemptPath,
+		Status:          state.FailureStatus(errors.New(reason)),
+		Outcome:         string(OutcomeProviderFailed),
+		ProviderOutcome: string(OutcomeProviderFailed),
+		Evidence:        []string{reason},
+		ExitCode:        agentResult.ExitCode,
+		LogBytes:        fileSize(dispatch.logPath),
+		Reason:          "outcome=provider_failed evidence=" + reason,
+		NextAction:      "inspect the provider log and retry provider execution if appropriate",
+	}
+}
+
+func reconcileBeforeProviderLaunch(ctx context.Context, dispatch *dispatchContext) providerreconcile.Receipt {
+	attempts, err := state.LoadAttempts(dispatch.repoPath, dispatch.opts.RunID)
+	if err != nil {
+		now := dispatch.deps.Now()
+		return providerreconcile.Receipt{
+			SchemaVersion:   providerreconcile.SchemaVersion,
+			Issue:           dispatch.opts.IssueNumber,
+			RunID:           dispatch.opts.RunID,
+			Outcome:         providerreconcile.OutcomeAmbiguous,
+			Action:          providerreconcile.ActionNeedsHuman,
+			NeedsHuman:      true,
+			BlockRedispatch: true,
+			Reason:          "load attempts before provider reconciliation: " + err.Error(),
+			NextAction:      "request human review before launching another provider",
+			DecidedAt:       state.FormatTimestamp(now),
+			Evidence:        []string{"repo=" + dispatch.repoPath},
+		}
+	}
+	return providerreconcile.Check(ctx, providerreconcile.Options{
+		RepoPath: dispatch.repoPath,
+		RunID:    dispatch.opts.RunID,
+		Issue:    dispatch.opts.IssueNumber,
+		Attempts: attempts,
+		Now:      dispatch.deps.Now(),
+	})
+}
+
+func providerReconciliationResult(dispatch *dispatchContext, decision providerreconcile.Receipt) Result {
+	return Result{
+		OK:             false,
+		Issue:          dispatch.opts.IssueNumber,
+		Branch:         dispatch.opts.Branch,
+		RunID:          dispatch.opts.RunID,
+		Status:         state.StatusNeedsHuman,
+		Outcome:        string(OutcomeNeedsHuman),
+		Evidence:       append([]string{decision.JSONLine()}, decision.Evidence...),
+		ExitCode:       0,
+		Reason:         decision.Summary(),
+		NextAction:     decision.NextAction,
+		Reconciliation: &decision,
+	}
+}
+
+func finalizationFailureResult(dispatch *dispatchContext, report *reporter.Report, summary string, outcome Outcome, reason string, evidence []string) Result {
+	return finalizationResult(dispatch, report, summary, finalizationResultOptions{
+		OK:              false,
+		Status:          state.StatusFailed,
+		Outcome:         outcome,
+		DeliveryOutcome: outcome,
+		Evidence:        append([]string{reason}, evidence...),
+		NextAction:      "retry delivery finalization; provider work can be reused",
+	})
+}
+
+func finalizationResult(dispatch *dispatchContext, report *reporter.Report, summary string, opts finalizationResultOptions) Result {
+	status := firstNonEmpty(opts.Status, state.StatusFailed)
+	outcome := string(opts.Outcome)
+	evidence := compactEvidence(opts.Evidence)
+	return Result{
+		OK:              opts.OK,
+		Issue:           dispatch.opts.IssueNumber,
+		Branch:          dispatch.opts.Branch,
+		RunID:           dispatch.opts.RunID,
+		PR:              opts.PR,
+		Summary:         summary,
+		AttemptPath:     dispatch.attemptPath,
+		Status:          status,
+		Outcome:         outcome,
+		ProviderOutcome: string(OutcomeProviderCompleted),
+		DeliveryOutcome: string(opts.DeliveryOutcome),
+		Evidence:        evidence,
+		ExitCode:        0,
+		LogBytes:        fileSize(dispatch.logPath),
+		Reason:          finalizationReason(outcome, evidence),
+		NextAction:      opts.NextAction,
+		Report:          report,
+	}
+}
+
+func finalizationReason(outcome string, evidence []string) string {
+	if len(evidence) == 0 {
+		return "outcome=" + outcome
+	}
+	return "outcome=" + outcome + " evidence=" + strings.Join(evidence, "; ")
+}
+
+func compactEvidence(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func adoptExistingBranchPR(ctx context.Context, dispatch *dispatchContext, report *reporter.Report, summary string, outcome Outcome, evidence string) (Result, bool, error) {
+	if dispatch.github == nil {
+		return Result{}, false, nil
+	}
+	prs, err := dispatch.github.ListHeadPRs(ctx, dispatch.opts.Branch)
+	if err != nil {
+		return Result{}, false, err
+	}
+	if len(prs) == 0 {
+		return Result{}, false, nil
+	}
+	pr := prs[0]
+	prURL := strings.TrimSpace(pr.URL)
+	if prURL == "" && pr.Number > 0 {
+		prURL = fmt.Sprintf("#%d", pr.Number)
+	}
+	dispatch.tracker.transition(dispatch.activePhase, state.StatusSucceeded, dispatch.tracker.exitCode, nil)
+	dispatch.dispatchSucceeded = true
+	return finalizationResult(dispatch, report, summary, finalizationResultOptions{
+		OK:              true,
+		Status:          state.StatusSucceeded,
+		Outcome:         outcome,
+		DeliveryOutcome: outcome,
+		Evidence:        []string{"provider_completed", evidence, fmt.Sprintf("pr=%s", prURL)},
+		NextAction:      "review the existing pull request",
+		PR:              prURL,
+	}), true, nil
+}
+
+func adoptExistingBranchPRPreflight(ctx context.Context, dispatch *dispatchContext) (Result, bool, error) {
+	if dispatch.github == nil {
+		return Result{}, false, nil
+	}
+	prs, err := dispatch.github.ListHeadPRs(ctx, dispatch.opts.Branch)
+	if err != nil {
+		return Result{}, false, err
+	}
+	if len(prs) == 0 {
+		return Result{}, false, nil
+	}
+	reportRecord, attemptPath, foundReport := reusableBranchReport(dispatch)
+	if !foundReport && dispatch.opts.Attempt <= 1 {
+		return Result{}, false, nil
+	}
+	summary := "existing branch PR adopted without provider execution"
+	pr := prs[0]
+	prURL := strings.TrimSpace(pr.URL)
+	if prURL == "" && pr.Number > 0 {
+		prURL = fmt.Sprintf("#%d", pr.Number)
+	}
+	evidence := []string{"existing branch PR found before provider launch", fmt.Sprintf("pr=%s", prURL)}
+	if attemptPath != "" {
+		evidence = append(evidence, "reused_report_attempt="+attemptPath)
+	}
+	result := Result{
+		OK:              true,
+		Issue:           dispatch.opts.IssueNumber,
+		Branch:          dispatch.opts.Branch,
+		RunID:           dispatch.opts.RunID,
+		PR:              prURL,
+		Summary:         summary,
+		AttemptPath:     attemptPath,
+		Status:          state.StatusSucceeded,
+		Outcome:         string(OutcomePRAdopted),
+		ProviderOutcome: string(OutcomeProviderCompleted),
+		DeliveryOutcome: string(OutcomePRAdopted),
+		Evidence:        compactEvidence(evidence),
+		ExitCode:        0,
+		LogBytes:        fileSize(dispatch.logPath),
+		Reason:          finalizationReason(string(OutcomePRAdopted), evidence),
+		NextAction:      "review the existing pull request",
+		Report:          reportRecord,
+	}
+	return result, true, nil
+}
+
+func reusableBranchReport(dispatch *dispatchContext) (*reporter.Report, string, bool) {
+	attempts, err := state.LoadAttempts(dispatch.repoPath, dispatch.opts.RunID)
+	if err == nil {
+		for i := len(attempts) - 1; i >= 0; i-- {
+			attempt := attempts[i]
+			if attempt.Issue != dispatch.opts.IssueNumber || attempt.Branch != dispatch.opts.Branch || attempt.Report == nil {
+				continue
+			}
+			return attempt.Report, attempt.Path, true
+		}
+	}
+	now := state.FormatTimestamp(dispatch.deps.Now())
+	zero := int64(0)
+	return &reporter.Report{
+		WorkID:      dispatch.opts.RunID,
+		Issue:       dispatch.opts.IssueNumber,
+		Branch:      dispatch.opts.Branch,
+		Role:        reporter.RoleWorker,
+		Provider:    firstNonEmpty(dispatch.opts.Provider, "local"),
+		Model:       firstNonEmpty(dispatch.opts.Model, "unknown"),
+		ModelSource: reporter.ModelSourceForProvider(dispatch.opts.Provider),
+		Effort:      dispatch.opts.Effort,
+		Permission:  reporter.PermissionWrite,
+		Action:      fmt.Sprintf("adopt existing PR for issue #%d", dispatch.opts.IssueNumber),
+		ExitCode:    0,
+		StartedAt:   now,
+		EndedAt:     now,
+		DurationMS:  0,
+		Usage: reporter.Usage{
+			TotalTokens: &zero,
+		},
+		Verified: true,
+	}, "", false
+}
+
+func noChangesExpected(summary string) bool {
+	summary = strings.ToLower(strings.TrimSpace(summary))
+	if summary == "" {
+		return false
+	}
+	for _, signal := range []string{
+		"no changes expected",
+		"no file changes expected",
+		"valid no-op",
+		"valid noop",
+		"no-op",
+		"noop",
+		"already implemented",
+		"already satisfied",
+		"nothing to change",
+		"no changes needed",
+	} {
+		if strings.Contains(summary, signal) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPushConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrExist) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	for _, signal := range []string{
+		"non-fast-forward",
+		"fetch first",
+		"rejected",
+		"failed to push some refs",
+		"stale info",
+		"already exists",
+	} {
+		if strings.Contains(text, signal) {
+			return true
+		}
+	}
+	return false
+}
+
+type scratchOwnerRecord struct {
+	Version     int    `json:"version"`
+	RunID       string `json:"run_id"`
+	JobID       string `json:"job_id"`
+	Issue       int    `json:"issue"`
+	Attempt     int    `json:"attempt"`
+	Branch      string `json:"branch"`
+	Generation  int    `json:"generation"`
+	OwnerID     string `json:"owner_id"`
+	ScratchRoot string `json:"scratch_root,omitempty"`
+	Scratch     string `json:"scratch"`
+}
+
+type preservationManifest struct {
+	Version              int      `json:"version"`
+	RunID                string   `json:"run_id"`
+	JobID                string   `json:"job_id"`
+	Issue                int      `json:"issue"`
+	Attempt              int      `json:"attempt"`
+	Branch               string   `json:"branch"`
+	Status               string   `json:"status"`
+	Reason               string   `json:"reason"`
+	WorktreePath         string   `json:"worktree_path"`
+	ScratchPath          string   `json:"scratch_path"`
+	LogPath              string   `json:"log_path"`
+	PromptPath           string   `json:"prompt_path"`
+	SummaryPath          string   `json:"summary_path"`
+	AttemptPath          string   `json:"attempt_path"`
+	RecoveryContextPath  string   `json:"recovery_context_path"`
+	ManifestPath         string   `json:"manifest_path"`
+	PartialArtifactPaths []string `json:"partial_artifact_paths,omitempty"`
+	DisposalGuidance     string   `json:"disposal_guidance"`
+	PreservationErrors   []string `json:"preservation_errors,omitempty"`
+	PreservedAt          string   `json:"preserved_at"`
+}
+
+func writeScratchOwner(dispatch *dispatchContext) error {
+	record := scratchOwnerRecord{
+		Version:    1,
+		RunID:      dispatch.opts.RunID,
+		JobID:      dispatch.jobID,
+		Issue:      dispatch.opts.IssueNumber,
+		Attempt:    dispatch.opts.Attempt,
+		Branch:     dispatch.opts.Branch,
+		Generation: 1,
+		OwnerID:    workerOwnershipOwnerID(dispatch),
+		Scratch:    dispatch.scratch,
+	}
+	if dispatch.runtimeRoots.Registered {
+		record.ScratchRoot = dispatch.runtimeRoots.TmpRoot
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("marshal scratch owner marker: %w", err)
+	}
+	path := filepath.Join(dispatch.scratch, scratchOwnerFile)
+	if err := dispatch.deps.WriteFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("write scratch owner marker: %w", err)
+	}
+	return nil
+}
+
+func removeOwnedScratch(dispatch *dispatchContext) error {
+	if dispatch == nil || strings.TrimSpace(dispatch.scratch) == "" {
+		return errors.New("scratch path is empty")
+	}
+	if err := validateScratchCleanupDecision(dispatch); err != nil {
+		return err
+	}
+	path := filepath.Join(dispatch.scratch, scratchOwnerFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read scratch owner marker: %w", err)
+	}
+	var record scratchOwnerRecord
+	if err := json.Unmarshal(data, &record); err != nil {
+		return fmt.Errorf("parse scratch owner marker: %w", err)
+	}
+	recordScratch, err := pathid.Identity(record.Scratch)
+	if err != nil {
+		return fmt.Errorf("resolve scratch owner marker identity: %w", err)
+	}
+	dispatchScratch, err := pathid.Identity(dispatch.scratch)
+	if err != nil {
+		return fmt.Errorf("resolve scratch identity: %w", err)
+	}
+	repoIdentity, err := pathid.Identity(dispatch.repoPath)
+	if err != nil {
+		return fmt.Errorf("resolve repository identity: %w", err)
+	}
+	if dispatchScratch == repoIdentity {
+		return fmt.Errorf("refusing to remove repository root as scratch directory")
+	}
+	if sameOrDescendantPhysicalPath(dispatchScratch, repoIdentity) {
+		return fmt.Errorf("refusing to remove repository ancestor as scratch directory")
+	}
+	if sameOrDescendantPhysicalPath(repoIdentity, dispatchScratch) {
+		return fmt.Errorf("refusing to remove repository descendant as scratch directory")
+	}
+	if dispatch.runtimeRoots.Registered {
+		tmpRoot, err := pathid.Identity(dispatch.runtimeRoots.TmpRoot)
+		if err != nil {
+			return fmt.Errorf("resolve registered temp root identity: %w", err)
+		}
+		if !sameOrDescendantPhysicalPath(tmpRoot, dispatchScratch) || tmpRoot == dispatchScratch {
+			return fmt.Errorf("scratch path is outside registered temp root")
+		}
+		if strings.TrimSpace(record.ScratchRoot) == "" {
+			return fmt.Errorf("scratch owner marker is missing registered scratch root")
+		}
+		recordScratchRoot, err := pathid.Identity(record.ScratchRoot)
+		if err != nil {
+			return fmt.Errorf("resolve scratch owner marker root identity: %w", err)
+		}
+		if subtle.ConstantTimeCompare([]byte(recordScratchRoot), []byte(tmpRoot)) != 1 {
+			return fmt.Errorf("scratch owner marker root does not match registered temp root")
+		}
+	}
+	if record.Version != 1 ||
+		record.Issue != dispatch.opts.IssueNumber ||
+		record.Attempt != dispatch.opts.Attempt ||
+		record.Generation != 1 ||
+		subtle.ConstantTimeCompare([]byte(record.RunID), []byte(dispatch.opts.RunID)) != 1 ||
+		subtle.ConstantTimeCompare([]byte(record.JobID), []byte(dispatch.jobID)) != 1 ||
+		subtle.ConstantTimeCompare([]byte(record.OwnerID), []byte(workerOwnershipOwnerID(dispatch))) != 1 ||
+		subtle.ConstantTimeCompare([]byte(recordScratch), []byte(dispatchScratch)) != 1 {
+		return fmt.Errorf("scratch owner marker does not match attempt %s/%s", dispatch.opts.RunID, dispatch.jobID)
+	}
+	return dispatch.deps.RemoveAll(dispatch.scratch)
+}
+
+func validateScratchCleanupDecision(dispatch *dispatchContext) error {
+	if dispatch == nil || dispatch.tracker == nil || dispatch.tracker.artifactDecision == nil {
+		return nil
+	}
+	decision := dispatch.tracker.artifactDecision
+	switch decision.State {
+	case artifactDecisionCleanupSelected, artifactDecisionCleanupPartial, artifactDecisionCleanupCompleted:
+	case artifactDecisionPreserveSelected:
+		return fmt.Errorf("refusing scratch cleanup because artifact preservation is selected for %s/%s", dispatch.opts.RunID, dispatch.jobID)
+	default:
+		return fmt.Errorf("refusing scratch cleanup with ambiguous artifact decision state %q", decision.State)
+	}
+	if decision.Generation != 1 ||
+		subtle.ConstantTimeCompare([]byte(decision.OwnerID), []byte(workerOwnershipOwnerID(dispatch))) != 1 ||
+		subtle.ConstantTimeCompare([]byte(decision.ScratchPath), []byte(dispatch.scratch)) != 1 {
+		return fmt.Errorf("artifact cleanup decision does not match attempt %s/%s", dispatch.opts.RunID, dispatch.jobID)
+	}
+	if dispatch.runtimeRoots.Registered {
+		if strings.TrimSpace(decision.ScratchRoot) == "" {
+			return fmt.Errorf("artifact cleanup decision is missing registered scratch root")
+		}
+		decisionRoot, err := pathid.Identity(decision.ScratchRoot)
+		if err != nil {
+			return fmt.Errorf("resolve artifact cleanup decision scratch root: %w", err)
+		}
+		tmpRoot, err := pathid.Identity(dispatch.runtimeRoots.TmpRoot)
+		if err != nil {
+			return fmt.Errorf("resolve registered temp root identity: %w", err)
+		}
+		if subtle.ConstantTimeCompare([]byte(decisionRoot), []byte(tmpRoot)) != 1 {
+			return fmt.Errorf("artifact cleanup decision scratch root does not match registered temp root")
+		}
+	}
+	return nil
+}
+
+func preserveAttemptArtifacts(dispatch *dispatchContext, reason string, preservationErrors []string) {
+	if dispatch == nil {
+		return
+	}
+	selectArtifactPreservation(dispatch, reason, preservationErrors)
+	decision := dispatch.tracker.artifactDecision
+	if decision == nil {
+		return
+	}
+	manifest := preservationManifest{
+		Version:              1,
+		RunID:                dispatch.opts.RunID,
+		JobID:                dispatch.jobID,
+		Issue:                dispatch.opts.IssueNumber,
+		Attempt:              dispatch.opts.Attempt,
+		Branch:               dispatch.tracker.branch,
+		Status:               dispatch.tracker.status,
+		Reason:               reason,
+		WorktreePath:         decision.WorktreePath,
+		ScratchPath:          decision.ScratchPath,
+		LogPath:              decision.LogPath,
+		PromptPath:           decision.PromptPath,
+		SummaryPath:          decision.SummaryPath,
+		AttemptPath:          decision.AttemptPath,
+		RecoveryContextPath:  decision.RecoveryContextPath,
+		ManifestPath:         decision.ManifestPath,
+		PartialArtifactPaths: append([]string(nil), decision.PartialArtifactPaths...),
+		DisposalGuidance:     "Inspect the preserved worktree and recovery brief before deleting anything. Dispose only with an ownership check that matches this run_id and job_id, generation, owner_id, scratch root, and scratch owner marker.",
+		PreservationErrors:   append([]string(nil), decision.PreservationErrors...),
+		PreservedAt:          state.FormatTimestamp(dispatch.deps.Now()),
+	}
+	if manifest.Branch == "" {
+		manifest.Branch = dispatch.opts.Branch
+	}
+	if manifest.Status == "" {
+		manifest.Status = dispatch.cleanupStatus
+	}
+	manifestPath := state.PreservationManifestPath(dispatch.repoPath, dispatch.opts.RunID, dispatch.jobID)
+	manifest.ManifestPath = manifestPath
+	if err := writePreservationManifest(dispatch, manifestPath, manifest); err != nil {
+		fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to write preservation manifest %s: %v\n", manifestPath, err)
+		manifest.PreservationErrors = append(manifest.PreservationErrors, err.Error())
+		manifest.ManifestPath = ""
+		updateArtifactDecisionErrors(dispatch, manifest.PreservationErrors)
+	} else {
+		updateArtifactDecisionManifest(dispatch, manifestPath)
+	}
+	printPreservationManifest(dispatch.warnings, manifest)
+}
+
+func writePreservationManifest(dispatch *dispatchContext, path string, manifest preservationManifest) error {
+	if err := dispatch.deps.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create preservation directory: %w", err)
+	}
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal preservation manifest: %w", err)
+	}
+	data = append(data, '\n')
+	if err := dispatch.deps.WriteFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("write preservation manifest: %w", err)
+	}
+	return nil
+}
+
+func printPreservationManifest(w io.Writer, manifest preservationManifest) {
+	if w == nil {
+		return
+	}
+	label := strings.TrimSpace(manifest.Reason)
+	if !strings.HasSuffix(label, "attempt") {
+		label = strings.TrimSpace(manifest.Status) + " attempt"
+	}
+	if strings.TrimSpace(label) == "" {
+		label = "attempt"
+	}
+	fmt.Fprintf(w, "[loopcoder] preserved %s artifacts for %s/%s (%s)\n", label, manifest.RunID, manifest.JobID, manifest.Reason)
+	for _, line := range []struct {
+		label string
+		value string
+	}{
+		{"worktree", manifest.WorktreePath},
+		{"scratch", manifest.ScratchPath},
+		{"log", manifest.LogPath},
+		{"prompt", manifest.PromptPath},
+		{"summary", manifest.SummaryPath},
+		{"attempt", manifest.AttemptPath},
+		{"recovery", manifest.RecoveryContextPath},
+		{"manifest", manifest.ManifestPath},
+	} {
+		if strings.TrimSpace(line.value) != "" {
+			fmt.Fprintf(w, "[loopcoder] preserved %s: %s\n", line.label, line.value)
+		}
+	}
+	if len(manifest.PreservationErrors) > 0 {
+		fmt.Fprintf(w, "[loopcoder] preservation incomplete: %s\n", strings.Join(manifest.PreservationErrors, "; "))
+	}
+	if len(manifest.PartialArtifactPaths) > 0 {
+		fmt.Fprintf(w, "[loopcoder] preserved partial artifacts: %s\n", strings.Join(manifest.PartialArtifactPaths, ", "))
+	}
+	fmt.Fprintf(w, "[loopcoder] disposal: %s\n", manifest.DisposalGuidance)
+}
+
+const (
+	artifactDecisionPreserveSelected = "preserve-selected"
+	artifactDecisionCleanupSelected  = "cleanup-selected"
+	artifactDecisionCleanupCompleted = "cleanup-completed"
+	artifactDecisionCleanupPartial   = "cleanup-partial"
+)
+
+func selectArtifactPreservation(dispatch *dispatchContext, reason string, preservationErrors []string) {
+	if dispatch == nil || dispatch.tracker == nil {
+		return
+	}
+	dispatch.preserveArtifacts = true
+	dispatch.preserveReason = firstNonEmpty(reason, dispatch.preserveReason)
+	existing := cloneArtifactDecision(dispatch.tracker.artifactDecision)
+	alreadySelected := existing != nil && existing.State == artifactDecisionPreserveSelected
+	decision := buildArtifactDecision(dispatch, artifactDecisionPreserveSelected, dispatch.preserveReason)
+	if alreadySelected {
+		decision.DecidedAt = existing.DecidedAt
+		decision.Generation = existing.Generation
+		decision.ManifestPath = existing.ManifestPath
+	}
+	if existing != nil {
+		decision.PreservationErrors = append(decision.PreservationErrors, existing.PreservationErrors...)
+	}
+	decision.PreservationErrors = sortedUniqueNonEmpty(append(decision.PreservationErrors, preservationErrors...))
+	dispatch.tracker.setArtifactDecision(decision)
+	dispatch.tracker.writeAttempt()
+	if !alreadySelected {
+		dispatch.tracker.appendEvent("artifact_preservation_selected", artifactDecisionPreserveSelected, artifactDecisionEventDetails(decision))
+	}
+}
+
+func selectArtifactCleanup(dispatch *dispatchContext, reason string) {
+	if dispatch == nil || dispatch.tracker == nil {
+		return
+	}
+	decision := buildArtifactDecision(dispatch, artifactDecisionCleanupSelected, reason)
+	dispatch.tracker.setArtifactDecision(decision)
+	dispatch.tracker.writeAttempt()
+	dispatch.tracker.appendEvent("artifact_cleanup_selected", artifactDecisionCleanupSelected, artifactDecisionEventDetails(decision))
+}
+
+func completeArtifactCleanup(dispatch *dispatchContext, cleanupErrors []string) {
+	if dispatch == nil || dispatch.tracker == nil || dispatch.tracker.artifactDecision == nil {
+		return
+	}
+	decision := cloneArtifactDecision(dispatch.tracker.artifactDecision)
+	decision.UpdatedAt = state.FormatTimestamp(dispatch.deps.Now())
+	decision.CleanupErrors = append([]string(nil), cleanupErrors...)
+	if len(cleanupErrors) > 0 {
+		decision.State = artifactDecisionCleanupPartial
+	} else {
+		decision.State = artifactDecisionCleanupCompleted
+	}
+	dispatch.tracker.setArtifactDecision(*decision)
+	dispatch.tracker.writeAttempt()
+	dispatch.tracker.appendEvent("artifact_cleanup_completed", decision.State, artifactDecisionEventDetails(*decision))
+}
+
+func updateArtifactDecisionManifest(dispatch *dispatchContext, manifestPath string) {
+	if dispatch == nil || dispatch.tracker == nil || dispatch.tracker.artifactDecision == nil {
+		return
+	}
+	decision := cloneArtifactDecision(dispatch.tracker.artifactDecision)
+	if existing, ok := existingArtifactPath(dispatch, "manifest", manifestPath); ok {
+		decision.ManifestPath = existing
+		decision.PartialArtifactPaths = sortedUniqueNonEmpty(append(decision.PartialArtifactPaths, existing))
+	}
+	decision.UpdatedAt = state.FormatTimestamp(dispatch.deps.Now())
+	dispatch.tracker.setArtifactDecision(*decision)
+	dispatch.tracker.writeAttempt()
+}
+
+func updateArtifactDecisionErrors(dispatch *dispatchContext, preservationErrors []string) {
+	if dispatch == nil || dispatch.tracker == nil || dispatch.tracker.artifactDecision == nil {
+		return
+	}
+	decision := cloneArtifactDecision(dispatch.tracker.artifactDecision)
+	decision.PreservationErrors = sortedUniqueNonEmpty(append(decision.PreservationErrors, preservationErrors...))
+	decision.UpdatedAt = state.FormatTimestamp(dispatch.deps.Now())
+	dispatch.tracker.setArtifactDecision(*decision)
+	dispatch.tracker.writeAttempt()
+}
+
+func buildArtifactDecision(dispatch *dispatchContext, stateValue, reason string) state.ArtifactDecision {
+	now := state.FormatTimestamp(dispatch.deps.Now())
+	decision := state.ArtifactDecision{
+		State:      stateValue,
+		Reason:     strings.TrimSpace(reason),
+		Generation: 1,
+		OwnerID:    workerOwnershipOwnerID(dispatch),
+		DecidedAt:  now,
+		UpdatedAt:  now,
+	}
+	if dispatch.runtimeRoots.Registered {
+		decision.ScratchRoot = dispatch.runtimeRoots.TmpRoot
+	}
+	type pathField struct {
+		label string
+		value string
+		set   func(string)
+	}
+	for _, field := range []pathField{
+		{label: "worktree", value: dispatch.worktreePath, set: func(v string) { decision.WorktreePath = v }},
+		{label: "scratch", value: dispatch.scratch, set: func(v string) { decision.ScratchPath = v }},
+		{label: "log", value: dispatch.logPath, set: func(v string) { decision.LogPath = v }},
+		{label: "prompt", value: dispatch.promptPath, set: func(v string) { decision.PromptPath = v }},
+		{label: "summary", value: dispatch.summaryPath, set: func(v string) { decision.SummaryPath = v }},
+		{label: "attempt", value: dispatch.attemptPath, set: func(v string) { decision.AttemptPath = v }},
+		{label: "recovery", value: state.RecoveryBriefPath(dispatch.repoPath, dispatch.opts.RunID, dispatch.jobID), set: func(v string) { decision.RecoveryContextPath = v }},
+	} {
+		existing, ok := existingArtifactPath(dispatch, field.label, field.value)
+		if ok {
+			field.set(existing)
+			decision.PartialArtifactPaths = append(decision.PartialArtifactPaths, existing)
+			continue
+		}
+		if stateValue == artifactDecisionPreserveSelected && strings.TrimSpace(field.value) != "" {
+			decision.PreservationErrors = append(decision.PreservationErrors, fmt.Sprintf("%s path is not preserved because it is absent: %s", field.label, field.value))
+		}
+	}
+	decision.PartialArtifactPaths = sortedUniqueNonEmpty(decision.PartialArtifactPaths)
+	decision.PreservationErrors = sortedUniqueNonEmpty(decision.PreservationErrors)
+	return decision
+}
+
+func existingArtifactPath(dispatch *dispatchContext, _, path string) (string, bool) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", false
+	}
+	info, err := dispatch.deps.Stat(path)
+	if err != nil || info == nil {
+		return "", false
+	}
+	return path, true
+}
+
+func artifactDecisionEventDetails(decision state.ArtifactDecision) map[string]any {
+	return map[string]any{
+		"state":                  decision.State,
+		"reason":                 decision.Reason,
+		"generation":             decision.Generation,
+		"owner_id":               decision.OwnerID,
+		"scratch_root":           decision.ScratchRoot,
+		"partial_artifact_paths": append([]string(nil), decision.PartialArtifactPaths...),
+	}
+}
+
 type hungHarvestOptions struct {
-	repoPath     string
-	runID        string
-	jobID        string
-	worktreePath string
-	logPath      string
-	summaryPath  string
-	opts         Options
-	agentResult  agent.Result
-	errorMessage string
-	git          GitClient
-	github       GitHubClient
-	now          func() time.Time
-	warnings     io.Writer
+	repoPath          string
+	runID             string
+	jobID             string
+	worktreePath      string
+	logPath           string
+	summaryPath       string
+	opts              Options
+	agentResult       agent.Result
+	errorMessage      string
+	git               GitClient
+	github            GitHubClient
+	now               func() time.Time
+	warnings          io.Writer
+	validateOwnership func(context.Context) error
 }
 
 type hungHarvestResult struct {
@@ -707,6 +1713,9 @@ type hungHarvestResult struct {
 }
 
 func harvestHungWorktree(ctx context.Context, opts hungHarvestOptions) (*hungHarvestResult, error) {
+	if err := validateHarvestOwnership(ctx, opts); err != nil {
+		return nil, err
+	}
 	dirty, err := opts.git.StatusPorcelain(ctx, opts.worktreePath)
 	if err != nil {
 		return nil, fmt.Errorf("git status --porcelain before harvest: %w", err)
@@ -761,11 +1770,20 @@ func harvestHungWorktree(ctx context.Context, opts hungHarvestOptions) (*hungHar
 		}, nil
 	}
 
+	if err := validateHarvestOwnership(ctx, opts); err != nil {
+		return nil, err
+	}
 	if err := opts.git.AddAll(ctx, opts.worktreePath); err != nil {
 		return nil, fmt.Errorf("git add -A for harvest: %w", err)
 	}
+	if err := validateHarvestOwnership(ctx, opts); err != nil {
+		return nil, err
+	}
 	if err := opts.git.Commit(ctx, opts.worktreePath, buildHarvestCommitMessage(opts.opts.IssueTitle, opts.opts.IssueNumber)); err != nil {
 		return nil, fmt.Errorf("git commit harvest: %w", err)
+	}
+	if err := validateHarvestOwnership(ctx, opts); err != nil {
+		return nil, err
 	}
 	if err := opts.git.PushUpstreamForceWithLease(ctx, opts.worktreePath, harvestBranch); err != nil {
 		return nil, fmt.Errorf("git push --force-with-lease origin %s: %w", harvestBranch, err)
@@ -777,6 +1795,9 @@ func harvestHungWorktree(ctx context.Context, opts hungHarvestOptions) (*hungHar
 		return nil, fmt.Errorf("validate harvest conductor report: %w", err)
 	}
 	body := buildHarvestPRBody(opts.opts, opts.agentResult, briefText)
+	if err := validateHarvestOwnership(ctx, opts); err != nil {
+		return nil, err
+	}
 	prURL, err := opts.github.CreatePR(ctx, harvestBranch, opts.opts.BaseBranch, buildHarvestPRTitle(opts.opts.IssueTitle, opts.opts.IssueNumber), body)
 	if err != nil {
 		return nil, fmt.Errorf("gh pr create harvest: %w", err)
@@ -789,6 +1810,13 @@ func harvestHungWorktree(ctx context.Context, opts hungHarvestOptions) (*hungHar
 		Mode:    "created-pr",
 		Report:  record,
 	}, nil
+}
+
+func validateHarvestOwnership(ctx context.Context, opts hungHarvestOptions) error {
+	if opts.validateOwnership == nil {
+		return nil
+	}
+	return opts.validateOwnership(ctx)
 }
 
 func harvestBranchName(issueNumber, attempt int) string {
@@ -1045,11 +2073,26 @@ func withDefaults(deps Deps) Deps {
 	if deps.MkdirTemp == nil {
 		deps.MkdirTemp = defaults.MkdirTemp
 	}
+	if deps.MkdirAll == nil {
+		deps.MkdirAll = defaults.MkdirAll
+	}
+	if deps.WriteFile == nil {
+		deps.WriteFile = defaults.WriteFile
+	}
+	if deps.Stat == nil {
+		deps.Stat = defaults.Stat
+	}
 	if deps.RemoveAll == nil {
 		deps.RemoveAll = defaults.RemoveAll
 	}
 	if deps.RepoSkills == nil {
 		deps.RepoSkills = defaults.RepoSkills
+	}
+	if deps.OpenStore == nil {
+		deps.OpenStore = defaults.OpenStore
+	}
+	if deps.OpenProgressStore == nil {
+		deps.OpenProgressStore = defaults.OpenProgressStore
 	}
 	return deps
 }
@@ -1088,6 +2131,160 @@ func addWorktreeWithLock(ctx context.Context, deps Deps, repoPath, branch, workt
 	return nil
 }
 
+func acquireWorkerOwnership(ctx context.Context, dispatch *dispatchContext) error {
+	if dispatch == nil || !dispatch.runtimeRoots.Registered {
+		return nil
+	}
+	if dispatch.ownershipLease != nil {
+		return nil
+	}
+	store, err := dispatch.deps.OpenStore(ctx, storage.Options{Path: dispatch.runtimeRoots.DatabasePath, Now: dispatch.deps.Now})
+	if err != nil {
+		return fmt.Errorf("open ownership store: %w", err)
+	}
+	dispatch.ownershipStore = store
+	worktreeIdentity, err := pathid.Identity(dispatch.worktreePath)
+	if err != nil {
+		closeWorkerOwnershipStore(dispatch)
+		return fmt.Errorf("resolve worktree identity: %w", err)
+	}
+	now := dispatch.deps.Now().UTC()
+	leaseDuration := WorkerHardCap
+	if dispatch.opts.Timeout > leaseDuration {
+		leaseDuration = dispatch.opts.Timeout
+	}
+	leaseUntil := now.Add(leaseDuration + 30*time.Minute)
+	lease, err := storage.AcquireAgentOwnershipLease(ctx, store, storage.AgentOwnershipLeaseRequest{
+		ProjectID:     dispatch.runtimeRoots.ProjectID,
+		DeliveryRunID: dispatch.opts.RunID,
+		RunID:         dispatch.opts.RunID,
+		OwnerID:       workerOwnershipOwnerID(dispatch),
+		Now:           now,
+		LeaseUntil:    leaseUntil,
+		Resources: []storage.AgentOwnershipResource{
+			{ResourceKind: "repo-path", ResourceKey: "."},
+			{ResourceKind: "worktree", ResourceKey: worktreeIdentity},
+			{ResourceKind: "git-ref", ResourceKey: dispatch.opts.Branch},
+			{ResourceKind: "runtime-run", ResourceKey: dispatch.opts.RunID},
+		},
+	})
+	if err != nil {
+		closeWorkerOwnershipStore(dispatch)
+		return fmt.Errorf("acquire worker ownership: %w", err)
+	}
+	dispatch.ownershipLease = &lease
+	return nil
+}
+
+func validateWorkerOwnership(ctx context.Context, dispatch *dispatchContext) error {
+	if dispatch == nil || dispatch.ownershipStore == nil || dispatch.ownershipLease == nil {
+		return nil
+	}
+	if err := storage.ValidateAgentOwnershipFence(ctx, dispatch.ownershipStore, *dispatch.ownershipLease); err != nil {
+		if errors.Is(err, storage.ErrOwnershipStale) {
+			dispatch.failureStatus = "needs-human"
+		}
+		return fmt.Errorf("worker ownership fence: %w", err)
+	}
+	return nil
+}
+
+func persistProviderExecutionAuthority(ctx context.Context, dispatch *dispatchContext, started agent.ProviderProcess) error {
+	if dispatch == nil || dispatch.tracker == nil {
+		return errors.New("provider execution authority dispatch context is missing")
+	}
+	if started.PID <= 0 {
+		return errors.New("provider execution authority provider pid is missing")
+	}
+	if err := validateWorkerOwnership(ctx, dispatch); err != nil {
+		return err
+	}
+	if dispatch.ownershipStore == nil || dispatch.ownershipLease == nil {
+		return nil
+	}
+	startedAt := started.ObservedAt
+	if startedAt.IsZero() {
+		startedAt = dispatch.deps.Now()
+	}
+	authority := storage.ProviderExecutionAuthority{
+		ProjectID:            dispatch.runtimeRoots.ProjectID,
+		RunID:                dispatch.opts.RunID,
+		AttemptID:            dispatch.jobID,
+		ProviderPID:          started.PID,
+		ProviderPGID:         started.PGID,
+		ProcessBirthIdentity: started.ProcessBirthIdentity,
+		ExecutableIdentity:   started.ExecutableIdentity,
+		OwnerID:              dispatch.ownershipLease.OwnerID,
+		ClaimGeneration:      dispatch.ownershipLease.ClaimGeneration,
+		StartedAt:            state.FormatTimestamp(startedAt),
+		HeartbeatAt:          state.FormatTimestamp(startedAt),
+		WorktreePath:         dispatch.worktreePath,
+		LogPath:              dispatch.logPath,
+		IdentityAmbiguous:    started.IdentityAmbiguous,
+		AmbiguityReason:      started.IdentityAmbiguityNote,
+	}
+	persisted, err := storage.PersistProviderExecutionAuthority(ctx, dispatch.ownershipStore, authority, startedAt)
+	if err != nil {
+		return fmt.Errorf("persist provider execution authority: %w", err)
+	}
+	dispatch.providerAuthorityFence = &storage.ProviderExecutionAuthorityFence{
+		ProjectID:       persisted.ProjectID,
+		RunID:           persisted.RunID,
+		AttemptID:       persisted.AttemptID,
+		OwnerID:         persisted.OwnerID,
+		ClaimGeneration: persisted.ClaimGeneration,
+	}
+	dispatch.providerAuthority = persisted
+	return nil
+}
+
+func completeProviderExecutionAuthority(dispatch *dispatchContext, terminalState string) {
+	if dispatch == nil || dispatch.ownershipStore == nil || dispatch.providerAuthorityFence == nil {
+		return
+	}
+	if err := storage.CompleteProviderExecutionAuthority(context.Background(), dispatch.ownershipStore, *dispatch.providerAuthorityFence, dispatch.deps.Now(), terminalState); err != nil {
+		fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to complete provider execution authority for %s/%s: %v\n", dispatch.opts.RunID, dispatch.jobID, err)
+	}
+}
+
+func releaseWorkerOwnership(dispatch *dispatchContext) {
+	if dispatch == nil || dispatch.ownershipStore == nil || dispatch.ownershipLease == nil {
+		return
+	}
+	if err := storage.ReleaseAgentOwnershipLease(context.Background(), dispatch.ownershipStore, *dispatch.ownershipLease, dispatch.deps.Now()); err != nil {
+		fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to release ownership lease for %s/%s: %v\n", dispatch.opts.RunID, dispatch.jobID, err)
+		return
+	}
+	dispatch.ownershipLease = nil
+}
+
+func closeWorkerOwnershipStore(dispatch *dispatchContext) {
+	if dispatch == nil || dispatch.ownershipStore == nil {
+		return
+	}
+	if err := dispatch.ownershipStore.Close(); err != nil {
+		fmt.Fprintf(dispatch.warnings, "[loopcoder] warning: failed to close ownership store: %v\n", err)
+	}
+	dispatch.ownershipStore = nil
+}
+
+func workerOwnershipOwnerID(dispatch *dispatchContext) string {
+	if dispatch == nil {
+		return ""
+	}
+	return fmt.Sprintf("worker:%s:%s:%d", strings.TrimSpace(dispatch.opts.RunID), strings.TrimSpace(dispatch.jobID), dispatch.opts.Attempt)
+}
+
+func sameOrDescendantPhysicalPath(root, child string) bool {
+	root = filepath.Clean(root)
+	child = filepath.Clean(child)
+	if root == child {
+		return true
+	}
+	separator := string(filepath.Separator)
+	return strings.HasPrefix(child, strings.TrimSuffix(root, separator)+separator)
+}
+
 type attemptTrackerOptions struct {
 	repoPath    string
 	runID       string
@@ -1102,31 +2299,34 @@ type attemptTrackerOptions struct {
 	now         func() time.Time
 	warnings    io.Writer
 	attemptPath string
+	progress    *progressRecorder
 }
 
 type attemptTracker struct {
-	repoPath       string
-	runID          string
-	jobID          string
-	issue          int
-	attempt        int
-	provider       string
-	pid            int
-	branch         string
-	logPath        string
-	startedAt      string
-	heartbeatAt    string
-	lastProgressAt string
-	phase          string
-	status         string
-	logBytes       int64
-	exitCode       *int
-	errorMessage   *string
-	usage          *reporter.Usage
-	reporter       *reporter.Report
-	now            func() time.Time
-	warnings       io.Writer
-	attemptPath    string
+	repoPath         string
+	runID            string
+	jobID            string
+	issue            int
+	attempt          int
+	provider         string
+	pid              int
+	branch           string
+	logPath          string
+	startedAt        string
+	heartbeatAt      string
+	lastProgressAt   string
+	phase            string
+	status           string
+	logBytes         int64
+	exitCode         *int
+	errorMessage     *string
+	usage            *reporter.Usage
+	reporter         *reporter.Report
+	now              func() time.Time
+	warnings         io.Writer
+	attemptPath      string
+	artifactDecision *state.ArtifactDecision
+	progress         *progressRecorder
 }
 
 func newAttemptTracker(opts attemptTrackerOptions) *attemptTracker {
@@ -1148,6 +2348,7 @@ func newAttemptTracker(opts attemptTrackerOptions) *attemptTracker {
 		now:            opts.now,
 		warnings:       opts.warnings,
 		attemptPath:    opts.attemptPath,
+		progress:       opts.progress,
 	}
 }
 
@@ -1157,6 +2358,28 @@ func (t *attemptTracker) setUsage(usage reporter.Usage) {
 
 func (t *attemptTracker) setReport(record reporter.Report) {
 	t.reporter = cloneReport(&record)
+}
+
+func (t *attemptTracker) setPID(pid int) {
+	if pid > 0 {
+		t.pid = pid
+	}
+}
+
+func (t *attemptTracker) setArtifactDecision(decision state.ArtifactDecision) {
+	t.artifactDecision = cloneArtifactDecision(&decision)
+}
+
+func (t *attemptTracker) snapshot(phase, status string) {
+	now := state.FormatTimestamp(t.now())
+	if strings.TrimSpace(phase) != "" {
+		t.phase = phase
+	}
+	if strings.TrimSpace(status) != "" {
+		t.status = status
+	}
+	t.heartbeatAt = now
+	t.writeAttempt()
 }
 
 func (t *attemptTracker) transition(phase, status string, exitCode *int, errorMessage *string) {
@@ -1201,6 +2424,9 @@ func (t *attemptTracker) transition(phase, status string, exitCode *int, errorMe
 		fmt.Fprintf(t.warnings, "[loopcoder] warning: failed to append event state %s: %v\n", state.EventsPath(t.repoPath, t.runID), err)
 	}
 	t.appendLifecycle(now, "")
+	if t.progress != nil {
+		t.progress.RecordAttempt(t.attemptRecord(), t.progressTerminal())
+	}
 }
 
 func (t *attemptTracker) appendEvent(eventName, outcome string, details any) {
@@ -1223,6 +2449,11 @@ func (t *attemptTracker) appendEvent(eventName, outcome string, details any) {
 		fmt.Fprintf(t.warnings, "[loopcoder] warning: failed to append event state %s: %v\n", state.EventsPath(t.repoPath, t.runID), err)
 	}
 	t.appendLifecycle(now, eventName)
+	if t.progress != nil && strings.TrimSpace(eventName) != "" {
+		record := t.attemptRecord()
+		record.Status = firstNonEmpty(outcome, record.Status)
+		t.progress.RecordAttempt(record, false)
+	}
 }
 
 func (t *attemptTracker) appendLifecycle(timestamp, eventName string) {
@@ -1252,28 +2483,39 @@ func (t *attemptTracker) appendLifecycle(timestamp, eventName string) {
 }
 
 func (t *attemptTracker) writeAttempt() {
-	record := state.AttemptRecord{
-		Version:        1,
-		JobID:          t.jobID,
-		Issue:          t.issue,
-		Attempt:        t.attempt,
-		Provider:       t.provider,
-		PID:            t.pid,
-		Phase:          t.phase,
-		Status:         t.status,
-		Branch:         t.branch,
-		StartedAt:      t.startedAt,
-		HeartbeatAt:    t.heartbeatAt,
-		LastProgressAt: t.lastProgressAt,
-		LogBytes:       t.logBytes,
-		ExitCode:       t.exitCode,
-		Error:          t.errorMessage,
-		Usage:          cloneUsage(t.usage),
-		Report:         cloneReport(t.reporter),
-	}
-	if _, err := state.WriteAttempt(t.repoPath, t.runID, record); err != nil {
+	if _, err := state.WriteAttempt(t.repoPath, t.runID, t.attemptRecord()); err != nil {
 		fmt.Fprintf(t.warnings, "[loopcoder] warning: failed to write durable attempt state %s: %v\n", t.attemptPath, err)
 	}
+}
+
+func (t *attemptTracker) attemptRecord() state.AttemptRecord {
+	return state.AttemptRecord{
+		Version:          1,
+		JobID:            t.jobID,
+		Issue:            t.issue,
+		Attempt:          t.attempt,
+		Provider:         t.provider,
+		PID:              t.pid,
+		Phase:            t.phase,
+		Status:           t.status,
+		Branch:           t.branch,
+		StartedAt:        t.startedAt,
+		HeartbeatAt:      t.heartbeatAt,
+		LastProgressAt:   t.lastProgressAt,
+		LogBytes:         t.logBytes,
+		ExitCode:         t.exitCode,
+		Error:            t.errorMessage,
+		Usage:            cloneUsage(t.usage),
+		Report:           cloneReport(t.reporter),
+		ArtifactDecision: cloneArtifactDecision(t.artifactDecision),
+	}
+}
+
+func (t *attemptTracker) progressTerminal() bool {
+	if !state.IsTerminalStatus(t.status) {
+		return false
+	}
+	return t.status != state.StatusSucceeded || t.phase == "cleanup"
 }
 
 func cloneReport(record *reporter.Report) *reporter.Report {
@@ -1303,6 +2545,32 @@ func cloneUsage(usage *reporter.Usage) *reporter.Usage {
 		clone.TotalTokens = &value
 	}
 	return &clone
+}
+
+func cloneArtifactDecision(decision *state.ArtifactDecision) *state.ArtifactDecision {
+	if decision == nil {
+		return nil
+	}
+	clone := *decision
+	clone.PartialArtifactPaths = append([]string(nil), decision.PartialArtifactPaths...)
+	clone.PreservationErrors = append([]string(nil), decision.PreservationErrors...)
+	clone.CleanupErrors = append([]string(nil), decision.CleanupErrors...)
+	return &clone
+}
+
+func sortedUniqueNonEmpty(values []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
 }
 
 type recoveryBriefOptions struct {

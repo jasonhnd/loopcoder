@@ -17,6 +17,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/migration"
+	"github.com/jasonhnd/loopcoder/internal/observability"
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/relaygate"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
@@ -26,6 +27,7 @@ import (
 )
 
 const (
+	SchemaVersion       = "loopcoder.report_query.v1"
 	DefaultLimit        = 20
 	notReported         = "not reported"
 	maxReportFileBytes  = 4 * 1024 * 1024
@@ -182,7 +184,7 @@ func RenderTextWithOptions(records []Record, opts RenderOptions) string {
 		fmt.Fprintf(&out, "Source\n")
 		fmt.Fprintf(&out, "- source: %s\n", display(record.Source))
 		fmt.Fprintf(&out, "- run ID: %s\n", display(record.RunID))
-		fmt.Fprintf(&out, "- path: %s\n", display(record.Path))
+		fmt.Fprintf(&out, "- source ID: %s\n", display(renderedRecordSourceID(record)))
 		if opts.Verbose {
 			fmt.Fprintf(&out, "\nRaw record\n")
 			fmt.Fprintf(&out, "- header: %s\n", r.Header())
@@ -207,15 +209,27 @@ func MarshalJSONWithRunTree(records []Record, runTree any) ([]byte, error) {
 			Report: record.Report,
 			Source: record.Source,
 			RunID:  record.RunID,
-			Path:   record.Path,
+			Path:   renderedRecordSourceID(record),
 		})
 	}
 	payload := struct {
-		Reports []reporter.Report `json:"reports"`
-		Records []jsonRecord      `json:"records"`
-		RunTree any               `json:"run_tree,omitempty"`
-	}{Reports: reports, Records: jsonRecords, RunTree: runTree}
+		SchemaVersion string                 `json:"schema_version"`
+		Observability observability.Document `json:"observability"`
+		Reports       []reporter.Report      `json:"reports"`
+		Records       []jsonRecord           `json:"records"`
+		RunTree       any                    `json:"run_tree,omitempty"`
+	}{
+		SchemaVersion: SchemaVersion,
+		Observability: ObservabilityDocument(records),
+		Reports:       reports,
+		Records:       jsonRecords,
+		RunTree:       runTree,
+	}
 	return json.Marshal(payload)
+}
+
+func renderedRecordSourceID(record Record) string {
+	return reportItemID(record)
 }
 
 type jsonRecord struct {

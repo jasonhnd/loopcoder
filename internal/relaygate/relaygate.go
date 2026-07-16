@@ -61,9 +61,8 @@ func Write(opts WriteOptions) (string, error) {
 		return "", fmt.Errorf("repo path is required")
 	}
 	role := strings.TrimSpace(opts.Role)
-	switch role {
-	case "worker", "verifier":
-	default:
+	relayRole, ok := NormalizeRole(role)
+	if !ok {
 		return "", fmt.Errorf("unsupported relay role %q", opts.Role)
 	}
 	if opts.PRNumber < 0 {
@@ -73,12 +72,12 @@ func Write(opts WriteOptions) (string, error) {
 		return "", fmt.Errorf("pretty block is required")
 	}
 
-	nonce := Nonce(opts.RunID, opts.PRNumber, role)
+	nonce := Nonce(opts.RunID, opts.PRNumber, relayRole)
 	rec := Record{
 		Version:  recordVersion,
 		Nonce:    nonce,
 		RunID:    strings.TrimSpace(opts.RunID),
-		Role:     role,
+		Role:     relayRole,
 		PRNumber: opts.PRNumber,
 		Block:    ensureTrailingNewline(opts.Block),
 		Report:   cloneReport(opts.Report),
@@ -126,6 +125,18 @@ func Write(opts WriteOptions) (string, error) {
 	}
 	cleanup = false
 	return path, nil
+}
+
+// NormalizeRole returns the supported pending-relay role for a report role.
+func NormalizeRole(role string) (string, bool) {
+	switch role {
+	case "worker", "verifier":
+		return role, true
+	case "conductor":
+		return "worker", true
+	default:
+		return "", false
+	}
 }
 
 func cloneReport(record *reporter.Report) *reporter.Report {

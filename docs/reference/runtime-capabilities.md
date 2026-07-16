@@ -10,6 +10,27 @@ model, and depth still resolve from command flags, `.delivery.yml`, and the
 static model registry. Runtime capabilities describe whether the selected
 provider or host can safely satisfy a requested invocation mode.
 
+Host negotiation has two independent axes:
+
+1. **Host invocation capability**: whether the current host can run the
+   foreground `loopcoder` subprocess, preserve stdout/stderr, pass JSON through
+   unchanged, and allow loopcoder's own timeout/cancellation supervision to
+   work.
+2. **Progress transport capability**: whether the host declares durable
+   polling, resumable follow, callbacks, wake-up, acknowledgment, host-managed
+   background work, detached steering/cancellation, and explicit payload/rate
+   limits for progress delivery.
+
+A host profile name or environment marker can only propose a profile. Active
+callback, wake-up, acknowledgment, and detached control support require
+declared handshake evidence in the versioned host negotiation request. LoopCoder
+must not infer those capabilities from `codex-cli`, `claude-code`, a process
+environment variable, or the Worker/Verifier provider choice.
+
+Future provider declarations use the same contract and must follow
+[`future-provider-adapters.md`](future-provider-adapters.md) before they can
+participate in provider inventory or later routing.
+
 ## Provider Capability Fields
 
 Each provider runtime is represented internally with these fields:
@@ -36,15 +57,38 @@ capability, supporting alternatives when known, and the local fix.
 
 | Provider | Executable | Read-only | Nested sub-agents | JSON output | MCP config | Cancellation | Token usage | Auth probe | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `codex` | `codex` | yes | no | yes | yes | yes | yes | none | Default Worker provider. |
-| `claude` | `claude` | yes | yes | yes | yes | yes | yes | none | Verified Worker and Verifier provider. |
-| `gemini` | `gemini` | yes | no | yes | yes | yes | yes | none | Experimental direct Gemini path, outside the static model registry. |
-| `antigravity` | `agy` | no | no | no | no | yes | no | `agy models` | Worker-only path. Uses plain text summary capture and self-reported selected model string. |
+| `codex` | `codex` | yes | no | yes | yes | yes | yes | `codex login status` | Default Worker provider; local status text only. |
+| `claude` | `claude` | yes | yes | yes | yes | yes | yes | `claude auth status --json` | Verified Worker and Verifier provider; local machine-readable status fields only. |
+| `gemini` | `gemini` | yes | no | yes | yes | yes | yes | reference existence only | Experimental direct Gemini path; checks declared auth artifact and environment-name existence without reading values. |
+| `antigravity` | `agy` | no | no | no | no | yes | no | `agy models` | Worker-only path. Declared network probe is skipped by default. |
+| `grok` | `grok` | yes | no | yes | no | yes | yes | `grok models` | Official Grok Build CLI only; auth/catalog probing is network-declared and skipped unless explicitly granted. |
 
 `antigravity` is the clearest partial provider today. If selected for a
 read-only invocation, an MCP-backed invocation, or schema-enforced JSON output,
 loopcoder must fail closed before launching `agy` and point the user to a
 supporting provider such as `codex` or `claude`.
+
+`grok` runs only with an approved execution profile. The adapter probes
+`grok version` and `grok --help` before launch, requires `-p`, `--cwd`,
+`--output-format`, `--no-auto-update`, `--no-alt-screen`, `--sandbox`,
+`--permission-mode`, `--allow`, and `--deny`, and fails closed when the
+installed CLI does not advertise the requested read-only or strict write mode.
+The adapter canonicalizes the worktree path, rejects workspace symlinks that
+resolve outside that physical workspace, replaces user home/config/temp roots
+with private per-attempt directories, passes only an environment allowlist plus
+`XAI_API_KEY`, disables memory, subagents, web search, auto-update, Bash,
+WebFetch, and MCP tools through CLI flags, and rejects known project-local
+Claude/Grok configuration sources before launch. Provider-controlled account,
+server-side conversation, and model state may still exist behind the official
+CLI; loopcoder records only redacted session references and normalized
+receipts. The detailed inherited-source inventory is in
+[`../security/grok-isolation.md`](../security/grok-isolation.md).
+Grok model discovery is dynamic when the operator grants
+`provider:grok/action:auth-catalog-inventory` style inventory access; otherwise
+the provider-machine catalog is recorded as unavailable rather than guessed.
+LoopCoder does not read Grok credential files or secret environment values,
+does not perform login, does not auto-install or auto-update Grok Build, and
+does not call a direct xAI API.
 
 ## Compatibility Smoke Matrix
 
@@ -53,6 +97,56 @@ from the runtime capability contract. Each entry has `provider`, `host`, `role`,
 `support`, `status`, `code`, and the required or missing provider capabilities.
 The matrix is local and static; it does not log in, launch paid remote calls, or
 try to automate provider authentication.
+
+Provider-native sub-agent eligibility is stricter than a static adapter claim:
+the live scheduler requires fresh durable provider inventory, task requirement,
+budget reservation, scope, ownership-lock, and plan/policy fingerprint authority
+before a native child can launch. `codex`, `gemini`, `antigravity`, and `grok`
+remain unsupported for provider-native sub-agents in the live matrix until a
+future provider passes the same conformance suite with accepted capability
+evidence. Grok's ordinary-worker conformance does not imply native federation
+or provider-native subagent support.
+
+`doctor --format json` also includes `provider_inventory`, and
+`loopcoder providers refresh --repo .` persists the same bounded installation,
+auth-readiness, and model catalog inventory in machine-local SQLite.
+ProviderInstallation, ProbeResult, AccountProfile, AuthReadiness,
+ModelCatalogSnapshot, and ModelCapability records show discovery source,
+redacted executable/profile provenance, captured time, freshness, confidence,
+probe outcome, output bounds, and `usable_for_invocation: "unknown"` from
+installation evidence alone.
+Provider installation probes pass only a bounded environment allowlist for
+location and platform facts; script shims may receive variables such as
+`LOCALAPPDATA`, `APPDATA`, `SystemRoot`, `ComSpec`, `PATH`, `PATHEXT`, `TMPDIR`,
+`LANG`, and `LC_ALL`, but credential-like variable names are denied regardless
+of allowlist membership.
+
+Auth readiness probes are credential-blind. Unsupported providers emit
+`readiness_state: "unknown"` with an explicit reason. A runtime-declared
+network auth probe is skipped unless a future permission path grants network
+access; today Antigravity's `agy models` is recorded with
+`network_declared: true`, `network_permission: "denied"`, and
+`network-permission-denied`. No current adapter exposes a safe
+machine-readable expiry value, so the implementation does not emit or persist
+an `expires_at` field.
+
+Built-in local declarations are part of `internal/runtimecap`: Codex uses
+`codex login status` as sanctioned local status text, Claude uses
+`claude auth status --json` as declared non-secret machine-readable status,
+Gemini reports only auth-reference existence, Antigravity declares
+`agy models` as network-capable so it is recorded but not run by default, and
+Grok declares `grok models` as the network-capable auth/catalog surface.
+Quota telemetry for Grok remains confidence-scoped to what the official CLI
+returns. Exact account quota, subscription limits, reset windows, or
+provider-wide allowance are not inferred when the CLI does not report them.
+
+ModelCapability records reuse this same capability vocabulary rather than
+creating a parallel model-tier scheme. `read_only`, `json_output`,
+`nested_subagents`, `mcp_config`, `cancellation`, and
+`token_usage_reporting` are `true`, `false`, or `unknown` facts with
+provenance and freshness. Unknown or stale values do not satisfy hard
+requirements; routing policies must use the exact `model_catalog_snapshot_id`
+and `model_capability_id` when they consume catalog evidence.
 
 Support levels:
 
@@ -70,6 +164,7 @@ Current role matrix:
 | `claude` | supported | supported | supported |
 | `gemini` | experimental | experimental | unsupported |
 | `antigravity` | experimental | unsupported | unsupported |
+| `grok` | experimental | experimental | unsupported |
 
 Current host matrix:
 
@@ -112,14 +207,107 @@ Required host behavior:
 | Timeouts | The host can keep the session open long enough for configured hard caps, or terminate cleanly and let recovery re-derive state. |
 | No private API dependency | Host integration may use documented hooks or local subprocess behavior, but core delivery cannot require private host APIs. |
 
+The host negotiation record is `loopcoder.host_negotiation.v1`. It is pure
+data: evaluating it must not launch providers, collect provider inventory,
+write delivery records, open callbacks, wake hosts, perform network I/O, or
+start background supervisors.
+
+Progress delivery records stay provider-neutral. Receipt generation, transport
+write, host acceptance, user visibility, and acknowledgment are distinct states
+with distinct evidence requirements. Negotiation may say that a stage requires
+evidence, is local-only, is replay-only, or is unsupported, but it must not
+claim acceptance, visibility, or acknowledgment until the progress outbox has
+the exact matching transport evidence.
+
+Progress transport fallback order is deterministic:
+
+1. `acknowledged-streaming` when callbacks, wake-up, and acknowledgment are all
+   declared supported.
+2. `unacknowledged-streaming` when callbacks and wake-up are declared supported
+   but acknowledgment is not.
+3. `durable-follow-poll` when durable polling or resumable follow is declared
+   supported.
+4. `known-origin-next-invocation-replay` when an opaque run origin is bound but
+   no active wake path is declared.
+5. `next-invocation-replay` for generic, unknown, partial, or unsupported
+   active transport declarations.
+
+The optional run origin is bound with
+`loopcoder.host_run_origin.v1`. The binding is scoped to exactly one
+`project_id`, `delivery_run_id`, and `correlation_id`, and it persists only
+redacted identifiers, metadata keys, and digests. Raw opaque host tokens,
+credentials, local paths, and secret-like values are not authority and must not
+be persisted or rendered. Replaying the same origin in the same scope produces
+the same binding; replaying it for another project, run, or correlation produces
+a different binding and cannot authorize delivery for the original scope.
+
 Current host profiles:
 
 | Host profile | Invocation style | Hooks | Notes |
 | --- | --- | --- | --- |
 | `codex-cli` | Interactive Codex CLI conductor session calls `loopcoder` as a local subprocess. | best-effort/manual | Codex hook enforcement is best-effort unless manually wired. |
 | `claude-code` | Claude Code skill or conductor session calls `loopcoder` as a local subprocess. | supported | Project hook install writes conductor reporter and relay guard commands. |
-| `paseo-style` | External conductor or agent supervisor calls `loopcoder` as a local subprocess. | host-owned | The host owns session lifetime and must keep stderr visible for relay obligations. |
+| `paseo-style` | External conductor or agent supervisor calls `loopcoder` as a local subprocess. | host-owned | Optional host transport. The current adapter records only LoopCoder-local durable status/follow plus matching-origin next-invocation replay; no documented Paseo callback, targeted wake, visibility, or acknowledgment surface has been proven. |
 | `generic-local` | Unknown local agent host calls `loopcoder` as a subprocess. | unknown | Fallback when no explicit profile or known host signal is available. |
+
+Progress delivery capabilities are declared per host surface, not inferred from
+provider/model selection. Codex CLI and Claude Code support foreground
+stdout/stderr, JSON pass-through, durable `status --receipts`, and resumable
+`attach` follow as LoopCoder local surfaces. Paseo-style hosts currently inherit
+only those LoopCoder-local durable status/follow and matching-origin replay
+surfaces; LoopCoder has not found documented Paseo poll/follow, callback,
+targeted wake, visibility, or acknowledgment evidence. Claude Code also supports
+documented project hooks for observing local tool events, but hook invocation is
+only hook evidence; it is not evidence that the original user saw a message,
+that a session woke up, or that a progress receipt was acknowledged. Until a
+documented targeted wake or callback path is proven by an opt-in integration
+fixture, these hosts fall back to local durable follow/poll and matching-origin
+next-invocation replay for terminal or consequential detached progress.
+
+### Paseo Host Delivery
+
+Paseo is optional. If it is absent, disconnected, incompatible, or not selected
+by `LOOPCODER_HOST`, `.delivery.yml` `host.profile`, or known environment
+markers, LoopCoder continues with the normal host profile resolution and durable
+local receipt surfaces. No Paseo package is linked into LoopCoder core.
+
+When `PASEO_AGENT_ID` is present, LoopCoder may bind the run to a redacted
+Paseo origin for durable next-invocation replay. The raw agent id is never
+persisted; only a scoped digest, origin reference, and bounded marker-key
+evidence such as `env.PASEO_AGENT_ID` are stored. `PASEO_HOST` is a presence
+marker only. By itself it can help detect a Paseo-style host, but it does not
+create an origin binding and is not evidence of a callback, managed task,
+targeted wake, user visibility, or acknowledgment capability.
+
+The current negotiated Paseo transport is `durable-follow-poll` with `no-ack`,
+where durable follow/poll means LoopCoder's local receipt store, `status`, and
+`attach` surfaces. It is not evidence of a documented Paseo polling or following
+API.
+`callbacks`, `wake-up`, `acknowledgment`, and LoopCoder-managed background
+delivery through Paseo are advertised as unsupported until a documented Paseo
+surface and an opt-in macOS Apple Silicon integration fixture prove targeted
+progress and terminal delivery to the original session after the foreground
+turn ends. The credential-free real smoke fixture checks only that a supported
+Paseo CLI can be inspected and that LoopCoder does not claim wake/ack from CLI
+presence alone; `paseo --version` is not wake evidence.
+
+Fallback behavior is intentionally local and provider-neutral:
+
+- Use `loopcoder status --repo . --run <run-id> --receipts` for durable receipt
+  history.
+- Use `loopcoder status --repo . --follow --run <run-id>` or
+  `loopcoder attach --repo . --run <run-id>` for follow/poll.
+- On a later invocation from the same redacted Paseo origin, pending terminal or
+  consequential receipts replay exactly once before new dispatch work starts.
+- Host delivery failure, callback timeout/unsupported status, host disconnect,
+  daemon restart, session refresh, or the upstream Paseo #2034 Claude refresh
+  race must not cancel a healthy worker, renew its watchdog, alter run state, or
+  change provider/model routing.
+
+Paseo is a host transport here, not a Worker or Verifier provider. Worker and
+Verifier provider selection remains controlled by `.delivery.yml` and command
+flags, and may use Codex, Claude, Gemini, Grok, or future providers while the
+Paseo adapter only scopes host progress replay.
 
 ## Host Profile Resolution
 

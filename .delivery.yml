@@ -41,7 +41,7 @@ verifier:
 #     Optional. Absent = 300; kill the verifier provider CLI after this many seconds with no log output or worktree file activity (stall).
 #     stall_timeout_seconds: 300
 ci:
-  checks: [verify, go, staticcheck, govulncheck, audit]
+  checks: [verify, test, race, security]
   # Optional. Absent = no local test command gate.
   # tests:
   #   - bun run test
@@ -65,6 +65,14 @@ ci:
 #       - app/**
 #       - "**/*.css"
 #       - "**/*.tsx"
+# orchestration:
+#   cost_budget:
+#     Optional conservative per-run caps; defaults shown below.
+#     max_model_calls: 8
+#     max_tokens: 500000
+#     Release integration fails closed when coordination tokens exceed this
+#     percentage of useful Worker + Verifier tokens.
+#     max_overhead_percent: 10
 report:
   channel: chat
 audit:

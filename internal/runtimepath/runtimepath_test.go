@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/relay"
 	"github.com/jasonhnd/loopcoder/internal/relaygate"
@@ -251,6 +252,7 @@ func initRepoWithOrigin(t *testing.T, repo, remote string) {
 	} {
 		cmd := exec.Command("git", args...)
 		cmd.Dir = repo
+		cmd.Env = gitutil.CleanEnv(os.Environ())
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, out)
 		}

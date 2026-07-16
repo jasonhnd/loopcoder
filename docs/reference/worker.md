@@ -23,16 +23,23 @@ registry. The registered worker providers are:
 - `codex` (default; verified)
 - `claude` (verified)
 - `antigravity` (Google Antigravity CLI path through executable `agy`)
+- `grok` (Grok Build CLI ordinary Worker/Verifier path)
 - `gemini` (experimental/unverified)
 
 `loopcoder models` exposes the static model registry for `codex`, `claude`,
-and `antigravity`. The older direct `gemini` worker adapter code is still
-present and registered, but it is experimental and is not part of the static
-model registry because the Antigravity provider is the current Gemini-family
-target path.
+`antigravity`, and Grok's built-in default model entry. Grok inventory can also
+discover the operator's currently available models through the official
+`grok models` surface when an explicit network inventory grant is provided.
+The older direct `gemini` worker adapter code is still present and registered,
+but it is experimental and is not part of the static model registry because
+the Antigravity provider is the current Gemini-family target path.
 
-The provider is selected per dispatch with the `--provider` flag and defaults to
-`codex`. The registry rejects any unknown provider with an actionable error.
+The provider is selected per dispatch with the `--provider` flag and defaults
+to `codex`. The registry rejects any unknown provider with an actionable error.
+LoopCoder does not install, update, log in to, or provision subscription access
+for provider CLIs. Operators own Grok Build installation and authentication
+outside loopcoder; loopcoder only probes declared, bounded status/catalog
+commands and launches the selected local executable.
 
 `--model` and `--effort` are provider-specific overrides. When either value is
 absent, loopcoder resolves it from `.delivery.yml` and then from the static
@@ -93,6 +100,12 @@ Worker reports are surfaced locally only: the `dispatch` stdout records, the
 dispatch result JSON `report` object, stderr pretty output, and gitignored
 `.loopcoder/` run records. The PR body does not carry reports; it should
 contain delivery text such as the issue closing line and provider summary.
+The local usage ledger ingests these same report surfaces when token usage is
+present. It normalizes input, output, and total token quantities into
+append-only records with deterministic replay keys; duplicate reporter events
+and replayed relay records resolve to the same usage IDs instead of increasing
+totals. Ledger summaries stay local-only and do not claim provider-wide quota
+or exact remaining capacity.
 
 This replaces the older bare `worker: <provider>` line. If report
 validation fails, including missing model identity or token usage, dispatch
@@ -155,6 +168,44 @@ plain stdout as the summary and writes stdout/stderr to the normal provider log.
 Antigravity read-only mode is not available or verified, so read-only
 Verifier/audit invocations fail closed before launching `agy`.
 
+The `grok` adapter runs the official Grok Build CLI with a bounded headless
+profile:
+
+```text
+grok --no-auto-update -p <prompt> --cwd <physical-worktree> --output-format streaming-json --no-alt-screen --disable-web-search --no-subagents --no-memory --permission-mode dontAsk ...
+```
+
+For write-mode Workers it adds `--sandbox strict`, allows `Read`, `Grep`, and
+`Edit(**)`, and denies `Bash(*)`, `WebFetch(*)`, and `MCPTool(*)`. For
+read-only Verifier/audit calls it adds `--sandbox read-only`, allows only
+`Read` and `Grep`, and denies `Edit(*)`, `Bash(*)`, `WebFetch(*)`, and
+`MCPTool(*)`.
+
+Before any Grok launch, loopcoder probes `grok version` and `grok --help` with
+the same isolated environment used for execution. Supported versions must be at
+least `0.1.0` and must advertise the required headless, workspace, sandbox, and
+permission flags. Missing support is an actionable fail-closed error before
+the provider starts.
+
+The adapter resolves the worktree to its physical path, passes that path as
+both process directory and `--cwd`, rejects symlinks inside the worktree that
+resolve outside the accepted workspace, replaces user home/config/temp
+directories with private per-attempt roots, and passes only an environment
+allowlist plus `XAI_API_KEY`. It also refuses to run when known project-local
+Claude/Grok settings, hooks, plugins, agents, commands, MCP, or memory files
+are present, because the current official CLI surface does not expose a
+documented flag that proves they are ignored. See
+[`../security/grok-isolation.md`](../security/grok-isolation.md) for the full
+inventory and residual provider-controlled state.
+
+Grok execution is ordinary Worker/Verifier execution only. LoopCoder does not
+call a direct xAI API, does not estimate exact account quota, does not
+auto-install or auto-update Grok Build, and does not treat provider-native
+subagents or native federation as supported evidence for Grok. Token usage,
+cost, and quota-like telemetry are recorded only when the official CLI returns
+machine-readable values through the bounded surfaces, and unknown provider
+quota remains explicitly unknown.
+
 ## Why VCS Stays In The Adapter
 
 The adapter, not Codex, commits, pushes, and opens the PR. This keeps VCS state
@@ -178,7 +229,7 @@ deterministic and in the conductor's hands:
 | `--run-id` | No | generated | Run id used for attempt state and recovery context. |
 | `--attempt` | No | `1` | Attempt number recorded in state and recovery output. |
 | `--recovery-context` | No | unset | Prior recovery context to append to the worker prompt. |
-| `--provider` | No | `codex` | Worker provider registered in the provider registry: `codex`, `claude`, `antigravity`, or experimental/unverified `gemini`. |
+| `--provider` | No | `codex` | Worker provider registered in the provider registry: `codex`, `claude`, `grok`, `antigravity`, or experimental/unverified `gemini`. |
 | `--model` | No | resolved registry default | Optional provider-specific model override. When absent, role config and then the provider registry default are used. |
 | `--effort` | No | resolved model default | Optional provider-specific reasoning effort/depth override. When absent, role config and then the resolved model's default depth are used. |
 | `--strict` | No | false | Reject invalid model/depth selections instead of warning and preserving the pass-through value. |

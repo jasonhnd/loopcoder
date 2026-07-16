@@ -1,0 +1,77 @@
+schema_version: loopcoder.evaluation.simulation_result.v1
+scenario_id: fallback-rate-limit-outage-bounded
+seed: 1
+clock: 2026-07-14T00:00:00Z step_ms=10
+policy: version=simulation-release-policy-v3 profile=release-regression-profile fingerprint=sha256:fallback-rate-limit-outage-bounded-policy plan=sha256:fallback-rate-limit-outage-bounded-plan authorization=sha256:fallback-rate-limit-outage-bounded-auth
+sources: project=project-release-regression delivery=delivery-fallback-rate-limit-outage-bounded inventory=inventory-fallback-rate-limit-outage-bounded budget=budget-fallback-rate-limit-outage-bounded routing=routing-fallback-rate-limit-outage-bounded agent_tree=agent-tree-fallback-rate-limit-outage-bounded handoff=handoff-fallback-rate-limit-outage-bounded state=durable-state-fallback-rate-limit-outage-bounded
+truncated: false
+decisions:
+- decision_036d614b988ab629ad5889424dcad1fc event=event-provider-attempt-05 task=task-a kind=routing accepted=true chosen=model-a budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-a
+  rejected=model-outage code=provider-not-installed reason=provider installation is not installed
+- decision_03a7cd7195136f09b9dd89a1be09b8f9 event=event-provider-attempt-03 task=task-a kind=routing accepted=true chosen=model-a budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-a
+  rejected=model-outage code=provider-not-installed reason=provider installation is not installed
+- decision_7f0131b03e02e90526609a8367467a64 event=event-provider-attempt-02 task=task-a kind=routing accepted=true chosen=model-a budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-a
+  rejected=model-outage code=provider-not-installed reason=provider installation is not installed
+- decision_8bc0b296b0af0b195df47a38e4762606 event=event-route task=task-a kind=routing accepted=true chosen=model-a budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-a
+  rejected=model-outage code=provider-not-installed reason=provider installation is not installed
+- decision_93f4347a6ea7227496dae8e26fbbec72 event=event-provider-attempt-07 task=task-a kind=routing accepted=true chosen=model-a budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-a
+  rejected=model-outage code=provider-not-installed reason=provider installation is not installed
+- decision_966e3ea4a60ab140fe3ac79b82b134b7 event=event-provider-attempt-06 task=task-a kind=routing accepted=true chosen=model-a budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-a
+  rejected=model-outage code=provider-not-installed reason=provider installation is not installed
+- decision_a6115b3505622c79c8d702a8cbd46873 event=event-call task=task-a kind=routing accepted=true chosen=model-a budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-a
+  rejected=model-outage code=provider-not-installed reason=provider installation is not installed
+- decision_ae59bb12091be9c9647246c87e72eb5b event=event-provider-attempt-08 task=task-a kind=routing accepted=true chosen=model-a budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-a
+  rejected=model-outage code=provider-not-installed reason=provider installation is not installed
+- decision_e3021dd6f59354812b10f4be89828722 event=event-provider-attempt-01 task=task-a kind=routing accepted=true chosen=model-a budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-a
+  rejected=model-outage code=provider-not-installed reason=provider installation is not installed
+- decision_f94bb26d1dd8fa8e940ea581b160f28d event=event-provider-attempt-04 task=task-a kind=routing accepted=true chosen=model-a budget=budget-a reason=selected deterministic eligible candidate
+  quota_snapshots=quota-a
+  rejected=model-outage code=provider-not-installed reason=provider installation is not installed
+events:
+- 001 event-provider-attempt-01 kind=provider_call task=task-a status=failed decision=decision_e3021dd6f59354812b10f4be89828722 receipt=provider_receipt_b1abae89e0ae1e7697ed6ef06714acec idem=idem_e3021dd6f59354812b10f4be89828722 at=2026-07-14T00:00:00Z
+- 002 event-provider-attempt-02 kind=provider_call task=task-a status=applied decision=decision_7f0131b03e02e90526609a8367467a64 receipt=provider_receipt_a892836570fcb11b87dcf9ad78516db4 idem=idem_7f0131b03e02e90526609a8367467a64 at=2026-07-14T00:00:00.01Z
+- 003 event-provider-attempt-03 kind=provider_call task=task-a status=applied decision=decision_03a7cd7195136f09b9dd89a1be09b8f9 receipt=provider_receipt_241016da540be4ed4230e3425185e749 idem=idem_03a7cd7195136f09b9dd89a1be09b8f9 at=2026-07-14T00:00:00.02Z
+- 004 event-provider-attempt-04 kind=provider_call task=task-a status=applied decision=decision_f94bb26d1dd8fa8e940ea581b160f28d receipt=provider_receipt_a75185979a15c3efd96d53d905109a65 idem=idem_f94bb26d1dd8fa8e940ea581b160f28d at=2026-07-14T00:00:00.03Z
+- 005 event-provider-attempt-05 kind=provider_call task=task-a status=applied decision=decision_036d614b988ab629ad5889424dcad1fc receipt=provider_receipt_6fd07731241e15e63a139b74dc358c40 idem=idem_036d614b988ab629ad5889424dcad1fc at=2026-07-14T00:00:00.04Z
+- 006 event-provider-attempt-06 kind=provider_call task=task-a status=applied decision=decision_966e3ea4a60ab140fe3ac79b82b134b7 receipt=provider_receipt_4fcc024b6b8965bd13db4d9d22f3210d idem=idem_966e3ea4a60ab140fe3ac79b82b134b7 at=2026-07-14T00:00:00.05Z
+- 007 event-provider-attempt-07 kind=provider_call task=task-a status=applied decision=decision_93f4347a6ea7227496dae8e26fbbec72 receipt=provider_receipt_fca6711025877f2f0687e22f5f3c9bcb idem=idem_93f4347a6ea7227496dae8e26fbbec72 at=2026-07-14T00:00:00.06Z
+- 008 event-provider-attempt-08 kind=provider_call task=task-a status=applied decision=decision_ae59bb12091be9c9647246c87e72eb5b receipt=provider_receipt_ae67221c6ab7ad311ab3bfcff91eebfe idem=idem_ae59bb12091be9c9647246c87e72eb5b at=2026-07-14T00:00:00.07Z
+- 009 event-call kind=provider_call task=task-a status=applied decision=decision_a6115b3505622c79c8d702a8cbd46873 receipt=provider_receipt_78fc177039a4afbc0fa79892efb8588b idem=idem_a6115b3505622c79c8d702a8cbd46873 at=2026-07-14T00:00:00.08Z
+- 010 event-route kind=route_task task=task-a status=applied decision=decision_8bc0b296b0af0b195df47a38e4762606 receipt= idem=idem_8bc0b296b0af0b195df47a38e4762606 at=2026-07-14T00:00:00.09Z
+durable_state:
+- applied_events=event-call,event-provider-attempt-02,event-provider-attempt-03,event-provider-attempt-04,event-provider-attempt-05,event-provider-attempt-06,event-provider-attempt-07,event-provider-attempt-08,event-route
+- completed_tasks=task-a
+- provider_receipts:
+  - provider_receipt_241016da540be4ed4230e3425185e749 event=event-provider-attempt-03 task=task-a model=model-a status=succeeded failure= latency_ms=100 cost_microunits=10
+  - provider_receipt_4fcc024b6b8965bd13db4d9d22f3210d event=event-provider-attempt-06 task=task-a model=model-a status=succeeded failure= latency_ms=100 cost_microunits=10
+  - provider_receipt_6fd07731241e15e63a139b74dc358c40 event=event-provider-attempt-05 task=task-a model=model-a status=succeeded failure= latency_ms=100 cost_microunits=10
+  - provider_receipt_78fc177039a4afbc0fa79892efb8588b event=event-call task=task-a model=model-a status=succeeded failure= latency_ms=100 cost_microunits=10
+  - provider_receipt_a75185979a15c3efd96d53d905109a65 event=event-provider-attempt-04 task=task-a model=model-a status=succeeded failure= latency_ms=100 cost_microunits=10
+  - provider_receipt_a892836570fcb11b87dcf9ad78516db4 event=event-provider-attempt-02 task=task-a model=model-a status=succeeded failure= latency_ms=100 cost_microunits=10
+  - provider_receipt_ae67221c6ab7ad311ab3bfcff91eebfe event=event-provider-attempt-08 task=task-a model=model-a status=succeeded failure= latency_ms=100 cost_microunits=10
+  - provider_receipt_b1abae89e0ae1e7697ed6ef06714acec event=event-provider-attempt-01 task=task-a model=model-a status=failed failure=rate-limit latency_ms=100 cost_microunits=10
+  - provider_receipt_fca6711025877f2f0687e22f5f3c9bcb event=event-provider-attempt-07 task=task-a model=model-a status=succeeded failure= latency_ms=100 cost_microunits=10
+- host_deliveries:
+  - none
+- partial_results:
+  - none
+- owner_conflicts:
+  - none
+- handoffs:
+  - none
+- agent_owners:
+  - none
+invariants:
+- inv-fallback-route kind=route_accepted passed=true diagnostic=
+diagnostics:
+- ErrProviderFailure simulated provider failure rate-limit for model model-a
+diff: changed=true before=sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a after=sha256:6e1c72c913fa9e96c8dc000fa4a42a4abe19be706b623b166394de3a3ae5acd5 added_events=event-call,event-provider-attempt-02,event-provider-attempt-03,event-provider-attempt-04,event-provider-attempt-05,event-provider-attempt-06,event-provider-attempt-07,event-provider-attempt-08,event-route added_decisions=decision_036d614b988ab629ad5889424dcad1fc,decision_03a7cd7195136f09b9dd89a1be09b8f9,decision_7f0131b03e02e90526609a8367467a64,decision_8bc0b296b0af0b195df47a38e4762606,decision_93f4347a6ea7227496dae8e26fbbec72,decision_966e3ea4a60ab140fe3ac79b82b134b7,decision_a6115b3505622c79c8d702a8cbd46873,decision_ae59bb12091be9c9647246c87e72eb5b,decision_e3021dd6f59354812b10f4be89828722,decision_f94bb26d1dd8fa8e940ea581b160f28d

@@ -17,24 +17,27 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/gitremote"
 	"github.com/jasonhnd/loopcoder/internal/pathid"
 
-	_ "modernc.org/sqlite"
 	moderncsqlite "modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 9
+	CurrentSchemaVersion = 30
 
 	driverName = "sqlite"
 
 	rollbackTimeout = 5 * time.Second
+
+	defaultWriteTxRetryMaxAttempts = 8
+	defaultWriteTxRetryMaxElapsed  = 6 * time.Second
 )
 
 // Store is the internal storage interface for v0.7 runtime state.
 type Store interface {
 	Close() error
 	Path() string
+	Now() time.Time
 	Health(context.Context) (Health, error)
 	WithTx(context.Context, func(Tx) error) error
 	WithWriteTx(context.Context, func(Tx) error) error
@@ -51,7 +54,47 @@ type Tx interface {
 type Options struct {
 	Path string
 	Now  func() time.Time
+
+	BusyTimeout time.Duration
+
+	WriteTxCommitHookForTest WriteTxCommitHookForTest
+	WriteTxRetry             WriteTxRetryOptions
+
+	deliveryV10BackupHookForTest          deliveryV10BackupHookForTest
+	deliveryV10BackupBufferFactoryForTest func() []byte
 }
+
+// WriteTxCommitHookForTest lets tests inject deterministic failures at the
+// final write transaction boundary without sharing mutable package state.
+type WriteTxCommitHookForTest func(context.Context, Tx, func(context.Context) error) error
+
+// WriteTxRetryOptions controls bounded whole-transaction retry for SQLite
+// BUSY/LOCKED contention. Zero values use the production defaults.
+type WriteTxRetryOptions struct {
+	MaxAttempts int
+	MaxElapsed  time.Duration
+	Backoff     func(attempt int) time.Duration
+	Clock       WriteTxRetryClock
+}
+
+// WriteTxRetryClock lets tests advance retry time without real sleeps.
+type WriteTxRetryClock interface {
+	Now() time.Time
+	Sleep(context.Context, time.Duration) error
+}
+
+type deliveryV10BackupPhase string
+
+const (
+	deliveryV10BackupPhaseBeforeVacuum deliveryV10BackupPhase = "before-vacuum"
+	deliveryV10BackupPhaseAfterVacuum  deliveryV10BackupPhase = "after-vacuum"
+	deliveryV10BackupPhaseAfterHash    deliveryV10BackupPhase = "after-hash"
+	deliveryV10BackupPhaseBeforeRename deliveryV10BackupPhase = "before-rename"
+)
+
+// deliveryV10BackupHookForTest lets tests inject cancellation or faults at
+// deterministic backup boundaries without package-global mutable state.
+type deliveryV10BackupHookForTest func(context.Context, deliveryV10BackupPhase, string) error
 
 // Health reports the local database state without exposing table internals.
 type Health struct {
@@ -63,9 +106,15 @@ type Health struct {
 }
 
 type sqliteStore struct {
-	path string
-	db   *sql.DB
-	now  func() time.Time
+	path                                  string
+	db                                    *sql.DB
+	now                                   func() time.Time
+	busyTimeout                           time.Duration
+	writeTxCommitHookForTest              WriteTxCommitHookForTest
+	writeTxRetry                          writeTxRetryPolicy
+	sourceExistedBeforeOpen               bool
+	deliveryV10BackupHookForTest          deliveryV10BackupHookForTest
+	deliveryV10BackupBufferFactoryForTest func() []byte
 }
 
 type sqlTx struct {
@@ -75,6 +124,16 @@ type sqlTx struct {
 type sqlConnTx struct {
 	conn *sql.Conn
 }
+
+type writeTxRetryPolicy struct {
+	maxAttempts        int
+	maxElapsed         time.Duration
+	backoff            func(attempt int) time.Duration
+	clock              WriteTxRetryClock
+	useAttemptDeadline bool
+}
+
+type realWriteTxRetryClock struct{}
 
 var rollbackConnTxHookForTest func(*sql.Conn) error
 
@@ -286,9 +345,182 @@ var migrations = []migration{
 				WHERE phase = '' OR phase = 'claimed'`,
 		},
 	},
+	{
+		version: 10,
+		name:    "delivery run contracts",
+	},
+	{
+		version:    11,
+		name:       "provider inventory",
+		statements: providerInventorySchemaStatements,
+	},
+	{
+		version:    12,
+		name:       "quota telemetry",
+		statements: quotaTelemetrySchemaStatements,
+	},
+	{
+		version:    13,
+		name:       "usage ledger",
+		statements: usageLedgerSchemaStatements,
+	},
+	{
+		version:    14,
+		name:       "hierarchical budget accounting",
+		statements: budgetSchemaStatements,
+	},
+	{
+		version:    15,
+		name:       "scoped budget reservation idempotency",
+		statements: budgetSchemaV15Statements,
+	},
+	{
+		version:    16,
+		name:       "task requirement classification",
+		statements: taskRequirementSchemaStatements,
+	},
+	{
+		version:    17,
+		name:       "agent federation registration",
+		statements: agentFederationSchemaStatements,
+	},
+	{
+		version:    18,
+		name:       "availability read model",
+		statements: availabilitySchemaStatements,
+	},
+	{
+		version: 19,
+		name:    "bounded circuit breaker recovery",
+		apply:   migrateCircuitBreakerRecovery,
+	},
+	{
+		version:    20,
+		name:       "accepted task graph versions",
+		statements: acceptedTaskGraphSchemaStatements,
+	},
+	{
+		version:    21,
+		name:       "explainable routing decisions",
+		statements: routingDecisionSchemaStatements,
+	},
+	{
+		version:    22,
+		name:       "versioned routing policy profiles",
+		statements: routingPolicyProfileSchemaStatements,
+	},
+	{
+		version:    23,
+		name:       "fallback and replan decisions",
+		statements: fallbackReplanSchemaStatements,
+	},
+	{
+		version:    24,
+		name:       "independent verification decisions",
+		statements: verificationDecisionSchemaStatements,
+	},
+	{
+		version:    25,
+		name:       "canonical progress receipts",
+		statements: progressReceiptSchemaStatements,
+	},
+	{
+		version:    26,
+		name:       "durable handoff transactions",
+		statements: handoffSchemaStatements,
+	},
+	{
+		version:    27,
+		name:       "nested scheduler resource reservations",
+		statements: nestedSchedulerReservationSchemaStatements,
+	},
+	{
+		version:    28,
+		name:       "progress delivery outbox",
+		statements: progressDeliveryOutboxSchemaStatements,
+	},
+	{
+		version:    29,
+		name:       "detached run supervisors",
+		statements: detachedRunSupervisorSchemaStatements,
+	},
+	{
+		version:    30,
+		name:       "provider execution authority",
+		statements: providerExecutionAuthoritySchemaStatements,
+	},
 }
 
-var requiredTables = []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "run_claims", "legacy_import_records", "legacy_import_status"}
+var requiredTables = []string{
+	"migrations",
+	"projects",
+	"runs",
+	"run_events",
+	"run_edges",
+	"reports",
+	"child_plans",
+	"run_claims",
+	"legacy_import_records",
+	"legacy_import_status",
+	"delivery_runs",
+	"delivery_tasks",
+	"delivery_dependency_edges",
+	"delivery_attempts",
+	"delivery_decisions",
+	"delivery_approvals",
+	"delivery_overrides",
+	"delivery_plan_fingerprints",
+	"delivery_idempotency",
+	"delivery_migration_backups",
+	"delivery_legacy_imports",
+	"adapter_declarations",
+	"provider_installations",
+	"provider_probe_results",
+	"account_profiles",
+	"auth_readiness",
+	"model_catalog_snapshots",
+	"model_capabilities",
+	"quota_telemetry_sources",
+	"quota_snapshots",
+	"usage_records",
+	"usage_reconciliations",
+	"budget_policies",
+	"budget_reservations",
+	"budget_aggregates",
+	"quota_budget_events",
+	"inventory_events",
+	"task_requirements",
+	"task_requirement_overrides",
+	"task_graph_validations",
+	"accepted_task_graph_versions",
+	"routing_decisions",
+	"role_definitions",
+	"routing_policy_profiles",
+	"routing_policy_inputs",
+	"routing_legacy_model_mappings",
+	"routing_events",
+	"fallback_decisions",
+	"replan_decisions",
+	"verification_decisions",
+	"progress_receipts",
+	"progress_delivery_obligations",
+	"progress_delivery_attempts",
+	"progress_delivery_attempt_results",
+	"progress_delivery_acknowledgments",
+	"progress_delivery_replay_cursors",
+	"detached_run_supervisors",
+	"provider_execution_authorities",
+	"handoff_transactions",
+	"nested_scheduler_resource_reservations",
+	"agent_scope_grants",
+	"agent_registrations",
+	"agent_ownership_locks",
+	"agent_budget_bindings",
+	"agent_events",
+	"availability_observations",
+	"availability_scores",
+	"circuit_breakers",
+}
 
 type migration struct {
 	version    int
@@ -307,6 +539,14 @@ func Open(ctx context.Context, opts Options) (Store, error) {
 		return nil, errors.New("open storage: path is required")
 	}
 	path = filepath.Clean(path)
+	sourceExistedBeforeOpen := true
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			sourceExistedBeforeOpen = false
+		} else {
+			return nil, fmt.Errorf("open storage: inspect source database %s: %w", path, err)
+		}
+	}
 
 	var store *sqliteStore
 	err := withOwnerOnlyUmask(func() error {
@@ -318,7 +558,17 @@ func Open(ctx context.Context, opts Options) (Store, error) {
 			return fmt.Errorf("open storage %s: %w", path, err)
 		}
 		db.SetMaxOpenConns(1)
-		opened := &sqliteStore{path: path, db: db, now: normalizeNow(opts.Now)}
+		opened := &sqliteStore{
+			path:                                  path,
+			db:                                    db,
+			now:                                   normalizeNow(opts.Now),
+			busyTimeout:                           opts.BusyTimeout,
+			writeTxCommitHookForTest:              opts.WriteTxCommitHookForTest,
+			writeTxRetry:                          normalizeWriteTxRetryPolicy(opts.WriteTxRetry),
+			sourceExistedBeforeOpen:               sourceExistedBeforeOpen,
+			deliveryV10BackupHookForTest:          opts.deliveryV10BackupHookForTest,
+			deliveryV10BackupBufferFactoryForTest: opts.deliveryV10BackupBufferFactoryForTest,
+		}
 		if err := opened.configure(ctx); err != nil {
 			_ = db.Close()
 			return err
@@ -411,6 +661,10 @@ func (s *sqliteStore) Path() string {
 	return s.path
 }
 
+func (s *sqliteStore) Now() time.Time {
+	return s.now().UTC()
+}
+
 func (s *sqliteStore) Health(ctx context.Context) (Health, error) {
 	return CheckHealth(ctx, s.path)
 }
@@ -446,6 +700,12 @@ func (s *sqliteStore) WithWriteTx(ctx context.Context, fn func(Tx) error) error 
 	if fn == nil {
 		return errors.New("storage write transaction: callback is required")
 	}
+	return retryWriteTx(ctx, s.writeTxRetry, func(attemptCtx context.Context) error {
+		return s.withWriteTxOnce(attemptCtx, fn)
+	})
+}
+
+func (s *sqliteStore) withWriteTxOnce(ctx context.Context, fn func(Tx) error) error {
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("storage write transaction: connection: %w", err)
@@ -462,13 +722,130 @@ func (s *sqliteStore) WithWriteTx(ctx context.Context, fn func(Tx) error) error 
 		}
 		return err
 	}
-	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+	commit := func(commitCtx context.Context) error {
+		_, err := conn.ExecContext(commitCtx, `COMMIT`)
+		return err
+	}
+	var commitErr error
+	if s.writeTxCommitHookForTest != nil {
+		commitErr = s.writeTxCommitHookForTest(ctx, wrapped, commit)
+	} else {
+		commitErr = commit(ctx)
+	}
+	if commitErr != nil {
 		if rollbackErr := rollbackConnTx(conn); rollbackErr != nil {
 			_ = discardConn(conn)
 		}
-		return fmt.Errorf("storage write transaction: commit: %w", err)
+		return fmt.Errorf("storage write transaction: commit: %w", commitErr)
 	}
 	return nil
+}
+
+func normalizeWriteTxRetryPolicy(opts WriteTxRetryOptions) writeTxRetryPolicy {
+	policy := writeTxRetryPolicy{
+		maxAttempts: opts.MaxAttempts,
+		maxElapsed:  opts.MaxElapsed,
+		backoff:     opts.Backoff,
+		clock:       opts.Clock,
+	}
+	if policy.maxAttempts <= 0 {
+		policy.maxAttempts = defaultWriteTxRetryMaxAttempts
+	}
+	if policy.maxElapsed <= 0 {
+		policy.maxElapsed = defaultWriteTxRetryMaxElapsed
+	}
+	if policy.backoff == nil {
+		policy.backoff = defaultWriteTxRetryBackoff
+	}
+	if policy.clock == nil {
+		policy.clock = realWriteTxRetryClock{}
+		policy.useAttemptDeadline = true
+	}
+	return policy
+}
+
+func defaultWriteTxRetryBackoff(attempt int) time.Duration {
+	return time.Duration(attempt) * 25 * time.Millisecond
+}
+
+func retryWriteTx(ctx context.Context, policy writeTxRetryPolicy, op func(context.Context) error) error {
+	var err error
+	var lastBusyErr error
+	var deadline time.Time
+	retryWindowStarted := false
+	for attempt := 1; attempt <= policy.maxAttempts; attempt++ {
+		if retryWindowStarted && policy.maxElapsed > 0 && !policy.clock.Now().Before(deadline) {
+			return lastBusyErr
+		}
+		attemptCtx := ctx
+		cancel := func() {}
+		attemptHasInternalDeadline := false
+		if retryWindowStarted && policy.useAttemptDeadline && policy.maxElapsed > 0 {
+			attemptCtx, cancel = context.WithDeadline(ctx, deadline)
+			attemptHasInternalDeadline = true
+		}
+		err = op(attemptCtx)
+		attemptCtxErr := attemptCtx.Err()
+		cancel()
+		internalAttemptDeadlineExpired := attemptHasInternalDeadline && errors.Is(attemptCtxErr, context.DeadlineExceeded)
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil && lastBusyErr != nil && internalAttemptDeadlineExpired {
+			return lastBusyErr
+		}
+		if err == nil || !IsBusy(err) {
+			return err
+		}
+		lastBusyErr = err
+		if !retryWindowStarted {
+			retryWindowStarted = true
+			if policy.maxElapsed > 0 {
+				deadline = policy.clock.Now().Add(policy.maxElapsed)
+			}
+		}
+		if attempt == policy.maxAttempts {
+			return err
+		}
+		if policy.maxElapsed > 0 && !policy.clock.Now().Before(deadline) {
+			return err
+		}
+		delay := policy.backoff(attempt)
+		if delay < 0 {
+			delay = 0
+		}
+		if policy.maxElapsed > 0 {
+			remaining := deadline.Sub(policy.clock.Now())
+			if remaining <= 0 {
+				return err
+			}
+			if delay > remaining {
+				delay = remaining
+			}
+		}
+		if delay == 0 {
+			continue
+		}
+		if sleepErr := policy.clock.Sleep(ctx, delay); sleepErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return sleepErr
+		}
+	}
+	return err
+}
+
+func (realWriteTxRetryClock) Now() time.Time {
+	return time.Now()
+}
+
+func (realWriteTxRetryClock) Sleep(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func rollbackConnTx(conn *sql.Conn) error {
@@ -494,7 +871,7 @@ func withRetry(ctx context.Context, op func() error) error {
 	var err error
 	for attempt := 0; attempt < 8; attempt++ {
 		err = op()
-		if err == nil || !sqliteBusy(err) {
+		if err == nil || !IsBusy(err) {
 			return err
 		}
 		delay := time.Duration(attempt+1) * 25 * time.Millisecond
@@ -507,13 +884,29 @@ func withRetry(ctx context.Context, op func() error) error {
 	return err
 }
 
-func sqliteBusy(err error) bool {
+func IsBusy(err error) bool {
 	if err == nil {
 		return false
 	}
 	var sqliteErr *moderncsqlite.Error
 	if errors.As(err, &sqliteErr) {
-		return sqliteErr.Code()&0xff == sqlite3.SQLITE_BUSY
+		switch sqliteErr.Code() & 0xff {
+		case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED:
+			return true
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+func IsConstraint(err error) bool {
+	if err == nil {
+		return false
+	}
+	var sqliteErr *moderncsqlite.Error
+	if errors.As(err, &sqliteErr) {
+		return sqliteErr.Code()&0xff == sqlite3.SQLITE_CONSTRAINT
 	}
 	return false
 }
@@ -543,9 +936,13 @@ func (tx sqlConnTx) QueryRow(ctx context.Context, query string, args ...any) *sq
 }
 
 func (s *sqliteStore) configure(ctx context.Context) error {
+	busyTimeout := s.busyTimeout
+	if busyTimeout <= 0 {
+		busyTimeout = 5 * time.Second
+	}
 	for _, statement := range []string{
 		`PRAGMA foreign_keys = ON`,
-		`PRAGMA busy_timeout = 5000`,
+		fmt.Sprintf(`PRAGMA busy_timeout = %d`, busyTimeout.Milliseconds()),
 	} {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("open storage %s: configure sqlite: %w", s.path, err)
@@ -555,6 +952,36 @@ func (s *sqliteStore) configure(ctx context.Context) error {
 }
 
 func (s *sqliteStore) migrate(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS migrations (
+		version INTEGER PRIMARY KEY,
+		name TEXT NOT NULL,
+		applied_at TEXT NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("migrate storage: initialize migrations table: %w", err)
+	}
+	version, err := schemaVersion(ctx, s.db)
+	if err != nil {
+		return fmt.Errorf("migrate storage: %w", err)
+	}
+	if version > CurrentSchemaVersion {
+		return unsupportedVersionError(version)
+	}
+	var deliveryV10Backup *deliveryMigrationBackup
+	if CurrentSchemaVersion >= 10 {
+		switch {
+		case version == 9:
+			deliveryV10Backup, err = prepareDeliveryV10Backup(ctx, s.db, s.path, formatTimestamp(s.now()), deliveryV10BackupOptions{
+				hook:          s.deliveryV10BackupHookForTest,
+				bufferFactory: s.deliveryV10BackupBufferFactoryForTest,
+			})
+		case version < 10 && !s.sourceExistedBeforeOpen:
+			deliveryV10Backup = prepareDeliveryV10NoSourceMetadata(s.path, formatTimestamp(s.now()))
+		}
+		if err != nil {
+			return err
+		}
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("migrate storage: begin: %w", err)
@@ -568,7 +995,7 @@ func (s *sqliteStore) migrate(ctx context.Context) error {
 	)`); err != nil {
 		return fmt.Errorf("migrate storage: initialize migrations table: %w", err)
 	}
-	version, err := txSchemaVersion(ctx, tx)
+	version, err = txSchemaVersion(ctx, tx)
 	if err != nil {
 		return fmt.Errorf("migrate storage: %w", err)
 	}
@@ -582,6 +1009,11 @@ func (s *sqliteStore) migrate(ctx context.Context) error {
 		}
 		for _, statement := range migration.statements {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migrate storage to version %d: %w", migration.version, err)
+			}
+		}
+		if migration.version == 10 {
+			if err := migrateDeliveryRunContracts(ctx, tx, deliveryV10Backup, formatTimestamp(s.now())); err != nil {
 				return fmt.Errorf("migrate storage to version %d: %w", migration.version, err)
 			}
 		}
@@ -618,7 +1050,9 @@ func scrubProjectRemoteURLs(ctx context.Context, tx *sql.Tx) error {
 	for rows.Next() {
 		var current projectRemote
 		if err := rows.Scan(&current.id, &current.display, &current.normalized); err != nil {
-			rows.Close()
+			if closeErr := rows.Close(); closeErr != nil {
+				return fmt.Errorf("close project remote rows after scan error: %v: %w", closeErr, err)
+			}
 			return err
 		}
 		nextDisplay, _ := gitremote.SanitizeDisplayURL(current.display)
@@ -709,7 +1143,9 @@ func reconcilePhysicalProjectIdentities(ctx context.Context, tx *sql.Tx) error {
 	for rows.Next() {
 		var project storedProjectIdentity
 		if err := rows.Scan(&project.id, &project.canonical, &project.localPath, &project.gitRoot, &project.createdAt, &project.detachedAt); err != nil {
-			rows.Close()
+			if closeErr := rows.Close(); closeErr != nil {
+				return fmt.Errorf("close project identity rows after scan error: %v: %w", closeErr, err)
+			}
 			return err
 		}
 		physical := physicalProjectCanonical(firstNonEmpty(project.gitRoot, project.canonical, project.localPath))

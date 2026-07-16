@@ -20,12 +20,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/migration"
+	"github.com/jasonhnd/loopcoder/internal/platform"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	"gopkg.in/yaml.v3"
 )
@@ -267,6 +269,14 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	}
 	deps = normalizeDeps(deps)
 
+	tuple := platform.Normalize(platform.Tuple{
+		GOOS:   firstNonEmpty(opts.RuntimeGOOS, deps.RuntimeGOOS),
+		GOARCH: firstNonEmpty(opts.RuntimeGOARCH, deps.RuntimeGOARCH),
+	})
+	if err := platform.Check(tuple, platform.StartupPhase); err != nil {
+		return Result{}, err
+	}
+
 	currentPath, err := deps.ExecutablePath()
 	if err != nil || strings.TrimSpace(currentPath) == "" {
 		currentPath = "(unknown)"
@@ -283,8 +293,8 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		RequestedVersion: strings.TrimSpace(opts.RequestedVersion),
 	}
 
-	goos := firstNonEmpty(opts.RuntimeGOOS, deps.RuntimeGOOS)
-	goarch := firstNonEmpty(opts.RuntimeGOARCH, deps.RuntimeGOARCH)
+	goos := tuple.GOOS
+	goarch := tuple.GOARCH
 	archiveKind, err := archiveKind(goos)
 	if err != nil {
 		return result, err
@@ -691,6 +701,9 @@ func scanLegacyStateRoot(root string, deps Deps) ([]OldSurfaceDiagnostic, int, [
 			skipped = append(skipped, filepath.ToSlash(dir)+": "+err.Error())
 			return
 		}
+		sort.SliceStable(entries, func(i, j int) bool {
+			return entries[i].Name() < entries[j].Name()
+		})
 		for _, entry := range entries {
 			if seen > maxMigrationStatusEntries || len(diagnostics) >= maxMigrationStatusFindings {
 				return

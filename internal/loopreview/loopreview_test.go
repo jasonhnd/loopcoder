@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -120,6 +121,71 @@ func TestVerdictJSONSchemaIsValidJSON(t *testing.T) {
 	if !json.Valid([]byte(VerdictJSONSchema)) {
 		t.Fatalf("VerdictJSONSchema is not valid JSON: %s", VerdictJSONSchema)
 	}
+}
+
+func TestVerdictJSONSchemaMatchesAcceptedWireContractAndStrictRequired(t *testing.T) {
+	var schema map[string]any
+	if err := json.Unmarshal([]byte(VerdictJSONSchema), &schema); err != nil {
+		t.Fatalf("unmarshal VerdictJSONSchema: %v", err)
+	}
+
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("schema properties = %#v, want object", schema["properties"])
+	}
+	got := mapKeys(properties)
+	want := []string{"evidence", "findings", "spec_conformance", "verdict"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("top-level schema properties = %#v, want %#v", got, want)
+	}
+
+	assertObjectSchemasRequireAllProperties(t, "#", schema)
+}
+
+func assertObjectSchemasRequireAllProperties(t *testing.T, path string, node any) {
+	t.Helper()
+
+	switch typed := node.(type) {
+	case map[string]any:
+		if schemaType, _ := typed["type"].(string); schemaType == "object" {
+			properties, _ := typed["properties"].(map[string]any)
+			if len(properties) > 0 {
+				got := mapKeys(properties)
+				required := stringArray(typed["required"])
+				if !reflect.DeepEqual(required, got) {
+					t.Fatalf("%s required = %#v, want exactly all properties %#v", path, required, got)
+				}
+			}
+		}
+		for key, child := range typed {
+			assertObjectSchemasRequireAllProperties(t, path+"/"+key, child)
+		}
+	case []any:
+		for i, child := range typed {
+			assertObjectSchemasRequireAllProperties(t, fmt.Sprintf("%s/%d", path, i), child)
+		}
+	}
+}
+
+func mapKeys(values map[string]any) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func stringArray(value any) []string {
+	values, _ := value.([]any)
+	out := make([]string, 0, len(values))
+	for _, item := range values {
+		if text, ok := item.(string); ok {
+			out = append(out, text)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func TestNormalizeVerdictNeedsHumanUsesFindingReasonBeforePositiveEvidence(t *testing.T) {
@@ -1877,6 +1943,7 @@ func TestRunInvokesReadOnlyVerifierAndReturnsPass(t *testing.T) {
 		summary: `{"verdict":"pass","findings":[],"evidence":"diff satisfies issue and spec","spec_conformance":"pass"}`,
 	}
 	fakeLock := &loopreviewFakeLock{}
+	providerReservations := 0
 
 	result, err := Run(context.Background(), Options{
 		RepoPath:   repo,
@@ -1885,6 +1952,10 @@ func TestRunInvokesReadOnlyVerifierAndReturnsPass(t *testing.T) {
 		Model:      "claude-opus",
 		Effort:     "max",
 		BaseBranch: "main",
+		BeforeProviderCall: func() error {
+			providerReservations++
+			return nil
+		},
 	}, Deps{
 		Git: fakeGit,
 		GitHub: func(path string) GitHubClient {
@@ -1921,6 +1992,9 @@ func TestRunInvokesReadOnlyVerifierAndReturnsPass(t *testing.T) {
 	}
 	if result.Verdict.Report == nil {
 		t.Fatal("verdict missing report")
+	}
+	if providerReservations != 1 {
+		t.Fatalf("provider reservations = %d, want one before verifier launch", providerReservations)
 	}
 	sourceRef := prHeadLocalRef(152)
 	if fakeGit.fetchBase != "main" || fakeGit.fetchPRRef != 152 || fakeGit.fetchPRRefDest != sourceRef || fakeGit.addRev != sourceRef {
@@ -2469,6 +2543,29 @@ func TestVerifierReportAllowsAntigravitySelfReportedNoUsage(t *testing.T) {
 	}
 }
 
+func TestVerifierReportIncludesGrokAdapterAttribution(t *testing.T) {
+	record := verifierReport(Options{
+		PRNumber: 834,
+		Provider: "grok",
+	}, agent.Result{
+		ExitCode:           0,
+		Model:              "grok-4.5",
+		AdapterVersion:     "0.1.211",
+		ExternalSessionRef: "session-abc",
+		StartedAt:          "2026-07-13T00:00:00Z",
+		EndedAt:            "2026-07-13T00:00:01Z",
+		DurationMS:         1000,
+	}, reviewInputs{}, reviewRefs{}, "", "loopreview-834")
+
+	want := "review PR #834 [adapter=0.1.211 attempt=loopreview-834 session=session-abc]"
+	if record.Action != want {
+		t.Fatalf("Action = %q, want %q", record.Action, want)
+	}
+	if err := record.Validate(); err != nil {
+		t.Fatalf("Validate returned error: %v", err)
+	}
+}
+
 func TestRunSurfacesFailVerdict(t *testing.T) {
 	result := runWithAgentSummary(t, `{"verdict":"fail","findings":[{"severity":"error","file":"file.go","note":"bug"}],"evidence":"bug in diff","spec_conformance":"fail"}`, nil)
 	if result.Verdict.Verdict != VerdictFail || result.ExitCode != 1 {
@@ -2576,6 +2673,9 @@ func TestRunVerifierTimeoutReturnsNeedsHuman(t *testing.T) {
 	}
 	if result.Verdict.Report != nil {
 		t.Fatalf("hung verifier result had report: %#v", result.Verdict.Report)
+	}
+	if !result.ProviderInvoked {
+		t.Fatal("hung verifier did not report its provider invocation")
 	}
 	if fakeAgent.calls != 1 {
 		t.Fatalf("agent calls = %d, want 1", fakeAgent.calls)
@@ -2928,6 +3028,11 @@ type loopreviewFakeAgent struct {
 func (f *loopreviewFakeAgent) Run(ctx context.Context, invocation agent.Invocation) (agent.Result, error) {
 	f.calls++
 	f.invocation = invocation
+	if invocation.OnProviderStart != nil {
+		if err := invocation.OnProviderStart(agent.ProviderProcess{PID: os.Getpid()}); err != nil {
+			return agent.Result{ExitCode: -1}, err
+		}
+	}
 	if err := os.WriteFile(invocation.LogPath, []byte("verifier log\n"), 0o644); err != nil {
 		return agent.Result{ExitCode: -1}, err
 	}

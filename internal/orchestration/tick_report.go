@@ -5,10 +5,18 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
+	"github.com/jasonhnd/loopcoder/internal/orchestrationcost"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 )
 
 func normalizeTickReport(report TickReport) TickReport {
+	if report.OrchestrationCost.SchemaVersion == "" {
+		runID := strings.TrimSpace(report.RunID)
+		if runID == "" {
+			runID = "unknown-run"
+		}
+		report.OrchestrationCost, _ = orchestrationcost.Build(runID, orchestrationcost.DefaultPolicy(), nil)
+	}
 	if report.Reviews == nil {
 		report.Reviews = []TickReviewResult{}
 	}

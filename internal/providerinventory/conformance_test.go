@@ -1,0 +1,527 @@
+package providerinventory
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/runtimecap"
+)
+
+func TestAdapterConformanceFutureProviderFixturePipeline(t *testing.T) {
+	root := t.TempDir()
+	binDir := filepath.Join(root, "bin")
+	exe := filepath.Join(binDir, executableName("futurefixture"))
+	writeExecutable(t, exe)
+
+	contract := runtimecap.DefaultContract()
+	contract.Providers = append(contract.Providers, runtimecap.ProviderRuntime{
+		Name:                "futurefixture",
+		AdapterVersion:      "v1",
+		DisplayName:         "Future Fixture",
+		Vendor:              "LoopCoder Fixture",
+		Executable:          "futurefixture",
+		VersionArgv:         []string{"--version"},
+		ReadOnly:            true,
+		JSONOutput:          true,
+		MCPConfig:           true,
+		Cancellation:        true,
+		TokenUsageReporting: true,
+		AuthProbeCommand:    []string{"futurefixture", "auth", "status"},
+		AuthProbeParser:     "fixture-text-status",
+		StaticModelCatalog: []runtimecap.ProviderModelCapability{{
+			ModelID:             "future-model",
+			DisplayName:         "Future Model",
+			ReadOnly:            true,
+			JSONOutput:          true,
+			MCPConfig:           true,
+			Cancellation:        true,
+			TokenUsageReporting: true,
+			RolesSupported:      []runtimecap.CompatibilityRole{runtimecap.RoleWorker, runtimecap.RoleVerifier},
+			AvailabilityState:   string(AvailabilityAvailable),
+			LifecycleState:      string(LifecycleAvailable),
+		}},
+	})
+
+	deps := fakeDeps(t, nil)
+	deps.Getenv = func(key string) string {
+		switch key {
+		case "PATH":
+			return binDir
+		case "PATHEXT":
+			return ".EXE;.CMD;.BAT"
+		case "LOOPCODER_TEST_TOKEN":
+			return "runtime-" + "opaque-value"
+		default:
+			return ""
+		}
+	}
+	var sawVersionProbe, sawAuthProbe bool
+	deps.RunProbe = func(_ context.Context, req ProbeExecution) (ProbeExecutionResult, error) {
+		for _, env := range req.Env {
+			if strings.Contains(env, "LOOPCODER_TEST_TOKEN") || strings.Contains(env, "opaque-value") {
+				t.Fatalf("credential-like env reached adapter probe: %q", env)
+			}
+		}
+		if strings.Contains(strings.Join(req.Argv, " "), root+string(filepath.Separator)+"unrelated") {
+			t.Fatalf("adapter probe received unrelated repo path in typed input: %#v", req.Argv)
+		}
+		switch {
+		case len(req.Argv) == 2 && req.Argv[1] == "--version":
+			sawVersionProbe = true
+			return ProbeExecutionResult{Stdout: "futurefixture 4.0.0\n", ExitCode: 0}, nil
+		case len(req.Argv) == 3 && req.Argv[1] == "auth" && req.Argv[2] == "status":
+			sawAuthProbe = true
+			return ProbeExecutionResult{Stdout: "profile future ready\n", ExitCode: 0}, nil
+		default:
+			t.Fatalf("unexpected probe argv: %#v", req.Argv)
+			return ProbeExecutionResult{ExitCode: 2}, nil
+		}
+	}
+
+	report, err := Discover(context.Background(), Options{
+		RepoPath:        filepath.Join(root, "unrelated"),
+		Config:          config.Config{Adapters: config.Adapters{Worker: "futurefixture"}},
+		RuntimeContract: contract,
+		Now:             fixedInventoryNow,
+	}, deps)
+	if err != nil {
+		t.Fatalf("Discover returned error: %v", err)
+	}
+	if !sawVersionProbe || !sawAuthProbe {
+		t.Fatalf("probe coverage version=%v auth=%v, want both", sawVersionProbe, sawAuthProbe)
+	}
+	installation := installationForAdapter(t, report, "futurefixture")
+	if installation.Version != "futurefixture 4.0.0" || installation.AdapterDeclarationID == "" {
+		t.Fatalf("future fixture installation = %#v", installation)
+	}
+	readiness := latestAuthReadinessFor(t, report, "futurefixture")
+	if readiness.ReadinessState != ReadinessReady || readiness.EvidenceKind != EvidenceStatusCommand {
+		t.Fatalf("future fixture readiness = %#v, want ready status command", readiness)
+	}
+	capability := capabilityForAdapterModel(t, report, "futurefixture", "future-model")
+	if !capability.SatisfiesHardRequirements(HardRequirement{ReadOnly: true, JSONOutput: true, Cancellation: true}) {
+		t.Fatalf("future fixture capability did not satisfy declared hard requirements: %#v", capability)
+	}
+}
+
+func TestGrokOrdinaryWorkerInventoryConformanceDoesNotAffectOtherProviders(t *testing.T) {
+	codexExe := writeFakeCodex(t)
+	deps := fakeDeps(t, map[string]string{filepath.Clean(codexExe): "codex 0.9.0"})
+	deps.Getenv = func(key string) string {
+		if key == "PATH" {
+			return filepath.Dir(codexExe)
+		}
+		return ""
+	}
+	deps.RunProbe = func(_ context.Context, req ProbeExecution) (ProbeExecutionResult, error) {
+		if filepath.Base(req.Argv[0]) == executableName("grok") {
+			t.Fatalf("absent grok executable was probed: %#v", req.Argv)
+		}
+		return ProbeExecutionResult{Stdout: "codex 0.9.0\n", ExitCode: 0}, nil
+	}
+
+	report, err := Discover(context.Background(), Options{
+		Config: config.Config{Adapters: config.Adapters{Worker: "codex", Verifier: "grok"}},
+		Now:    fixedInventoryNow,
+	}, deps)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if installationForAdapter(t, report, "codex").InstallationState != InstallationInstalled {
+		t.Fatalf("codex installation not installed: %#v", report.Installations)
+	}
+	if probe := findProbe(t, report, "grok", "install"); probe.Outcome != OutcomeNotInstalled || !contains(probe.GapReasons, "executable-not-found") {
+		t.Fatalf("grok absent probe = %#v", probe)
+	}
+	if len(capabilitiesForAdapter(report, "codex")) == 0 {
+		t.Fatalf("absent grok removed codex model capabilities: %#v", report.ModelCapabilities)
+	}
+}
+
+func TestGrokOrdinaryWorkerAuthNotReadyIsCredentialBlind(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, executableName("grok"))
+	writeExecutable(t, exe)
+	secretCanary := "AKIA" + strings.Repeat("A", 16)
+	deps := fakeDeps(t, nil)
+	deps.Getenv = func(key string) string {
+		switch key {
+		case "PATH":
+			return dir
+		case "XAI_API_KEY", "AWS_ACCESS_KEY_ID", "GIT_DIR", "GIT_WORK_TREE":
+			return secretCanary
+		default:
+			return ""
+		}
+	}
+	modelCalls := 0
+	deps.RunProbe = func(_ context.Context, req ProbeExecution) (ProbeExecutionResult, error) {
+		for _, env := range req.Env {
+			if strings.Contains(env, secretCanary) || strings.HasPrefix(env, "XAI_API_KEY=") || strings.HasPrefix(env, "GIT_") {
+				t.Fatalf("credential or repository selector reached grok inventory probe: %q", env)
+			}
+		}
+		switch {
+		case len(req.Argv) == 2 && req.Argv[1] == "version":
+			return ProbeExecutionResult{Stdout: "grok 0.1.211\n", ExitCode: 0}, nil
+		case len(req.Argv) == 2 && req.Argv[1] == "models":
+			modelCalls++
+			return ProbeExecutionResult{Stdout: "not logged in. run grok auth login\n" + secretCanary, ExitCode: 1}, nil
+		case len(req.Argv) == 4 && req.Argv[1] == "agent" && req.Argv[2] == "stdio" && req.Argv[3] == "--help":
+			return ProbeExecutionResult{Stdout: `{"schema_version":"grok.native_agent_capability.v1","protocol_version":"unsupported","native_subagents":false}`, ExitCode: 0}, nil
+		default:
+			t.Fatalf("unexpected grok probe argv: %#v", req.Argv)
+			return ProbeExecutionResult{ExitCode: 2}, nil
+		}
+	}
+
+	report, err := Discover(context.Background(), Options{
+		Config:        config.Config{Adapters: config.Adapters{Worker: "grok"}},
+		Now:           fixedInventoryNow,
+		NetworkGrants: []NetworkGrant{{ProviderID: "grok", Purpose: NetworkPurposeAuthCatalogInventory, Scope: NetworkScopeMachineInventory}},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if modelCalls != 1 {
+		t.Fatalf("grok models calls = %d, want one shared auth/catalog probe", modelCalls)
+	}
+	readiness := latestAuthReadinessFor(t, report, "grok")
+	if readiness.ReadinessState != ReadinessNotAuthenticated || !contains(readiness.GapReasons, "provider-reports-not-authenticated") {
+		t.Fatalf("grok readiness = %#v, want credential-blind not-authenticated", readiness)
+	}
+	payload, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("json.Marshal report: %v", err)
+	}
+	if strings.Contains(string(payload), secretCanary) {
+		t.Fatalf("inventory report retained secret canary: %s", payload)
+	}
+}
+
+func TestGrokOrdinaryWorkerDefaultTestsDoNotUseLiveSmokeGate(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, executableName("grok"))
+	writeExecutable(t, exe)
+	t.Setenv("LOOPCODER_GROK_LIVE_SMOKE", "1")
+	t.Setenv("LOOPCODER_ALLOW_LIVE_PROVIDER", "1")
+	deps := fakeDeps(t, nil)
+	deps.Getenv = func(key string) string {
+		switch key {
+		case "PATH":
+			return dir
+		case "LOOPCODER_GROK_LIVE_SMOKE", "LOOPCODER_ALLOW_LIVE_PROVIDER":
+			return os.Getenv(key)
+		default:
+			return ""
+		}
+	}
+	deps.RunProbe = func(_ context.Context, req ProbeExecution) (ProbeExecutionResult, error) {
+		switch {
+		case len(req.Argv) == 2 && req.Argv[1] == "version":
+			return ProbeExecutionResult{Stdout: "grok 0.1.211\n", ExitCode: 0}, nil
+		case len(req.Argv) == 4 && req.Argv[1] == "agent" && req.Argv[2] == "stdio" && req.Argv[3] == "--help":
+			return ProbeExecutionResult{Stdout: `{"schema_version":"grok.native_agent_capability.v1","protocol_version":"unsupported","native_subagents":false}`, ExitCode: 0}, nil
+		case len(req.Argv) == 2 && req.Argv[1] == "models":
+			t.Fatalf("live smoke env gate must not grant inventory network by itself: %#v", req.Argv)
+		default:
+			t.Fatalf("unexpected grok probe argv: %#v", req.Argv)
+		}
+		return ProbeExecutionResult{ExitCode: 2}, nil
+	}
+	deps.RunGrokACP = func(context.Context, GrokACPBillingRequest) (GrokACPBillingResult, error) {
+		t.Fatal("live smoke env gate must not grant quota or paid provider invocation")
+		return GrokACPBillingResult{}, nil
+	}
+
+	report, err := Discover(context.Background(), Options{
+		Config: config.Config{Adapters: config.Adapters{Worker: "grok"}},
+		Now:    fixedInventoryNow,
+	}, deps)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if findProbe(t, report, "grok", "catalog").NetworkPermission != NetworkDenied {
+		t.Fatalf("catalog probe unexpectedly received network permission: %#v", report.ProbeResults)
+	}
+	if got := onlyQuotaSnapshot(t, report, "grok"); got.TerminalErrorCode != "ErrQuotaCollectionGrantRequired" {
+		t.Fatalf("quota snapshot = %#v, want grant required", got)
+	}
+}
+
+func TestGrokFreshAbsentUpgradeRollbackCompositionPreservesOtherAdapters(t *testing.T) {
+	root := t.TempDir()
+	exes := map[string]string{}
+	for _, name := range []string{"codex", "claude", "grok", "agy"} {
+		path := filepath.Join(root, name, executableName(name))
+		writeExecutable(t, path)
+		exes[name] = path
+	}
+	baseVersions := map[string]string{
+		filepath.Clean(exes["codex"]):  "codex 0.9.0",
+		filepath.Clean(exes["claude"]): "claude 1.2.3",
+		filepath.Clean(exes["grok"]):   "grok 0.1.211",
+		filepath.Clean(exes["agy"]):    "agy 2.0.0",
+	}
+	run := func(t *testing.T, name string, versions map[string]string, includeGrok bool) Report {
+		t.Helper()
+		deps := fakeDeps(t, versions)
+		deps.Getenv = func(key string) string {
+			if key == "PATH" {
+				return filepath.Join(root, "empty-path-"+name)
+			}
+			return ""
+		}
+		deps.RunProbe = func(_ context.Context, req ProbeExecution) (ProbeExecutionResult, error) {
+			base := filepath.Base(req.Argv[0])
+			switch {
+			case base == executableName("grok") && len(req.Argv) == 2 && req.Argv[1] == "version":
+				return ProbeExecutionResult{Stdout: versions[filepath.Clean(req.Argv[0])] + "\n", ExitCode: 0}, nil
+			case base == executableName("grok") && len(req.Argv) == 4 && req.Argv[1] == "agent" && req.Argv[2] == "stdio" && req.Argv[3] == "--help":
+				return ProbeExecutionResult{Stdout: `{"schema_version":"grok.native_agent_capability.v1","protocol_version":"unsupported","native_subagents":false}`, ExitCode: 0}, nil
+			case base == executableName("grok") && len(req.Argv) == 2 && req.Argv[1] == "models":
+				t.Fatalf("%s: grok catalog probe ran without explicit network grant: %#v", name, req.Argv)
+			}
+			version := versions[filepath.Clean(req.Argv[0])]
+			if version == "" {
+				version = base + " 0.0.0"
+			}
+			return ProbeExecutionResult{Stdout: version + "\n", ExitCode: 0}, nil
+		}
+		executables := map[string][]string{
+			"codex":       {exes["codex"]},
+			"claude":      {exes["claude"]},
+			"antigravity": {exes["agy"]},
+		}
+		if includeGrok {
+			executables["grok"] = []string{exes["grok"]}
+		}
+		report, err := Discover(context.Background(), Options{
+			Config: config.Config{
+				Adapters: config.Adapters{Worker: "grok", Verifier: "claude"},
+				ProviderInventory: config.ProviderInventory{
+					Executables: executables,
+				},
+			},
+			Now: fixedInventoryNow,
+		}, deps)
+		if err != nil {
+			t.Fatalf("%s Discover: %v", name, err)
+		}
+		return report
+	}
+
+	fresh := run(t, "fresh", baseVersions, true)
+	baselineIDs := map[string]string{}
+	for _, adapterID := range []string{"codex", "claude", "antigravity"} {
+		installation := installationForAdapter(t, fresh, adapterID)
+		if installation.InstallationState != InstallationInstalled {
+			t.Fatalf("fresh %s installation = %#v, want installed", adapterID, installation)
+		}
+		baselineIDs[adapterID] = installation.ProviderInstallationID
+		if len(capabilitiesForAdapter(fresh, adapterID)) == 0 {
+			t.Fatalf("fresh %s capabilities missing", adapterID)
+		}
+	}
+	if installationForAdapter(t, fresh, "grok").InstallationState != InstallationInstalled {
+		t.Fatalf("fresh grok installation = %#v, want installed", installationForAdapter(t, fresh, "grok"))
+	}
+	if got := findProbe(t, fresh, "grok", "catalog").NetworkPermission; got != NetworkDenied {
+		t.Fatalf("fresh grok catalog network permission = %s, want denied", got)
+	}
+
+	upgradedVersions := map[string]string{}
+	for key, value := range baseVersions {
+		upgradedVersions[key] = value
+	}
+	upgradedVersions[filepath.Clean(exes["grok"])] = "grok 0.1.212"
+	upgraded := run(t, "upgrade", upgradedVersions, true)
+	for _, adapterID := range []string{"codex", "claude", "antigravity"} {
+		if got := installationForAdapter(t, upgraded, adapterID).ProviderInstallationID; got != baselineIDs[adapterID] {
+			t.Fatalf("upgrade rewrote %s installation id: got %s want %s", adapterID, got, baselineIDs[adapterID])
+		}
+	}
+	if installationForAdapter(t, upgraded, "grok").Version != "grok 0.1.212" {
+		t.Fatalf("upgrade grok version = %q", installationForAdapter(t, upgraded, "grok").Version)
+	}
+
+	rollback := run(t, "rollback", baseVersions, false)
+	for _, adapterID := range []string{"codex", "claude", "antigravity"} {
+		if got := installationForAdapter(t, rollback, adapterID).ProviderInstallationID; got != baselineIDs[adapterID] {
+			t.Fatalf("rollback rewrote %s installation id: got %s want %s", adapterID, got, baselineIDs[adapterID])
+		}
+	}
+	if probe := findProbe(t, rollback, "grok", "install"); probe.Outcome != OutcomeNotInstalled || !contains(probe.GapReasons, "executable-not-found") {
+		t.Fatalf("rollback grok absent probe = %#v", probe)
+	}
+	payload, err := json.Marshal(rollback)
+	if err != nil {
+		t.Fatalf("marshal rollback report: %v", err)
+	}
+	if strings.Contains(string(payload), root) {
+		t.Fatalf("rollback report leaked unredacted fixture root: %s", payload)
+	}
+}
+
+func TestAdapterConformanceRejectsMalformedDeclarations(t *testing.T) {
+	tests := []struct {
+		name string
+		decl AdapterDeclaration
+		want string
+	}{
+		{
+			name: "empty executable",
+			decl: AdapterDeclaration{AdapterID: "fixture", ExecutableNames: []string{""}, AuthUnsupportedReason: "unsupported"},
+			want: "executable_names[0]",
+		},
+		{
+			name: "path separator in command",
+			decl: AdapterDeclaration{AdapterID: "fixture", ExecutableNames: []string{"fixture"}, AuthProbeCommand: []string{"bin/fixture", "auth"}},
+			want: "auth_probe_command[0]",
+		},
+		{
+			name: "network true without command",
+			decl: AdapterDeclaration{AdapterID: "fixture", ExecutableNames: []string{"fixture"}, MayNetwork: true, AuthUnsupportedReason: "unsupported"},
+			want: "may_network",
+		},
+		{
+			name: "unsupported schema",
+			decl: AdapterDeclaration{AdapterID: "fixture", DeclarationSchemaVersion: "loopcoder.adapter_declaration.v99", ExecutableNames: []string{"fixture"}, AuthUnsupportedReason: "unsupported"},
+			want: "unsupported",
+		},
+		{
+			name: "catalog missing provenance",
+			decl: AdapterDeclaration{AdapterID: "fixture", ExecutableNames: []string{"fixture"}, CatalogProbeMayNetwork: true, AuthUnsupportedReason: "unsupported"},
+			want: "catalog_probe_may_network",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			violations := ValidateAdapterDeclaration(tt.decl)
+			if len(violations) == 0 {
+				t.Fatalf("ValidateAdapterDeclaration returned no violations for %#v", tt.decl)
+			}
+			if !strings.Contains(strings.Join(violations, "; "), tt.want) {
+				t.Fatalf("violations = %#v, want substring %q", violations, tt.want)
+			}
+		})
+	}
+}
+
+func TestAdapterConformanceCoversPartialMalformedTimeoutCancellationAndRedaction(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, executableName("fixture"))
+	writeExecutable(t, exe)
+	adapter := AdapterDeclaration{
+		AdapterID:                "fixture",
+		AdapterVersion:           "v1",
+		DeclarationSchemaVersion: AdapterDeclarationSchema,
+		ConformanceVersion:       "loopcoder.adapter_conformance.v1",
+		DisplayName:              "Fixture",
+		Vendor:                   "LoopCoder Fixture",
+		ExecutableNames:          []string{"fixture"},
+		VersionArgv:              []string{"--version"},
+		AuthProbeCommand:         []string{"fixture", "auth", "status"},
+		AuthProbeParser:          "fixture-text-status",
+	}
+	if violations := ValidateAdapterDeclaration(adapter); len(violations) > 0 {
+		t.Fatalf("valid fixture adapter violations: %#v", violations)
+	}
+
+	deps := fakeDeps(t, nil)
+	deps.RunProbe = func(context.Context, ProbeExecution) (ProbeExecutionResult, error) {
+		return ProbeExecutionResult{Stdout: "{malformed", ExitCode: 0}, nil
+	}
+	_, readiness, probe := inspectAuthReadiness(context.Background(), nil, adapter, candidate{path: exe, source: DiscoveryFixture}, "pinst_fixture", fixedInventoryNow(), deps)
+	if probe == nil || !contains(probe.GapReasons, "auth-status-unrecognized") || len(readiness) != 1 || readiness[0].ReadinessState != ReadinessUnknown || readiness[0].TerminalErrorCode != "ErrAuthStatusUnrecognized" {
+		t.Fatalf("malformed auth output probe=%#v readiness=%#v, want schema mismatch unknown", probe, readiness)
+	}
+
+	deps.RunProbe = func(context.Context, ProbeExecution) (ProbeExecutionResult, error) {
+		return ProbeExecutionResult{ExitCode: -1, TimedOut: true, Killed: true}, nil
+	}
+	_, readiness, probe = inspectAuthReadiness(context.Background(), nil, adapter, candidate{path: exe, source: DiscoveryFixture}, "pinst_fixture", fixedInventoryNow(), deps)
+	if probe == nil || !probe.TimedOut || !probe.Killed || probe.TerminalErrorCode != "ErrAuthProbeTimeout" || readiness[0].TerminalErrorCode != "ErrAuthProbeTimeout" {
+		t.Fatalf("timeout/cancellation probe=%#v readiness=%#v", probe, readiness)
+	}
+
+	partial := AdapterDeclaration{
+		AdapterID:                "partial",
+		AdapterVersion:           "v1",
+		DeclarationSchemaVersion: AdapterDeclarationSchema,
+		DisplayName:              "Partial",
+		Vendor:                   "LoopCoder Fixture",
+		ExecutableNames:          []string{"partial"},
+		AuthUnsupportedReason:    "partial adapter has no safe auth readiness command",
+	}
+	if violations := ValidateAdapterDeclaration(partial); len(violations) > 0 {
+		t.Fatalf("partial adapter should be explicitly supported as unknown: %#v", violations)
+	}
+	unsupported := unsupportedAuthReadiness(partial, nil, fixedInventoryNow(), partial.AuthUnsupportedReason)
+	if unsupported.ReadinessState != ReadinessUnknown || unsupported.EvidenceKind != EvidenceUnsupported || unsupported.UnsupportedReason == "" {
+		t.Fatalf("unsupported readiness = %#v, want explicit unknown unsupported", unsupported)
+	}
+
+	secretish := "api_" + "key=" + strings.Repeat("x", 20)
+	redacted, findings := redactProviderOutput("provider said " + secretish)
+	if findings == 0 || strings.Contains(redacted, secretish) {
+		t.Fatalf("redaction failed findings=%d output=%q", findings, redacted)
+	}
+}
+
+func TestAdapterDeclarationVersionUpgradeChangesIdentity(t *testing.T) {
+	base := normalizeAdapterDeclaration(AdapterDeclaration{
+		AdapterID:             "fixture",
+		DisplayName:           "Fixture",
+		Vendor:                "LoopCoder Fixture",
+		ExecutableNames:       []string{"fixture"},
+		AuthUnsupportedReason: "unsupported",
+		ConformanceVersion:    "loopcoder.adapter_conformance.v1",
+	})
+	upgraded := base
+	upgraded.AdapterVersion = "v2"
+	if adapterDeclarationID(base) == adapterDeclarationID(upgraded) {
+		t.Fatalf("adapter declaration id did not change across version upgrade: %s", adapterDeclarationID(base))
+	}
+	upgraded.DeclarationSchemaVersion = "loopcoder.adapter_declaration.v99"
+	if violations := ValidateAdapterDeclaration(upgraded); len(violations) == 0 {
+		t.Fatal("unknown declaration schema version passed validation")
+	}
+}
+
+func installationForAdapter(t *testing.T, report Report, adapterID string) ProviderInstallation {
+	t.Helper()
+	for _, installation := range report.Installations {
+		if installation.AdapterID == adapterID {
+			return installation
+		}
+	}
+	t.Fatalf("installation for %s missing in %#v", adapterID, report.Installations)
+	return ProviderInstallation{}
+}
+
+func capabilityForAdapterModel(t *testing.T, report Report, adapterID, modelID string) ModelCapability {
+	t.Helper()
+	for _, capability := range report.ModelCapabilities {
+		if capability.AdapterID == adapterID && capability.CanonicalModelID == modelID {
+			return capability
+		}
+	}
+	t.Fatalf("model capability %s/%s missing in %#v", adapterID, modelID, report.ModelCapabilities)
+	return ModelCapability{}
+}
+
+func capabilitiesForAdapter(report Report, adapterID string) []ModelCapability {
+	var out []ModelCapability
+	for _, capability := range report.ModelCapabilities {
+		if capability.AdapterID == adapterID {
+			out = append(out, capability)
+		}
+	}
+	return out
+}

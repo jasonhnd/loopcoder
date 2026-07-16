@@ -228,15 +228,19 @@ func (ExecRunner) Run(ctx context.Context, dir, name string, args ...string) ([]
 		return nil, fmt.Errorf("%s %s timed out after %s", name, strings.Join(args, " "), ghHardCap)
 	}
 	if result.ExitCode != 0 {
+		output := stdout.Bytes()
+		if len(output) == 0 {
+			output = nil
+		}
 		detail := strings.TrimSpace(stderr.String())
 		if detail == "" {
 			detail = strings.TrimSpace(stdout.String())
 		}
 		err := execresult.CommandExitError(cmd, result.ExitCode)
 		if detail != "" {
-			return nil, fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, detail)
+			return output, fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, detail)
 		}
-		return nil, fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
+		return output, fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
 	}
 	return stdout.Bytes(), nil
 }
@@ -335,11 +339,22 @@ func (c *CLI) PRDiffNameOnly(ctx context.Context, number int) ([]string, error) 
 
 func (c *CLI) PRChecks(ctx context.Context, number int) ([]Check, error) {
 	var checks []Check
-	err := c.runJSON(ctx, []string{
+	args := []string{
 		"pr", "checks", fmt.Sprintf("%d", number),
 		"--json", "name,state,bucket",
-	}, &checks)
+	}
+	output, err := c.run(ctx, "gh", args...)
 	if err != nil {
+		// `gh pr checks` intentionally exits non-zero for status outcomes such as
+		// pending (8) and failed (1), while still emitting the complete JSON
+		// payload. The payload is authoritative; transport/auth failures do not
+		// produce parseable check JSON and continue to return the command error.
+		if len(bytes.TrimSpace(output)) > 0 && parseJSONOutput(output, &checks) == nil {
+			return checks, nil
+		}
+		return nil, err
+	}
+	if err := parseJSONOutput(output, &checks); err != nil {
 		return nil, err
 	}
 	return checks, nil

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -10,7 +11,29 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
+
+// ProviderCallRefusedError marks a deliberate pre-launch refusal such as a
+// per-run cost cap. It is safe to inspect through wrapping and must not be
+// treated as a provider execution failure or retried automatically.
+type ProviderCallRefusedError struct {
+	Err error
+}
+
+func (e ProviderCallRefusedError) Error() string {
+	if e.Err == nil {
+		return "provider call refused"
+	}
+	return e.Err.Error()
+}
+
+func (e ProviderCallRefusedError) Unwrap() error { return e.Err }
+
+func IsProviderCallRefused(err error) bool {
+	var target ProviderCallRefusedError
+	return errors.As(err, &target)
+}
 
 type Invocation struct {
 	WorktreePath    string
@@ -25,6 +48,7 @@ type Invocation struct {
 	StallTimeout    time.Duration
 	LivenessMode    string
 	LivenessCommand string
+	Guardian        supervisedexec.GuardianOptions
 	// RunID and Role tag the spawned provider process as loopcoder-managed and
 	// place it in a per-run kill-group (spec 0390, Decision 11).
 	RunID string
@@ -32,7 +56,9 @@ type Invocation struct {
 	// ProviderKey is loopcoder's durable idempotency key for the logical child
 	// operation. Runners may pass it to providers with native support; providers
 	// without native support receive it only as loopcoder metadata.
-	ProviderKey string
+	ProviderKey      string
+	OnProviderLaunch func(pid int)
+	OnProviderStart  func(ProviderProcess) error
 	// MCPServers carries provider-neutral MCP declarations. Provider-specific
 	// flags and config files are still owned by each runner.
 	MCPServers []MCPServer
@@ -43,16 +69,28 @@ type MCPServer = config.MCPServer
 type MCPAuth = config.MCPAuth
 
 type Result struct {
-	ExitCode   int
-	Summary    string
-	Model      string
-	Effort     string
-	Usage      reporter.Usage
-	StartedAt  string
-	EndedAt    string
-	DurationMS int64
-	Hung       bool
-	HungReason string
+	ExitCode           int
+	Summary            string
+	Model              string
+	Effort             string
+	Usage              reporter.Usage
+	StartedAt          string
+	EndedAt            string
+	DurationMS         int64
+	Hung               bool
+	HungReason         string
+	AdapterVersion     string
+	ExternalSessionRef string
+}
+
+type ProviderProcess struct {
+	PID                   int
+	PGID                  int
+	ProcessBirthIdentity  string
+	ExecutableIdentity    string
+	ObservedAt            time.Time
+	IdentityAmbiguous     bool
+	IdentityAmbiguityNote string
 }
 
 type Runner interface {

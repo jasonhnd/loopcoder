@@ -2,6 +2,7 @@ package runstatus
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -10,6 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/home"
+	"github.com/jasonhnd/loopcoder/internal/providerinventory"
+	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/state"
 )
@@ -38,13 +42,100 @@ func TestRenderNormalRunWithWorkerAndVerifierRecords(t *testing.T) {
 		"Events: 1",
 		"Verifier records: 1",
 		"Lifecycle: succeeded (source=legacy entries=1)",
-		"| #101 | job-101-1 | https://github.com/owner/repo/pull/501 | codex | gpt-5.5 | parsed | xhigh | write | 42s | 100 | 50 | 150 | true | codex_exited | succeeded | pass | claude | claude-sonnet-4-5 | parsed | high | read-only | 7s | 20 | 10 | 30 | true |",
+		"| #101 | job-101-1 | https://github.com/owner/repo/pull/501 | codex | gpt-5.5 | parsed | xhigh | write | 42s | 100 | 50 | 150 | true | not reported | not reported | not reported | not reported | not reported | not reported | not reported | codex_exited | succeeded | pass | claude | claude-sonnet-4-5 | parsed | high | read-only | 7s | 20 | 10 | 30 | true |",
 		"status is read-only and local-only",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("rendered status missing %q:\n%s", want, got)
 		}
 	}
+}
+
+func TestRenderStatusIncludesGrokAttributionWithoutSecrets(t *testing.T) {
+	repo := t.TempDir()
+	runID := "run-grok"
+	secretCanary := "xai_" + strings.Repeat("s", 24)
+	writeAttempt(t, repo, runID, 838, 1, "job-838-1", grokWorkerReport(838, usageTotal(8380)))
+
+	report, err := Load(Options{RepoPath: repo, RunID: runID})
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	got := Render(report)
+	for _, want := range []string{
+		"RUN STATUS",
+		"| #838 | job-838-1 | not reported | grok | grok-4.5 | parsed | high | write | 42s | not reported | not reported | 8380 | true |",
+		"status is read-only and local-only",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("rendered status missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, secretCanary) {
+		t.Fatalf("rendered status leaked secret canary:\n%s", got)
+	}
+	data, err := MarshalJSON(report)
+	if err != nil {
+		t.Fatalf("MarshalJSON returned error: %v", err)
+	}
+	var payload struct {
+		Rows []Row `json:"rows"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("status JSON did not unmarshal: %v\n%s", err, string(data))
+	}
+	if len(payload.Rows) != 1 || payload.Rows[0].WorkerProvider != "grok" || payload.Rows[0].WorkerModel != "grok-4.5" || payload.Rows[0].WorkerModelSource != "parsed" {
+		t.Fatalf("Grok status JSON rows = %#v", payload.Rows)
+	}
+	if strings.Contains(string(data), secretCanary) {
+		t.Fatalf("status JSON leaked secret canary: %s", string(data))
+	}
+}
+
+func TestLoadRegisteredRunningAttemptWithoutProviderAuthorityReportsMissingRow(t *testing.T) {
+	repo := t.TempDir()
+	t.Setenv(home.EnvHome, filepath.Join(t.TempDir(), "home"))
+	if _, err := registry.Register(context.Background(), registry.Options{RepoPath: repo, Now: fixedRunstatusNow}, registry.DefaultDeps()); err != nil {
+		t.Fatalf("registry.Register: %v", err)
+	}
+	runID := "run-missing-authority"
+	pid := os.Getpid()
+	attemptPath, err := state.WriteAttempt(repo, runID, state.AttemptRecord{
+		Version:        1,
+		JobID:          "job-missing-authority",
+		Issue:          909,
+		Attempt:        1,
+		Provider:       "codex",
+		PID:            pid,
+		Phase:          "codex_started",
+		Status:         state.StatusRunning,
+		StartedAt:      "2026-07-01T00:00:00Z",
+		HeartbeatAt:    "2026-07-01T00:00:01Z",
+		LastProgressAt: "2026-07-01T00:00:01Z",
+		LogBytes:       1,
+	})
+	if err != nil {
+		t.Fatalf("WriteAttempt: %v", err)
+	}
+	fixtureTime := fixedRunstatusNow()
+	if err := os.Chtimes(attemptPath, fixtureTime, fixtureTime); err != nil {
+		t.Fatalf("Chtimes attempt: %v", err)
+	}
+	report, err := Load(Options{RepoPath: repo, RunID: runID, Now: fixedRunstatusNow})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(report.Rows) != 1 {
+		t.Fatalf("rows = %#v", report.Rows)
+	}
+	row := report.Rows[0]
+	if row.ProviderAuthority != "missing-row" || row.ProviderVerified != "false" || row.ProviderAuthorityNote != "provider execution authority row is missing" {
+		t.Fatalf("authority columns = %#v", row)
+	}
+}
+
+func fixedRunstatusNow() time.Time {
+	return time.Date(2026, 7, 15, 0, 0, 0, 0, time.UTC)
 }
 
 func TestRenderLifecycleRecordWithParentAndChild(t *testing.T) {
@@ -177,6 +268,13 @@ func TestMarshalJSONIncludesRunTreeContract(t *testing.T) {
 			} `json:"summary"`
 			Nodes []RunTreeNode `json:"nodes"`
 		} `json:"run_tree"`
+		QuotaUsageRefs struct {
+			SchemaVersion         string                       `json:"schema_version"`
+			QuotaUsageFingerprint string                       `json:"quota_usage_fingerprint"`
+			UsageRecordIDs        []string                     `json:"usage_record_ids"`
+			Confidence            providerinventory.Confidence `json:"confidence"`
+			GapReasons            []string                     `json:"gap_reasons"`
+		} `json:"quota_usage_refs"`
 		Rows []Row `json:"rows"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
@@ -217,6 +315,15 @@ func TestMarshalJSONIncludesRunTreeContract(t *testing.T) {
 	}
 	if len(payload.Rows) != 1 || payload.Rows[0].Issue != "#651" {
 		t.Fatalf("rows = %#v, want issue #651", payload.Rows)
+	}
+	if payload.QuotaUsageRefs.SchemaVersion != providerinventory.QuotaUsageRefsSchema || !strings.HasPrefix(payload.QuotaUsageRefs.QuotaUsageFingerprint, "sha256:") {
+		t.Fatalf("quota usage refs metadata = %#v", payload.QuotaUsageRefs)
+	}
+	if payload.QuotaUsageRefs.Confidence != providerinventory.ConfidenceEstimated || len(payload.QuotaUsageRefs.UsageRecordIDs) == 0 {
+		t.Fatalf("quota usage refs = %#v, want estimated local refs", payload.QuotaUsageRefs)
+	}
+	if !containsString(payload.QuotaUsageRefs.GapReasons, "loopcoder-local-ledger-not-provider-global") {
+		t.Fatalf("quota usage refs gaps = %#v", payload.QuotaUsageRefs.GapReasons)
 	}
 	if strings.Contains(string(data), "RunID") {
 		t.Fatalf("status JSON used unstable CamelCase keys:\n%s", string(data))
@@ -264,7 +371,7 @@ func TestRenderTotalOnlyTokensAsNotReportedSplit(t *testing.T) {
 	}
 	got := Render(report)
 
-	want := "| #102 | job-102-1 | not reported | codex | gpt-5.5 | parsed | xhigh | write | 42s | not reported | not reported | 102585 | true | codex_exited | succeeded | not reported |"
+	want := "| #102 | job-102-1 | not reported | codex | gpt-5.5 | parsed | xhigh | write | 42s | not reported | not reported | 102585 | true | not reported | not reported | not reported | not reported | not reported | not reported | not reported | codex_exited | succeeded | not reported |"
 	if !strings.Contains(got, want) {
 		t.Fatalf("rendered status missing total-only token row %q:\n%s", want, got)
 	}
@@ -301,7 +408,7 @@ func TestRenderInterruptedChildRunStatus(t *testing.T) {
 	}
 	got := Render(report)
 
-	want := "| #801 | job-801-abandoned | not reported | codex | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | parent_stopped_before_dispatch | timed_out | not reported |"
+	want := "| #801 | job-801-abandoned | not reported | codex | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | not reported | parent_stopped_before_dispatch | timed_out | not reported |"
 	if !strings.Contains(got, want) {
 		t.Fatalf("rendered status missing timed out child row %q:\n%s", want, got)
 	}
@@ -536,6 +643,16 @@ func workerReport(issue int, usage reporter.Usage) reporter.Report {
 	}
 }
 
+func grokWorkerReport(issue int, usage reporter.Usage) reporter.Report {
+	report := workerReport(issue, usage)
+	report.Provider = "grok"
+	report.Model = "grok-4.5"
+	report.ModelSource = reporter.ModelSourceParsed
+	report.Effort = "high"
+	report.Action = "implement issue #" + strconv.Itoa(issue) + " [adapter=0.1.211 attempt=run-grok session=session-redacted]"
+	return report
+}
+
 func verifierReport(pr int, usage reporter.Usage) reporter.Report {
 	return reporter.Report{
 		Role:        reporter.RoleVerifier,
@@ -566,4 +683,13 @@ func usageTotal(total int64) reporter.Usage {
 	return reporter.Usage{
 		TotalTokens: &total,
 	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

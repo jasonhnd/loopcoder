@@ -1,0 +1,502 @@
+package waitstate
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestThirtyMinuteCIWaitUsesNoProviderAndEmitsPolicyReceipts(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 16, 0, 0, 0, 0, time.UTC)}
+	receipts := 0
+	report, err := Run(context.Background(), Options{
+		Kind:   KindGitHubCI,
+		WaitID: "pr-971",
+		Clock:  clock,
+		Policy: Policy{
+			MinPollInterval: time.Minute,
+			MaxPollInterval: time.Minute,
+			ReceiptCadence:  5 * time.Minute,
+			Timeout:         30 * time.Minute,
+		},
+		Probe: func(context.Context) (Observation, error) {
+			return Observation{EventID: "checks-pending", State: StateWaiting, Code: "required-checks-pending"}, nil
+		},
+		Receipt: func(context.Context, Receipt) error {
+			receipts++
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if report.StopReason != StopTimeout || report.ProviderInvocations != 0 {
+		t.Fatalf("report = %#v, want timeout and zero provider invocations", report)
+	}
+	if report.DurationMS != (30 * time.Minute).Milliseconds() {
+		t.Fatalf("duration_ms = %d, want %d", report.DurationMS, (30 * time.Minute).Milliseconds())
+	}
+	if elapsed := clock.now.Sub(time.Date(2026, 7, 16, 0, 0, 0, 0, time.UTC)); elapsed != 30*time.Minute {
+		t.Fatalf("elapsed = %s, want 30m", elapsed)
+	}
+	if receipts != 7 || report.Receipts != receipts {
+		t.Fatalf("receipts = callback:%d report:%d, want initial plus each five-minute boundary", receipts, report.Receipts)
+	}
+	if report.Polls < 25 || report.Polls > 31 {
+		t.Fatalf("polls = %d, want bounded cadence", report.Polls)
+	}
+}
+
+func TestDefaultPolicyCoversQueuedMacOSCIWithoutChangingReceiptCadence(t *testing.T) {
+	policy := DefaultPolicy()
+	if policy.Timeout != 2*time.Hour {
+		t.Fatalf("default timeout = %s, want 2h", policy.Timeout)
+	}
+	if policy.ReceiptCadence != 5*time.Minute {
+		t.Fatalf("default receipt cadence = %s, want 5m", policy.ReceiptCadence)
+	}
+}
+
+func TestTimeoutSnapshotDoesNotRepeatTimeoutAfterRestart(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 16, 0, 30, 0, 0, time.UTC)}
+	first, err := Run(context.Background(), Options{
+		Kind: KindGitHubCI, WaitID: "pr-timeout-restart", Clock: clock, Policy: fastPolicy(),
+		Probe: func(context.Context) (Observation, error) {
+			return Observation{EventID: "checks-pending", State: StateWaiting, Code: "required-checks-pending"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	if first.Snapshot.LastState != StateTerminal || first.Snapshot.LastCode != "wait-timeout" || first.Snapshot.PendingWake == nil {
+		t.Fatalf("timeout snapshot = %#v", first.Snapshot)
+	}
+	wantDecision := first.Snapshot.LastDecisionKey
+	probes, receipts := 0, 0
+	second, err := Run(context.Background(), Options{
+		Kind: KindGitHubCI, WaitID: "pr-timeout-restart", Clock: clock, Policy: fastPolicy(), Initial: first.Snapshot,
+		Probe: func(context.Context) (Observation, error) {
+			probes++
+			return Observation{}, errors.New("completed timeout must not be probed")
+		},
+		Receipt: func(context.Context, Receipt) error { receipts++; return nil },
+	})
+	if err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if second.StopReason != StopTimeout || probes != 0 || receipts != 0 || second.WakeDecisions != 0 {
+		t.Fatalf("second report = %#v, probes=%d receipts=%d", second, probes, receipts)
+	}
+	if second.Snapshot.LastDecisionKey != wantDecision || second.Snapshot.PendingWake == nil {
+		t.Fatalf("timeout decision changed across restart: %#v", second.Snapshot)
+	}
+}
+
+func TestRestartPreservesOriginalAbsoluteDeadline(t *testing.T) {
+	start := time.Date(2026, 7, 16, 0, 45, 0, 0, time.UTC)
+	clock := &fakeClock{now: start, cancelAfterSleeps: 1}
+	first, err := Run(context.Background(), Options{
+		Kind: KindApproval, WaitID: "approval-original-deadline", Clock: clock,
+		Policy: Policy{MinPollInterval: 30 * time.Second, MaxPollInterval: 30 * time.Second, ReceiptCadence: 5 * time.Minute, Timeout: time.Minute},
+		Probe: func(context.Context) (Observation, error) {
+			return Observation{EventID: "pending", State: StateWaiting, Code: "approval-pending"}, nil
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("first Run error = %v, want context canceled", err)
+	}
+	if first.Snapshot.DeadlineAt != timestamp(start.Add(time.Minute)) {
+		t.Fatalf("deadline_at = %q, want original one-minute deadline", first.Snapshot.DeadlineAt)
+	}
+	if first.DurationMS != (30 * time.Second).Milliseconds() {
+		t.Fatalf("duration_ms = %d, want canceled sleep duration %d", first.DurationMS, (30 * time.Second).Milliseconds())
+	}
+	clock = &fakeClock{now: start.Add(time.Minute)}
+	probes := 0
+	second, err := Run(context.Background(), Options{
+		Kind: KindApproval, WaitID: "approval-original-deadline", Clock: clock,
+		Policy: DefaultPolicy(), Initial: first.Snapshot,
+		Probe: func(context.Context) (Observation, error) {
+			probes++
+			return Observation{}, errors.New("expired original deadline must not probe")
+		},
+	})
+	if err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if second.StopReason != StopTimeout || probes != 0 {
+		t.Fatalf("second report = %#v, probes=%d", second, probes)
+	}
+}
+
+func TestLegacyV1SnapshotWithoutDeadlineRecoversPendingWake(t *testing.T) {
+	start := time.Date(2026, 7, 16, 0, 50, 0, 0, time.UTC)
+	clock := &fakeClock{now: start}
+	first, err := Run(context.Background(), Options{
+		Kind: KindDetachedWorker, WaitID: "legacy-worker", Clock: clock, Policy: fastPolicy(),
+		Probe: func(context.Context) (Observation, error) {
+			return Observation{EventID: "worker-succeeded", State: StateTerminal, Code: "worker-succeeded", Consequential: true, Terminal: true}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	legacy := first.Snapshot
+	legacy.DeadlineAt = ""
+	clock.now = start.Add(2 * time.Minute)
+	probes, wakes, checkpoints := 0, 0, 0
+	second, err := Run(context.Background(), Options{
+		Kind: KindDetachedWorker, WaitID: "legacy-worker", Clock: clock, Policy: fastPolicy(), Initial: legacy,
+		Probe: func(context.Context) (Observation, error) {
+			probes++
+			return Observation{}, errors.New("completed legacy snapshot must not be probed")
+		},
+		Wake: func(context.Context, WakeDecision) error { wakes++; return nil },
+		Checkpoint: func(context.Context, Snapshot) error {
+			checkpoints++
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if second.StopReason != StopTransition || probes != 0 || wakes != 1 || checkpoints != 1 {
+		t.Fatalf("second report = %#v, probes=%d wakes=%d checkpoints=%d", second, probes, wakes, checkpoints)
+	}
+	if second.Snapshot.DeadlineAt != timestamp(start.Add(fastPolicy().Timeout)) {
+		t.Fatalf("migrated deadline_at = %q", second.Snapshot.DeadlineAt)
+	}
+}
+
+func TestWaitIDRejectsLossyNormalizationAndPrefixCollisions(t *testing.T) {
+	for _, waitID := range []string{"approval with spaces", "quota-重置", strings.Repeat("a", 160) + "-one", strings.Repeat("a", 160) + "-two"} {
+		_, err := Run(context.Background(), Options{
+			Kind: KindApproval, WaitID: waitID, Policy: fastPolicy(),
+			Probe: func(context.Context) (Observation, error) { return Observation{}, nil },
+		})
+		if err == nil {
+			t.Fatalf("Run accepted lossy wait_id %q", waitID)
+		}
+	}
+}
+
+func TestApprovalAndQuotaWaitsUseNoProvider(t *testing.T) {
+	for _, kind := range []Kind{KindApproval, KindQuotaReset} {
+		t.Run(string(kind), func(t *testing.T) {
+			clock := &fakeClock{now: time.Date(2026, 7, 16, 1, 0, 0, 0, time.UTC)}
+			calls := 0
+			report, err := Run(context.Background(), Options{
+				Kind: kind, WaitID: "wait-1", Clock: clock,
+				Policy: Policy{MinPollInterval: time.Minute, MaxPollInterval: time.Minute, ReceiptCadence: 5 * time.Minute, Timeout: 2 * time.Minute},
+				Probe: func(context.Context) (Observation, error) {
+					calls++
+					if calls == 2 {
+						return Observation{EventID: "ready-1", State: StateReady, Code: "authority-available", Consequential: true}, nil
+					}
+					return Observation{EventID: "waiting-1", State: StateWaiting, Code: "authority-pending"}, nil
+				},
+			})
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if report.StopReason != StopTransition || report.WakeDecisions != 1 || report.ProviderInvocations != 0 {
+				t.Fatalf("report = %#v", report)
+			}
+		})
+	}
+}
+
+func TestNamedWatchersCoverEveryWaitAuthority(t *testing.T) {
+	watchers := []struct {
+		kind Kind
+		run  func(context.Context, Options) (Report, error)
+	}{
+		{KindGitHubCI, WatchGitHubCI},
+		{KindApproval, WatchApproval},
+		{KindQuotaReset, WatchQuotaReset},
+		{KindDeliveryOutbox, WatchDeliveryOutbox},
+		{KindDetachedWorker, WatchDetachedWorker},
+	}
+	for _, watcher := range watchers {
+		t.Run(string(watcher.kind), func(t *testing.T) {
+			clock := &fakeClock{now: time.Date(2026, 7, 16, 1, 30, 0, 0, time.UTC)}
+			report, err := watcher.run(context.Background(), Options{
+				WaitID: "authority-1", Clock: clock, Policy: fastPolicy(),
+				Probe: func(context.Context) (Observation, error) {
+					return Observation{EventID: "ready", State: StateReady, Code: "ready"}, nil
+				},
+			})
+			if err != nil {
+				t.Fatalf("watcher: %v", err)
+			}
+			if report.Kind != watcher.kind || report.ProviderInvocations != 0 {
+				t.Fatalf("report = %#v", report)
+			}
+		})
+	}
+}
+
+func TestDuplicateTransitionProducesAtMostOneWakeDecisionAcrossRestart(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 16, 2, 0, 0, 0, time.UTC)}
+	wakes := 0
+	first, err := Run(context.Background(), Options{
+		Kind: KindDeliveryOutbox, WaitID: "outbox-1", Clock: clock,
+		Policy: fastPolicy(),
+		Probe: func(context.Context) (Observation, error) {
+			return Observation{EventID: "obligation-42-ack", State: StateReady, Code: "delivery-acknowledged", Consequential: true}, nil
+		},
+		Wake: func(context.Context, WakeDecision) error {
+			wakes++
+			return nil
+		},
+		Checkpoint: func(context.Context, Snapshot) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	second, err := Run(context.Background(), Options{
+		Kind: KindDeliveryOutbox, WaitID: "outbox-1", Clock: clock,
+		Policy:  fastPolicy(),
+		Initial: first.Snapshot,
+		Probe: func(context.Context) (Observation, error) {
+			return Observation{EventID: "obligation-42-ack", State: StateReady, Code: "delivery-acknowledged", Consequential: true}, nil
+		},
+		Wake: func(context.Context, WakeDecision) error {
+			wakes++
+			return nil
+		},
+		Checkpoint: func(context.Context, Snapshot) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if first.WakeDecisions != 1 || second.WakeDecisions != 0 || wakes != 1 {
+		t.Fatalf("decisions first=%d second=%d wakes=%d, want 1/0/1", first.WakeDecisions, second.WakeDecisions, wakes)
+	}
+}
+
+func TestCompletedSnapshotSurvivesRestartAfterDeadline(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 16, 2, 30, 0, 0, time.UTC)}
+	first, err := Run(context.Background(), Options{
+		Kind: KindDetachedWorker, WaitID: "worker-completed", Clock: clock, Policy: fastPolicy(),
+		Probe: func(context.Context) (Observation, error) {
+			return Observation{EventID: "worker-succeeded", State: StateTerminal, Code: "worker-succeeded", Consequential: true, Terminal: true}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	if first.Snapshot.PendingWake == nil {
+		t.Fatal("first Run did not preserve the disconnected-host wake")
+	}
+	wantDecision := first.Snapshot.LastDecisionKey
+	clock.now = clock.now.Add(2 * time.Minute)
+	probes := 0
+	second, err := Run(context.Background(), Options{
+		Kind: KindDetachedWorker, WaitID: "worker-completed", Clock: clock, Policy: fastPolicy(), Initial: first.Snapshot,
+		Probe: func(context.Context) (Observation, error) {
+			probes++
+			return Observation{}, errors.New("completed snapshot must not be probed")
+		},
+	})
+	if err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if probes != 0 || second.StopReason != StopTransition || second.Snapshot.LastCode != "worker-succeeded" {
+		t.Fatalf("second report = %#v, probes=%d", second, probes)
+	}
+	if second.Snapshot.LastDecisionKey != wantDecision || second.Snapshot.PendingWake == nil {
+		t.Fatalf("terminal decision was replaced across restart: %#v", second.Snapshot)
+	}
+}
+
+func TestWakeDecisionIsCheckpointedBeforeDelivery(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 16, 5, 0, 0, 0, time.UTC)}
+	checkpointed := false
+	delivered := false
+	_, err := Run(context.Background(), Options{
+		Kind: KindApproval, WaitID: "approval-checkpoint", Clock: clock, Policy: fastPolicy(),
+		Probe: func(context.Context) (Observation, error) {
+			return Observation{EventID: "approved", State: StateReady, Code: "approved", Consequential: true}, nil
+		},
+		Checkpoint: func(_ context.Context, snapshot Snapshot) error {
+			if !delivered && snapshot.PendingWake != nil && snapshot.LastDecisionKey != "" {
+				checkpointed = true
+			}
+			return nil
+		},
+		Wake: func(context.Context, WakeDecision) error {
+			if !checkpointed {
+				t.Fatal("wake delivered before durable decision checkpoint")
+			}
+			delivered = true
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !checkpointed || !delivered {
+		t.Fatalf("checkpointed=%v delivered=%v, want both", checkpointed, delivered)
+	}
+}
+
+func TestStatePacketIsBoundedAndCannotCarryRawLogsPromptsOrTranscripts(t *testing.T) {
+	refs := make([]Reference, 0, 500)
+	for i := 0; i < 500; i++ {
+		refs = append(refs, Reference{
+			Kind: "github-check",
+			ID:   fmt.Sprintf("check-%04d-%s", i, strings.Repeat("x", 300)),
+			URL:  fmt.Sprintf("https://example.invalid/check/%d?token=raw-secret-query", i),
+		})
+	}
+	packet, err := BuildStatePacket(PacketInput{
+		Kind: KindGitHubCI, WaitID: "pr-967", PreviousState: StateWaiting, CurrentState: StateReady,
+		EventID: strings.Repeat("event", 1000), Code: strings.Repeat("code", 1000), References: refs,
+		ObservedAt: time.Date(2026, 7, 16, 3, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("BuildStatePacket: %v", err)
+	}
+	if len(packet) > MaxStatePacketBytes {
+		t.Fatalf("packet bytes = %d, want <= %d", len(packet), MaxStatePacketBytes)
+	}
+	text := string(packet)
+	for _, forbidden := range []string{"raw-secret-query", "token=", "raw_logs", "prompt", "transcript", strings.Repeat("event", 200)} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("packet contains forbidden raw material %q", forbidden)
+		}
+	}
+}
+
+func TestRestartUnavailableRateLimitAndHostDisconnectConvergeWithoutBusyLoop(t *testing.T) {
+	start := time.Date(2026, 7, 16, 4, 0, 0, 0, time.UTC)
+	clock := &fakeClock{now: start, cancelAfterSleeps: 2}
+	probes := 0
+	first, err := Run(context.Background(), Options{
+		Kind: KindDetachedWorker, WaitID: "worker-1", Clock: clock,
+		Policy: Policy{MinPollInterval: time.Second, MaxPollInterval: 4 * time.Second, ReceiptCadence: 5 * time.Minute, Timeout: time.Hour},
+		Probe: func(context.Context) (Observation, error) {
+			probes++
+			if probes == 1 {
+				return Observation{}, errors.New("github unavailable: raw response must not enter packet")
+			}
+			return Observation{EventID: "rate-limit", State: StateRateLimited, Code: "rate-limited", RetryAfter: 3 * time.Second}, nil
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("first Run error = %v, want context canceled", err)
+	}
+	if first.Polls != 2 || len(clock.sleeps) != 2 {
+		t.Fatalf("first report polls=%d sleeps=%v", first.Polls, clock.sleeps)
+	}
+	for _, delay := range clock.sleeps {
+		if delay < time.Second {
+			t.Fatalf("busy-loop delay = %s", delay)
+		}
+	}
+
+	resumeClock := &fakeClock{now: clock.now}
+	second, err := Run(context.Background(), Options{
+		Kind: KindDetachedWorker, WaitID: "worker-1", Clock: resumeClock,
+		Policy:  fastPolicy(),
+		Initial: first.Snapshot,
+		Probe: func(context.Context) (Observation, error) {
+			return Observation{EventID: "worker-terminal", State: StateTerminal, Code: "worker-succeeded", Consequential: true, Terminal: true}, nil
+		},
+		// A disconnected or capability-incompatible host has no Wake callback.
+	})
+	if err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if second.StopReason != StopTransition || second.WakeDecisions != 1 || second.WakeDelivered != 0 {
+		t.Fatalf("second report = %#v", second)
+	}
+	if second.Snapshot.PendingWake == nil {
+		t.Fatal("host-disconnected wake decision was not preserved for read-only status/attach recovery")
+	}
+}
+
+func TestRetryAfterIsProbeLowerBoundWhileReceiptsContinue(t *testing.T) {
+	start := time.Date(2026, 7, 16, 4, 0, 0, 0, time.UTC)
+	clock := &fakeClock{now: start}
+	probes := 0
+	receipts := 0
+	_, err := Run(context.Background(), Options{
+		Kind: KindQuotaReset, WaitID: "quota-retry-after", Clock: clock,
+		Policy: Policy{MinPollInterval: time.Minute, MaxPollInterval: 2 * time.Minute, ReceiptCadence: 5 * time.Minute, Timeout: 20 * time.Minute},
+		Probe: func(context.Context) (Observation, error) {
+			probes++
+			if probes == 1 {
+				return Observation{EventID: "limited", State: StateRateLimited, Code: "rate-limited", RetryAfter: 10 * time.Minute}, nil
+			}
+			if elapsed := clock.now.Sub(start); elapsed < 10*time.Minute {
+				t.Fatalf("probe resumed after %s, before Retry-After", elapsed)
+			}
+			return Observation{EventID: "reset", State: StateReady, Code: "quota-reset", Consequential: true}, nil
+		},
+		Receipt: func(context.Context, Receipt) error { receipts++; return nil },
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if probes != 2 || receipts != 3 || clock.now.Sub(start) != 10*time.Minute {
+		t.Fatalf("probes=%d receipts=%d elapsed=%s, want 2/3/10m", probes, receipts, clock.now.Sub(start))
+	}
+}
+
+func TestRetryAfterRemainsLowerBoundUnderNegativeJitter(t *testing.T) {
+	policy := DefaultPolicy()
+	retryAfter := 10 * time.Minute
+	for i := 0; i < 1000; i++ {
+		waitID := fmt.Sprintf("jitter-wait-%d", i)
+		if delay := nextDelay(policy, waitID, 0, retryAfter); delay < retryAfter {
+			t.Fatalf("nextDelay(%q) = %s, want >= Retry-After %s", waitID, delay, retryAfter)
+		}
+	}
+}
+
+func TestPollingAndReceiptsDoNotRenewExternalAuthority(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 16, 5, 0, 0, 0, time.UTC)}
+	claimGeneration := int64(7)
+	budgetRemaining := int64(9000)
+	watchdogDeadline := clock.now.Add(time.Hour)
+	_, err := Run(context.Background(), Options{
+		Kind: KindApproval, WaitID: "approval-1", Clock: clock,
+		Policy: Policy{MinPollInterval: time.Minute, MaxPollInterval: time.Minute, ReceiptCadence: time.Minute, Timeout: 3 * time.Minute},
+		Probe: func(context.Context) (Observation, error) {
+			return Observation{EventID: "approval-pending", State: StateWaiting, Code: "approval-pending"}, nil
+		},
+		Receipt: func(context.Context, Receipt) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if claimGeneration != 7 || budgetRemaining != 9000 || !watchdogDeadline.Equal(time.Date(2026, 7, 16, 6, 0, 0, 0, time.UTC)) {
+		t.Fatalf("wait path mutated authority: claim=%d budget=%d watchdog=%s", claimGeneration, budgetRemaining, watchdogDeadline)
+	}
+}
+
+func fastPolicy() Policy {
+	return Policy{MinPollInterval: time.Second, MaxPollInterval: time.Second, ReceiptCadence: 5 * time.Minute, Timeout: time.Minute}
+}
+
+type fakeClock struct {
+	now               time.Time
+	sleeps            []time.Duration
+	cancelAfterSleeps int
+}
+
+func (c *fakeClock) Now() time.Time { return c.now }
+
+func (c *fakeClock) Sleep(_ context.Context, delay time.Duration) error {
+	c.sleeps = append(c.sleeps, delay)
+	c.now = c.now.Add(delay)
+	if c.cancelAfterSleeps > 0 && len(c.sleeps) >= c.cancelAfterSleeps {
+		return context.Canceled
+	}
+	return nil
+}

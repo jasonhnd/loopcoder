@@ -2,16 +2,25 @@ package supervisedexec
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/process"
+	"github.com/jasonhnd/loopcoder/internal/progress"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
 func TestRunCompletedExitCodeZero(t *testing.T) {
@@ -30,6 +39,215 @@ func TestRunCompletedExitCodeZero(t *testing.T) {
 	if result.Killed {
 		t.Fatal("Killed = true, want false")
 	}
+}
+
+func TestRunDarwinArm64ProviderAuthorityIdentifiesProviderProcessGroup(t *testing.T) {
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("macOS arm64 process authority fixture")
+	}
+	outerPID := os.Getpid()
+	var started StartedProcess
+	cmd := exec.Command("/bin/sleep", "0.1")
+	result, err := Run(context.Background(), cmd, Options{
+		HardCap: 5 * time.Second,
+		RunID:   "run-authority-fixture",
+		Role:    "worker",
+		OnStart: func(startedProcess StartedProcess) error {
+			started = startedProcess
+			identity := process.Identity{
+				PID:                  startedProcess.PID,
+				PGID:                 startedProcess.PGID,
+				ProcessBirthIdentity: startedProcess.ProcessBirthIdentity,
+				ExecutableIdentity:   startedProcess.ExecutableIdentity,
+				Ambiguous:            startedProcess.IdentityAmbiguous,
+			}
+			if err := process.VerifySnapshot(identity); err != nil {
+				return err
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Outcome != OutcomeCompleted || result.ExitCode != 0 {
+		t.Fatalf("result = %#v, want completed sleep", result)
+	}
+	if started.PID <= 0 || started.PID == outerPID {
+		t.Fatalf("started PID = %d, outer PID = %d; want provider child PID", started.PID, outerPID)
+	}
+	if started.PGID != started.PID {
+		t.Fatalf("started PGID = %d, PID = %d; want provider-led process group", started.PGID, started.PID)
+	}
+	if started.ProcessBirthIdentity == "" || started.ExecutableIdentity == "" || started.IdentityAmbiguous {
+		t.Fatalf("started process authority = %#v, want complete identity", started)
+	}
+	identity := process.Identity{
+		PID:                  started.PID,
+		PGID:                 started.PGID,
+		ProcessBirthIdentity: started.ProcessBirthIdentity,
+		ExecutableIdentity:   started.ExecutableIdentity,
+		Ambiguous:            started.IdentityAmbiguous,
+	}
+	if err := process.VerifySnapshot(identity); err == nil {
+		t.Fatalf("VerifySnapshot succeeded after sleep exited; fixture should not treat exited/PID-reused process as proof")
+	}
+}
+
+func TestGuardianVerifyAndKillRequiresCurrentAuthority(t *testing.T) {
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("macOS arm64 guardian authority fixture")
+	}
+	cmd, authority := startGuardianAuthorityProcess(t)
+	defer terminateProcessGroup(cmd.Process.Pid)
+	defer cmd.Wait()
+
+	cfg := guardianConfig{
+		SchemaVersion:   guardianSchema,
+		ProjectID:       authority.ProjectID,
+		RunID:           authority.RunID,
+		AttemptID:       authority.AttemptID,
+		OwnerID:         authority.OwnerID,
+		ClaimGeneration: authority.ClaimGeneration,
+	}
+	tests := []struct {
+		name       string
+		mutate     func(storage.ProviderExecutionAuthority) storage.ProviderExecutionAuthority
+		wantEvent  string
+		wantKilled bool
+	}{
+		{
+			name:       "current live authority kills process group",
+			wantEvent:  "killed",
+			wantKilled: true,
+		},
+		{
+			name: "completed authority is not killed",
+			mutate: func(a storage.ProviderExecutionAuthority) storage.ProviderExecutionAuthority {
+				a.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
+				a.TerminalState = "succeeded"
+				return a
+			},
+			wantEvent: "skip",
+		},
+		{
+			name: "authority generation change is not killed",
+			mutate: func(a storage.ProviderExecutionAuthority) storage.ProviderExecutionAuthority {
+				a.ClaimGeneration++
+				return a
+			},
+			wantEvent: "skip",
+		},
+		{
+			name: "pid reuse birth mismatch is not killed",
+			mutate: func(a storage.ProviderExecutionAuthority) storage.ProviderExecutionAuthority {
+				a.ProcessBirthIdentity = "different process birth identity"
+				return a
+			},
+			wantEvent: "skip",
+		},
+		{
+			name: "ambiguous identity is not killed",
+			mutate: func(a storage.ProviderExecutionAuthority) storage.ProviderExecutionAuthority {
+				a.IdentityAmbiguous = true
+				a.AmbiguityReason = "process-birth-identity-unavailable"
+				return a
+			},
+			wantEvent: "skip",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			candidate := authority
+			if tt.mutate != nil {
+				candidate = tt.mutate(candidate)
+			}
+			var killedPGID int
+			event := guardianVerifyAndKill(context.Background(), cfg, func(context.Context, guardianConfig) (storage.ProviderExecutionAuthority, error) {
+				return candidate, nil
+			}, func(pgid int) error {
+				killedPGID = pgid
+				return nil
+			})
+			if event.Event != tt.wantEvent {
+				t.Fatalf("event = %#v, want %q", event, tt.wantEvent)
+			}
+			if (killedPGID != 0) != tt.wantKilled {
+				t.Fatalf("killedPGID = %d, want killed=%v event=%#v", killedPGID, tt.wantKilled, event)
+			}
+			if tt.wantKilled && killedPGID != authority.ProviderPGID {
+				t.Fatalf("killed pgid = %d, want %d", killedPGID, authority.ProviderPGID)
+			}
+		})
+	}
+}
+
+func TestDarwinGuardianReapsProviderAfterSupervisorSIGKILL(t *testing.T) {
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("macOS arm64 guardian crash fixture")
+	}
+	// Full 100-run acceptance under normal tests; under -race each attempt is multi-second
+	// and the package would exceed CI's default 10m package timeout.
+	attempts := 100
+	if raceBuildEnabled {
+		attempts = 5
+	}
+	stopWithin := 2 * time.Second
+	finalReapWithin := 30 * time.Second
+	if raceBuildEnabled {
+		stopWithin = 10 * time.Second
+		finalReapWithin = 60 * time.Second
+	}
+	testRoot := t.TempDir()
+	var pendingReaps []processReapTarget
+	for i := 0; i < attempts; i++ {
+		if !t.Run(fmt.Sprintf("attempt-%03d", i), func(t *testing.T) {
+			root := filepath.Join(testRoot, fmt.Sprintf("attempt-%03d", i))
+			if err := os.MkdirAll(root, 0o700); err != nil {
+				t.Fatalf("create attempt root: %v", err)
+			}
+			storePath := filepath.Join(root, "home", "data", "loopcoder.db")
+			diagPath := filepath.Join(root, "home", "logs", fmt.Sprintf("guardian-%03d.jsonl", i))
+			readyPath := filepath.Join(root, "ready.json")
+			ctx := context.Background()
+			store, err := storage.Open(ctx, storage.Options{Path: storePath})
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			seedGuardianProject(t, ctx, store, "proj-guardian", root)
+			if err := store.Close(); err != nil {
+				t.Fatalf("Close seed store: %v", err)
+			}
+
+			parent := helperCommand(t, "guardian-supervisor", storePath, diagPath, readyPath, strconv.Itoa(i))
+			if err := parent.Start(); err != nil {
+				t.Fatalf("start supervisor helper: %v", err)
+			}
+			ready := waitGuardianReady(t, readyPath)
+			if ready.ProviderPID <= 0 || ready.GuardianPID <= 0 {
+				t.Fatalf("ready = %#v, want provider and guardian pids", ready)
+			}
+			if !process.Alive(ready.ProviderPID) {
+				t.Fatalf("provider pid %d is not alive before crash", ready.ProviderPID)
+			}
+			if err := parent.Process.Kill(); err != nil {
+				t.Fatalf("kill supervisor: %v", err)
+			}
+			_ = parent.Wait()
+			waitNotExecuting(t, ready.ProviderPID, stopWithin, "provider", diagPath)
+			waitNotExecuting(t, ready.GuardianPID, stopWithin, "guardian", diagPath)
+			pendingReaps = append(pendingReaps,
+				processReapTarget{pid: ready.ProviderPID, label: "provider", diagnosticPath: diagPath},
+				processReapTarget{pid: ready.GuardianPID, label: "guardian", diagnosticPath: diagPath},
+			)
+			pendingReaps = drainReapedProcesses(t, pendingReaps, 0)
+			assertGuardianDiagnostic(t, diagPath, "killed")
+		}) {
+			break
+		}
+	}
+	assertProcessesReaped(t, pendingReaps, finalReapWithin)
 }
 
 func TestRunCompletedExitCodeNonZero(t *testing.T) {
@@ -180,6 +398,177 @@ func TestRunWorktreeActivityStallDetection(t *testing.T) {
 	}
 }
 
+func TestRunSilentProcessTreeActivityDoesNotStall(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "worker.log")
+	cmd := helperCommand(t, "silent-child-churn", logPath, "100ms", "16", "850ms", "0")
+
+	result, err := Run(context.Background(), cmd, Options{
+		HardCap:      10 * time.Second,
+		StallTimeout: 1500 * time.Millisecond,
+		LogPath:      logPath,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Outcome != OutcomeCompleted {
+		t.Fatalf("Outcome = %v, want %v (quiet child-process activity must not stall)", result.Outcome, OutcomeCompleted)
+	}
+	if result.Killed {
+		t.Fatal("Killed = true, want false")
+	}
+	if result.Elapsed < 2*time.Second {
+		t.Fatalf("Elapsed = %s, want >= 2s so process-tree activity crossed the stall window", result.Elapsed)
+	}
+}
+
+func TestRunSilentCPUActiveChildDoesNotStall(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "worker.log")
+	cmd := helperCommand(t, "silent-cpu-child", logPath, "2500ms", "0")
+
+	result, err := Run(context.Background(), cmd, Options{
+		HardCap:      10 * time.Second,
+		StallTimeout: 1200 * time.Millisecond,
+		LogPath:      logPath,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Outcome != OutcomeCompleted {
+		t.Fatalf("Outcome = %v, want %v (quiet CPU-active child must not stall)", result.Outcome, OutcomeCompleted)
+	}
+	if result.Killed {
+		t.Fatal("Killed = true, want false")
+	}
+	if result.Elapsed < 2*time.Second {
+		t.Fatalf("Elapsed = %s, want >= 2s so CPU activity crossed the stall window", result.Elapsed)
+	}
+}
+
+func TestRunSilentCPUActiveProviderContinuesWhenReceiptPersistenceFails(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	logPath := filepath.Join(root, "worker.log")
+	dbPath := filepath.Join(root, "loopcoder.db")
+	store, err := storage.Open(ctx, storage.Options{Path: dbPath})
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	defer store.Close()
+	ts := time.Now().UTC().Format(time.RFC3339Nano)
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, local_path_canonical, display_name, identity_source, created_at, updated_at)
+			VALUES ('proj_supervised_progress', ?, ?, 'repo', 'local-path', ?, ?)`,
+			root, root, ts, ts)
+		return err
+	}); err != nil {
+		t.Fatalf("seed project: %v", err)
+	}
+	failing := &supervisedFailingWriteStore{Store: store, skip: 1, failures: 100}
+	emitter, err := progress.NewEmitter(progress.EmitterOptions{
+		Store:              failing,
+		ProjectID:          "proj_supervised_progress",
+		DeliveryRunID:      "run-supervised-progress",
+		RunID:              "run-supervised-progress",
+		CorrelationID:      "cpu-active-worker",
+		MaxSilenceInterval: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewEmitter: %v", err)
+	}
+	emitter.Start(ctx)
+	if _, err := emitter.Emit(ctx, progress.Observation{
+		TaskID:         "issue-828",
+		AttemptID:      "job-cpu-active",
+		AttemptOrdinal: 1,
+		Phase:          "codex_started",
+		Status:         "running",
+		TaskCounts:     progress.TaskCounts{Total: 1, Running: 1},
+		Provider: progress.ProviderIdentity{
+			ProviderID:         "codex",
+			ProviderConfidence: "exact",
+		},
+		Heartbeat: progress.AgeEvidence{State: "exact", ObservedAt: ts},
+		Progress:  progress.AgeEvidence{State: "exact", ObservedAt: ts},
+		Evidence: []progress.EvidenceRef{{
+			RecordKind:     "attempt-sidecar",
+			RecordID:       "job-cpu-active",
+			Summary:        "worker process is still supervised",
+			Classification: "local-diagnostic",
+			Confidence:     "exact",
+		}},
+		QuotaBudget: progress.QuotaBudgetState{State: progress.Unknown, Confidence: progress.Unknown, RemainingQuantity: -1},
+		NextAction:  progress.ActionState{State: "wait-provider"},
+		OccurredAt:  time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("Emit initial: %v", err)
+	}
+	defer emitter.Stop(context.Background())
+
+	cmd := helperCommand(t, "silent-cpu-child", logPath, "2500ms", "0")
+	result, err := Run(ctx, cmd, Options{
+		HardCap:      10 * time.Second,
+		StallTimeout: 1200 * time.Millisecond,
+		LogPath:      logPath,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Outcome != OutcomeCompleted {
+		t.Fatalf("Outcome = %v, want %v while CPU activity continues despite receipt persistence failures", result.Outcome, OutcomeCompleted)
+	}
+	if got := failing.Attempts(); got < 2 {
+		t.Fatalf("progress write attempts = %d, want initial plus failed periodic attempt", got)
+	}
+	receipts, err := progress.ListReceipts(ctx, store, progress.ListFilter{
+		ProjectID:     "proj_supervised_progress",
+		DeliveryRunID: "run-supervised-progress",
+		CorrelationID: "cpu-active-worker",
+	})
+	if err != nil {
+		t.Fatalf("ListReceipts: %v", err)
+	}
+	if len(receipts) != 1 {
+		t.Fatalf("receipt count = %d, want only initial receipt while periodic persistence fails", len(receipts))
+	}
+}
+
+func TestRunLoopCoderReceiptLogGrowthDoesNotResetStallClock(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "worker.log")
+	cmd := helperCommand(t, "write-then-sleep", logPath, "10s")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				appendLog(logPath, "[loopcoder] receipt: still supervising")
+			}
+		}
+	}()
+
+	result, err := Run(ctx, cmd, Options{
+		HardCap:      10 * time.Second,
+		StallTimeout: 300 * time.Millisecond,
+		LogPath:      logPath,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Outcome != OutcomeStalled {
+		t.Fatalf("Outcome = %v, want %v", result.Outcome, OutcomeStalled)
+	}
+	if !result.Killed {
+		t.Fatal("Killed = false, want true")
+	}
+	if result.Elapsed > 2*time.Second {
+		t.Fatalf("Elapsed = %s, receipt-only log writes reset the stall clock", result.Elapsed)
+	}
+}
+
 func TestRunLogOnlyIgnoresWorktreeActivity(t *testing.T) {
 	root := t.TempDir()
 	logPath := filepath.Join(root, "worker.log")
@@ -201,6 +590,27 @@ func TestRunLogOnlyIgnoresWorktreeActivity(t *testing.T) {
 	}
 	if result.Outcome != OutcomeStalled {
 		t.Fatalf("Outcome = %v, want %v when log-only ignores worktree writes", result.Outcome, OutcomeStalled)
+	}
+	if !result.Killed {
+		t.Fatal("Killed = false, want true")
+	}
+}
+
+func TestRunLogOnlyIgnoresProcessTreeActivity(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "worker.log")
+	cmd := helperCommand(t, "silent-child-churn", logPath, "100ms", "16", "850ms", "0")
+
+	result, err := Run(context.Background(), cmd, Options{
+		HardCap:      10 * time.Second,
+		StallTimeout: 400 * time.Millisecond,
+		LogPath:      logPath,
+		LivenessMode: LivenessModeLogOnly,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Outcome != OutcomeStalled {
+		t.Fatalf("Outcome = %v, want %v when log-only ignores process-tree churn", result.Outcome, OutcomeStalled)
 	}
 	if !result.Killed {
 		t.Fatal("Killed = false, want true")
@@ -343,6 +753,29 @@ func TestWorktreePollIntervalDecouplesFromLogPollAtScale(t *testing.T) {
 	}
 	if walks >= logPolls/10 {
 		t.Fatalf("worktree walks = %d over %d log polls, want far less than log cadence", walks, logPolls)
+	}
+}
+
+func TestProcessActivityFirstAvailableCountsAsProgress(t *testing.T) {
+	current := processActivityObservation{available: true, signature: "123:S:0"}
+	if !current.changedFrom(processActivityObservation{}) {
+		t.Fatal("changedFrom = false, want first available process observation to count as progress")
+	}
+	if current.changedFrom(current) {
+		t.Fatal("changedFrom = true, want unchanged available process observation to be idle")
+	}
+}
+
+func TestProcessActivityRunnableProcessCountsAsProgressWithoutCPUClockAdvance(t *testing.T) {
+	previous := processActivityObservation{available: true, signature: "123:R:42", runnable: true}
+	current := processActivityObservation{available: true, signature: "123:R:42", runnable: true}
+	if !current.changedFrom(previous) {
+		t.Fatal("changedFrom = false, want a runnable process to count as progress while scheduler contention delays CPU clock advance")
+	}
+
+	sleeping := processActivityObservation{available: true, signature: "123:S:42"}
+	if sleeping.changedFrom(sleeping) {
+		t.Fatal("changedFrom = true, want an unchanged sleeping process observation to remain idle")
 	}
 }
 
@@ -593,6 +1026,63 @@ func TestHelperProcess(t *testing.T) {
 			time.Sleep(interval)
 		}
 		os.Exit(code)
+	case "silent-child-churn":
+		logPath := args[0]
+		interval := parseDuration(args[1])
+		count := parseInt(args[2])
+		childDuration := parseDuration(args[3])
+		code := parseInt(args[4])
+		appendLog(logPath, "first")
+		children := make([]*exec.Cmd, 0, count)
+		for i := 0; i < count; i++ {
+			child := helperCommandForProcess("sleep-exit", childDuration.String(), "0")
+			child.Stdout = io.Discard
+			child.Stderr = io.Discard
+			if err := child.Start(); err != nil {
+				fmt.Fprintf(os.Stderr, "start silent child: %v\n", err)
+				os.Exit(2)
+			}
+			children = append(children, child)
+			time.Sleep(interval)
+		}
+		for _, child := range children {
+			if err := child.Wait(); err != nil {
+				fmt.Fprintf(os.Stderr, "wait silent child: %v\n", err)
+				os.Exit(2)
+			}
+		}
+		os.Exit(code)
+	case "silent-cpu-child":
+		logPath := args[0]
+		childDuration := parseDuration(args[1])
+		code := parseInt(args[2])
+		appendLog(logPath, "first")
+		child := helperCommandForProcess("burn-cpu", childDuration.String(), "0")
+		child.Stdout = io.Discard
+		child.Stderr = io.Discard
+		if err := child.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "start cpu child: %v\n", err)
+			os.Exit(2)
+		}
+		if err := child.Wait(); err != nil {
+			fmt.Fprintf(os.Stderr, "wait cpu child: %v\n", err)
+			os.Exit(2)
+		}
+		os.Exit(code)
+	case "burn-cpu":
+		duration := parseDuration(args[0])
+		code := parseInt(args[1])
+		deadline := time.Now().Add(duration)
+		var sum uint64
+		for time.Now().Before(deadline) {
+			sum += uint64(time.Now().UnixNano()) | 1
+			sum ^= sum << 7
+			sum ^= sum >> 3
+		}
+		if sum == 0 {
+			fmt.Fprintln(os.Stderr, "unreachable cpu sink")
+		}
+		os.Exit(code)
 	case "assert-arg":
 		if len(args) != 1 {
 			fmt.Fprintf(os.Stderr, "assert-arg got %d args\n", len(args))
@@ -600,18 +1090,142 @@ func TestHelperProcess(t *testing.T) {
 		}
 		fmt.Println(args[0])
 		os.Exit(0)
+	case "guardian-supervisor":
+		runGuardianSupervisorHelper(args)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
 		os.Exit(2)
 	}
 }
 
+type guardianReadyRecord struct {
+	ProviderPID  int `json:"provider_pid"`
+	ProviderPGID int `json:"provider_pgid"`
+	GuardianPID  int `json:"guardian_pid"`
+}
+
+func runGuardianSupervisorHelper(args []string) {
+	if len(args) != 4 {
+		fmt.Fprintf(os.Stderr, "guardian-supervisor got %d args\n", len(args))
+		os.Exit(2)
+	}
+	storePath, diagPath, readyPath, suffix := args[0], args[1], args[2], args[3]
+	ctx := context.Background()
+	store, err := storage.Open(ctx, storage.Options{Path: storePath})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
+		os.Exit(2)
+	}
+	defer store.Close()
+	runID := "run-guardian-crash-" + suffix
+	attemptID := "job-guardian-crash-" + suffix
+	ownerID := "worker:" + runID + ":" + attemptID + ":1"
+	var started StartedProcess
+	var persistedAuthority storage.ProviderExecutionAuthority
+	cmd := helperCommandForProcess("sleep", "30s")
+	_, err = Run(ctx, cmd, Options{
+		HardCap: 35 * time.Second,
+		RunID:   runID,
+		Role:    "worker",
+		OnStart: func(process StartedProcess) error {
+			started = process
+			persisted, err := storage.PersistProviderExecutionAuthority(ctx, store, storage.ProviderExecutionAuthority{
+				ProjectID:            "proj-guardian",
+				RunID:                runID,
+				AttemptID:            attemptID,
+				ProviderPID:          process.PID,
+				ProviderPGID:         process.PGID,
+				ProcessBirthIdentity: process.ProcessBirthIdentity,
+				ExecutableIdentity:   process.ExecutableIdentity,
+				OwnerID:              ownerID,
+				ClaimGeneration:      1,
+				WorktreePath:         filepath.Dir(readyPath),
+				LogPath:              filepath.Join(filepath.Dir(readyPath), "provider.log"),
+				IdentityAmbiguous:    process.IdentityAmbiguous,
+				AmbiguityReason:      process.IdentityAmbiguityNote,
+			}, time.Now())
+			persistedAuthority = persisted
+			return err
+		},
+		Guardian: GuardianOptions{
+			Enabled:         true,
+			StorePath:       storePath,
+			DiagnosticPath:  diagPath,
+			ProjectID:       "proj-guardian",
+			RunID:           runID,
+			AttemptID:       attemptID,
+			OwnerID:         ownerID,
+			ClaimGeneration: 1,
+			ProviderAuthority: func() (storage.ProviderExecutionAuthority, bool) {
+				return persistedAuthority, persistedAuthority.ProviderPID > 0
+			},
+			OnStart: func(guardian GuardianProcess) error {
+				return writeGuardianReadyRecord(readyPath, guardianReadyRecord{
+					ProviderPID:  started.PID,
+					ProviderPGID: started.PGID,
+					GuardianPID:  guardian.PID,
+				})
+			},
+		},
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "guardian supervisor run: %v\n", err)
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
+
 func helperCommand(t *testing.T, args ...string) *exec.Cmd {
 	t.Helper()
+	return helperCommandForProcess(args...)
+}
+
+func helperCommandForProcess(args ...string) *exec.Cmd {
 	cmdArgs := append([]string{"-test.run=TestHelperProcess", "--"}, args...)
 	cmd := exec.Command(os.Args[0], cmdArgs...)
-	cmd.Env = append(os.Environ(), "GO_WANT_SUPERVISEDEXEC_HELPER=1")
+	cmd.Env = helperProcessEnv("GO_WANT_SUPERVISEDEXEC_HELPER=1")
 	return cmd
+}
+
+func helperProcessEnv(extra ...string) []string {
+	env := make([]string, 0, len(os.Environ())+len(extra))
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(key, "GIT_") {
+			continue
+		}
+		env = append(env, entry)
+	}
+	return append(env, extra...)
+}
+
+type supervisedFailingWriteStore struct {
+	storage.Store
+	mu       sync.Mutex
+	attempts int
+	skip     int
+	failures int
+}
+
+func (s *supervisedFailingWriteStore) WithWriteTx(ctx context.Context, fn func(storage.Tx) error) error {
+	s.mu.Lock()
+	s.attempts++
+	attempt := s.attempts
+	shouldFail := attempt > s.skip && s.failures > 0
+	if shouldFail {
+		s.failures--
+	}
+	s.mu.Unlock()
+	if shouldFail {
+		return errors.New("injected progress write failure")
+	}
+	return s.Store.WithWriteTx(ctx, fn)
+}
+
+func (s *supervisedFailingWriteStore) Attempts() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.attempts
 }
 
 func shellExitCommand(code int) string {
@@ -694,4 +1308,109 @@ func updateWorktreeActivity(worktreePath string, index int) {
 		fmt.Fprintf(os.Stderr, "chtimes activity: %v\n", err)
 		os.Exit(2)
 	}
+}
+
+func startGuardianAuthorityProcess(t *testing.T) (*exec.Cmd, storage.ProviderExecutionAuthority) {
+	t.Helper()
+	cmd := exec.Command("/bin/sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start authority process: %v", err)
+	}
+	identity, err := process.Snapshot(cmd.Process.Pid, time.Now())
+	if err != nil {
+		terminateProcessGroup(cmd.Process.Pid)
+		t.Fatalf("snapshot authority process: %v", err)
+	}
+	return cmd, storage.ProviderExecutionAuthority{
+		ProjectID:            "proj-guardian",
+		RunID:                "run-guardian",
+		AttemptID:            "job-guardian",
+		ProviderPID:          identity.PID,
+		ProviderPGID:         identity.PGID,
+		ProcessBirthIdentity: identity.ProcessBirthIdentity,
+		ExecutableIdentity:   identity.ExecutableIdentity,
+		OwnerID:              "worker:run-guardian:job-guardian:1",
+		ClaimGeneration:      1,
+		WorktreePath:         t.TempDir(),
+		LogPath:              filepath.Join(t.TempDir(), "provider.log"),
+		IdentityAmbiguous:    identity.Ambiguous,
+		AmbiguityReason:      identity.AmbiguityReason,
+	}
+}
+
+func terminateProcessGroup(pid int) {
+	if pid <= 0 {
+		return
+	}
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
+}
+
+func seedGuardianProject(t *testing.T, ctx context.Context, store storage.Store, projectID, projectPath string) {
+	t.Helper()
+	err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		_, err := tx.Exec(ctx, `INSERT INTO projects(
+				id, local_path, created_at, updated_at, local_path_canonical, git_root, identity_source
+			) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			projectID, projectPath, now, now, projectPath, projectPath, "test")
+		return err
+	})
+	if err != nil {
+		t.Fatalf("seed guardian project: %v", err)
+	}
+}
+
+func waitGuardianReady(t *testing.T, path string) guardianReadyRecord {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			var ready guardianReadyRecord
+			if err := json.Unmarshal(data, &ready); err != nil {
+				t.Fatalf("decode ready record: %v\n%s", err, string(data))
+			}
+			return ready
+		}
+		lastErr = err
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("ready record %s not written: %v", path, lastErr)
+	return guardianReadyRecord{}
+}
+
+func writeGuardianReadyRecord(path string, record guardianReadyRecord) error {
+	data, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	tmp := fmt.Sprintf("%s.tmp.%d", path, os.Getpid())
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+func assertGuardianDiagnostic(t *testing.T, path, wantEvent string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read guardian diagnostic: %v", err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var event guardianEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("decode guardian diagnostic line %q: %v", line, err)
+		}
+		if event.Event == wantEvent {
+			return
+		}
+	}
+	t.Fatalf("guardian diagnostic missing event %q:\n%s", wantEvent, string(data))
 }

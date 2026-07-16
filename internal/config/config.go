@@ -3,6 +3,8 @@ package config
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base32"
 	"errors"
 	"fmt"
 	"io"
@@ -18,23 +20,30 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/migration"
 )
 
+const (
+	roleDefinitionSchema = "loopcoder.role_definition.v1"
+)
+
 type Config struct {
-	Version      int          `yaml:"version"`
-	Adapters     Adapters     `yaml:"adapters"`
-	Worker       Worker       `yaml:"worker"`
-	Verifier     Verifier     `yaml:"verifier"`
-	CI           CI           `yaml:"ci"`
-	Models       Models       `yaml:"models"`
-	Verification Verification `yaml:"verification"`
-	Resilience   Resilience   `yaml:"resilience"`
-	Guardrails   Guardrails   `yaml:"guardrails"`
-	Environment  Environment  `yaml:"environment"`
-	Evidence     Evidence     `yaml:"evidence"`
-	Host         Host         `yaml:"host,omitempty"`
-	Domain       Domain       `yaml:"domain,omitempty"`
-	MCP          MCP          `yaml:"mcp,omitempty"`
-	Audit        Audit        `yaml:"audit,omitempty"`
-	Report       Report       `yaml:"report"`
+	Version           int               `yaml:"version"`
+	Adapters          Adapters          `yaml:"adapters"`
+	Worker            Worker            `yaml:"worker"`
+	Verifier          Verifier          `yaml:"verifier"`
+	CI                CI                `yaml:"ci"`
+	Models            Models            `yaml:"models"`
+	Verification      Verification      `yaml:"verification"`
+	Orchestration     Orchestration     `yaml:"orchestration"`
+	Resilience        Resilience        `yaml:"resilience"`
+	Guardrails        Guardrails        `yaml:"guardrails"`
+	Environment       Environment       `yaml:"environment"`
+	Evidence          Evidence          `yaml:"evidence"`
+	Host              Host              `yaml:"host,omitempty"`
+	Domain            Domain            `yaml:"domain,omitempty"`
+	MCP               MCP               `yaml:"mcp,omitempty"`
+	ProviderInventory ProviderInventory `yaml:"provider_inventory,omitempty"`
+	RoleDefinitions   []RoleDefinition  `yaml:"role_definitions,omitempty" json:"role_definitions,omitempty"`
+	Audit             Audit             `yaml:"audit,omitempty"`
+	Report            Report            `yaml:"report"`
 }
 
 type ShowBaseConfigFunc func(ctx context.Context, repoPath, baseBranch string) ([]byte, error)
@@ -110,6 +119,16 @@ type Verification struct {
 type Browser struct {
 	Enabled string   `yaml:"enabled"`
 	Globs   []string `yaml:"globs"`
+}
+
+type Orchestration struct {
+	CostBudget OrchestrationCostBudget `yaml:"cost_budget"`
+}
+
+type OrchestrationCostBudget struct {
+	MaxModelCalls      int   `yaml:"max_model_calls"`
+	MaxTokens          int64 `yaml:"max_tokens"`
+	MaxOverheadPercent int   `yaml:"max_overhead_percent"`
 }
 
 type Resilience struct {
@@ -248,6 +267,64 @@ type MCPAuth struct {
 	Env    string `yaml:"env,omitempty"`
 }
 
+type ProviderInventory struct {
+	Executables      map[string][]string `yaml:"executables,omitempty"`
+	ProfileSelection map[string]string   `yaml:"profile_selection,omitempty"`
+	CodexBar         CodexBar            `yaml:"codexbar,omitempty"`
+}
+
+type CodexBar struct {
+	Enabled   bool                  `yaml:"enabled,omitempty"`
+	Providers []CodexBarProviderOpt `yaml:"providers,omitempty"`
+}
+
+type CodexBarProviderOpt struct {
+	Provider   string `yaml:"provider,omitempty"`
+	TrustClass string `yaml:"trust_class,omitempty"`
+}
+
+type RoleDefinition struct {
+	SchemaVersion              string             `yaml:"schema_version,omitempty" json:"schema_version,omitempty"`
+	RecordVersion              int                `yaml:"record_version,omitempty" json:"record_version,omitempty"`
+	RoleDefinitionID           string             `yaml:"role_definition_id,omitempty" json:"role_definition_id,omitempty"`
+	RoleKey                    string             `yaml:"role_key" json:"role_key"`
+	RoleVersion                string             `yaml:"role_version,omitempty" json:"role_version,omitempty"`
+	Description                string             `yaml:"description,omitempty" json:"description,omitempty"`
+	AllowedRiskTiers           []string           `yaml:"allowed_risk_tiers,omitempty" json:"allowed_risk_tiers,omitempty"`
+	MinimumCapabilities        []RoleCapability   `yaml:"minimum_capabilities,omitempty" json:"minimum_capabilities,omitempty"`
+	PermissionFloor            string             `yaml:"permission_floor,omitempty" json:"permission_floor,omitempty"`
+	PermissionCeiling          string             `yaml:"permission_ceiling,omitempty" json:"permission_ceiling,omitempty"`
+	DefaultOutputContract      string             `yaml:"default_output_contract,omitempty" json:"default_output_contract,omitempty"`
+	IndependenceRequirements   map[string]string  `yaml:"independence_requirements,omitempty" json:"independence_requirements,omitempty"`
+	ForbiddenBindings          []string           `yaml:"forbidden_bindings,omitempty" json:"forbidden_bindings,omitempty"`
+	QualityFloor               string             `yaml:"quality_floor,omitempty" json:"quality_floor,omitempty"`
+	ReasoningDepth             string             `yaml:"reasoning_depth,omitempty" json:"reasoning_depth,omitempty"`
+	RequiredTools              []string           `yaml:"required_tools,omitempty" json:"required_tools,omitempty"`
+	MinimumContextWindowTokens int                `yaml:"minimum_context_window_tokens,omitempty" json:"minimum_context_window_tokens,omitempty"`
+	MaxSideEffectClass         string             `yaml:"max_side_effect_class,omitempty" json:"max_side_effect_class,omitempty"`
+	VerificationRequirements   []RoleVerification `yaml:"verification_requirements,omitempty" json:"verification_requirements,omitempty"`
+	LatencyTolerance           string             `yaml:"latency_tolerance,omitempty" json:"latency_tolerance,omitempty"`
+	CostTolerance              string             `yaml:"cost_tolerance,omitempty" json:"cost_tolerance,omitempty"`
+	PolicyVersion              string             `yaml:"policy_version,omitempty" json:"policy_version,omitempty"`
+}
+
+type RoleCapability struct {
+	Dimension         string `yaml:"dimension" json:"dimension"`
+	RequiredValue     any    `yaml:"required_value" json:"required_value"`
+	MinimumConfidence string `yaml:"minimum_confidence,omitempty" json:"minimum_confidence,omitempty"`
+	FreshnessRequired string `yaml:"freshness_required,omitempty" json:"freshness_required,omitempty"`
+	Source            string `yaml:"source,omitempty" json:"source,omitempty"`
+}
+
+type RoleVerification struct {
+	VerificationKind     string   `yaml:"verification_kind" json:"verification_kind"`
+	RequiredForRiskTiers []string `yaml:"required_for_risk_tiers,omitempty" json:"required_for_risk_tiers,omitempty"`
+	IndependenceLevel    string   `yaml:"independence_level,omitempty" json:"independence_level,omitempty"`
+	PermissionRequired   string   `yaml:"permission_required,omitempty" json:"permission_required,omitempty"`
+	OutputContract       string   `yaml:"output_contract,omitempty" json:"output_contract,omitempty"`
+	Source               string   `yaml:"source,omitempty" json:"source,omitempty"`
+}
+
 // Audit is the optional 0.5.3 audit command configuration surface. It is
 // additive: absent fields preserve built-in audit defaults.
 type Audit struct {
@@ -371,6 +448,13 @@ func Default() Config {
 				Enabled: lcdefaults.VerificationBrowserMode,
 			},
 		},
+		Orchestration: Orchestration{
+			CostBudget: OrchestrationCostBudget{
+				MaxModelCalls:      8,
+				MaxTokens:          500_000,
+				MaxOverheadPercent: 10,
+			},
+		},
 		Resilience: Resilience{
 			Worker: ResilienceWorker{
 				HeartbeatIntervalSeconds: lcdefaults.WorkerHeartbeatIntervalSeconds,
@@ -413,13 +497,25 @@ func Parse(data []byte) (Config, error) {
 }
 
 func validateParsedConfig(cfg Config) error {
+	if err := validateAdapterProviderNames(cfg.Adapters); err != nil {
+		return err
+	}
 	if err := validateGuardrailBudget(cfg.Guardrails.Budget); err != nil {
+		return err
+	}
+	if err := validateOrchestrationCostBudget(cfg.Orchestration.CostBudget); err != nil {
 		return err
 	}
 	if err := validateGuardrailCircuitBreaker(cfg.Guardrails.CircuitBreaker); err != nil {
 		return err
 	}
 	if err := validateMCP(cfg.MCP); err != nil {
+		return err
+	}
+	if err := validateProviderInventory(cfg.ProviderInventory); err != nil {
+		return err
+	}
+	if err := validateRoleDefinitions(cfg.RoleDefinitions); err != nil {
 		return err
 	}
 	if err := validateDomainCommands(cfg.Domain); err != nil {
@@ -430,6 +526,25 @@ func validateParsedConfig(cfg Config) error {
 	}
 	if err := validateHost(cfg.Host); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateAdapterProviderNames(adapters Adapters) error {
+	for _, candidate := range []struct {
+		path  string
+		value string
+	}{
+		{path: "adapters.worker", value: adapters.Worker},
+		{path: "adapters.verifier", value: adapters.Verifier},
+	} {
+		value := strings.TrimSpace(candidate.value)
+		if value == "" {
+			continue
+		}
+		if !validMCPServerName(value) {
+			return fmt.Errorf("invalid delivery config: %s %q is not a safe provider adapter name", candidate.path, candidate.value)
+		}
 	}
 	return nil
 }
@@ -499,6 +614,19 @@ func validateGuardrailBudget(b GuardrailBudget) error {
 	return nil
 }
 
+func validateOrchestrationCostBudget(b OrchestrationCostBudget) error {
+	if b.MaxModelCalls <= 0 {
+		return fmt.Errorf("invalid delivery config: orchestration.cost_budget.max_model_calls must be greater than zero")
+	}
+	if b.MaxTokens <= 0 {
+		return fmt.Errorf("invalid delivery config: orchestration.cost_budget.max_tokens must be greater than zero")
+	}
+	if b.MaxOverheadPercent <= 0 || b.MaxOverheadPercent > 100 {
+		return fmt.Errorf("invalid delivery config: orchestration.cost_budget.max_overhead_percent must be between 1 and 100")
+	}
+	return nil
+}
+
 func validateGuardrailCircuitBreaker(c GuardrailCircuitBreaker) error {
 	if c.MaxNoProgressWaves != nil && *c.MaxNoProgressWaves <= 0 {
 		return fmt.Errorf("invalid delivery config: guardrails.circuit_breaker.max_no_progress_waves must be greater than zero")
@@ -511,6 +639,353 @@ func validateGuardrailCircuitBreaker(c GuardrailCircuitBreaker) error {
 
 func validateMCP(m MCP) error {
 	return validateMCPDeclarations(m, "invalid delivery config: ")
+}
+
+func validateProviderInventory(inventory ProviderInventory) error {
+	for provider, paths := range inventory.Executables {
+		if !validMCPServerName(provider) {
+			return fmt.Errorf("invalid delivery config: provider_inventory.executables contains unsafe provider key %q", provider)
+		}
+		for index, path := range paths {
+			if strings.TrimSpace(path) == "" {
+				return fmt.Errorf("invalid delivery config: provider_inventory.executables.%s[%d] must not be empty", provider, index)
+			}
+		}
+	}
+	for provider, accountProfileID := range inventory.ProfileSelection {
+		if !validMCPServerName(provider) {
+			return fmt.Errorf("invalid delivery config: provider_inventory.profile_selection contains unsafe provider key %q", provider)
+		}
+		accountProfileID = strings.TrimSpace(accountProfileID)
+		if !strings.HasPrefix(accountProfileID, "acct_") || len(accountProfileID) < len("acct_")+8 {
+			return fmt.Errorf("invalid delivery config: provider_inventory.profile_selection.%s must be an opaque acct_ account profile id", provider)
+		}
+	}
+	if inventory.CodexBar.Enabled {
+		if len(inventory.CodexBar.Providers) == 0 {
+			return fmt.Errorf("invalid delivery config: provider_inventory.codexbar.providers must list at least one provider when enabled")
+		}
+		seen := map[string]bool{}
+		for index, provider := range inventory.CodexBar.Providers {
+			name := strings.TrimSpace(provider.Provider)
+			if !validMCPServerName(name) {
+				return fmt.Errorf("invalid delivery config: provider_inventory.codexbar.providers[%d].provider %q is not a safe provider key", index, provider.Provider)
+			}
+			if seen[name] {
+				return fmt.Errorf("invalid delivery config: provider_inventory.codexbar.providers[%d].provider %q is duplicated", index, name)
+			}
+			seen[name] = true
+			switch strings.TrimSpace(provider.TrustClass) {
+			case "local-machine", "credential-delegated", "internal-protocol", "browser-session":
+			default:
+				return fmt.Errorf("invalid delivery config: provider_inventory.codexbar.providers[%d].trust_class %q is not allowlisted", index, provider.TrustClass)
+			}
+		}
+	}
+	return nil
+}
+
+func validateRoleDefinitions(roles []RoleDefinition) error {
+	seen := map[string]bool{}
+	for index, role := range roles {
+		key := strings.ToLower(strings.TrimSpace(role.RoleKey))
+		if key == "" {
+			return fmt.Errorf("invalid delivery config: role_definitions[%d].role_key must not be empty", index)
+		}
+		if role.SchemaVersion != roleDefinitionSchema {
+			return fmt.Errorf("invalid delivery config: role_definitions[%d].schema_version %q is not supported", index, role.SchemaVersion)
+		}
+		if role.RecordVersion != 1 {
+			return fmt.Errorf("invalid delivery config: role_definitions[%d].record_version %d is not supported", index, role.RecordVersion)
+		}
+		if !validMCPServerName(key) {
+			return fmt.Errorf("invalid delivery config: role_definitions[%d].role_key %q is not a safe role key", index, role.RoleKey)
+		}
+		if seen[key] {
+			return fmt.Errorf("invalid delivery config: role_definitions[%d].role_key %q is duplicated", index, role.RoleKey)
+		}
+		seen[key] = true
+		if strings.TrimSpace(role.RoleVersion) == "" {
+			return fmt.Errorf("invalid delivery config: role_definitions[%d].role_version must not be empty", index)
+		}
+		if strings.TrimSpace(role.Description) == "" {
+			return fmt.Errorf("invalid delivery config: role_definitions[%d].description must not be empty", index)
+		}
+		policyVersion := strings.TrimSpace(role.PolicyVersion)
+		if policyVersion == "" {
+			return fmt.Errorf("invalid delivery config: role_definitions[%d].policy_version must not be empty", index)
+		}
+		if role.RoleDefinitionID != "" && role.RoleDefinitionID != configRoleDefinitionID(key, role.RoleVersion, policyVersion) {
+			return fmt.Errorf("invalid delivery config: role_definitions[%d].role_definition_id does not match role_key, role_version, and policy_version", index)
+		}
+		if len(role.AllowedRiskTiers) == 0 {
+			return fmt.Errorf("invalid delivery config: role_definitions[%d].allowed_risk_tiers must not be empty", index)
+		}
+		for riskIndex, risk := range role.AllowedRiskTiers {
+			if !validConfigRiskTier(risk) {
+				return fmt.Errorf("invalid delivery config: role_definitions[%d].allowed_risk_tiers[%d] %q is unknown", index, riskIndex, risk)
+			}
+		}
+		if len(role.MinimumCapabilities) == 0 {
+			return fmt.Errorf("invalid delivery config: role_definitions[%d].minimum_capabilities must not be empty", index)
+		}
+		for capIndex, capability := range role.MinimumCapabilities {
+			if err := validateConfigRoleCapability(capability); err != nil {
+				return fmt.Errorf("invalid delivery config: role_definitions[%d].minimum_capabilities[%d]: %w", index, capIndex, err)
+			}
+		}
+		if !validConfigPermission(role.PermissionFloor) || !validConfigPermission(role.PermissionCeiling) || configPermissionRank(role.PermissionFloor) > configPermissionRank(role.PermissionCeiling) {
+			return fmt.Errorf("invalid delivery config: role_definitions[%d].permission_floor and permission_ceiling are invalid", index)
+		}
+		if !validConfigOutput(role.DefaultOutputContract) {
+			return fmt.Errorf("invalid delivery config: role_definitions[%d].default_output_contract %q is unknown", index, role.DefaultOutputContract)
+		}
+		for risk, independence := range role.IndependenceRequirements {
+			if !validConfigRiskTier(risk) || !validConfigIndependence(independence) {
+				return fmt.Errorf("invalid delivery config: role_definitions[%d].independence_requirements contains unknown field", index)
+			}
+		}
+		if !validConfigQuality(role.QualityFloor) || !validConfigReasoningDepth(role.ReasoningDepth) || !validConfigSideEffect(role.MaxSideEffectClass) || !validConfigLatency(role.LatencyTolerance) || !validConfigCost(role.CostTolerance) {
+			return fmt.Errorf("invalid delivery config: role_definitions[%d] contains an unknown envelope enum", index)
+		}
+		if role.MinimumContextWindowTokens < 0 {
+			return fmt.Errorf("invalid delivery config: role_definitions[%d].minimum_context_window_tokens must be non-negative", index)
+		}
+		for verificationIndex, verification := range role.VerificationRequirements {
+			if err := validateConfigRoleVerification(verification); err != nil {
+				return fmt.Errorf("invalid delivery config: role_definitions[%d].verification_requirements[%d]: %w", index, verificationIndex, err)
+			}
+		}
+	}
+	return nil
+}
+
+func validateConfigRoleCapability(capability RoleCapability) error {
+	dimension := strings.TrimSpace(capability.Dimension)
+	if !validConfigCapabilityDimension(dimension) {
+		return fmt.Errorf("dimension %q is unknown", capability.Dimension)
+	}
+	if capability.RequiredValue == nil {
+		return fmt.Errorf("required_value must be set")
+	}
+	if !validConfigHardConfidence(capability.MinimumConfidence) {
+		return fmt.Errorf("minimum_confidence %q is not a supported hard evidence floor", capability.MinimumConfidence)
+	}
+	if strings.TrimSpace(capability.FreshnessRequired) != "fresh" {
+		return fmt.Errorf("freshness_required must be fresh")
+	}
+	switch dimension {
+	case "roles_supported", "tool_support":
+		if values, ok := configStringList(capability.RequiredValue); !ok || len(values) == 0 {
+			return fmt.Errorf("%s required_value must be a non-empty string or string list", dimension)
+		}
+	case "context_window_tokens":
+		if value, ok := configIntValue(capability.RequiredValue); !ok || value < 0 {
+			return fmt.Errorf("context_window_tokens required_value must be a non-negative integer")
+		}
+	default:
+		value, ok := capability.RequiredValue.(bool)
+		if !ok || !value {
+			return fmt.Errorf("%s required_value must be true", dimension)
+		}
+	}
+	return nil
+}
+
+func validateConfigRoleVerification(verification RoleVerification) error {
+	if !validConfigVerificationKind(verification.VerificationKind) {
+		return fmt.Errorf("verification_kind %q is unknown", verification.VerificationKind)
+	}
+	for _, risk := range verification.RequiredForRiskTiers {
+		if !validConfigRiskTier(risk) {
+			return fmt.Errorf("required_for_risk_tiers contains unknown risk %q", risk)
+		}
+	}
+	if !validConfigIndependence(verification.IndependenceLevel) || !validConfigPermission(verification.PermissionRequired) || !validConfigOutput(verification.OutputContract) {
+		return fmt.Errorf("verification requirement contains an unknown enum")
+	}
+	return nil
+}
+
+func validConfigRiskTier(value string) bool {
+	switch strings.TrimSpace(value) {
+	case "low", "medium", "high", "critical":
+		return true
+	default:
+		return false
+	}
+}
+
+func validConfigPermission(value string) bool {
+	return configPermissionRank(value) > 0
+}
+
+func configPermissionRank(value string) int {
+	switch strings.TrimSpace(value) {
+	case "read-only":
+		return 1
+	case "write":
+		return 2
+	case "orchestrate":
+		return 3
+	default:
+		return 0
+	}
+}
+
+func validConfigOutput(value string) bool {
+	switch strings.TrimSpace(value) {
+	case "freeform", "markdown", "json", "json-schema", "patch", "branch", "pr", "report", "verification-verdict":
+		return true
+	default:
+		return false
+	}
+}
+
+func validConfigIndependence(value string) bool {
+	switch strings.TrimSpace(value) {
+	case "none", "different-model", "different-account", "different-provider", "human":
+		return true
+	default:
+		return false
+	}
+}
+
+func validConfigQuality(value string) bool {
+	switch strings.TrimSpace(value) {
+	case "standard", "strong", "adversarial":
+		return true
+	default:
+		return false
+	}
+}
+
+func validConfigReasoningDepth(value string) bool {
+	switch strings.TrimSpace(value) {
+	case "standard", "deep", "adversarial":
+		return true
+	default:
+		return false
+	}
+}
+
+func validConfigSideEffect(value string) bool {
+	switch strings.TrimSpace(value) {
+	case "none", "local-read", "local-write", "repo-write", "provider-launch", "git-remote-write", "github-write", "external-write":
+		return true
+	default:
+		return false
+	}
+}
+
+func validConfigLatency(value string) bool {
+	switch strings.TrimSpace(value) {
+	case "low", "standard", "relaxed":
+		return true
+	default:
+		return false
+	}
+}
+
+func validConfigCost(value string) bool {
+	switch strings.TrimSpace(value) {
+	case "low", "standard", "high":
+		return true
+	default:
+		return false
+	}
+}
+
+func validConfigVerificationKind(value string) bool {
+	switch strings.TrimSpace(value) {
+	case "none", "self-check", "local-command", "hosted-check", "loopreview", "security-review", "human-approval", "override":
+		return true
+	default:
+		return false
+	}
+}
+
+func validConfigCapabilityDimension(value string) bool {
+	switch strings.TrimSpace(value) {
+	case "roles_supported", "read_only", "json_output", "nested_subagents", "mcp_config", "cancellation", "token_usage_reporting", "context_window_tokens", "tool_support", "image_input", "image_output":
+		return true
+	default:
+		return false
+	}
+}
+
+func validConfigHardConfidence(value string) bool {
+	switch strings.TrimSpace(value) {
+	case "exact", "estimated":
+		return true
+	default:
+		return false
+	}
+}
+
+func configStringList(value any) ([]string, bool) {
+	switch v := value.(type) {
+	case string:
+		text := strings.TrimSpace(v)
+		if text == "" {
+			return nil, false
+		}
+		return []string{text}, true
+	case []string:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				return nil, false
+			}
+			out = append(out, item)
+		}
+		return out, len(out) > 0
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			text, ok := item.(string)
+			if !ok || strings.TrimSpace(text) == "" {
+				return nil, false
+			}
+			out = append(out, strings.TrimSpace(text))
+		}
+		return out, len(out) > 0
+	default:
+		return nil, false
+	}
+}
+
+func configIntValue(value any) (int, bool) {
+	switch v := value.(type) {
+	case int:
+		return v, true
+	case int64:
+		if v > int64(^uint(0)>>1) {
+			return int(^uint(0) >> 1), true
+		}
+		return int(v), true
+	case float64:
+		if v != float64(int(v)) {
+			return 0, false
+		}
+		return int(v), true
+	default:
+		return 0, false
+	}
+}
+
+func configRoleDefinitionID(roleKey, roleVersion, policyVersion string) string {
+	return "roledef_" + configRoleDigestBase32(strings.ToLower(strings.TrimSpace(roleKey)), strings.TrimSpace(roleVersion), strings.TrimSpace(policyVersion))
+}
+
+func configRoleDigestBase32(parts ...string) string {
+	sum := sha256.New()
+	for _, part := range parts {
+		sum.Write([]byte(part))
+		sum.Write([]byte{0})
+	}
+	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum.Sum(nil)))
 }
 
 func validateMCPDeclarations(m MCP, errorPrefix string) error {

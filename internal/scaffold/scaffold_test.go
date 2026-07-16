@@ -16,6 +16,9 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/gitlocal"
+	"github.com/jasonhnd/loopcoder/internal/home"
+	"github.com/jasonhnd/loopcoder/internal/registry"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 )
 
 func TestInitFreshRepoCreatesFilesAndMissingLabels(t *testing.T) {
@@ -24,7 +27,7 @@ func TestInitFreshRepoCreatesFilesAndMissingLabels(t *testing.T) {
 		listOutput: `[{"name":"status:ready"}]`,
 	}
 
-	result, err := Init(context.Background(), Options{RepoPath: "repo"}, scaffoldDepsForTest(fsys, gh))
+	result, err := Init(context.Background(), Options{RepoPath: "repo"}, scaffoldDepsForTest(t, fsys, gh))
 	if err != nil {
 		t.Fatalf("Init returned error: %v", err)
 	}
@@ -92,7 +95,7 @@ func TestInitExistingFilesDoesNotClobber(t *testing.T) {
 	fsys.mustWrite(filepath.Join("repo", RoadmapFilename), []byte("custom roadmap"))
 	gh := &fakeGitHubRunner{listOutput: allLabelsJSON(t)}
 
-	result, err := Init(context.Background(), Options{RepoPath: "repo"}, scaffoldDepsForTest(fsys, gh))
+	result, err := Init(context.Background(), Options{RepoPath: "repo"}, scaffoldDepsForTest(t, fsys, gh))
 	if err != nil {
 		t.Fatalf("Init returned error: %v", err)
 	}
@@ -118,7 +121,7 @@ func TestInitForceOverwritesExistingFiles(t *testing.T) {
 	result, err := Init(context.Background(), Options{
 		RepoPath: "repo",
 		Force:    true,
-	}, scaffoldDepsForTest(fsys, &fakeGitHubRunner{listOutput: allLabelsJSON(t)}))
+	}, scaffoldDepsForTest(t, fsys, &fakeGitHubRunner{listOutput: allLabelsJSON(t)}))
 	if err != nil {
 		t.Fatalf("Init returned error: %v", err)
 	}
@@ -142,7 +145,7 @@ func TestInitModelFlagsPersistRoleValues(t *testing.T) {
 		WorkerEffort:   "high",
 		VerifierModel:  "claude-sonnet-4-5",
 		VerifierEffort: "max",
-	}, scaffoldDepsForTest(fsys, &fakeGitHubRunner{listOutput: allLabelsJSON(t)}))
+	}, scaffoldDepsForTest(t, fsys, &fakeGitHubRunner{listOutput: allLabelsJSON(t)}))
 	if err != nil {
 		t.Fatalf("Init returned error: %v", err)
 	}
@@ -165,7 +168,7 @@ func TestInitGateAutoGeneratesAutoGate(t *testing.T) {
 	_, err := Init(context.Background(), Options{
 		RepoPath: "repo",
 		Gate:     "auto",
-	}, scaffoldDepsForTest(fsys, &fakeGitHubRunner{listOutput: allLabelsJSON(t)}))
+	}, scaffoldDepsForTest(t, fsys, &fakeGitHubRunner{listOutput: allLabelsJSON(t)}))
 	if err != nil {
 		t.Fatalf("Init returned error: %v", err)
 	}
@@ -185,7 +188,7 @@ func TestInitRejectsInvalidGateBeforeWrites(t *testing.T) {
 	_, err := Init(context.Background(), Options{
 		RepoPath: "repo",
 		Gate:     "bogus",
-	}, scaffoldDepsForTest(fsys, &fakeGitHubRunner{listOutput: allLabelsJSON(t)}))
+	}, scaffoldDepsForTest(t, fsys, &fakeGitHubRunner{listOutput: allLabelsJSON(t)}))
 	if err == nil || !strings.Contains(err.Error(), "allowed values: human-merge, auto") {
 		t.Fatalf("Init error = %v, want invalid gate", err)
 	}
@@ -201,6 +204,24 @@ func TestInitProtectsLocalLoopcoderState(t *testing.T) {
 	result, err := Init(context.Background(), Options{RepoPath: "repo"}, Deps{
 		FS:     fsys,
 		GitHub: &fakeGitHubRunner{listOutput: allLabelsJSON(t)},
+		Getenv: func(key string) string {
+			if key == home.EnvHome {
+				return t.TempDir()
+			}
+			return ""
+		},
+		UserHomeDir: func() (string, error) { return t.TempDir(), nil },
+		RunGit: func(context.Context, string, ...string) (string, error) {
+			return "", nil
+		},
+		InspectLocalState: func(context.Context, string) (*LocalStateResult, *Mutation, error) {
+			return &LocalStateResult{Path: filepath.Join("repo", ".git", "info", "exclude"), Status: gitlocal.ProtectUnchanged}, nil, nil
+		},
+		ResolveProject: fakeResolveProject,
+		RegisterProject: func(ctx context.Context, opts registry.Options) (registry.RegisterResult, error) {
+			project, err := fakeResolveProject(ctx, opts)
+			return registry.RegisterResult{Project: project, Created: true}, err
+		},
 		ProtectLocalState: func(_ context.Context, repoPath string) (gitlocal.ProtectResult, error) {
 			called = true
 			if repoPath != "repo" {
@@ -226,7 +247,7 @@ func TestInitGitHubUnavailableWarnsWithoutFailing(t *testing.T) {
 		listErr: errors.New("exec: gh not found"),
 	}
 
-	result, err := Init(context.Background(), Options{RepoPath: "repo"}, scaffoldDepsForTest(fsys, gh))
+	result, err := Init(context.Background(), Options{RepoPath: "repo"}, scaffoldDepsForTest(t, fsys, gh))
 	if err != nil {
 		t.Fatalf("Init returned error: %v", err)
 	}
@@ -241,14 +262,245 @@ func TestInitGitHubUnavailableWarnsWithoutFailing(t *testing.T) {
 	}
 }
 
-func scaffoldDepsForTest(fsys FileSystem, gh GitHubRunner) Deps {
+func TestPreviewDirtyRepositoryWarnsWithoutMutation(t *testing.T) {
+	fsys := newFakeFileSystem()
+	deps := scaffoldDepsForTest(t, fsys, &fakeGitHubRunner{listOutput: allLabelsJSON(t)})
+	deps.RunGit = func(_ context.Context, _ string, args ...string) (string, error) {
+		if reflect.DeepEqual(args, []string{"status", "--porcelain"}) {
+			return " M tracked.go\n?? untracked.txt\n", nil
+		}
+		return "", nil
+	}
+
+	result, err := Preview(context.Background(), Options{RepoPath: "repo"}, deps)
+	if err != nil {
+		t.Fatalf("Preview returned error: %v", err)
+	}
+	if result.Dirty == nil || !result.Dirty.Dirty || !strings.Contains(result.Dirty.Porcelain, "tracked.go") {
+		t.Fatalf("Dirty = %#v, want porcelain warning", result.Dirty)
+	}
+	if !containsWarning(result.Warnings, "repository has uncommitted changes") {
+		t.Fatalf("Warnings = %#v, want dirty warning", result.Warnings)
+	}
+	if len(fsys.files) != 0 {
+		t.Fatalf("preview wrote files: %#v", fsys.files)
+	}
+}
+
+func TestInitRuntimePermissionFailureBlocksBeforeRegistryOrFiles(t *testing.T) {
+	fsys := newFakeFileSystem()
+	homeDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(homeDir, "projects"), []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("write projects blocker: %v", err)
+	}
+	registerCalled := false
+	deps := scaffoldDepsForTest(t, fsys, &fakeGitHubRunner{listOutput: allLabelsJSON(t)})
+	deps.Getenv = func(key string) string {
+		if key == home.EnvHome {
+			return homeDir
+		}
+		return ""
+	}
+	deps.UserHomeDir = func() (string, error) { return homeDir, nil }
+	deps.RegisterProject = func(context.Context, registry.Options) (registry.RegisterResult, error) {
+		registerCalled = true
+		return registry.RegisterResult{}, errors.New("register should not be called")
+	}
+
+	result, err := Init(context.Background(), Options{RepoPath: "repo"}, deps)
+	var blocked *BlockedError
+	if !errors.As(err, &blocked) || blocked.Code != "runtime-root-permission" {
+		t.Fatalf("Init error = %v, want runtime-root-permission BlockedError", err)
+	}
+	if result.Outcome != OutcomeBlocked || result.Blocked == nil || result.Blocked.Code != "runtime-root-permission" {
+		t.Fatalf("blocked result = %#v", result.Blocked)
+	}
+	if registerCalled {
+		t.Fatal("RegisterProject was called after runtime dir failure")
+	}
+	if len(fsys.files) != 0 {
+		t.Fatalf("files were written after blocked runtime setup: %#v", fsys.files)
+	}
+	if _, err := os.Stat(filepath.Join(homeDir, "data", "loopcoder.db")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("database stat err = %v, want not exist", err)
+	}
+}
+
+func TestInitAlreadyConfiguredSkipsRegistryUpdate(t *testing.T) {
+	fsys := newFakeFileSystem()
+	fsys.mustWrite(filepath.Join("repo", DeliveryFilename), []byte("custom delivery"))
+	fsys.mustWrite(filepath.Join("repo", RoadmapFilename), []byte("custom roadmap"))
+	homeDir := t.TempDir()
+	dbPath := filepath.Join(homeDir, "data", "loopcoder.db")
+	store, err := storage.Open(context.Background(), storage.Options{Path: dbPath})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	project := registry.Project{
+		ProjectID:          "proj_test",
+		DisplayName:        "repo",
+		LocalPath:          filepath.Clean("repo"),
+		LocalPathCanonical: filepath.Clean("repo"),
+		IdentitySource:     registry.IdentityLocalPath,
+	}
+	if err := store.WithTx(context.Background(), func(tx storage.Tx) error {
+		_, err := tx.Exec(context.Background(), `INSERT INTO projects(id, display_name, local_path, local_path_canonical, git_root, default_branch, remote_url, remote_url_normalized, github_owner, github_name, identity_source, created_at, updated_at, detached_at) VALUES (?, ?, ?, ?, '', '', '', '', '', '', 'local-path', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '')`,
+			project.ProjectID, project.DisplayName, project.LocalPath, project.LocalPathCanonical)
+		return err
+	}); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	store.Close()
+	layout := home.New(homeDir)
+	for _, dir := range []string{
+		filepath.Join(layout.ProjectDir(project.ProjectID), "runs"),
+		filepath.Join(layout.ProjectDir(project.ProjectID), "relay"),
+		filepath.Join(layout.ProjectDir(project.ProjectID), "recovery"),
+		filepath.Join(layout.ProjectDir(project.ProjectID), "audit"),
+		layout.LogsDir(),
+		layout.TmpDir(),
+	} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	registerCalled := false
+	deps := scaffoldDepsForTest(t, fsys, &fakeGitHubRunner{listOutput: allLabelsJSON(t)})
+	deps.Getenv = func(key string) string {
+		if key == home.EnvHome {
+			return homeDir
+		}
+		return ""
+	}
+	deps.UserHomeDir = func() (string, error) { return homeDir, nil }
+	deps.RegisterProject = func(context.Context, registry.Options) (registry.RegisterResult, error) {
+		registerCalled = true
+		return registry.RegisterResult{}, nil
+	}
+
+	result, err := Init(context.Background(), Options{RepoPath: "repo"}, deps)
+	if err != nil {
+		t.Fatalf("Init returned error: %v", err)
+	}
+	if result.Outcome != OutcomeAlreadyConfigured || len(result.Mutations) != 0 {
+		t.Fatalf("result outcome=%q mutations=%#v, want already-configured with no mutations", result.Outcome, result.Mutations)
+	}
+	if registerCalled {
+		t.Fatal("RegisterProject was called for already-registered setup")
+	}
+}
+
+func TestPreviewMultiCheckoutCanonicalConflictIsDeterministic(t *testing.T) {
+	fsys := newFakeFileSystem()
+	homeDir := t.TempDir()
+	dbPath := filepath.Join(homeDir, "data", "loopcoder.db")
+	store, err := storage.Open(context.Background(), storage.Options{Path: dbPath})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	canonical := filepath.Join(t.TempDir(), "repo")
+	if err := store.WithTx(context.Background(), func(tx storage.Tx) error {
+		for _, id := range []string{"proj_a", "proj_b"} {
+			if _, err := tx.Exec(context.Background(), `INSERT INTO projects(id, display_name, local_path, local_path_canonical, git_root, default_branch, remote_url, remote_url_normalized, github_owner, github_name, identity_source, created_at, updated_at, detached_at) VALUES (?, ?, ?, ?, ?, '', '', '', '', '', 'local-path', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '')`,
+				id, id, canonical, canonical, canonical); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("insert projects: %v", err)
+	}
+	store.Close()
+
+	deps := scaffoldDepsForTest(t, fsys, &fakeGitHubRunner{listOutput: allLabelsJSON(t)})
+	deps.Getenv = func(key string) string {
+		if key == home.EnvHome {
+			return homeDir
+		}
+		return ""
+	}
+	deps.UserHomeDir = func() (string, error) { return homeDir, nil }
+	deps.ResolveProject = func(context.Context, registry.Options) (registry.Project, error) {
+		return registry.Project{
+			ProjectID:          "proj_current",
+			DisplayName:        "repo",
+			LocalPath:          canonical,
+			LocalPathCanonical: canonical,
+			GitRoot:            canonical,
+			IdentitySource:     registry.IdentityLocalPath,
+		}, nil
+	}
+
+	result, err := Preview(context.Background(), Options{RepoPath: "repo"}, deps)
+	if err != nil {
+		t.Fatalf("Preview returned error: %v", err)
+	}
+	if result.Outcome != OutcomeBlocked || result.Blocked == nil || result.Blocked.Code != "project-registry-conflict" {
+		t.Fatalf("Outcome/block = %q/%#v, want registry conflict", result.Outcome, result.Blocked)
+	}
+	if gotIDs := conflictIDs(result.Conflicts); !reflect.DeepEqual(gotIDs, []string{"proj_a", "proj_b"}) {
+		t.Fatalf("conflict IDs = %#v, want deterministic proj_a/proj_b", gotIDs)
+	}
+	if len(fsys.files) != 0 {
+		t.Fatalf("preview wrote files: %#v", fsys.files)
+	}
+}
+
+func scaffoldDepsForTest(t *testing.T, fsys FileSystem, gh GitHubRunner) Deps {
+	t.Helper()
+	homeDir := t.TempDir()
 	return Deps{
 		FS:     fsys,
 		GitHub: gh,
+		Getenv: func(key string) string {
+			if key == home.EnvHome {
+				return homeDir
+			}
+			return ""
+		},
+		UserHomeDir: func() (string, error) { return homeDir, nil },
+		RunGit: func(context.Context, string, ...string) (string, error) {
+			return "", nil
+		},
+		InspectLocalState: func(context.Context, string) (*LocalStateResult, *Mutation, error) {
+			return &LocalStateResult{Path: filepath.Join("repo", ".git", "info", "exclude"), Status: gitlocal.ProtectUnchanged}, nil, nil
+		},
+		ResolveProject: fakeResolveProject,
+		RegisterProject: func(ctx context.Context, opts registry.Options) (registry.RegisterResult, error) {
+			project, err := fakeResolveProject(ctx, opts)
+			return registry.RegisterResult{Project: project, Created: true}, err
+		},
 		ProtectLocalState: func(context.Context, string) (gitlocal.ProtectResult, error) {
 			return gitlocal.ProtectResult{ExcludePath: filepath.Join("repo", ".git", "info", "exclude"), Status: gitlocal.ProtectUnchanged}, nil
 		},
 	}
+}
+
+func fakeResolveProject(_ context.Context, _ registry.Options) (registry.Project, error) {
+	return registry.Project{
+		ProjectID:          "proj_test",
+		DisplayName:        "repo",
+		LocalPath:          filepath.Clean("repo"),
+		LocalPathCanonical: filepath.Clean("repo"),
+		IdentitySource:     registry.IdentityLocalPath,
+	}, nil
+}
+
+func containsWarning(warnings []string, want string) bool {
+	for _, warning := range warnings {
+		if strings.Contains(warning, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func conflictIDs(projects []registry.Project) []string {
+	out := make([]string, 0, len(projects))
+	for _, project := range projects {
+		out = append(out, project.ProjectID)
+	}
+	return out
 }
 
 func TestExecGitHubRunnerCombinedOutputAndNonZeroExit(t *testing.T) {

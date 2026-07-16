@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -21,17 +22,26 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/audit"
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/detachedrun"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/gitlocal"
+	"github.com/jasonhnd/loopcoder/internal/gitutil"
+	"github.com/jasonhnd/loopcoder/internal/hostprofile"
 	"github.com/jasonhnd/loopcoder/internal/loopreview"
 	localmigrate "github.com/jasonhnd/loopcoder/internal/migrate"
 	"github.com/jasonhnd/loopcoder/internal/migration"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/perception"
+	"github.com/jasonhnd/loopcoder/internal/platform"
+	"github.com/jasonhnd/loopcoder/internal/process"
+	"github.com/jasonhnd/loopcoder/internal/progress"
+	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
+	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/relaygate"
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/runtimecap"
 	"github.com/jasonhnd/loopcoder/internal/scaffold"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
@@ -90,6 +100,185 @@ func TestSubcommandHelpWorks(t *testing.T) {
 	}
 }
 
+func waitForTestSignal(t *testing.T, signal <-chan struct{}, failure string) {
+	t.Helper()
+	deadline, ok := t.Deadline()
+	if !ok {
+		<-signal
+		return
+	}
+	wait := time.Until(deadline) - 500*time.Millisecond
+	if wait <= 0 {
+		wait = time.Nanosecond
+	}
+	select {
+	case <-signal:
+	case <-time.After(wait):
+		t.Fatal(failure)
+	}
+}
+
+func unsupportedPlatformNoSideEffectDeps(t *testing.T) Deps {
+	t.Helper()
+	fail := func(name string) {
+		t.Helper()
+		t.Fatalf("%s dependency should not be called on unsupported platform", name)
+	}
+	return Deps{
+		RuntimeGOOS:   "linux",
+		RuntimeGOARCH: "amd64",
+		NewGitHubReader: func(string) orchestration.GitHubReader {
+			fail("NewGitHubReader")
+			return nil
+		},
+		NewIssueWriter: func(string) compiler.IssueWriter {
+			fail("NewIssueWriter")
+			return nil
+		},
+		NewPreProdWriter: func(string) orchestration.PreProdWriter {
+			fail("NewPreProdWriter")
+			return nil
+		},
+		NewPromoteWriter: func(string) orchestration.PromotionWriter {
+			fail("NewPromoteWriter")
+			return nil
+		},
+		ProcessAlive: func(int) bool {
+			fail("ProcessAlive")
+			return false
+		},
+		Now: func() time.Time {
+			fail("Now")
+			return time.Time{}
+		},
+		IsTerminal: func(io.Writer) bool {
+			fail("IsTerminal")
+			return false
+		},
+		TerminalWidth: func(io.Writer) int {
+			fail("TerminalWidth")
+			return 0
+		},
+		Stdin: strings.NewReader(""),
+		ComputeReadySet: func(context.Context, orchestration.Options) (report.ReadySetReport, error) {
+			fail("ComputeReadySet")
+			return report.ReadySetReport{}, errors.New("unexpected ComputeReadySet")
+		},
+		Tick: func(context.Context, orchestration.TickOptions) (orchestration.TickReport, error) {
+			fail("Tick")
+			return orchestration.TickReport{}, errors.New("unexpected Tick")
+		},
+		Discover: func(context.Context, perception.Options) (perception.Report, error) {
+			fail("Discover")
+			return perception.Report{}, errors.New("unexpected Discover")
+		},
+		Compile: func(context.Context, compiler.Options) (compiler.Report, error) {
+			fail("Compile")
+			return compiler.Report{}, errors.New("unexpected Compile")
+		},
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			fail("Dispatch")
+			return worker.Result{}, errors.New("unexpected Dispatch")
+		},
+		Loopreview: func(context.Context, loopreview.Options) (loopreview.Result, error) {
+			fail("Loopreview")
+			return loopreview.Result{}, errors.New("unexpected Loopreview")
+		},
+		Promote: func(context.Context, orchestration.PromoteOptions) (orchestration.PromoteReport, error) {
+			fail("Promote")
+			return orchestration.PromoteReport{}, errors.New("unexpected Promote")
+		},
+		Recover: func(context.Context, recovery.Options) (recovery.Result, error) {
+			fail("Recover")
+			return recovery.Result{}, errors.New("unexpected Recover")
+		},
+		Verify: func(context.Context, verify.Options) verify.Result {
+			fail("Verify")
+			return verify.Result{}
+		},
+		Audit: func(context.Context, audit.Options) (audit.Result, error) {
+			fail("Audit")
+			return audit.Result{}, errors.New("unexpected Audit")
+		},
+		Doctor: func(context.Context, doctor.Options) doctor.Report {
+			fail("Doctor")
+			return doctor.Report{}
+		},
+		ProviderInventory: func(context.Context, providerinventory.Options) (providerinventory.Report, error) {
+			fail("ProviderInventory")
+			return providerinventory.Report{}, errors.New("unexpected ProviderInventory")
+		},
+		ProviderInventoryRefresh: func(context.Context, providerinventory.Report, time.Time) error {
+			fail("ProviderInventoryRefresh")
+			return errors.New("unexpected ProviderInventoryRefresh")
+		},
+		ProviderQuotaRefresh: func(context.Context, providerinventory.RefreshRequest) (providerinventory.RefreshResult, error) {
+			fail("ProviderQuotaRefresh")
+			return providerinventory.RefreshResult{}, errors.New("unexpected ProviderQuotaRefresh")
+		},
+		ProviderQuotaStatus: func(context.Context, providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error) {
+			fail("ProviderQuotaStatus")
+			return providerinventory.QuotaRefreshStatus{}, errors.New("unexpected ProviderQuotaStatus")
+		},
+		Init: func(context.Context, scaffold.Options) (scaffold.Result, error) {
+			fail("Init")
+			return scaffold.Result{}, errors.New("unexpected Init")
+		},
+		Upgrade: func(context.Context, upgrade.Options) (upgrade.Result, error) {
+			fail("Upgrade")
+			return upgrade.Result{}, errors.New("unexpected Upgrade")
+		},
+		MigrateLocalState: func(context.Context, localmigrate.Options) (localmigrate.Result, error) {
+			fail("MigrateLocalState")
+			return localmigrate.Result{}, errors.New("unexpected MigrateLocalState")
+		},
+		MigrateStorage: func(context.Context, storage.SchemaMigrationOptions) (storage.SchemaMigrationResult, error) {
+			fail("MigrateStorage")
+			return storage.SchemaMigrationResult{}, errors.New("unexpected MigrateStorage")
+		},
+		SkillInstall: func(context.Context, SkillInstallOptions) (SkillInstallResult, error) {
+			fail("SkillInstall")
+			return SkillInstallResult{}, errors.New("unexpected SkillInstall")
+		},
+		StatePush: func(context.Context, statebranch.PushOptions) (statebranch.PushResult, error) {
+			fail("StatePush")
+			return statebranch.PushResult{}, errors.New("unexpected StatePush")
+		},
+		StatePull: func(context.Context, statebranch.PullOptions) (statebranch.PullResult, error) {
+			fail("StatePull")
+			return statebranch.PullResult{}, errors.New("unexpected StatePull")
+		},
+		LeaseAcquire: func(context.Context, statebranch.LeaseOptions) (statebranch.LeaseResult, error) {
+			fail("LeaseAcquire")
+			return statebranch.LeaseResult{}, errors.New("unexpected LeaseAcquire")
+		},
+		LeaseRelease: func(context.Context, statebranch.LeaseOptions) (statebranch.LeaseResult, error) {
+			fail("LeaseRelease")
+			return statebranch.LeaseResult{}, errors.New("unexpected LeaseRelease")
+		},
+		StartDetachedDispatch: func(context.Context, []string, string) (int, error) {
+			fail("StartDetachedDispatch")
+			return 0, errors.New("unexpected StartDetachedDispatch")
+		},
+		KillProcessTree: func(int) error {
+			fail("KillProcessTree")
+			return errors.New("unexpected KillProcessTree")
+		},
+		KillProcessGroup: func(int) error {
+			fail("KillProcessGroup")
+			return errors.New("unexpected KillProcessGroup")
+		},
+		ProcessAuthority: func(int, time.Time) (string, error) {
+			fail("ProcessAuthority")
+			return "", errors.New("unexpected ProcessAuthority")
+		},
+		VerifyProcessAuthority: func(int, string) error {
+			fail("VerifyProcessAuthority")
+			return errors.New("unexpected VerifyProcessAuthority")
+		},
+	}
+}
+
 func TestDoctorJSONStdoutIsMachineReadable(t *testing.T) {
 	repo := t.TempDir()
 	var stdout, stderr bytes.Buffer
@@ -133,6 +322,623 @@ func TestDoctorJSONStdoutIsMachineReadable(t *testing.T) {
 	}
 	if payload.HostProfile.Name != "codex-cli" || payload.HostProfile.Source != "env" || len(payload.Checks) != 1 {
 		t.Fatalf("payload = %#v, want host profile and one check", payload)
+	}
+}
+
+func TestUnsupportedPlatformHumanDiagnosticGolden(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"dispatch", "--repo", t.TempDir()}, &stdout, &stderr, unsupportedPlatformNoSideEffectDeps(t))
+	if exitCode != platform.UnsupportedExitCode {
+		t.Fatalf("exit = %d, want %d", exitCode, platform.UnsupportedExitCode)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	const want = "LoopCoder v0.8.0 supports macOS Apple Silicon only (darwin/arm64).\n" +
+		"Actual platform: linux/amd64.\n" +
+		"LoopCoder v0.7.0 is the final legacy multi-platform release for Windows, Linux, WSL, containers, and Intel macOS.\n"
+	if stderr.String() != want {
+		t.Fatalf("stderr:\n%s\nwant:\n%s", stderr.String(), want)
+	}
+}
+
+func TestUnsupportedPlatformDoctorJSONDiagnosticGolden(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	deps := unsupportedPlatformNoSideEffectDeps(t)
+	deps.Doctor = func(context.Context, doctor.Options) doctor.Report {
+		t.Fatal("Doctor dependency should not be called on unsupported platform")
+		return doctor.Report{}
+	}
+
+	exitCode := RunWithDeps([]string{"doctor", "--repo", t.TempDir(), "--format", "json"}, &stdout, &stderr, deps)
+	if exitCode != platform.UnsupportedExitCode {
+		t.Fatalf("exit = %d, want %d", exitCode, platform.UnsupportedExitCode)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	const want = `{"schema_version":"loopcoder.diagnostic.v1","error_code":"ErrUnsupportedPlatform","message":"LoopCoder v0.8.0 supports macOS Apple Silicon only (darwin/arm64).","supported":[{"goos":"darwin","goarch":"arm64"}],"actual":{"goos":"linux","goarch":"amd64"},"phase":"startup","exit_code":78,"side_effects_performed":false}` + "\n"
+	if stdout.String() != want {
+		t.Fatalf("stdout:\n%s\nwant:\n%s", stdout.String(), want)
+	}
+}
+
+func TestUnsupportedPlatformGateRunsBeforeEveryCommand(t *testing.T) {
+	for _, command := range Commands() {
+		if command.Name == "version" {
+			continue
+		}
+		t.Run(command.Name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			exitCode := RunWithDeps([]string{command.Name}, &stdout, &stderr, unsupportedPlatformNoSideEffectDeps(t))
+			if exitCode != platform.UnsupportedExitCode {
+				t.Fatalf("exit = %d, want %d; stdout=%q stderr=%q", exitCode, platform.UnsupportedExitCode, stdout.String(), stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			if firstLine := strings.SplitN(stderr.String(), "\n", 2)[0]; firstLine != platform.HumanFirstLine {
+				t.Fatalf("first line = %q, want %q; stderr=%q", firstLine, platform.HumanFirstLine, stderr.String())
+			}
+		})
+	}
+}
+
+func TestUnsupportedPlatformUnknownCommandDoesNotBypassGate(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"not-a-command"}, &stdout, &stderr, unsupportedPlatformNoSideEffectDeps(t))
+	if exitCode != platform.UnsupportedExitCode {
+		t.Fatalf("exit = %d, want %d", exitCode, platform.UnsupportedExitCode)
+	}
+	if strings.Contains(stderr.String(), "unknown command") {
+		t.Fatalf("stderr = %q, want platform diagnostic before unknown-command handling", stderr.String())
+	}
+}
+
+func TestUnsupportedPlatformAllowsHelpAndVersionOnly(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "root help", args: []string{"--help"}},
+		{name: "command help", args: []string{"dispatch", "--help"}},
+		{name: "root version", args: []string{"--version"}},
+		{name: "version command", args: []string{"version"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			exitCode := RunWithDeps(tt.args, &stdout, &stderr, unsupportedPlatformNoSideEffectDeps(t))
+			if exitCode != 0 {
+				t.Fatalf("exit = %d, want 0; stderr=%q", exitCode, stderr.String())
+			}
+			if stdout.Len() == 0 {
+				t.Fatal("stdout is empty, want help/version output")
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("stderr = %q, want empty", stderr.String())
+			}
+		})
+	}
+}
+
+func TestSupportedPlatformInjectionPreservesDoctorBehavior(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	called := false
+	exitCode := RunWithDeps([]string{"doctor", "--repo", repo}, &stdout, &stderr, Deps{
+		RuntimeGOOS:   platform.SupportedGOOS,
+		RuntimeGOARCH: platform.SupportedGOARCH,
+		Doctor: func(_ context.Context, opts doctor.Options) doctor.Report {
+			called = true
+			if opts.RepoPath != repo {
+				t.Fatalf("RepoPath = %q, want %q", opts.RepoPath, repo)
+			}
+			return doctor.Report{Checks: []doctor.Check{{
+				Name:    "supported platform",
+				Status:  doctor.StatusOK,
+				Message: "accepted",
+			}}}
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if !called {
+		t.Fatal("Doctor dependency was not called")
+	}
+	if stdout.String() != "[ok] supported platform: accepted\n" {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestProvidersRefreshJSONPersistsInventory(t *testing.T) {
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
+	report := providerinventory.Report{
+		SchemaVersion:        providerinventory.ProviderInventoryJSONSchema,
+		GeneratedAt:          now.Format(time.RFC3339),
+		InventoryFingerprint: "sha256:test",
+		Confidence:           providerinventory.ConfidenceExact,
+		Installations: []providerinventory.ProviderInstallation{{
+			SchemaVersion:          providerinventory.ProviderInstallationSchema,
+			RecordVersion:          1,
+			Scope:                  "machine",
+			ProviderInstallationID: "pinst_test",
+			AdapterID:              "codex",
+			AdapterDeclarationID:   "adapter_test",
+			ProviderDisplayName:    "Codex",
+			ExecutableName:         "codex",
+			ExecutableIdentity: providerinventory.ExecutableIdentity{
+				Basename:          "codex",
+				Platform:          "test",
+				PathHash:          "sha256:test",
+				SymlinkResolution: "not-symlink",
+				ExecutableMode:    "executable",
+			},
+			CanonicalPathRedacted: ".../bin/codex",
+			DiscoverySource:       providerinventory.DiscoveryPath,
+			VersionConfidence:     providerinventory.ConfidenceExact,
+			InstallationState:     providerinventory.InstallationInstalled,
+			UsableForInvocation:   "unknown",
+			KnownLimitations:      []string{},
+			CreatedAt:             now.Format(time.RFC3339),
+			UpdatedAt:             now.Format(time.RFC3339),
+			CreatedBy:             providerinventory.ActorProvenance{ActorKind: "policy-engine", ActorID: "test", DecisionAuthority: "deterministic-policy-engine", Source: "test"},
+			UpdatedBy:             providerinventory.ActorProvenance{ActorKind: "policy-engine", ActorID: "test", DecisionAuthority: "deterministic-policy-engine", Source: "test"},
+			Host:                  providerinventory.HostProvenance{HostKind: "generic-local", HostID: "test", ProcessID: 1, LoopcoderVersion: "test", Platform: "test"},
+			PolicyVersion:         providerinventory.PolicyVersion,
+			Confidence:            providerinventory.ConfidenceExact,
+			FreshnessState:        providerinventory.FreshnessFresh,
+			CapturedAt:            now.Format(time.RFC3339),
+			SideEffectClass:       "local-read",
+			Classification:        "sensitive-path",
+			Source:                providerinventory.SourceDescriptor{Kind: "test", AdapterID: "codex"},
+			Evidence:              providerinventory.EvidenceSummary{Kind: "test", CommandBounded: true, NoShell: true},
+			GapReasons:            []string{},
+		}},
+		ProbeResults:          []providerinventory.ProbeResult{},
+		AccountProfiles:       []providerinventory.AccountProfile{},
+		AuthReadiness:         []providerinventory.AuthReadiness{},
+		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{},
+		ModelCapabilities:     []providerinventory.ModelCapability{},
+		GapReasons:            []string{},
+	}
+	refreshed := false
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"providers", "refresh", "--repo", repo, "--format", "json"}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now },
+		ProviderInventory: func(_ context.Context, opts providerinventory.Options) (providerinventory.Report, error) {
+			if opts.RepoPath != repo {
+				t.Fatalf("RepoPath = %q, want %q", opts.RepoPath, repo)
+			}
+			return report, nil
+		},
+		ProviderInventoryRefresh: func(_ context.Context, got providerinventory.Report, gotNow time.Time) error {
+			refreshed = true
+			if got.InventoryFingerprint != report.InventoryFingerprint || !gotNow.Equal(now) {
+				t.Fatalf("refresh args = %#v %s", got, gotNow)
+			}
+			return nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps exit = %d stderr=%q", exitCode, stderr.String())
+	}
+	if !refreshed {
+		t.Fatal("ProviderInventoryRefresh was not called")
+	}
+	var payload providerinventory.Report
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, stdout.String())
+	}
+	if payload.SchemaVersion != providerinventory.ProviderInventoryJSONSchema || len(payload.Installations) != 1 {
+		t.Fatalf("payload = %#v", payload)
+	}
+	if payload.Installations[0].UsableForInvocation != "unknown" {
+		t.Fatalf("usable_for_invocation = %q, want unknown", payload.Installations[0].UsableForInvocation)
+	}
+}
+
+func TestProvidersRefreshTextRendersNotInstalledProbe(t *testing.T) {
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
+	report := providerinventory.Report{
+		SchemaVersion:         providerinventory.ProviderInventoryJSONSchema,
+		GeneratedAt:           now.Format(time.RFC3339),
+		InventoryFingerprint:  "sha256:test",
+		Confidence:            providerinventory.ConfidenceUnavailable,
+		Installations:         []providerinventory.ProviderInstallation{},
+		AccountProfiles:       []providerinventory.AccountProfile{},
+		AuthReadiness:         []providerinventory.AuthReadiness{},
+		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{},
+		ModelCapabilities:     []providerinventory.ModelCapability{},
+		ProbeResults: []providerinventory.ProbeResult{{
+			SchemaVersion:        providerinventory.ProbeResultSchema,
+			RecordVersion:        1,
+			ProbeResultID:        "probe_grok_absent",
+			AdapterID:            "grok",
+			ProbeKind:            "install",
+			ProbeMethod:          providerinventory.ProbeMethodLookPath,
+			Outcome:              providerinventory.OutcomeNotInstalled,
+			Confidence:           providerinventory.ConfidenceUnavailable,
+			FreshnessState:       providerinventory.FreshnessNotApplicable,
+			NetworkPermission:    providerinventory.NetworkNotNeeded,
+			Source:               providerinventory.SourceDescriptor{Kind: "path-lookup", AdapterID: "grok", ExecutableName: "grok"},
+			Evidence:             providerinventory.EvidenceSummary{Kind: "declared-executable-not-found", CommandBounded: true, NoShell: true},
+			GapReasons:           []string{"executable-not-found"},
+			EnvironmentKeys:      []string{},
+			CreatedAt:            now.Format(time.RFC3339),
+			UpdatedAt:            now.Format(time.RFC3339),
+			CapturedAt:           now.Format(time.RFC3339),
+			PolicyVersion:        providerinventory.PolicyVersion,
+			SideEffectClass:      "local-read",
+			Classification:       "provider-output-untrusted",
+			AdapterDeclarationID: "adapter_grok",
+		}},
+		GapReasons: []string{"provider-grok-not-installed"},
+	}
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"providers", "refresh", "--repo", repo}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now },
+		ProviderInventory: func(context.Context, providerinventory.Options) (providerinventory.Report, error) {
+			return report, nil
+		},
+		ProviderInventoryRefresh: func(context.Context, providerinventory.Report, time.Time) error {
+			return nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps exit = %d stderr=%q", exitCode, stderr.String())
+	}
+	for _, want := range []string{
+		"- no provider CLI installations discovered",
+		"- grok grok state=not-installed confidence=unavailable freshness=not-applicable gaps=executable-not-found",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+}
+
+func TestProvidersStatusJSONRendersBoundedQuotaCacheState(t *testing.T) {
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
+	age := int64(60000)
+	status := providerinventory.QuotaRefreshStatus{
+		SchemaVersion: providerinventory.QuotaRefreshStatusSchema,
+		GeneratedAt:   now.Format(time.RFC3339),
+		Providers: []providerinventory.ProviderQuotaStatus{{
+			AdapterID:         "codex",
+			AgeMS:             &age,
+			SourceKind:        providerinventory.QuotaSourceFixture,
+			Confidence:        providerinventory.ConfidenceStale,
+			FreshnessState:    providerinventory.FreshnessStale,
+			TerminalErrorCode: "ErrProviderQuotaUnavailable",
+			InFlight:          true,
+			NextRefreshAt:     now.Add(time.Minute).Format(time.RFC3339),
+			QuotaSnapshotIDs:  []string{"qsnap_status"},
+			GapReasons:        []string{"provider-error"},
+		}},
+	}
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"providers", "status", "--repo", repo, "--format", "json"}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now },
+		ProviderQuotaStatus: func(_ context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error) {
+			if req.RepoPath != repo {
+				t.Fatalf("RepoPath = %q, want %q", req.RepoPath, repo)
+			}
+			return status, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps exit = %d stderr=%q", exitCode, stderr.String())
+	}
+	var payload providerinventory.QuotaRefreshStatus
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, stdout.String())
+	}
+	if payload.SchemaVersion != providerinventory.QuotaRefreshStatusSchema || len(payload.Providers) != 1 {
+		t.Fatalf("payload = %#v", payload)
+	}
+	got := payload.Providers[0]
+	if got.AdapterID != "codex" || got.TerminalErrorCode != "ErrProviderQuotaUnavailable" || !got.InFlight || got.AgeMS == nil || *got.AgeMS != age {
+		t.Fatalf("provider status = %#v", got)
+	}
+}
+
+func TestProviderQuotaDefaultLifecycleStatusObservesInFlightRefresh(t *testing.T) {
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	ctx := context.Background()
+	now := time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
+	lifecycle := newDefaultProviderQuotaLifecycle()
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseRefresh := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	t.Cleanup(func() {
+		releaseRefresh()
+		if err := lifecycle.Close(); err != nil {
+			t.Errorf("close lifecycle: %v", err)
+		}
+	})
+	manager, err := lifecycle.managerFor(ctx, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("managerFor: %v", err)
+	}
+	started := make(chan struct{})
+	var once sync.Once
+	manager.Collector = func(ctx context.Context, opts providerinventory.Options, deps providerinventory.Deps) (providerinventory.Report, error) {
+		once.Do(func() { close(started) })
+		<-release
+		return providerQuotaEmptyReport(now), ctx.Err()
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := lifecycle.Refresh(ctx, providerinventory.RefreshRequest{
+			Config:  config.Config{Adapters: config.Adapters{Worker: "codex"}},
+			Trigger: providerinventory.RefreshTriggerExplicit,
+			Now:     func() time.Time { return now },
+		})
+		done <- err
+	}()
+	<-started
+	status, err := lifecycle.Status(ctx, providerinventory.RefreshRequest{
+		Config: config.Config{Adapters: config.Adapters{Worker: "codex"}},
+		Now:    func() time.Time { return now },
+	})
+	releaseRefresh()
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if len(status.Providers) != 1 || !status.Providers[0].InFlight {
+		t.Fatalf("status = %#v, want codex in flight", status)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if err := lifecycle.Close(); err != nil {
+		t.Fatalf("close lifecycle: %v", err)
+	}
+
+	restarted := newDefaultProviderQuotaLifecycle()
+	t.Cleanup(func() {
+		if err := restarted.Close(); err != nil {
+			t.Errorf("close restarted lifecycle: %v", err)
+		}
+	})
+	restartedStatus, err := restarted.Status(ctx, providerinventory.RefreshRequest{
+		Config: config.Config{Adapters: config.Adapters{Worker: "codex"}},
+		Now:    func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("restarted Status: %v", err)
+	}
+	if len(restartedStatus.Providers) != 1 || restartedStatus.Providers[0].InFlight {
+		t.Fatalf("restarted status = %#v, want no phantom in-flight state", restartedStatus)
+	}
+	if err := restarted.Close(); err != nil {
+		t.Fatalf("close restarted lifecycle: %v", err)
+	}
+}
+
+func TestProviderQuotaDefaultLifecycleCloseWaitsForInFlightRefresh(t *testing.T) {
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	ctx := context.Background()
+	now := time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
+	lifecycle := newDefaultProviderQuotaLifecycle()
+	releaseRefresh := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseRefresh) })
+	}
+	t.Cleanup(func() {
+		release()
+		if err := lifecycle.Close(); err != nil {
+			t.Errorf("close lifecycle: %v", err)
+		}
+	})
+	manager, err := lifecycle.managerFor(ctx, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("managerFor: %v", err)
+	}
+	started := make(chan struct{})
+	var startOnce sync.Once
+	manager.Collector = func(ctx context.Context, opts providerinventory.Options, deps providerinventory.Deps) (providerinventory.Report, error) {
+		startOnce.Do(func() { close(started) })
+		<-releaseRefresh
+		return providerQuotaEmptyReport(now), ctx.Err()
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := lifecycle.Refresh(ctx, providerinventory.RefreshRequest{
+			Config:  config.Config{Adapters: config.Adapters{Worker: "codex"}},
+			Trigger: providerinventory.RefreshTriggerExplicit,
+			Now:     func() time.Time { return now },
+		})
+		done <- err
+	}()
+	<-started
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- lifecycle.Close()
+	}()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before in-flight refresh joined: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	release()
+	if err := <-done; err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not return after in-flight refresh released")
+	}
+	reopened := newDefaultProviderQuotaLifecycle()
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("close reopened lifecycle: %v", err)
+		}
+	})
+	status, err := reopened.Status(ctx, providerinventory.RefreshRequest{
+		Config: config.Config{Adapters: config.Adapters{Worker: "codex"}},
+		Now:    func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("reopened Status: %v", err)
+	}
+	if len(status.Providers) != 1 || status.Providers[0].InFlight {
+		t.Fatalf("reopened status = %#v, want no in-flight state", status)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("close reopened lifecycle: %v", err)
+	}
+}
+
+func providerQuotaEmptyReport(now time.Time) providerinventory.Report {
+	return providerinventory.Report{
+		SchemaVersion:         providerinventory.ProviderInventoryJSONSchema,
+		GeneratedAt:           now.Format(time.RFC3339Nano),
+		Confidence:            providerinventory.ConfidenceExact,
+		Installations:         []providerinventory.ProviderInstallation{},
+		ProbeResults:          []providerinventory.ProbeResult{},
+		AccountProfiles:       []providerinventory.AccountProfile{},
+		AuthReadiness:         []providerinventory.AuthReadiness{},
+		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{},
+		ModelCapabilities:     []providerinventory.ModelCapability{},
+		QuotaTelemetrySources: []providerinventory.QuotaTelemetrySource{},
+		QuotaSnapshots:        []providerinventory.QuotaSnapshot{},
+		GapReasons:            []string{},
+	}
+}
+
+func TestBudgetSmokeJSONRoundTrip(t *testing.T) {
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	repo := t.TempDir()
+	now := time.Unix(7, 0).UTC()
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"budget", "smoke",
+		"--repo", repo,
+		"--project-id", "proj_budget_cli",
+		"--ceiling", "50",
+		"--reserve", "20",
+		"--commit", "12",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{Now: func() time.Time { return now }})
+	if exitCode != 0 {
+		t.Fatalf("budget smoke exit = %d stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	var payload struct {
+		OK        bool     `json:"ok"`
+		PolicyIDs []string `json:"budget_policy_ids"`
+		Released  struct {
+			Reservation struct {
+				State          string `json:"state"`
+				CommittedValue int64  `json:"committed_value"`
+				ReleasedValue  int64  `json:"released_value"`
+				ReservedValue  int64  `json:"reserved_value"`
+			} `json:"reservation"`
+		} `json:"released"`
+		BudgetSummary []struct {
+			BudgetPolicyID   string `json:"budget_policy_id"`
+			CeilingValue     int64  `json:"ceiling_value"`
+			ReservedValue    int64  `json:"reserved_value"`
+			CommittedValue   int64  `json:"committed_value"`
+			AvailableValue   int64  `json:"available_value"`
+			EffectiveCeiling int64  `json:"effective_ceiling"`
+		} `json:"budget_summary"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, stdout.String())
+	}
+	if !payload.OK || len(payload.PolicyIDs) != 2 || payload.Released.Reservation.State != "released" {
+		t.Fatalf("payload = %#v, want successful smoke release", payload)
+	}
+	if payload.Released.Reservation.CommittedValue != 12 || payload.Released.Reservation.ReleasedValue != 8 || payload.Released.Reservation.ReservedValue != 0 {
+		t.Fatalf("released reservation = %#v", payload.Released.Reservation)
+	}
+	if len(payload.BudgetSummary) != 2 {
+		t.Fatalf("budget summaries = %#v, want machine and project summaries", payload.BudgetSummary)
+	}
+	for _, summary := range payload.BudgetSummary {
+		if summary.CeilingValue != 50 || summary.ReservedValue != 0 || summary.CommittedValue != 12 || summary.AvailableValue != 38 || summary.EffectiveCeiling != 50 {
+			t.Fatalf("summary = %#v, want committed smoke accounting", summary)
+		}
+	}
+}
+
+func TestBudgetSmokeSoftPolicyWarningsInTextAndJSON(t *testing.T) {
+	repo := t.TempDir()
+	now := time.Unix(8, 0).UTC()
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	var textStdout, textStderr bytes.Buffer
+	textExit := RunWithDeps([]string{
+		"budget", "smoke",
+		"--repo", repo,
+		"--project-id", "proj_budget_soft_cli",
+		"--policy-mode", "soft",
+		"--ceiling", "5",
+		"--reserve", "8",
+		"--commit", "6",
+		"--idempotency-key", "soft-text",
+	}, &textStdout, &textStderr, Deps{Now: func() time.Time { return now }})
+	if textExit != 0 {
+		t.Fatalf("budget soft text exit = %d stderr=%q", textExit, textStderr.String())
+	}
+	if !strings.Contains(textStdout.String(), "Budget warning: soft-budget-warn-only:") || !strings.Contains(textStdout.String(), "Budget warning: soft-budget-overflow:") {
+		t.Fatalf("text output = %q, want soft budget warnings", textStdout.String())
+	}
+
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	var jsonStdout, jsonStderr bytes.Buffer
+	jsonExit := RunWithDeps([]string{
+		"budget", "smoke",
+		"--repo", repo,
+		"--project-id", "proj_budget_soft_cli_json",
+		"--policy-mode", "soft",
+		"--ceiling", "5",
+		"--reserve", "8",
+		"--commit", "6",
+		"--idempotency-key", "soft-json",
+		"--format", "json",
+	}, &jsonStdout, &jsonStderr, Deps{Now: func() time.Time { return now }})
+	if jsonExit != 0 {
+		t.Fatalf("budget soft json exit = %d stderr=%q", jsonExit, jsonStderr.String())
+	}
+	var payload struct {
+		Reserved struct {
+			Reservation struct {
+				GapReasons []string `json:"gap_reasons"`
+			} `json:"reservation"`
+		} `json:"reserved"`
+		BudgetSummary []struct {
+			GapReasons []string `json:"gap_reasons"`
+		} `json:"budget_summary"`
+	}
+	if err := json.Unmarshal(jsonStdout.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v\n%s", err, jsonStdout.String())
+	}
+	if !containsPrefix(payload.Reserved.Reservation.GapReasons, "soft-budget-warn-only:") {
+		t.Fatalf("reserved gap reasons = %#v, want soft warn-only reason", payload.Reserved.Reservation.GapReasons)
+	}
+	var summaryReasons []string
+	for _, summary := range payload.BudgetSummary {
+		summaryReasons = append(summaryReasons, summary.GapReasons...)
+	}
+	if !containsPrefix(summaryReasons, "soft-budget-overflow:") {
+		t.Fatalf("summary gap reasons = %#v, want soft overflow reason", summaryReasons)
 	}
 }
 
@@ -191,6 +997,9 @@ func TestReportCommandListsLocalReportsReadOnly(t *testing.T) {
 	}
 	if payload.Records[0].Report.WorkID != "run-report-test" || payload.Records[0].Source != "attempt" || payload.Records[0].RunID != "run-report-test" || payload.Records[0].Path == "" {
 		t.Fatalf("records = %#v, want one filtered local record with source context", payload.Records)
+	}
+	if strings.Contains(stdout.String(), repo) || strings.Contains(payload.Records[0].Path, string(filepath.Separator)) {
+		t.Fatalf("report JSON leaked local report path: path=%q output=%s", payload.Records[0].Path, stdout.String())
 	}
 	if strings.Contains(stdout.String(), `"`+migration.LegacyReportStateKey+`"`) {
 		t.Fatalf("report JSON used legacy report key:\n%s", stdout.String())
@@ -277,6 +1086,18 @@ func TestStatusCommandRendersRunTreeJSON(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	var payload struct {
+		SchemaVersion string `json:"schema_version"`
+		Observability struct {
+			SchemaVersion string `json:"schema_version"`
+			Command       string `json:"command"`
+			Correlation   struct {
+				DeliveryRunID string `json:"delivery_run_id"`
+			} `json:"correlation"`
+			Items []struct {
+				Kind   string `json:"kind"`
+				Status string `json:"status"`
+			} `json:"items"`
+		} `json:"observability"`
 		RunID   string `json:"run_id"`
 		Project struct {
 			ProjectID string `json:"project_id"`
@@ -297,14 +1118,26 @@ func TestStatusCommandRendersRunTreeJSON(t *testing.T) {
 	if payload.RunID != child || payload.Project.ProjectID == "" || payload.RunTree.RootRunID != parent || len(payload.RunTree.Nodes) != 2 {
 		t.Fatalf("status JSON = %#v", payload)
 	}
+	if payload.SchemaVersion != "loopcoder.run_status.v1" || payload.Observability.SchemaVersion != "loopcoder.observability_render.v1" || payload.Observability.Command != "status" || payload.Observability.Correlation.DeliveryRunID != child {
+		t.Fatalf("status observability = %#v", payload.Observability)
+	}
 	var foundChild bool
+	var foundObservableChild bool
 	for _, node := range payload.RunTree.Nodes {
 		if node.RunID == child && node.ParentRunID == parent && node.Issue == 651 && node.Provider == "codex" {
 			foundChild = true
 		}
 	}
+	for _, item := range payload.Observability.Items {
+		if item.Kind == "run-tree-node" && item.Status == "planned" {
+			foundObservableChild = true
+		}
+	}
 	if !foundChild {
 		t.Fatalf("child node missing metadata: %#v", payload.RunTree.Nodes)
+	}
+	if !foundObservableChild {
+		t.Fatalf("status observability missing run-tree node: %#v", payload.Observability.Items)
 	}
 }
 
@@ -355,6 +1188,16 @@ func TestReportCommandJSONCanIncludeRunTree(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	var payload struct {
+		SchemaVersion string `json:"schema_version"`
+		Observability struct {
+			SchemaVersion string `json:"schema_version"`
+			Command       string `json:"command"`
+			Items         []struct {
+				Kind     string `json:"kind"`
+				Provider string `json:"provider"`
+				Model    string `json:"model"`
+			} `json:"items"`
+		} `json:"observability"`
 		Reports []reporter.Report `json:"reports"`
 		Records []struct {
 			RunID string `json:"run_id"`
@@ -371,6 +1214,12 @@ func TestReportCommandJSONCanIncludeRunTree(t *testing.T) {
 	}
 	if len(payload.Reports) != 1 || len(payload.Records) != 1 || payload.Records[0].RunID != child {
 		t.Fatalf("report records = %#v %#v", payload.Reports, payload.Records)
+	}
+	if payload.SchemaVersion != "loopcoder.report_query.v1" || payload.Observability.SchemaVersion != "loopcoder.observability_render.v1" || payload.Observability.Command != "report" {
+		t.Fatalf("report observability schema = %#v", payload.Observability)
+	}
+	if len(payload.Observability.Items) != 1 || payload.Observability.Items[0].Kind != "worker" || payload.Observability.Items[0].Provider != "codex" || payload.Observability.Items[0].Model == "" {
+		t.Fatalf("report observability item = %#v", payload.Observability.Items)
 	}
 	if payload.RunTree.RootRunID != parent || len(payload.RunTree.Nodes) != 2 {
 		t.Fatalf("run tree = %#v", payload.RunTree)
@@ -426,6 +1275,100 @@ func TestMigrateLocalStateCommandRunsInjectedMigration(t *testing.T) {
 	}
 	if payload.ProjectID != "proj_test" || !payload.DryRun || payload.Status != "completed-with-warnings" || payload.MalformedCount != 1 || len(payload.Diagnostics) != 1 {
 		t.Fatalf("payload = %#v", payload)
+	}
+}
+
+func TestMigrateStorageCommandDefaultsToReadOnlyPlan(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "loopcoder.db")
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{"migrate", "storage", "--database", databasePath, "--format", "json"}, &stdout, &stderr, Deps{
+		Now: fixedCLINow,
+		MigrateStorage: func(_ context.Context, opts storage.SchemaMigrationOptions) (storage.SchemaMigrationResult, error) {
+			if opts.Path != databasePath {
+				t.Fatalf("Path = %q, want %q", opts.Path, databasePath)
+			}
+			if opts.Apply {
+				t.Fatal("Apply = true, want read-only plan by default")
+			}
+			if opts.Now == nil || !opts.Now().Equal(fixedCLINow()) {
+				t.Fatalf("Now clock did not return %s", fixedCLINow())
+			}
+			plan := storage.SchemaMigrationPlan{
+				SchemaVersion:       storage.SchemaMigrationContract,
+				DatabasePath:        databasePath,
+				SourceExists:        true,
+				SourceSchemaVersion: 9,
+				TargetSchemaVersion: storage.CurrentSchemaVersion,
+				Status:              "upgrade-required",
+				PlanFingerprint:     "sha256:test",
+			}
+			return storage.SchemaMigrationResult{
+				SchemaVersion: storage.SchemaMigrationContract,
+				Status:        "planned",
+				DryRun:        true,
+				Plan:          plan,
+			}, nil
+		},
+	})
+	if exitCode != 0 || stderr.Len() != 0 {
+		t.Fatalf("RunWithDeps exit=%d stderr=%q", exitCode, stderr.String())
+	}
+	var payload storage.SchemaMigrationResult
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
+	}
+	if payload.SchemaVersion != storage.SchemaMigrationContract || payload.Status != "planned" || !payload.DryRun || payload.Plan.SourceSchemaVersion != 9 {
+		t.Fatalf("payload = %#v", payload)
+	}
+}
+
+func TestMigrateStorageCommandApplyRendersVerifiedRecoveryPoint(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "loopcoder.db")
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"migrate", "storage", "--database", databasePath, "--apply"}, &stdout, &stderr, Deps{
+		MigrateStorage: func(_ context.Context, opts storage.SchemaMigrationOptions) (storage.SchemaMigrationResult, error) {
+			if !opts.Apply {
+				t.Fatal("Apply = false, want true")
+			}
+			return storage.SchemaMigrationResult{
+				SchemaVersion: storage.SchemaMigrationContract,
+				Status:        "migrated",
+				Applied:       true,
+				Plan: storage.SchemaMigrationPlan{
+					DatabasePath:        databasePath,
+					SourceSchemaVersion: 9,
+					TargetSchemaVersion: storage.CurrentSchemaVersion,
+					Status:              "upgrade-required",
+					PlanFingerprint:     "sha256:plan",
+					BackupRequired:      true,
+				},
+				Backup: &storage.SchemaMigrationBackup{
+					Path:     databasePath + ".backup",
+					SHA256:   "abc123",
+					Verified: true,
+				},
+				Rollback: storage.SchemaRollbackPlan{
+					Supported:   true,
+					Strategy:    "offline-copy-verified-v0.7-backup",
+					Limitations: []string{"requires-all-loopcoder-processes-stopped"},
+				},
+			}, nil
+		},
+	})
+	if exitCode != 0 || stderr.Len() != 0 {
+		t.Fatalf("RunWithDeps exit=%d stderr=%q", exitCode, stderr.String())
+	}
+	for _, want := range []string{
+		"status: migrated",
+		"mode: apply",
+		"backup_verified: true",
+		"rollback_supported: true",
+		"requires-all-loopcoder-processes-stopped",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("text output missing %q:\n%s", want, stdout.String())
+		}
 	}
 }
 
@@ -827,7 +1770,14 @@ func expectedModelsOutput() string {
 		"  - claude-opus-4-8[1m]\n" +
 		"    depths: low, medium, high, max*\n" +
 		"\n" +
-		expectedAntigravityModelsOutput()
+		expectedAntigravityModelsOutput() +
+		"\n" +
+		"provider: grok\n" +
+		"vendor: xAI\n" +
+		"cli: grok\n" +
+		"default: (provider default) / (none)\n" +
+		"models:\n" +
+		"  (dynamic inventory required)\n"
 }
 
 func expectedAntigravityModelsOutput() string {
@@ -1505,7 +2455,7 @@ func TestStatusRendersLocalRunState(t *testing.T) {
 	for _, want := range []string{
 		"RUN STATUS",
 		"RunId: run-test (requested run)",
-		"| #101 | job-101-1 | not reported | codex | gpt-5.5 | parsed | high | write | 42s | 120 | 34 | 154 | true | codex_exited | succeeded |",
+		"| #101 | job-101-1 | not reported | codex | gpt-5.5 | parsed | high | write | 42s | 120 | 34 | 154 | true | not reported | not reported | not reported | not reported | not reported | not reported | not reported | codex_exited | succeeded |",
 		"status is read-only and local-only",
 	} {
 		if !strings.Contains(output, want) {
@@ -1530,6 +2480,140 @@ func TestStatusMissingRunReturnsClearError(t *testing.T) {
 	}
 }
 
+func TestStatusProgressReceiptsJSONLIsCleanStdout(t *testing.T) {
+	repo, runID, store := setupStatusProgressFixture(t)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+
+	deps := DefaultDeps()
+	deps.Now = func() time.Time { return time.Date(2026, 7, 13, 12, 1, 0, 0, time.UTC) }
+	exitCode := RunWithDeps([]string{"status", "--repo", repo, "--run", runID, "--receipts", "--format", "jsonl"}, &stdout, &stderr, deps)
+	if exitCode != 0 {
+		t.Fatalf("status receipts exit = %d, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("stdout lines = %d, want 1:\n%s", len(lines), stdout.String())
+	}
+	var view progress.ReceiptView
+	if err := json.Unmarshal([]byte(lines[0]), &view); err != nil {
+		t.Fatalf("stdout jsonl did not parse: %v\n%s", err, stdout.String())
+	}
+	if view.Receipt.DeliveryRunID != runID || view.DeliveryState.State != "unsupported-pending-unacknowledged" || view.RenderAuthority != "attached-consumer-write-only" {
+		t.Fatalf("receipt view = %#v", view)
+	}
+}
+
+func TestStatusProgressReceiptsDiagnosticsStayOnStderr(t *testing.T) {
+	repo, runID, store := setupStatusProgressFixture(t)
+	insertStatusUnknownProgressRecord(t, store, runID)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+
+	deps := DefaultDeps()
+	deps.Now = func() time.Time { return time.Date(2026, 7, 13, 12, 1, 0, 0, time.UTC) }
+	exitCode := RunWithDeps([]string{"status", "--repo", repo, "--run", runID, "--receipts", "--format", "jsonl"}, &stdout, &stderr, deps)
+	if exitCode != 0 {
+		t.Fatalf("status receipts exit = %d, stderr=%q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "progress-receipt-skipped") {
+		t.Fatalf("stderr missing receipt warning:\n%s", stderr.String())
+	}
+	for lineNumber, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+		var view progress.ReceiptView
+		if err := json.Unmarshal([]byte(line), &view); err != nil {
+			t.Fatalf("stdout line %d was corrupted by diagnostics: %v\n%s", lineNumber+1, err, stdout.String())
+		}
+	}
+}
+
+func TestStatusProgressReceiptsRedactCorruptRecordDiagnostics(t *testing.T) {
+	repo, runID, store := setupStatusProgressFixture(t)
+	canary := "sk-" + strings.Repeat("Z9q_", 8)
+	insertStatusCorruptTimestampProgressRecord(t, store, runID, "api_"+"key="+canary)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+
+	deps := DefaultDeps()
+	deps.Now = func() time.Time { return time.Date(2026, 7, 13, 12, 1, 0, 0, time.UTC) }
+	exitCode := RunWithDeps([]string{"status", "--repo", repo, "--run", runID, "--receipts", "--format", "jsonl"}, &stdout, &stderr, deps)
+	if exitCode != 0 {
+		t.Fatalf("status receipts exit = %d, stderr=%q", exitCode, stderr.String())
+	}
+	for _, stream := range []struct {
+		name string
+		text string
+	}{
+		{name: "stdout", text: stdout.String()},
+		{name: "stderr", text: stderr.String()},
+	} {
+		assertNoStatusCanaryFragments(t, stream.name, stream.text, canary)
+	}
+	if !strings.Contains(stderr.String(), "progress-receipt-skipped") || !strings.Contains(stderr.String(), "[REDACTED]") || !strings.Contains(stderr.String(), "ErrInvalidRecord") {
+		t.Fatalf("stderr missing bounded redacted warning:\n%s", stderr.String())
+	}
+	for lineNumber, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+		var view progress.ReceiptView
+		if err := json.Unmarshal([]byte(line), &view); err != nil {
+			t.Fatalf("stdout line %d was corrupted by diagnostics: %v\n%s", lineNumber+1, err, stdout.String())
+		}
+	}
+}
+
+func TestStatusProgressFollowReconnectsFromCursor(t *testing.T) {
+	repo, runID, store := setupStatusProgressFixture(t)
+	ctx := context.Background()
+	first, err := progress.ReadReceipts(ctx, store, progress.ReadFilter{ProjectID: statusProgressProjectID(t, store), DeliveryRunID: runID}, time.Date(2026, 7, 13, 12, 1, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("ReadReceipts first: %v", err)
+	}
+	if len(first.Views) != 1 || first.NextCursor == "" {
+		t.Fatalf("first receipt batch = %#v", first)
+	}
+	if _, err := progress.PersistReceipt(ctx, store, statusProgressReceipt(statusProgressProjectID(t, store), runID, func(r *progress.ProgressReceipt) {
+		r.CorrelationSequence = 2
+		r.Status = "running"
+		r.NextAction = progress.ActionState{State: "continue", Summary: "still waiting"}
+		r.OccurredAt = "2026-07-13T12:00:10Z"
+	})); err != nil {
+		t.Fatalf("persist second receipt: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	deps := DefaultDeps()
+	deps.Now = func() time.Time { return time.Date(2026, 7, 13, 12, 1, 0, 0, time.UTC) }
+	exitCode := RunWithDeps([]string{"status", "--repo", repo, "--run", runID, "--follow", "--cursor", string(first.NextCursor), "--format", "jsonl", "--follow-for", "80ms"}, &stdout, &stderr, deps)
+	if exitCode != 0 {
+		t.Fatalf("status follow exit = %d, stderr=%q", exitCode, stderr.String())
+	}
+	var views []progress.ReceiptView
+	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var view progress.ReceiptView
+		if err := json.Unmarshal([]byte(line), &view); err != nil {
+			t.Fatalf("follow stdout did not parse: %v\n%s", err, stdout.String())
+		}
+		views = append(views, view)
+	}
+	if len(views) != 1 || views[0].Receipt.CorrelationSequence != 2 {
+		t.Fatalf("follow views = %#v, want only second receipt", views)
+	}
+}
+
 func TestDispatchHelpDocumentsProviderAgnosticModelEffortFlags(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
@@ -1541,13 +2625,2087 @@ func TestDispatchHelpDocumentsProviderAgnosticModelEffortFlags(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	help := stdout.String()
-	for _, want := range []string{"--model string", "worker model override", "--effort string", "worker reasoning effort override", "--strict", "--pretty", "--no-pretty", "LOOPCODER_PRETTY", "LOOPCODER_NO_PRETTY"} {
+	for _, want := range []string{"--model string", "worker model override", "--effort string", "worker reasoning effort override", "--timeout duration", "worker hard-cap override", "--strict", "--pretty", "--no-pretty", "LOOPCODER_PRETTY", "LOOPCODER_NO_PRETTY"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
 	}
 	if strings.Contains(help, "Codex model") || strings.Contains(help, "Codex reasoning") {
 		t.Fatalf("dispatch help still describes model/effort as Codex-specific:\n%s", help)
+	}
+}
+
+func setupStatusProgressFixture(t *testing.T) (string, string, storage.Store) {
+	t.Helper()
+	clearGitSelectionEnvForFixture(t)
+	home := t.TempDir()
+	t.Setenv("LOOPCODER_HOME", home)
+	repo := t.TempDir()
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC) }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("register progress fixture project: %v", err)
+	}
+	dbPath := filepath.Join(home, "data", "loopcoder.db")
+	store, err := storage.Open(ctx, storage.Options{Path: dbPath, Now: func() time.Time { return time.Date(2026, 7, 13, 12, 0, 5, 0, time.UTC) }})
+	if err != nil {
+		t.Fatalf("open progress fixture store: %v", err)
+	}
+	runID := "run-progress-status"
+	if _, err := progress.PersistReceipt(ctx, store, statusProgressReceipt(registered.Project.ProjectID, runID, func(r *progress.ProgressReceipt) {})); err != nil {
+		t.Fatalf("persist progress fixture receipt: %v", err)
+	}
+	return repo, runID, store
+}
+
+func clearGitSelectionEnvForFixture(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{
+		"GIT_DIR",
+		"GIT_WORK_TREE",
+		"GIT_INDEX_FILE",
+		"GIT_OBJECT_DIRECTORY",
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+		"GIT_COMMON_DIR",
+		"GIT_NAMESPACE",
+	} {
+		t.Setenv(key, "")
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func hostCapabilitySupport(capabilities []runtimecap.HostCapabilityDeclaration, capability runtimecap.HostCapability) runtimecap.HostCapabilitySupport {
+	for _, declaration := range capabilities {
+		if declaration.Capability == capability {
+			return declaration.Support
+		}
+	}
+	return runtimecap.HostCapabilityUnknown
+}
+
+func statusProgressProjectID(t *testing.T, store storage.Store) string {
+	t.Helper()
+	var projectID string
+	if err := store.WithTx(context.Background(), func(tx storage.Tx) error {
+		return tx.QueryRow(context.Background(), `SELECT id FROM projects ORDER BY created_at LIMIT 1`).Scan(&projectID)
+	}); err != nil {
+		t.Fatalf("load fixture project id: %v", err)
+	}
+	return projectID
+}
+
+func statusProgressReceipt(projectID, runID string, mutate func(*progress.ProgressReceipt)) progress.ProgressReceipt {
+	receipt := progress.ProgressReceipt{
+		ProjectID:           projectID,
+		DeliveryRunID:       runID,
+		RunID:               runID,
+		TaskID:              "task-progress-status",
+		AttemptID:           "attempt-progress-status",
+		AttemptOrdinal:      1,
+		CorrelationID:       "corr-progress-status",
+		CorrelationSequence: 1,
+		Phase:               "dispatching",
+		Status:              "pending",
+		TaskCounts:          progress.TaskCounts{Total: 1, Ready: 0, Running: 1, Succeeded: 0, Failed: 0, Blocked: 0, Unknown: 0},
+		Provider: progress.ProviderIdentity{
+			ProviderID:           "codex",
+			ModelID:              "gpt-5.5",
+			AccountProfileID:     progress.Unknown,
+			ModelCapabilityID:    progress.Unknown,
+			ProviderConfidence:   "exact",
+			ProviderInstallation: progress.Unknown,
+		},
+		Heartbeat:   progress.AgeEvidence{State: "exact", ObservedAt: "2026-07-13T12:00:03Z", AgeMillis: 2000},
+		Progress:    progress.AgeEvidence{State: "exact", ObservedAt: "2026-07-13T12:00:02Z", AgeMillis: 3000},
+		Evidence:    []progress.EvidenceRef{{RecordKind: "terminal-receipt", RecordID: "attached-consumer", Summary: "receipt rendered to attached consumer", Classification: "local-diagnostic", Confidence: "exact"}},
+		QuotaBudget: progress.QuotaBudgetState{State: "unknown", Confidence: "unknown", BudgetPolicyID: progress.Unknown, BudgetReservationID: progress.Unknown, RemainingQuantity: -1, Unit: progress.Unknown, GapReasons: []string{"not-collected"}},
+		Blocker:     progress.ActionState{State: "none"},
+		NextAction:  progress.ActionState{State: "continue", Summary: "wait for provider completion"},
+		OccurredAt:  "2026-07-13T12:00:05Z",
+	}
+	mutate(&receipt)
+	return receipt
+}
+
+func insertStatusUnknownProgressRecord(t *testing.T, store storage.Store, runID string) {
+	t.Helper()
+	ctx := context.Background()
+	projectID := statusProgressProjectID(t, store)
+	payload := `{"schema_version":"loopcoder.progress_receipt.future","record_version":1}`
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO progress_receipts(
+			progress_receipt_id, schema_version, record_version, project_id, delivery_run_id, run_id, task_id,
+			attempt_id, attempt_ordinal, correlation_id, correlation_sequence, semantic_fingerprint, phase, status,
+			provider_id, model_id, heartbeat_age_millis, progress_age_millis, occurred_at, persisted_at,
+			task_counts_json, provider_json, heartbeat_json, progress_json, evidence_json, quota_budget_json,
+			blocker_json, next_action_json, redaction_json, gap_reasons_json, payload_json
+		) VALUES ('prec_future_status', 'loopcoder.progress_receipt.v1', 1, ?, ?, ?, 'task-progress-status',
+			'attempt-progress-status', 1, 'corr-progress-status', 2, 'sha256:future-status', 'future-host', 'pending',
+			'future-host', 'future-model', -1, -1, '2026-07-13T12:00:06Z', '2026-07-13T12:00:06Z',
+			'{}', '{}', '{}', '{}', '[]', '{}', '{}', '{}', '{}', '[]', ?)`,
+			projectID, runID, runID, payload)
+		return err
+	}); err != nil {
+		t.Fatalf("insert unknown progress fixture record: %v", err)
+	}
+}
+
+func insertStatusCorruptTimestampProgressRecord(t *testing.T, store storage.Store, runID, invalidTimestamp string) {
+	t.Helper()
+	ctx := context.Background()
+	projectID := statusProgressProjectID(t, store)
+	receipt, err := progress.NormalizeReceipt(statusProgressReceipt(projectID, runID, func(r *progress.ProgressReceipt) {
+		r.CorrelationSequence = 3
+		r.CorrelationID = "corr-progress-corrupt"
+		r.OccurredAt = "2026-07-13T12:00:07Z"
+	}), time.Date(2026, 7, 13, 12, 0, 5, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("normalize corrupt status fixture: %v", err)
+	}
+	receipt.OccurredAt = invalidTimestamp
+	payload, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatalf("marshal corrupt status fixture: %v", err)
+	}
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO progress_receipts(
+			progress_receipt_id, schema_version, record_version, project_id, delivery_run_id, run_id, task_id,
+			attempt_id, attempt_ordinal, correlation_id, correlation_sequence, semantic_fingerprint, phase, status,
+			provider_id, model_id, heartbeat_age_millis, progress_age_millis, occurred_at, persisted_at,
+			task_counts_json, provider_json, heartbeat_json, progress_json, evidence_json, quota_budget_json,
+			blocker_json, next_action_json, redaction_json, gap_reasons_json, payload_json
+		) VALUES ('prec_corrupt_status', 'loopcoder.progress_receipt.v1', 1, ?, ?, ?, 'task-progress-status',
+			'attempt-progress-status', 1, 'corr-progress-corrupt', 3, 'sha256:corrupt-status', 'dispatching', 'pending',
+			'codex', 'gpt-5.5', -1, -1, '2026-07-13T12:00:07Z', '2026-07-13T12:00:07Z',
+			'{}', '{}', '{}', '{}', '[]', '{}', '{}', '{}', '{}', '[]', ?)`,
+			projectID, runID, runID, string(payload))
+		return err
+	}); err != nil {
+		t.Fatalf("insert corrupt status progress fixture record: %v", err)
+	}
+}
+
+func assertNoStatusCanaryFragments(t *testing.T, name, text, canary string) {
+	t.Helper()
+	for _, forbidden := range []string{canary, canary[:8], canary[len(canary)-8:]} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("%s leaked canary fragment %q:\n%s", name, forbidden, text)
+		}
+	}
+}
+
+func TestDispatchReplaysCodexOriginProgressBeforeWorkerAndKeepsJSONStdoutPure(t *testing.T) {
+	repo, runID, store := setupStatusProgressFixture(t)
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv("CODEX_THREAD_ID", "thread-dispatch-replay")
+	t.Setenv("CODEX_CLI", "1")
+	binding := codexHostOriginBinding(projectID, runID, runID)
+	if !binding.Bound {
+		t.Fatalf("Codex host origin binding = %#v, want bound", binding)
+	}
+	receipt := statusProgressReceipt(projectID, runID, func(r *progress.ProgressReceipt) {
+		r.ProgressReceiptID = ""
+		r.CorrelationID = "corr-dispatch-replay"
+		r.CorrelationSequence = 4
+		r.Phase = "detached-terminal"
+		r.Status = "succeeded"
+		r.TaskCounts = progress.TaskCounts{Total: 1, Succeeded: 1}
+		r.NextAction = progress.ActionState{State: "complete", Summary: "detached run completed while host was offline"}
+	})
+	if _, err := progress.PersistReceiptWithObligation(context.Background(), store, receipt, progress.DeliveryObligation{
+		OriginKind:        "progress-receipt",
+		OriginID:          binding.OriginRef,
+		SinkKind:          "host",
+		SinkID:            binding.BindingID,
+		TransportContract: runtimecap.HostProgressKnownOriginReplay,
+		AckPolicy:         progress.DeliveryAckPolicyRequired,
+		MaxAttempts:       3,
+	}); err != nil {
+		t.Fatalf("PersistReceiptWithObligation replay fixture: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.RunID = runID
+	dispatchCalled := false
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--foreground",
+		"--repo", repo,
+		"--issue-number", "899",
+		"--issue-title", "Codex replay",
+		"--run-id", runID,
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return time.Date(2026, 7, 13, 12, 2, 0, 0, time.UTC) },
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			dispatchCalled = true
+			if !strings.Contains(stderr.String(), "replaying 1 pending progress receipt") {
+				return worker.Result{}, fmt.Errorf("worker started before Codex progress replay was emitted: %q", stderr.String())
+			}
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	if !dispatchCalled {
+		t.Fatal("dispatch was not called")
+	}
+	var parsed worker.Result
+	assertSingleJSONValue(t, stdout.String(), &parsed)
+	if parsed.RunID != runID {
+		t.Fatalf("stdout JSON run_id = %q, want %q", parsed.RunID, runID)
+	}
+	if strings.Contains(stdout.String(), "progress receipt") || strings.Contains(stdout.String(), "[loopcoder]") {
+		t.Fatalf("stdout contains human replay text:\n%s", stdout.String())
+	}
+	store, _, err := openDetachedStore(context.Background(), repo, Deps{Now: func() time.Time { return time.Date(2026, 7, 13, 12, 3, 0, 0, time.UTC) }})
+	if err != nil {
+		t.Fatalf("open store after dispatch replay: %v", err)
+	}
+	defer store.Close()
+	obligations, err := progress.ListDeliveryObligations(context.Background(), store, progress.DeliveryObligationFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		SinkKind:      "host",
+		SinkID:        binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].Status != progress.DeliveryPending || obligations[0].AttemptCount != 0 {
+		t.Fatalf("obligations after replay = %#v, want pending and unattempted", obligations)
+	}
+	acks, err := progress.ListDeliveryAcknowledgments(context.Background(), store, progress.DeliveryAckFilter{ProjectID: projectID, DeliveryRunID: runID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("acks after replay = %#v, want none", acks)
+	}
+}
+
+func TestDispatchWithoutRunIDReplaysPriorCodexOriginBeforeWorker(t *testing.T) {
+	repo, priorRunID, store := setupStatusProgressFixture(t)
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv("CODEX_THREAD_ID", "thread-dispatch-next-invocation")
+	t.Setenv("CODEX_CLI", "1")
+	binding := codexHostOriginBinding(projectID, priorRunID, priorRunID)
+	if !binding.Bound {
+		t.Fatalf("Codex host origin binding = %#v, want bound", binding)
+	}
+	receipt := statusProgressReceipt(projectID, priorRunID, func(r *progress.ProgressReceipt) {
+		r.ProgressReceiptID = ""
+		r.CorrelationID = "corr-dispatch-next"
+		r.CorrelationSequence = 5
+		r.Phase = "detached-terminal"
+		r.Status = "succeeded"
+		r.TaskCounts = progress.TaskCounts{Total: 1, Succeeded: 1}
+		r.NextAction = progress.ActionState{State: "complete", Summary: "prior run completed while host was offline"}
+	})
+	if _, err := progress.PersistReceiptWithObligation(context.Background(), store, receipt, progress.DeliveryObligation{
+		OriginKind:        "progress-receipt",
+		OriginID:          binding.OriginRef,
+		SinkKind:          "host",
+		SinkID:            binding.BindingID,
+		TransportContract: runtimecap.HostProgressKnownOriginReplay,
+		AckPolicy:         progress.DeliveryAckPolicyRequired,
+		MaxAttempts:       3,
+	}); err != nil {
+		t.Fatalf("PersistReceiptWithObligation replay fixture: %v", err)
+	}
+	heartbeat := statusProgressReceipt(projectID, priorRunID, func(r *progress.ProgressReceipt) {
+		r.ProgressReceiptID = ""
+		r.CorrelationID = "corr-dispatch-next-heartbeat"
+		r.CorrelationSequence = 6
+		r.Phase = "detached-supervisor-heartbeat"
+		r.Status = "running"
+		r.NextAction = progress.ActionState{State: "continue", Summary: "heartbeat chatter"}
+	})
+	if _, err := progress.PersistReceiptWithObligation(context.Background(), store, heartbeat, progress.DeliveryObligation{
+		OriginKind:        "progress-receipt",
+		OriginID:          binding.OriginRef,
+		SinkKind:          "host",
+		SinkID:            binding.BindingID,
+		TransportContract: runtimecap.HostProgressKnownOriginReplay,
+		AckPolicy:         progress.DeliveryAckPolicyRequired,
+		MaxAttempts:       3,
+	}); err != nil {
+		t.Fatalf("PersistReceiptWithObligation heartbeat fixture: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.RunID = "run-new-dispatch"
+	dispatchCalled := false
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--foreground",
+		"--repo", repo,
+		"--issue-number", "900",
+		"--issue-title", "Next invocation replay",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return time.Date(2026, 7, 13, 12, 2, 0, 0, time.UTC) },
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			dispatchCalled = true
+			if opts.RunID != "" {
+				return worker.Result{}, fmt.Errorf("ordinary dispatch opts.RunID = %q, want empty", opts.RunID)
+			}
+			if !strings.Contains(stderr.String(), "replaying 1 pending progress receipt") || !strings.Contains(stderr.String(), priorRunID) {
+				return worker.Result{}, fmt.Errorf("worker started before prior Codex progress replay was emitted: %q", stderr.String())
+			}
+			if strings.Contains(stderr.String(), "detached-supervisor-heartbeat") || strings.Contains(stderr.String(), "heartbeat chatter") {
+				return worker.Result{}, fmt.Errorf("non-consequential heartbeat was replayed: %q", stderr.String())
+			}
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	if !dispatchCalled {
+		t.Fatal("dispatch was not called")
+	}
+	var parsed worker.Result
+	assertSingleJSONValue(t, stdout.String(), &parsed)
+	if parsed.RunID != result.RunID {
+		t.Fatalf("stdout JSON run_id = %q, want %q", parsed.RunID, result.RunID)
+	}
+	if strings.Contains(stdout.String(), "progress receipt") || strings.Contains(stdout.String(), "[loopcoder]") {
+		t.Fatalf("stdout contains human replay text:\n%s", stdout.String())
+	}
+}
+
+func TestCodexHostReplayRenderFailureRetriesWithoutCursorAdvance(t *testing.T) {
+	_, runID, store := setupStatusProgressFixture(t)
+	defer store.Close()
+	ctx := context.Background()
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv("CODEX_THREAD_ID", "thread-dispatch-render-failure")
+	t.Setenv("CODEX_CLI", "1")
+	created, binding := persistCodexReplayFixture(t, store, projectID, runID, "", "receipt survives failed stderr render", 7)
+
+	renderErr := errors.New("stderr render failed")
+	failing := &partialFailingWriter{failOnWrite: 2, partialBytes: 5, err: renderErr}
+	count, err := replayCodexHostProgressForBinding(ctx, store, projectID, runID, binding.BindingID, failing, func() time.Time {
+		return time.Date(2026, 7, 13, 12, 2, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit)
+	if !errors.Is(err, renderErr) {
+		t.Fatalf("failed replay error = %v, want render error", err)
+	}
+	if count != 0 {
+		t.Fatalf("failed replay count = %d, want 0", count)
+	}
+	if !strings.Contains(failing.String(), "[loopcoder] replaying 1 pending progress receipt") || !strings.Contains(failing.String(), "progr") {
+		t.Fatalf("failing writer did not exercise partial human render: %q", failing.String())
+	}
+	cursors, err := progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after failure: %v", err)
+	}
+	if len(cursors) != 0 {
+		t.Fatalf("cursors after failed render = %#v, want none", cursors)
+	}
+	obligations, err := progress.ListDeliveryObligations(ctx, store, progress.DeliveryObligationFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		SinkKind:      "host",
+		SinkID:        binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations after failure: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].ObligationID != created.Obligation.ObligationID {
+		t.Fatalf("obligations after failed render = %#v, want original obligation", obligations)
+	}
+	if obligations[0].Status != progress.DeliveryPending || obligations[0].ClaimOwner != "" || obligations[0].AttemptCount != 0 {
+		t.Fatalf("obligation after failed render = %#v, want pending unattempted with claim released", obligations[0])
+	}
+	acks, err := progress.ListDeliveryAcknowledgments(ctx, store, progress.DeliveryAckFilter{ProjectID: projectID, DeliveryRunID: runID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments after failure: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("acks after failed render = %#v, want none", acks)
+	}
+
+	var stderr bytes.Buffer
+	count, err = replayCodexHostProgressForBinding(ctx, store, projectID, runID, binding.BindingID, &stderr, func() time.Time {
+		return time.Date(2026, 7, 13, 12, 3, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit)
+	if err != nil {
+		t.Fatalf("retry replay: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("retry replay count = %d, want 1", count)
+	}
+	if !strings.Contains(stderr.String(), "receipt survives failed stderr render") {
+		t.Fatalf("retry stderr missing receipt:\n%s", stderr.String())
+	}
+	cursors, err = progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after retry: %v", err)
+	}
+	if len(cursors) != 1 || cursors[0].ObligationID != created.Obligation.ObligationID || cursors[0].CursorValue == "" {
+		t.Fatalf("cursors after retry = %#v, want exactly one advanced cursor", cursors)
+	}
+	advancedCursor := cursors[0].CursorValue
+	stderr.Reset()
+	count, err = replayCodexHostProgressForBinding(ctx, store, projectID, runID, binding.BindingID, &stderr, func() time.Time {
+		return time.Date(2026, 7, 13, 12, 4, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit)
+	if err != nil {
+		t.Fatalf("second healthy replay: %v", err)
+	}
+	if count != 0 || stderr.Len() != 0 {
+		t.Fatalf("second healthy replay count=%d stderr=%q, want suppressed duplicate", count, stderr.String())
+	}
+	cursors, err = progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after duplicate suppression: %v", err)
+	}
+	if len(cursors) != 1 || cursors[0].CursorValue != advancedCursor {
+		t.Fatalf("cursors after duplicate suppression = %#v, want one unchanged cursor %q", cursors, advancedCursor)
+	}
+}
+
+func TestCodexHostReplayCandidatesSkipExhaustedCursorGroupsBeforeLimit(t *testing.T) {
+	_, _, store := setupStatusProgressFixture(t)
+	defer store.Close()
+	ctx := context.Background()
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv("CODEX_THREAD_ID", "thread-candidate-live-window")
+	t.Setenv("CODEX_CLI", "1")
+	stableOriginRef := codexHostStableOriginRef(projectID)
+	if stableOriginRef == "" {
+		t.Fatal("Codex stable origin ref was empty")
+	}
+	for i := 0; i < 3; i++ {
+		runID := fmt.Sprintf("run-a-exhausted-%03d", i)
+		_, binding := persistCodexReplayFixture(t, store, projectID, runID, stableOriginRef, fmt.Sprintf("exhausted matching %03d", i), i+10)
+		result, err := progress.ReplayPendingForHost(ctx, store, progress.HostReplayOptions{
+			ProjectID:     projectID,
+			DeliveryRunID: runID,
+			OriginKind:    "host-run-origin",
+			OriginID:      binding.BindingID,
+			ClaimOwner:    "codex-query-test",
+			Now:           time.Date(2026, 7, 13, 12, 1, 0, 0, time.UTC),
+		}, func(progress.ReceiptView) error { return nil })
+		if err != nil {
+			t.Fatalf("ReplayPendingForHost exhausted %s: %v", runID, err)
+		}
+		if result.Replayed != 1 {
+			t.Fatalf("exhausted replay %s = %#v, want one cursor advance", runID, result)
+		}
+	}
+	targetRunID := "run-z-live-candidate"
+	_, targetBinding := persistCodexReplayFixture(t, store, projectID, targetRunID, stableOriginRef, "later live matching receipt", 99)
+	candidates, err := codexHostReplayCandidates(ctx, store, projectID, stableOriginRef, time.Date(2026, 7, 13, 12, 2, 0, 0, time.UTC), 1)
+	if err != nil {
+		t.Fatalf("codexHostReplayCandidates: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].deliveryRunID != targetRunID || candidates[0].sinkID != targetBinding.BindingID {
+		t.Fatalf("candidates = %#v, want only live target %s", candidates, targetRunID)
+	}
+}
+
+func TestCodexHostReplayCandidatesKeepStaleCursorAnchorsDiscoverable(t *testing.T) {
+	_, _, store := setupStatusProgressFixture(t)
+	defer store.Close()
+	ctx := context.Background()
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv("CODEX_THREAD_ID", "thread-candidate-stale-cursor")
+	t.Setenv("CODEX_CLI", "1")
+	stableOriginRef := codexHostStableOriginRef(projectID)
+	if stableOriginRef == "" {
+		t.Fatal("Codex stable origin ref was empty")
+	}
+	staleRunID := "run-a-stale-cursor-candidate"
+	_, staleBinding := persistCodexReplayFixture(t, store, projectID, staleRunID, stableOriginRef, "stale cursor candidate", 77)
+	result, err := progress.ReplayPendingForHost(ctx, store, progress.HostReplayOptions{
+		ProjectID:     projectID,
+		DeliveryRunID: staleRunID,
+		OriginKind:    "host-run-origin",
+		OriginID:      staleBinding.BindingID,
+		ClaimOwner:    "codex-stale-query-test",
+		Now:           time.Date(2026, 7, 13, 12, 1, 0, 0, time.UTC),
+	}, func(progress.ReceiptView) error { return nil })
+	if err != nil {
+		t.Fatalf("ReplayPendingForHost stale candidate: %v", err)
+	}
+	if result.Replayed != 1 {
+		t.Fatalf("stale candidate replay = %#v, want one cursor advance", result)
+	}
+	cursors, err := progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: staleRunID,
+		OriginKind:    "host-run-origin",
+		OriginID:      staleBinding.BindingID,
+		Limit:         1,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors: %v", err)
+	}
+	if len(cursors) != 1 {
+		t.Fatalf("cursors = %#v, want one", cursors)
+	}
+	corrupt := cursors[0]
+	corrupt.ObligationID = "pdelobl_missing_anchor"
+	payload, err := json.Marshal(corrupt)
+	if err != nil {
+		t.Fatalf("marshal corrupt cursor: %v", err)
+	}
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE progress_delivery_replay_cursors SET payload_json = ? WHERE cursor_id = ?`, string(payload), corrupt.CursorID)
+		return err
+	}); err != nil {
+		t.Fatalf("corrupt cursor payload: %v", err)
+	}
+	persistCodexReplayFixture(t, store, projectID, "run-z-live-after-stale-cursor", stableOriginRef, "live after stale cursor", 78)
+	candidates, err := codexHostReplayCandidates(ctx, store, projectID, stableOriginRef, time.Date(2026, 7, 13, 12, 2, 0, 0, time.UTC), 1)
+	if err != nil {
+		t.Fatalf("codexHostReplayCandidates: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].deliveryRunID != staleRunID || candidates[0].sinkID != staleBinding.BindingID {
+		t.Fatalf("candidates = %#v, want stale cursor candidate %s", candidates, staleRunID)
+	}
+	var stderr bytes.Buffer
+	_, err = replayCodexHostProgressForBinding(ctx, store, projectID, staleRunID, staleBinding.BindingID, &stderr, func() time.Time {
+		return time.Date(2026, 7, 13, 12, 3, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit)
+	if !errors.Is(err, progress.ErrMissingReference) {
+		t.Fatalf("stale cursor replay error = %v, want ErrMissingReference", err)
+	}
+	if strings.Contains(stderr.String(), "stale cursor candidate") {
+		t.Fatalf("stale cursor replay emitted from zero instead of failing closed:\n%s", stderr.String())
+	}
+}
+
+func TestDispatchWithoutRunIDBoundedReplayProgressesPastExhaustedAndUnrelatedCandidateGroups(t *testing.T) {
+	repo, _, store := setupStatusProgressFixture(t)
+	ctx := context.Background()
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv("CODEX_THREAD_ID", "thread-dispatch-live-window")
+	t.Setenv("CODEX_CLI", "1")
+	stableOriginRef := codexHostStableOriginRef(projectID)
+	if stableOriginRef == "" {
+		t.Fatal("Codex stable origin ref was empty")
+	}
+	for i := 0; i < progress.DefaultHostReplayLimit+5; i++ {
+		runID := fmt.Sprintf("run-a-exhausted-over-limit-%03d", i)
+		_, binding := persistCodexReplayFixture(t, store, projectID, runID, stableOriginRef, fmt.Sprintf("exhausted matching over limit %03d", i), i+100)
+		result, err := progress.ReplayPendingForHost(ctx, store, progress.HostReplayOptions{
+			ProjectID:     projectID,
+			DeliveryRunID: runID,
+			OriginKind:    "host-run-origin",
+			OriginID:      binding.BindingID,
+			ClaimOwner:    "codex-over-limit-test",
+			Now:           time.Date(2026, 7, 13, 12, 1, 0, 0, time.UTC),
+		}, func(progress.ReceiptView) error { return nil })
+		if err != nil {
+			t.Fatalf("ReplayPendingForHost exhausted %s: %v", runID, err)
+		}
+		if result.Replayed != 1 {
+			t.Fatalf("exhausted replay %s = %#v, want one cursor advance", runID, result)
+		}
+	}
+	for i := 0; i < progress.DefaultHostReplayLimit+5; i++ {
+		runID := fmt.Sprintf("run-b-unrelated-over-limit-%03d", i)
+		persistCodexReplayFixture(t, store, projectID, runID, fmt.Sprintf("sha256:unrelated-origin-%03d", i), fmt.Sprintf("unrelated origin over limit %03d", i), i+300)
+	}
+	targetRunID := "run-z-later-matching-over-limit"
+	persistCodexReplayFixture(t, store, projectID, targetRunID, stableOriginRef, "later matching receipt after exhausted and unrelated groups", 999)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.RunID = "run-after-over-limit-replay"
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--foreground",
+		"--repo", repo,
+		"--issue-number", "903",
+		"--issue-title", "Over limit replay",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return time.Date(2026, 7, 13, 12, 2, 0, 0, time.UTC) },
+		Dispatch: func(_ context.Context, _ worker.Options) (worker.Result, error) {
+			text := stderr.String()
+			if !strings.Contains(text, "replaying 1 pending progress receipt") || !strings.Contains(text, "later matching receipt after exhausted and unrelated groups") {
+				return worker.Result{}, fmt.Errorf("later matching receipt was not replayed before dispatch: %q", text)
+			}
+			if strings.Contains(text, "exhausted matching over limit") || strings.Contains(text, "unrelated origin over limit") {
+				return worker.Result{}, fmt.Errorf("earlier exhausted or unrelated receipt replayed: %q", text)
+			}
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	var parsed worker.Result
+	assertSingleJSONValue(t, stdout.String(), &parsed)
+	if parsed.RunID != result.RunID {
+		t.Fatalf("stdout JSON run_id = %q, want %q", parsed.RunID, result.RunID)
+	}
+}
+
+func TestDispatchDoesNotReplayPriorCodexOriginMismatch(t *testing.T) {
+	repo, priorRunID, store := setupStatusProgressFixture(t)
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv("CODEX_THREAD_ID", "thread-dispatch-origin-a")
+	t.Setenv("CODEX_CLI", "1")
+	binding := codexHostOriginBinding(projectID, priorRunID, priorRunID)
+	if !binding.Bound {
+		t.Fatalf("Codex host origin binding = %#v, want bound", binding)
+	}
+	receipt := statusProgressReceipt(projectID, priorRunID, func(r *progress.ProgressReceipt) {
+		r.ProgressReceiptID = ""
+		r.CorrelationID = "corr-dispatch-origin-mismatch"
+		r.CorrelationSequence = 6
+		r.Phase = "detached-terminal"
+		r.Status = "succeeded"
+	})
+	if _, err := progress.PersistReceiptWithObligation(context.Background(), store, receipt, progress.DeliveryObligation{
+		OriginKind:        "progress-receipt",
+		OriginID:          binding.OriginRef,
+		SinkKind:          "host",
+		SinkID:            binding.BindingID,
+		TransportContract: runtimecap.HostProgressKnownOriginReplay,
+		AckPolicy:         progress.DeliveryAckPolicyRequired,
+		MaxAttempts:       3,
+	}); err != nil {
+		t.Fatalf("PersistReceiptWithObligation replay fixture: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	t.Setenv("CODEX_THREAD_ID", "thread-dispatch-origin-b")
+
+	var stdout, stderr bytes.Buffer
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.RunID = "run-origin-mismatch-new"
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--foreground",
+		"--repo", repo,
+		"--issue-number", "901",
+		"--issue-title", "Origin mismatch",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now:      func() time.Time { return time.Date(2026, 7, 13, 12, 2, 0, 0, time.UTC) },
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) { return result, nil },
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), "replaying 1 pending progress receipt") || strings.Contains(stderr.String(), "progress receipt") {
+		t.Fatalf("origin mismatch replayed prior receipt:\n%s", stderr.String())
+	}
+	var parsed worker.Result
+	assertSingleJSONValue(t, stdout.String(), &parsed)
+}
+
+func TestDispatchReplaysClaudeOriginProgressBeforeWorkerAndKeepsJSONStdoutPure(t *testing.T) {
+	repo, runID, store := setupStatusProgressFixture(t)
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv(hostprofile.EnvName, "claude-code")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "claude-session-dispatch-replay")
+	t.Setenv("CLAUDECODE", "1")
+	binding := claudeHostOriginBinding(projectID, runID, runID)
+	if !binding.Bound {
+		t.Fatalf("Claude host origin binding = %#v, want bound", binding)
+	}
+	receipt := statusProgressReceipt(projectID, runID, func(r *progress.ProgressReceipt) {
+		r.ProgressReceiptID = ""
+		r.CorrelationID = "corr-claude-dispatch-replay"
+		r.CorrelationSequence = 44
+		r.Phase = "detached-terminal"
+		r.Status = "succeeded"
+		r.Progress.State = progress.KnownTerminal
+		r.TaskCounts = progress.TaskCounts{Total: 1, Succeeded: 1}
+		r.NextAction = progress.ActionState{State: "complete", Summary: "Claude detached run completed while host was offline"}
+	})
+	if _, err := progress.PersistReceiptWithObligation(context.Background(), store, receipt, progress.DeliveryObligation{
+		OriginKind:        "progress-receipt",
+		OriginID:          binding.OriginRef,
+		SinkKind:          "host",
+		SinkID:            binding.BindingID,
+		TransportContract: runtimecap.HostProgressKnownOriginReplay,
+		AckPolicy:         progress.DeliveryAckPolicyRequired,
+		MaxAttempts:       3,
+	}); err != nil {
+		t.Fatalf("PersistReceiptWithObligation Claude replay fixture: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.RunID = runID
+	dispatchCalled := false
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--foreground",
+		"--repo", repo,
+		"--issue-number", "900",
+		"--issue-title", "Claude replay",
+		"--run-id", runID,
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return time.Date(2026, 7, 14, 12, 2, 0, 0, time.UTC) },
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			dispatchCalled = true
+			if !strings.Contains(stderr.String(), "replaying 1 pending progress receipt for Claude Code origin") ||
+				!strings.Contains(stderr.String(), "Claude detached run completed while host was offline") {
+				return worker.Result{}, fmt.Errorf("worker started before Claude progress replay was emitted: %q", stderr.String())
+			}
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	if !dispatchCalled {
+		t.Fatal("dispatch was not called")
+	}
+	var parsed worker.Result
+	assertSingleJSONValue(t, stdout.String(), &parsed)
+	if parsed.RunID != runID {
+		t.Fatalf("stdout JSON run_id = %q, want %q", parsed.RunID, runID)
+	}
+	if strings.Contains(stdout.String(), "progress receipt") || strings.Contains(stdout.String(), "[loopcoder]") {
+		t.Fatalf("stdout contains human replay text:\n%s", stdout.String())
+	}
+}
+
+func TestDispatchWithoutRunIDReplaysPriorClaudeOriginExactlyOnce(t *testing.T) {
+	repo, priorRunID, store := setupStatusProgressFixture(t)
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv(hostprofile.EnvName, "claude-code")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "claude-session-next-invocation")
+	t.Setenv("CLAUDECODE", "1")
+	created, binding := persistClaudeReplayFixture(t, store, projectID, priorRunID, "", "Claude terminal result between turns", 45)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	record := validDispatchReport()
+	firstResult := validDispatchResult(record)
+	firstResult.RunID = "run-after-claude-replay"
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--foreground",
+		"--repo", repo,
+		"--issue-number", "900",
+		"--issue-title", "Claude next invocation replay",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return time.Date(2026, 7, 14, 12, 2, 0, 0, time.UTC) },
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			if opts.Provider != "codex" {
+				return worker.Result{}, fmt.Errorf("worker provider changed to %q; host replay must not route providers", opts.Provider)
+			}
+			if !strings.Contains(stderr.String(), "Claude terminal result between turns") {
+				return worker.Result{}, fmt.Errorf("Claude receipt was not replayed before dispatch: %q", stderr.String())
+			}
+			return firstResult, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("first dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	store, _, err := openDetachedStore(context.Background(), repo, Deps{Now: func() time.Time { return time.Date(2026, 7, 14, 12, 3, 0, 0, time.UTC) }})
+	if err != nil {
+		t.Fatalf("open store after first replay: %v", err)
+	}
+	cursors, err := progress.ListDeliveryReplayCursors(context.Background(), store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: priorRunID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors: %v", err)
+	}
+	if len(cursors) != 1 || cursors[0].ObligationID != created.Obligation.ObligationID {
+		t.Fatalf("cursors = %#v, want exactly one cursor for replayed Claude receipt", cursors)
+	}
+	var duplicate bytes.Buffer
+	count, err := replayHostProgressForBinding(context.Background(), store, projectID, priorRunID, binding.BindingID, &duplicate, func() time.Time {
+		return time.Date(2026, 7, 14, 12, 4, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit, claudeProgressAdapter)
+	if err != nil {
+		t.Fatalf("duplicate replay check: %v", err)
+	}
+	if count != 0 || duplicate.Len() != 0 {
+		t.Fatalf("duplicate Claude replay count=%d stderr=%q, want suppressed", count, duplicate.String())
+	}
+	store.Close()
+}
+
+func TestDispatchClaudeOriginMismatchThenOriginalSessionReplaysExactlyOnce(t *testing.T) {
+	repo, priorRunID, store := setupStatusProgressFixture(t)
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv(hostprofile.EnvName, "claude-code")
+	t.Setenv("CLAUDECODE", "1")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "claude-session-a-replacement")
+	created, bindingA := persistClaudeReplayFixture(t, store, projectID, priorRunID, "", "Claude session A terminal result", 47)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	record := validDispatchReport()
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "claude-session-b-replacement")
+	var stdoutB, stderrB bytes.Buffer
+	resultB := validDispatchResult(record)
+	resultB.RunID = "run-session-b"
+	dispatchB := false
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--foreground",
+		"--repo", repo,
+		"--issue-number", "900",
+		"--issue-title", "Claude session B",
+		"--format", "json",
+	}, &stdoutB, &stderrB, Deps{
+		Now: func() time.Time { return time.Date(2026, 7, 14, 12, 2, 0, 0, time.UTC) },
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			dispatchB = true
+			if strings.Contains(stderrB.String(), "Claude session A terminal result") || strings.Contains(stderrB.String(), "replaying 1 pending progress receipt") {
+				return worker.Result{}, fmt.Errorf("session B replayed session A receipt: %q", stderrB.String())
+			}
+			return resultB, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("session B dispatch exit = %d stdout=%q stderr=%q", exitCode, stdoutB.String(), stderrB.String())
+	}
+	if !dispatchB {
+		t.Fatal("session B dispatch was not called")
+	}
+	if err := relaygate.Flush(repo, io.Discard); err != nil {
+		t.Fatalf("flush session B relay gate: %v", err)
+	}
+
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "claude-session-a-replacement")
+	var stdoutA, stderrA bytes.Buffer
+	resultA := validDispatchResult(record)
+	resultA.RunID = "run-session-a-return"
+	dispatchA := false
+	exitCode = RunWithDeps([]string{
+		"dispatch",
+		"--foreground",
+		"--repo", repo,
+		"--issue-number", "900",
+		"--issue-title", "Claude session A return",
+		"--format", "json",
+	}, &stdoutA, &stderrA, Deps{
+		Now: func() time.Time { return time.Date(2026, 7, 14, 12, 3, 0, 0, time.UTC) },
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			dispatchA = true
+			if !strings.Contains(stderrA.String(), "Claude session A terminal result") {
+				return worker.Result{}, fmt.Errorf("session A receipt was not replayed before dispatch: %q", stderrA.String())
+			}
+			return resultA, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("session A dispatch exit = %d stdout=%q stderr=%q", exitCode, stdoutA.String(), stderrA.String())
+	}
+	if !dispatchA {
+		t.Fatal("session A dispatch was not called")
+	}
+
+	store, _, err := openDetachedStore(context.Background(), repo, Deps{Now: func() time.Time { return time.Date(2026, 7, 14, 12, 4, 0, 0, time.UTC) }})
+	if err != nil {
+		t.Fatalf("open store after session A replay: %v", err)
+	}
+	defer store.Close()
+	cursors, err := progress.ListDeliveryReplayCursors(context.Background(), store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: priorRunID,
+		OriginKind:    "host-run-origin",
+		OriginID:      bindingA.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors: %v", err)
+	}
+	if len(cursors) != 1 || cursors[0].ObligationID != created.Obligation.ObligationID {
+		t.Fatalf("cursors = %#v, want one cursor for session A receipt", cursors)
+	}
+	var duplicate bytes.Buffer
+	count, err := replayHostProgressForBinding(context.Background(), store, projectID, priorRunID, bindingA.BindingID, &duplicate, func() time.Time {
+		return time.Date(2026, 7, 14, 12, 5, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit, claudeProgressAdapter)
+	if err != nil {
+		t.Fatalf("duplicate session A replay check: %v", err)
+	}
+	if count != 0 || duplicate.Len() != 0 {
+		t.Fatalf("duplicate session A replay count=%d stderr=%q, want suppressed", count, duplicate.String())
+	}
+}
+
+func TestPaseoHostMarkerWithoutAgentIDUsesFallbackSinkOnly(t *testing.T) {
+	t.Setenv(hostprofile.EnvName, "paseo")
+	t.Setenv("PASEO_AGENT_ID", "")
+	t.Setenv("PASEO_HOST", "127.0.0.1:6767")
+	if binding := paseoHostOriginBinding("proj_paseo", "run_paseo", "corr_paseo"); binding.Bound || binding.Code != runtimecap.HostOriginAbsent {
+		t.Fatalf("Paseo marker-only binding = %#v, want absent", binding)
+	}
+	adapter, ok := currentHostProgressAdapter()
+	if !ok || adapter.Profile != paseoProgressAdapter.Profile {
+		t.Fatalf("currentHostProgressAdapter = %#v/%v, want explicit Paseo adapter", adapter, ok)
+	}
+	sinkID, originID, transport := hostSink(adapter, "proj_paseo", "run_paseo", "corr_paseo", "fallback-sink")
+	if sinkID != "fallback-sink" || originID != "corr_paseo" || transport != "host-jsonl-v1" {
+		t.Fatalf("Paseo marker-only hostSink = sink:%q origin:%q transport:%q, want fallback without known-origin replay", sinkID, originID, transport)
+	}
+}
+
+func TestDispatchPaseoOriginMismatchThenOriginalAgentReplaysExactlyOnce(t *testing.T) {
+	repo, priorRunID, store := setupStatusProgressFixture(t)
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv(hostprofile.EnvName, "paseo")
+	t.Setenv("PASEO_HOST", "127.0.0.1:6767")
+	t.Setenv("PASEO_AGENT_ID", "paseo-agent-a-replacement")
+	created, bindingA := persistPaseoReplayFixture(t, store, projectID, priorRunID, "", "Paseo agent A terminal result", 48)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	record := validDispatchReport()
+	t.Setenv("PASEO_AGENT_ID", "paseo-agent-b-replacement")
+	var stdoutB, stderrB bytes.Buffer
+	resultB := validDispatchResult(record)
+	resultB.RunID = "run-paseo-agent-b"
+	dispatchB := false
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--foreground",
+		"--repo", repo,
+		"--issue-number", "901",
+		"--issue-title", "Paseo agent B",
+		"--format", "json",
+	}, &stdoutB, &stderrB, Deps{
+		Now: func() time.Time { return time.Date(2026, 7, 14, 12, 2, 0, 0, time.UTC) },
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			dispatchB = true
+			if opts.Provider != "codex" {
+				return worker.Result{}, fmt.Errorf("worker provider changed to %q; Paseo must remain host transport only", opts.Provider)
+			}
+			if strings.Contains(stderrB.String(), "Paseo agent A terminal result") || strings.Contains(stderrB.String(), "replaying 1 pending progress receipt") {
+				return worker.Result{}, fmt.Errorf("Paseo agent B replayed agent A receipt: %q", stderrB.String())
+			}
+			return resultB, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("Paseo agent B dispatch exit = %d stdout=%q stderr=%q", exitCode, stdoutB.String(), stderrB.String())
+	}
+	if !dispatchB {
+		t.Fatal("Paseo agent B dispatch was not called")
+	}
+	if err := relaygate.Flush(repo, io.Discard); err != nil {
+		t.Fatalf("flush Paseo agent B relay gate: %v", err)
+	}
+
+	t.Setenv("PASEO_AGENT_ID", "paseo-agent-a-replacement")
+	var stdoutA, stderrA bytes.Buffer
+	resultA := validDispatchResult(record)
+	resultA.RunID = "run-paseo-agent-a-return"
+	dispatchA := false
+	exitCode = RunWithDeps([]string{
+		"dispatch",
+		"--foreground",
+		"--repo", repo,
+		"--issue-number", "901",
+		"--issue-title", "Paseo agent A return",
+		"--format", "json",
+	}, &stdoutA, &stderrA, Deps{
+		Now: func() time.Time { return time.Date(2026, 7, 14, 12, 3, 0, 0, time.UTC) },
+		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+			dispatchA = true
+			if opts.Provider != "codex" {
+				return worker.Result{}, fmt.Errorf("worker provider changed to %q; Paseo must remain host transport only", opts.Provider)
+			}
+			if !strings.Contains(stderrA.String(), "Paseo agent A terminal result") {
+				return worker.Result{}, fmt.Errorf("Paseo agent A receipt was not replayed before dispatch: %q", stderrA.String())
+			}
+			if !strings.Contains(stderrA.String(), "for Paseo origin") {
+				return worker.Result{}, fmt.Errorf("Paseo replay did not identify host transport: %q", stderrA.String())
+			}
+			return resultA, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("Paseo agent A dispatch exit = %d stdout=%q stderr=%q", exitCode, stdoutA.String(), stderrA.String())
+	}
+	if !dispatchA {
+		t.Fatal("Paseo agent A dispatch was not called")
+	}
+
+	store, _, err := openDetachedStore(context.Background(), repo, Deps{Now: func() time.Time { return time.Date(2026, 7, 14, 12, 4, 0, 0, time.UTC) }})
+	if err != nil {
+		t.Fatalf("open store after Paseo agent A replay: %v", err)
+	}
+	defer store.Close()
+	cursors, err := progress.ListDeliveryReplayCursors(context.Background(), store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: priorRunID,
+		OriginKind:    "host-run-origin",
+		OriginID:      bindingA.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors: %v", err)
+	}
+	if len(cursors) != 1 || cursors[0].ObligationID != created.Obligation.ObligationID {
+		t.Fatalf("cursors = %#v, want one cursor for Paseo agent A receipt", cursors)
+	}
+	var duplicate bytes.Buffer
+	count, err := replayHostProgressForBinding(context.Background(), store, projectID, priorRunID, bindingA.BindingID, &duplicate, func() time.Time {
+		return time.Date(2026, 7, 14, 12, 5, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit, paseoProgressAdapter)
+	if err != nil {
+		t.Fatalf("duplicate Paseo replay check: %v", err)
+	}
+	if count != 0 || duplicate.Len() != 0 {
+		t.Fatalf("duplicate Paseo replay count=%d stderr=%q, want suppressed", count, duplicate.String())
+	}
+}
+
+func TestPaseoHostReplayRenderFailureRetriesWithoutCursorAdvance(t *testing.T) {
+	_, runID, store := setupStatusProgressFixture(t)
+	defer store.Close()
+	ctx := context.Background()
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv(hostprofile.EnvName, "paseo")
+	t.Setenv("PASEO_AGENT_ID", "paseo-agent-render-failure")
+	t.Setenv("PASEO_HOST", "127.0.0.1:6767")
+	created, binding := persistPaseoReplayFixture(t, store, projectID, runID, "", "Paseo receipt survives failed stderr render", 49)
+
+	renderErr := errors.New("paseo stderr render failed")
+	failing := &partialFailingWriter{failOnWrite: 2, partialBytes: 5, err: renderErr}
+	count, err := replayHostProgressForBinding(ctx, store, projectID, runID, binding.BindingID, failing, func() time.Time {
+		return time.Date(2026, 7, 14, 12, 2, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit, paseoProgressAdapter)
+	if !errors.Is(err, renderErr) {
+		t.Fatalf("failed replay error = %v, want render error", err)
+	}
+	if count != 0 {
+		t.Fatalf("failed replay count = %d, want 0", count)
+	}
+	if !strings.Contains(failing.String(), "[loopcoder] replaying 1 pending progress receipt") || !strings.Contains(failing.String(), "progr") {
+		t.Fatalf("failing writer did not exercise partial human render: %q", failing.String())
+	}
+	cursors, err := progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after failure: %v", err)
+	}
+	if len(cursors) != 0 {
+		t.Fatalf("cursors after failed render = %#v, want none", cursors)
+	}
+	obligations, err := progress.ListDeliveryObligations(ctx, store, progress.DeliveryObligationFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		SinkKind:      "host",
+		SinkID:        binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations after failure: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].ObligationID != created.Obligation.ObligationID {
+		t.Fatalf("obligations after failed render = %#v, want original obligation", obligations)
+	}
+	if obligations[0].Status != progress.DeliveryPending || obligations[0].ClaimOwner != "" || obligations[0].AttemptCount != 0 {
+		t.Fatalf("obligation after failed render = %#v, want pending unattempted with claim released", obligations[0])
+	}
+	attempts, err := progress.ListDeliveryAttempts(ctx, store, progress.DeliveryAttemptFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		ObligationID:  created.Obligation.ObligationID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryAttempts after failure: %v", err)
+	}
+	if len(attempts) != 0 {
+		t.Fatalf("attempts after failed render = %#v, want none", attempts)
+	}
+	acks, err := progress.ListDeliveryAcknowledgments(ctx, store, progress.DeliveryAckFilter{ProjectID: projectID, DeliveryRunID: runID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments after failure: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("acks after failed render = %#v, want none", acks)
+	}
+
+	var stderr bytes.Buffer
+	count, err = replayHostProgressForBinding(ctx, store, projectID, runID, binding.BindingID, &stderr, func() time.Time {
+		return time.Date(2026, 7, 14, 12, 3, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit, paseoProgressAdapter)
+	if err != nil {
+		t.Fatalf("retry replay: %v", err)
+	}
+	if count != 1 || !strings.Contains(stderr.String(), "Paseo receipt survives failed stderr render") {
+		t.Fatalf("retry replay count=%d stderr=%q, want Paseo receipt", count, stderr.String())
+	}
+	cursors, err = progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after retry: %v", err)
+	}
+	if len(cursors) != 1 || cursors[0].ObligationID != created.Obligation.ObligationID || cursors[0].CursorValue == "" {
+		t.Fatalf("cursors after retry = %#v, want exactly one advanced cursor", cursors)
+	}
+	advancedCursor := cursors[0].CursorValue
+	stderr.Reset()
+	count, err = replayHostProgressForBinding(ctx, store, projectID, runID, binding.BindingID, &stderr, func() time.Time {
+		return time.Date(2026, 7, 14, 12, 4, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit, paseoProgressAdapter)
+	if err != nil {
+		t.Fatalf("second healthy replay: %v", err)
+	}
+	if count != 0 || stderr.Len() != 0 {
+		t.Fatalf("second healthy replay count=%d stderr=%q, want suppressed duplicate", count, stderr.String())
+	}
+	cursors, err = progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after duplicate suppression: %v", err)
+	}
+	if len(cursors) != 1 || cursors[0].CursorValue != advancedCursor {
+		t.Fatalf("cursors after duplicate suppression = %#v, want one unchanged cursor %q", cursors, advancedCursor)
+	}
+}
+
+func TestClaudeHostReplayRenderFailureRetriesWithoutCursorAdvance(t *testing.T) {
+	_, runID, store := setupStatusProgressFixture(t)
+	defer store.Close()
+	ctx := context.Background()
+	projectID := statusProgressProjectID(t, store)
+	t.Setenv(hostprofile.EnvName, "claude-code")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "claude-session-render-failure")
+	t.Setenv("CLAUDECODE", "1")
+	created, binding := persistClaudeReplayFixture(t, store, projectID, runID, "", "Claude receipt survives failed stderr render", 46)
+
+	renderErr := errors.New("claude stderr render failed")
+	failing := &partialFailingWriter{failOnWrite: 2, partialBytes: 5, err: renderErr}
+	count, err := replayHostProgressForBinding(ctx, store, projectID, runID, binding.BindingID, failing, func() time.Time {
+		return time.Date(2026, 7, 14, 12, 2, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit, claudeProgressAdapter)
+	if !errors.Is(err, renderErr) {
+		t.Fatalf("failed replay error = %v, want render error", err)
+	}
+	if count != 0 {
+		t.Fatalf("failed replay count = %d, want 0", count)
+	}
+	if !strings.Contains(failing.String(), "[loopcoder] replaying 1 pending progress receipt") || !strings.Contains(failing.String(), "progr") {
+		t.Fatalf("failing writer did not exercise partial human render: %q", failing.String())
+	}
+	cursors, err := progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after failure: %v", err)
+	}
+	if len(cursors) != 0 {
+		t.Fatalf("cursors after failed render = %#v, want none", cursors)
+	}
+	obligations, err := progress.ListDeliveryObligations(ctx, store, progress.DeliveryObligationFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		SinkKind:      "host",
+		SinkID:        binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations after failure: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].ObligationID != created.Obligation.ObligationID {
+		t.Fatalf("obligations after failed render = %#v, want original obligation", obligations)
+	}
+	if obligations[0].Status != progress.DeliveryPending || obligations[0].ClaimOwner != "" || obligations[0].AttemptCount != 0 {
+		t.Fatalf("obligation after failed render = %#v, want pending unattempted with claim released", obligations[0])
+	}
+	acks, err := progress.ListDeliveryAcknowledgments(ctx, store, progress.DeliveryAckFilter{ProjectID: projectID, DeliveryRunID: runID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments after failure: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("acks after failed render = %#v, want none", acks)
+	}
+
+	var stderr bytes.Buffer
+	count, err = replayHostProgressForBinding(ctx, store, projectID, runID, binding.BindingID, &stderr, func() time.Time {
+		return time.Date(2026, 7, 14, 12, 3, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit, claudeProgressAdapter)
+	if err != nil {
+		t.Fatalf("retry replay: %v", err)
+	}
+	if count != 1 || !strings.Contains(stderr.String(), "Claude receipt survives failed stderr render") {
+		t.Fatalf("retry replay count=%d stderr=%q, want Claude receipt", count, stderr.String())
+	}
+	cursors, err = progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after retry: %v", err)
+	}
+	if len(cursors) != 1 || cursors[0].ObligationID != created.Obligation.ObligationID {
+		t.Fatalf("cursors after retry = %#v, want exactly one advanced cursor", cursors)
+	}
+	advancedCursor := cursors[0].CursorValue
+	stderr.Reset()
+	count, err = replayHostProgressForBinding(ctx, store, projectID, runID, binding.BindingID, &stderr, func() time.Time {
+		return time.Date(2026, 7, 14, 12, 4, 0, 0, time.UTC)
+	}, progress.DefaultHostReplayLimit, claudeProgressAdapter)
+	if err != nil {
+		t.Fatalf("second healthy replay: %v", err)
+	}
+	if count != 0 || stderr.Len() != 0 {
+		t.Fatalf("second healthy replay count=%d stderr=%q, want suppressed duplicate", count, stderr.String())
+	}
+	cursors, err = progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     projectID,
+		DeliveryRunID: runID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after duplicate suppression: %v", err)
+	}
+	if len(cursors) != 1 || cursors[0].CursorValue != advancedCursor {
+		t.Fatalf("cursors after duplicate suppression = %#v, want unchanged cursor %q", cursors, advancedCursor)
+	}
+}
+
+func persistCodexReplayFixture(t *testing.T, store storage.Store, projectID, runID, originID, summary string, sequence int) (progress.PersistReceiptWithObligationResult, runtimecap.HostRunOriginBinding) {
+	t.Helper()
+	binding := codexHostOriginBinding(projectID, runID, runID)
+	if !binding.Bound {
+		t.Fatalf("Codex host origin binding for %s = %#v, want bound", runID, binding)
+	}
+	if strings.TrimSpace(originID) == "" {
+		originID = binding.OriginRef
+	}
+	receipt := statusProgressReceipt(projectID, runID, func(r *progress.ProgressReceipt) {
+		r.ProgressReceiptID = ""
+		r.CorrelationID = fmt.Sprintf("corr-%s-%d", runID, sequence)
+		r.CorrelationSequence = int64(sequence)
+		r.Phase = "detached-terminal"
+		r.Status = "succeeded"
+		r.Progress.State = progress.KnownTerminal
+		r.TaskCounts = progress.TaskCounts{Total: 1, Succeeded: 1}
+		r.NextAction = progress.ActionState{State: "complete", Summary: summary}
+	})
+	created, err := progress.PersistReceiptWithObligation(context.Background(), store, receipt, progress.DeliveryObligation{
+		OriginKind:        "progress-receipt",
+		OriginID:          originID,
+		SinkKind:          "host",
+		SinkID:            binding.BindingID,
+		TransportContract: runtimecap.HostProgressKnownOriginReplay,
+		AckPolicy:         progress.DeliveryAckPolicyRequired,
+		MaxAttempts:       3,
+	})
+	if err != nil {
+		t.Fatalf("PersistReceiptWithObligation %s: %v", runID, err)
+	}
+	return created, binding
+}
+
+func persistClaudeReplayFixture(t *testing.T, store storage.Store, projectID, runID, originID, summary string, sequence int) (progress.PersistReceiptWithObligationResult, runtimecap.HostRunOriginBinding) {
+	t.Helper()
+	binding := claudeHostOriginBinding(projectID, runID, runID)
+	if !binding.Bound {
+		t.Fatalf("Claude host origin binding for %s = %#v, want bound", runID, binding)
+	}
+	if strings.TrimSpace(originID) == "" {
+		originID = binding.OriginRef
+	}
+	receipt := statusProgressReceipt(projectID, runID, func(r *progress.ProgressReceipt) {
+		r.ProgressReceiptID = ""
+		r.CorrelationID = fmt.Sprintf("corr-claude-%s-%d", runID, sequence)
+		r.CorrelationSequence = int64(sequence)
+		r.Phase = "detached-terminal"
+		r.Status = "succeeded"
+		r.Progress.State = progress.KnownTerminal
+		r.TaskCounts = progress.TaskCounts{Total: 1, Succeeded: 1}
+		r.NextAction = progress.ActionState{State: "complete", Summary: summary}
+	})
+	created, err := progress.PersistReceiptWithObligation(context.Background(), store, receipt, progress.DeliveryObligation{
+		OriginKind:        "progress-receipt",
+		OriginID:          originID,
+		SinkKind:          "host",
+		SinkID:            binding.BindingID,
+		TransportContract: runtimecap.HostProgressKnownOriginReplay,
+		AckPolicy:         progress.DeliveryAckPolicyRequired,
+		MaxAttempts:       3,
+	})
+	if err != nil {
+		t.Fatalf("PersistReceiptWithObligation Claude %s: %v", runID, err)
+	}
+	return created, binding
+}
+
+func persistPaseoReplayFixture(t *testing.T, store storage.Store, projectID, runID, originID, summary string, sequence int) (progress.PersistReceiptWithObligationResult, runtimecap.HostRunOriginBinding) {
+	t.Helper()
+	binding := paseoHostOriginBinding(projectID, runID, runID)
+	if !binding.Bound {
+		t.Fatalf("Paseo host origin binding for %s = %#v, want bound", runID, binding)
+	}
+	if strings.TrimSpace(originID) == "" {
+		originID = binding.OriginRef
+	}
+	receipt := statusProgressReceipt(projectID, runID, func(r *progress.ProgressReceipt) {
+		r.ProgressReceiptID = ""
+		r.CorrelationID = fmt.Sprintf("corr-paseo-%s-%d", runID, sequence)
+		r.CorrelationSequence = int64(sequence)
+		r.Phase = "detached-terminal"
+		r.Status = "succeeded"
+		r.Progress.State = progress.KnownTerminal
+		r.TaskCounts = progress.TaskCounts{Total: 1, Succeeded: 1}
+		r.NextAction = progress.ActionState{State: "complete", Summary: summary}
+	})
+	created, err := progress.PersistReceiptWithObligation(context.Background(), store, receipt, progress.DeliveryObligation{
+		OriginKind:        "progress-receipt",
+		OriginID:          originID,
+		SinkKind:          "host",
+		SinkID:            binding.BindingID,
+		TransportContract: runtimecap.HostProgressKnownOriginReplay,
+		AckPolicy:         progress.DeliveryAckPolicyRequired,
+		MaxAttempts:       3,
+	})
+	if err != nil {
+		t.Fatalf("PersistReceiptWithObligation Paseo %s: %v", runID, err)
+	}
+	return created, binding
+}
+
+func TestDispatchReplaysCancelledDetachedRunAndLeavesUnacknowledged(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	t.Setenv("CODEX_THREAD_ID", "thread-cancelled-detached-replay")
+	t.Setenv("CODEX_CLI", "1")
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 6, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-cancelled-detached-replay",
+		Owner:          "owner-cancelled",
+		LeaseExpiresAt: now.Add(time.Minute),
+		IssueNumber:    899,
+		Attempt:        1,
+		BaseBranch:     "pre-prod",
+		Provider:       "codex",
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	terminalReceiptID, err := persistDetachedReceipt(ctx, store, claim, "detached-terminal", detachedrun.StatusCancelled, true, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("persistDetachedReceipt cancelled: %v", err)
+	}
+	if _, err := detachedrun.Complete(ctx, store, claim.Fence(), detachedrun.StatusCancelled, terminalReceiptID, "cancelled", "detached run cancellation requested", now.Add(time.Second)); err != nil {
+		t.Fatalf("Complete cancelled: %v", err)
+	}
+	store.Close()
+
+	var stdout, stderr bytes.Buffer
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.RunID = "run-after-cancelled-detached"
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "902",
+		"--issue-title", "After cancelled detached",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now.Add(2 * time.Minute) },
+		Dispatch: func(_ context.Context, _ worker.Options) (worker.Result, error) {
+			if !strings.Contains(stderr.String(), "status=cancelled") {
+				return worker.Result{}, fmt.Errorf("cancelled receipt was not replayed before dispatch: %q", stderr.String())
+			}
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	var parsed worker.Result
+	assertSingleJSONValue(t, stdout.String(), &parsed)
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(3 * time.Minute) }})
+	if err != nil {
+		t.Fatalf("open store after replay: %v", err)
+	}
+	defer store.Close()
+	binding := codexHostOriginBinding(registered.Project.ProjectID, claim.RunID, claim.RunID)
+	obligations, err := progress.ListDeliveryObligations(ctx, store, progress.DeliveryObligationFilter{
+		ProjectID:     registered.Project.ProjectID,
+		DeliveryRunID: claim.RunID,
+		SinkKind:      "host",
+		SinkID:        binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].Status != progress.DeliveryPending || obligations[0].AttemptCount != 0 {
+		t.Fatalf("cancelled obligation after replay = %#v, want pending and unacknowledged", obligations)
+	}
+	acks, err := progress.ListDeliveryAcknowledgments(ctx, store, progress.DeliveryAckFilter{ProjectID: registered.Project.ProjectID, DeliveryRunID: claim.RunID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("cancelled replay acknowledgments = %#v, want none", acks)
+	}
+}
+
+func TestDispatchReplaysCancelledDetachedRunForClaudeHostAndLeavesCancellationUnknown(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	t.Setenv(hostprofile.EnvName, "claude-code")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "claude-session-cancelled-detached")
+	t.Setenv("CLAUDECODE", "1")
+	host, ok := runtimecap.LookupHost("claude-code")
+	if !ok {
+		t.Fatal("LookupHost(claude-code) returned false")
+	}
+	capabilities := runtimecap.HostCapabilityDeclarations(host)
+	if got := hostCapabilitySupport(capabilities, runtimecap.HostDetachedCancellation); got != runtimecap.HostCapabilityUnknown {
+		t.Fatalf("Claude detached cancellation support = %q, want unknown", got)
+	}
+
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 6, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-claude-cancelled-detached-replay",
+		Owner:          "owner-claude-cancelled",
+		LeaseExpiresAt: now.Add(time.Minute),
+		IssueNumber:    900,
+		Attempt:        1,
+		BaseBranch:     "pre-prod",
+		Provider:       "grok",
+		Model:          "grok-build",
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	terminalReceiptID, err := persistDetachedReceipt(ctx, store, claim, "detached-terminal", detachedrun.StatusCancelled, true, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("persistDetachedReceipt cancelled: %v", err)
+	}
+	if _, err := detachedrun.Complete(ctx, store, claim.Fence(), detachedrun.StatusCancelled, terminalReceiptID, "cancelled", "detached run cancellation requested", now.Add(time.Second)); err != nil {
+		t.Fatalf("Complete cancelled: %v", err)
+	}
+	store.Close()
+
+	var stdout, stderr bytes.Buffer
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.RunID = "run-after-claude-cancelled-detached"
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "901",
+		"--issue-title", "After Claude cancelled detached",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now.Add(2 * time.Minute) },
+		Dispatch: func(_ context.Context, _ worker.Options) (worker.Result, error) {
+			if !strings.Contains(stderr.String(), "replaying 1 pending progress receipt for Claude Code origin") ||
+				!strings.Contains(stderr.String(), "status=cancelled") {
+				return worker.Result{}, fmt.Errorf("cancelled Claude receipt was not replayed before dispatch: %q", stderr.String())
+			}
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	var parsed worker.Result
+	assertSingleJSONValue(t, stdout.String(), &parsed)
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(3 * time.Minute) }})
+	if err != nil {
+		t.Fatalf("open store after replay: %v", err)
+	}
+	defer store.Close()
+	binding := claudeHostOriginBinding(registered.Project.ProjectID, claim.RunID, claim.RunID)
+	obligations, err := progress.ListDeliveryObligations(ctx, store, progress.DeliveryObligationFilter{
+		ProjectID:     registered.Project.ProjectID,
+		DeliveryRunID: claim.RunID,
+		SinkKind:      "host",
+		SinkID:        binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].Status != progress.DeliveryPending || obligations[0].AttemptCount != 0 || obligations[0].ClaimOwner != "" {
+		t.Fatalf("Claude cancelled obligation after replay = %#v, want pending unacknowledged with no claim", obligations)
+	}
+	acks, err := progress.ListDeliveryAcknowledgments(ctx, store, progress.DeliveryAckFilter{ProjectID: registered.Project.ProjectID, DeliveryRunID: claim.RunID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("Claude cancelled replay acknowledgments = %#v, want none", acks)
+	}
+}
+
+func TestDispatchReplaysCancelledDetachedRunForPaseoHostAndLeavesCancellationUnknown(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	t.Setenv(hostprofile.EnvName, "paseo")
+	t.Setenv("PASEO_AGENT_ID", "paseo-agent-cancelled-detached")
+	t.Setenv("PASEO_HOST", "127.0.0.1:6767")
+	host, ok := runtimecap.LookupHost("paseo-style")
+	if !ok {
+		t.Fatal("LookupHost(paseo-style) returned false")
+	}
+	capabilities := runtimecap.HostCapabilityDeclarations(host)
+	if got := hostCapabilitySupport(capabilities, runtimecap.HostDetachedCancellation); got != runtimecap.HostCapabilityUnknown {
+		t.Fatalf("Paseo detached cancellation support = %q, want unknown", got)
+	}
+
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 6, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-paseo-cancelled-detached-replay",
+		Owner:          "owner-paseo-cancelled",
+		LeaseExpiresAt: now.Add(time.Minute),
+		IssueNumber:    901,
+		Attempt:        1,
+		BaseBranch:     "pre-prod",
+		Provider:       "gemini",
+		Model:          "gemini-3.1-pro",
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	terminalReceiptID, err := persistDetachedReceipt(ctx, store, claim, "detached-terminal", detachedrun.StatusCancelled, true, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("persistDetachedReceipt cancelled: %v", err)
+	}
+	if _, err := detachedrun.Complete(ctx, store, claim.Fence(), detachedrun.StatusCancelled, terminalReceiptID, "cancelled", "detached run cancellation requested", now.Add(time.Second)); err != nil {
+		t.Fatalf("Complete cancelled: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store before replay restart: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.RunID = "run-after-paseo-cancelled-detached"
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "903",
+		"--issue-title", "After Paseo cancelled detached",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now.Add(2 * time.Minute) },
+		Dispatch: func(_ context.Context, _ worker.Options) (worker.Result, error) {
+			if !strings.Contains(stderr.String(), "replaying 1 pending progress receipt for Paseo origin") ||
+				!strings.Contains(stderr.String(), "status=cancelled") {
+				return worker.Result{}, fmt.Errorf("cancelled Paseo receipt was not replayed before dispatch: %q", stderr.String())
+			}
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	var parsed worker.Result
+	assertSingleJSONValue(t, stdout.String(), &parsed)
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(3 * time.Minute) }})
+	if err != nil {
+		t.Fatalf("open store after replay: %v", err)
+	}
+	defer store.Close()
+	binding := paseoHostOriginBinding(registered.Project.ProjectID, claim.RunID, claim.RunID)
+	obligations, err := progress.ListDeliveryObligations(ctx, store, progress.DeliveryObligationFilter{
+		ProjectID:     registered.Project.ProjectID,
+		DeliveryRunID: claim.RunID,
+		SinkKind:      "host",
+		SinkID:        binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].Status != progress.DeliveryPending || obligations[0].AttemptCount != 0 || obligations[0].ClaimOwner != "" {
+		t.Fatalf("Paseo cancelled obligation after replay = %#v, want pending unacknowledged with no claim", obligations)
+	}
+	acks, err := progress.ListDeliveryAcknowledgments(ctx, store, progress.DeliveryAckFilter{ProjectID: registered.Project.ProjectID, DeliveryRunID: claim.RunID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("Paseo cancelled replay acknowledgments = %#v, want none", acks)
+	}
+}
+
+func TestDispatchPaseoHostReplayProviderModelMatrix(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		provider string
+		model    string
+	}{
+		{name: "codex", provider: "codex", model: "gpt-5.5"},
+		{name: "claude", provider: "claude", model: "claude-opus-4.5"},
+		{name: "gemini", provider: "gemini", model: "gemini-3.1-pro"},
+		{name: "grok", provider: "grok", model: "grok-build"},
+		{name: "synthetic-future-provider", provider: "synthetic-future", model: "future-model"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, priorRunID, store := setupStatusProgressFixture(t)
+			projectID := statusProgressProjectID(t, store)
+			t.Setenv(hostprofile.EnvName, "paseo")
+			t.Setenv("PASEO_AGENT_ID", "paseo-agent-provider-matrix-"+tt.name)
+			t.Setenv("PASEO_HOST", "127.0.0.1:6767")
+			persistPaseoReplayFixture(t, store, projectID, priorRunID, "", "Paseo host replay before "+tt.provider, 50)
+			if err := store.Close(); err != nil {
+				t.Fatalf("close store: %v", err)
+			}
+
+			var stdout, stderr bytes.Buffer
+			record := validDispatchReport()
+			record.Provider = tt.provider
+			record.Model = tt.model
+			result := validDispatchResult(record)
+			result.RunID = "run-paseo-provider-independence-" + tt.name
+			exitCode := RunWithDeps([]string{
+				"dispatch",
+				"--foreground",
+				"--repo", repo,
+				"--issue-number", "901",
+				"--issue-title", "Paseo host provider independence",
+				"--provider", tt.provider,
+				"--model", tt.model,
+				"--format", "json",
+			}, &stdout, &stderr, Deps{
+				Now: func() time.Time { return time.Date(2026, 7, 14, 12, 6, 0, 0, time.UTC) },
+				Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+					if opts.Provider != tt.provider || opts.Model != tt.model {
+						return worker.Result{}, fmt.Errorf("worker selection = %s/%s, want %s/%s", opts.Provider, opts.Model, tt.provider, tt.model)
+					}
+					if !strings.Contains(stderr.String(), "Paseo host replay before "+tt.provider) {
+						return worker.Result{}, fmt.Errorf("Paseo host replay was not emitted before %s worker: %q", tt.provider, stderr.String())
+					}
+					if !strings.Contains(stderr.String(), "for Paseo origin") {
+						return worker.Result{}, fmt.Errorf("Paseo host replay did not identify host transport: %q", stderr.String())
+					}
+					return result, nil
+				},
+			})
+			if exitCode != 0 {
+				t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+			}
+			var parsed worker.Result
+			assertSingleJSONValue(t, stdout.String(), &parsed)
+			if parsed.RunID != result.RunID {
+				t.Fatalf("stdout JSON run_id = %q, want %q", parsed.RunID, result.RunID)
+			}
+			if parsed.Report == nil || parsed.Report.Provider != tt.provider || parsed.Report.Model != tt.model {
+				t.Fatalf("stdout report provider/model = %#v, want %s/%s", parsed.Report, tt.provider, tt.model)
+			}
+			if strings.Contains(stdout.String(), "progress receipt") || strings.Contains(stdout.String(), "[loopcoder]") {
+				t.Fatalf("stdout contains human replay text:\n%s", stdout.String())
+			}
+		})
+	}
+}
+
+func TestDispatchPaseoHostMarkerOnlyFallsBackWithoutReplayOrAck(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	t.Setenv(hostprofile.EnvName, "paseo")
+	t.Setenv("PASEO_AGENT_ID", "")
+	t.Setenv("PASEO_HOST", "127.0.0.1:6767")
+
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 7, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-paseo-marker-only-fallback",
+		Owner:          "owner-paseo-marker-only",
+		LeaseExpiresAt: now.Add(time.Minute),
+		IssueNumber:    901,
+		Attempt:        1,
+		BaseBranch:     "pre-prod",
+		Provider:       "codex",
+		Model:          "gpt-5.5",
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	terminalReceiptID, err := persistDetachedReceipt(ctx, store, claim, "detached-terminal", detachedrun.StatusSucceeded, true, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("persistDetachedReceipt marker-only: %v", err)
+	}
+	if _, err := detachedrun.Complete(ctx, store, claim.Fence(), detachedrun.StatusSucceeded, terminalReceiptID, "", "", now.Add(time.Second)); err != nil {
+		t.Fatalf("Complete marker-only: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store before marker-only dispatch: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.RunID = "run-after-paseo-marker-only"
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "904",
+		"--issue-title", "After Paseo marker-only fallback",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now.Add(2 * time.Minute) },
+		Dispatch: func(_ context.Context, _ worker.Options) (worker.Result, error) {
+			if strings.Contains(stderr.String(), "replaying 1 pending progress receipt") ||
+				strings.Contains(stderr.String(), "status=succeeded") {
+				return worker.Result{}, fmt.Errorf("marker-only Paseo host replayed without origin proof: %q", stderr.String())
+			}
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	var parsed worker.Result
+	assertSingleJSONValue(t, stdout.String(), &parsed)
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(3 * time.Minute) }})
+	if err != nil {
+		t.Fatalf("open store after marker-only dispatch: %v", err)
+	}
+	defer store.Close()
+	obligations, err := progress.ListDeliveryObligations(ctx, store, progress.DeliveryObligationFilter{
+		ProjectID:     registered.Project.ProjectID,
+		DeliveryRunID: claim.RunID,
+		SinkKind:      "host",
+		SinkID:        "detached-run-status",
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations marker-only: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].TransportContract != "host-jsonl-v1" || obligations[0].Status != progress.DeliveryPending || obligations[0].AttemptCount != 0 {
+		t.Fatalf("marker-only obligations = %#v, want local fallback pending", obligations)
+	}
+	acks, err := progress.ListDeliveryAcknowledgments(ctx, store, progress.DeliveryAckFilter{ProjectID: registered.Project.ProjectID, DeliveryRunID: claim.RunID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments marker-only: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("marker-only acknowledgments = %#v, want none", acks)
+	}
+}
+
+func TestPaseoClaudeRefreshFailureDoesNotMutateDetachedWorkerState(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	t.Setenv(hostprofile.EnvName, "paseo")
+	t.Setenv("PASEO_AGENT_ID", "paseo-agent-claude-refresh-race")
+	t.Setenv("PASEO_HOST", "127.0.0.1:6767")
+
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 8, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-paseo-2034-claude-refresh",
+		Owner:          "owner-paseo-2034",
+		LeaseExpiresAt: now.Add(10 * time.Minute),
+		IssueNumber:    901,
+		Attempt:        1,
+		BaseBranch:     "pre-prod",
+		Provider:       "claude",
+		Model:          "claude-opus-4.5",
+		Effort:         "high",
+		WorkerLease: map[string]any{
+			"watchdog_generation": float64(7),
+			"lease_expires_at":    now.Add(10 * time.Minute).Format(time.RFC3339Nano),
+		},
+		Now: now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if _, err := detachedrun.MarkWorkerStarted(ctx, store, claim.Fence(), now.Add(10*time.Second)); err != nil {
+		t.Fatalf("MarkWorkerStarted: %v", err)
+	}
+	terminalReceiptID, err := persistDetachedReceipt(ctx, store, claim, "detached-terminal", detachedrun.StatusSucceeded, true, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("persistDetachedReceipt succeeded: %v", err)
+	}
+	terminal, err := detachedrun.Complete(ctx, store, claim.Fence(), detachedrun.StatusSucceeded, terminalReceiptID, "", "worker completed before Paseo host refresh failed", now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("Complete succeeded: %v", err)
+	}
+	before, err := detachedrun.Get(ctx, store, claim.RunID)
+	if err != nil {
+		t.Fatalf("Get before replay failure: %v", err)
+	}
+	if before.TerminalReceiptID != terminal.TerminalReceiptID || before.Status != detachedrun.StatusSucceeded {
+		t.Fatalf("before terminal record = %#v, want succeeded terminal", before)
+	}
+	binding := paseoHostOriginBinding(registered.Project.ProjectID, claim.RunID, claim.RunID)
+	if !binding.Bound {
+		t.Fatalf("Paseo binding = %#v, want bound", binding)
+	}
+
+	hostErr := errors.New("paseo #2034 claude refresh timeout at host-delivery boundary")
+	failing := &partialFailingWriter{failOnWrite: 2, partialBytes: 0, err: hostErr}
+	count, err := replayHostProgressForBinding(ctx, store, registered.Project.ProjectID, claim.RunID, binding.BindingID, failing, func() time.Time {
+		return now.Add(2 * time.Minute)
+	}, progress.DefaultHostReplayLimit, paseoProgressAdapter)
+	if !errors.Is(err, hostErr) {
+		t.Fatalf("host replay error = %v, want #2034 boundary error", err)
+	}
+	if count != 0 {
+		t.Fatalf("host replay count = %d, want 0 after failed boundary write", count)
+	}
+	after, err := detachedrun.Get(ctx, store, claim.RunID)
+	if err != nil {
+		t.Fatalf("Get after replay failure: %v", err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("detached worker record mutated by host delivery failure\nbefore=%#v\nafter=%#v", before, after)
+	}
+	if after.Generation != before.Generation ||
+		after.LeaseExpiresAt != before.LeaseExpiresAt ||
+		after.HeartbeatAt != before.HeartbeatAt ||
+		!reflect.DeepEqual(after.WorkerLease, before.WorkerLease) ||
+		after.Provider != "claude" ||
+		after.Model != "claude-opus-4.5" ||
+		after.TerminalReceiptID != terminalReceiptID ||
+		after.Status != detachedrun.StatusSucceeded {
+		t.Fatalf("detached worker state changed after host failure: before=%#v after=%#v", before, after)
+	}
+	obligations, err := progress.ListDeliveryObligations(ctx, store, progress.DeliveryObligationFilter{
+		ProjectID:     registered.Project.ProjectID,
+		DeliveryRunID: claim.RunID,
+		SinkKind:      "host",
+		SinkID:        binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryObligations after #2034 fixture: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].Status != progress.DeliveryPending || obligations[0].ClaimOwner != "" || obligations[0].AttemptCount != 0 {
+		t.Fatalf("obligations after #2034 fixture = %#v, want only retryable local obligation pending with no attempt", obligations)
+	}
+	cursors, err := progress.ListDeliveryReplayCursors(ctx, store, progress.DeliveryCursorFilter{
+		ProjectID:     registered.Project.ProjectID,
+		DeliveryRunID: claim.RunID,
+		OriginKind:    "host-run-origin",
+		OriginID:      binding.BindingID,
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("ListDeliveryReplayCursors after #2034 fixture: %v", err)
+	}
+	if len(cursors) != 0 {
+		t.Fatalf("cursors after #2034 fixture = %#v, want none", cursors)
+	}
+	acks, err := progress.ListDeliveryAcknowledgments(ctx, store, progress.DeliveryAckFilter{ProjectID: registered.Project.ProjectID, DeliveryRunID: claim.RunID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeliveryAcknowledgments after #2034 fixture: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("acks after #2034 fixture = %#v, want none", acks)
+	}
+	store.Close()
+}
+
+func TestDispatchClaudeHostReplayIsIndependentOfWorkerProvider(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		provider string
+		model    string
+	}{
+		{name: "non-claude-worker", provider: "grok", model: "grok-build"},
+		{name: "synthetic-future-provider", provider: "synthetic-future", model: "future-model"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, priorRunID, store := setupStatusProgressFixture(t)
+			projectID := statusProgressProjectID(t, store)
+			t.Setenv(hostprofile.EnvName, "claude-code")
+			t.Setenv("CLAUDE_CODE_SESSION_ID", "claude-session-provider-independence-"+tt.name)
+			t.Setenv("CLAUDECODE", "1")
+			persistClaudeReplayFixture(t, store, projectID, priorRunID, "", "Claude host replay before "+tt.provider, 48)
+			if err := store.Close(); err != nil {
+				t.Fatalf("close store: %v", err)
+			}
+
+			var stdout, stderr bytes.Buffer
+			record := validDispatchReport()
+			result := validDispatchResult(record)
+			result.RunID = "run-provider-independence-" + tt.name
+			exitCode := RunWithDeps([]string{
+				"dispatch",
+				"--foreground",
+				"--repo", repo,
+				"--issue-number", "900",
+				"--issue-title", "Claude host provider independence",
+				"--provider", tt.provider,
+				"--model", tt.model,
+				"--format", "json",
+			}, &stdout, &stderr, Deps{
+				Now: func() time.Time { return time.Date(2026, 7, 14, 12, 6, 0, 0, time.UTC) },
+				Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
+					if opts.Provider != tt.provider || opts.Model != tt.model {
+						return worker.Result{}, fmt.Errorf("worker selection = %s/%s, want %s/%s", opts.Provider, opts.Model, tt.provider, tt.model)
+					}
+					if !strings.Contains(stderr.String(), "Claude host replay before "+tt.provider) {
+						return worker.Result{}, fmt.Errorf("Claude host replay was not emitted before %s worker: %q", tt.provider, stderr.String())
+					}
+					return result, nil
+				},
+			})
+			if exitCode != 0 {
+				t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+			}
+			var parsed worker.Result
+			assertSingleJSONValue(t, stdout.String(), &parsed)
+			if parsed.RunID != result.RunID {
+				t.Fatalf("stdout JSON run_id = %q, want %q", parsed.RunID, result.RunID)
+			}
+		})
 	}
 }
 
@@ -1562,7 +4720,7 @@ func TestDispatchWaveHelpDocumentsPrettyFlags(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 	help := stdout.String()
-	for _, want := range []string{"loopcoder dispatch-wave", "--strict", "--format", "--verbose", "--pretty", "--no-pretty", "LOOPCODER_PRETTY", "LOOPCODER_NO_PRETTY", "plain on non-TTY"} {
+	for _, want := range []string{"loopcoder dispatch-wave", "--strict", "--timeout duration", "--format", "--verbose", "--pretty", "--no-pretty", "LOOPCODER_PRETTY", "LOOPCODER_NO_PRETTY", "plain on non-TTY"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
@@ -1819,10 +4977,12 @@ func TestInitRunsWithInjectedDepsAndAliases(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	called := false
 	repo := t.TempDir()
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
 
 	exitCode := RunWithDeps([]string{
 		"init",
 		"-Repo", repo,
+		"--yes",
 		"-Gate", "auto",
 		"-Force",
 		"-WorkerModel", "gpt-5",
@@ -1864,6 +5024,45 @@ func TestInitRunsWithInjectedDepsAndAliases(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "[loopcoder] warning: gh label setup skipped") {
 		t.Fatalf("stderr missing warning:\n%s", stderr.String())
+	}
+}
+
+func TestInitDefaultJSONDeclinesWithoutMutation(t *testing.T) {
+	repo := initProjectRegistryCLITestRepo(t, "https://github.com/owner/setup.git")
+	homeDir := t.TempDir()
+	t.Setenv("LOOPCODER_HOME", homeDir)
+	t.Setenv("PATH", "")
+
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"init", "--repo", repo, "--format", "json"}, &stdout, &stderr, Deps{
+		Stdin: strings.NewReader(""),
+		Now:   fixedCLINow,
+	})
+	if exitCode != 0 {
+		t.Fatalf("init preview exit = %d stderr=%q", exitCode, stderr.String())
+	}
+	var payload struct {
+		Outcome   string `json:"outcome"`
+		Applied   bool   `json:"applied"`
+		Mutations []struct {
+			Name   string `json:"name"`
+			Action string `json:"action"`
+			Path   string `json:"path"`
+		} `json:"mutations"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("init JSON: %v\n%s", err, stdout.String())
+	}
+	if payload.Outcome != "declined" || payload.Applied {
+		t.Fatalf("payload = %#v, want declined without apply", payload)
+	}
+	if len(payload.Mutations) == 0 {
+		t.Fatalf("mutations = %#v, want planned mutations", payload.Mutations)
+	}
+	for _, path := range []string{filepath.Join(repo, ".delivery.yml"), filepath.Join(repo, "ROADMAP.md"), filepath.Join(homeDir, "data", "loopcoder.db")} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s stat err = %v, want not exist", path, err)
+		}
 	}
 }
 
@@ -3735,6 +6934,48 @@ evidence:
 	}
 }
 
+func TestTickHostProfiledNonInteractiveDefaultsToDetached(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	t.Setenv(hostprofile.EnvName, "generic-local")
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 4, 7, 0, 0, time.UTC)
+	if _, err := registry.Register(context.Background(), registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	var launchedArgs []string
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"tick",
+		"--format", "json",
+		"--repo", repo,
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now },
+		Tick: func(context.Context, orchestration.TickOptions) (orchestration.TickReport, error) {
+			t.Fatal("foreground tick should not run")
+			return orchestration.TickReport{}, nil
+		},
+		StartDetachedDispatch: func(_ context.Context, args []string, _ string) (int, error) {
+			launchedArgs = append([]string(nil), args...)
+			return 4245, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("tick exit=%d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	var launch detachedLaunchRecord
+	assertSingleJSONValue(t, stdout.String(), &launch)
+	if !launch.Detached || launch.RunID != "run-20260714T040700Z-wave" || launch.CancelCommand == "" {
+		t.Fatalf("launch = %#v, want detached tick launch with cancel command", launch)
+	}
+	for _, want := range []string{"supervise", "tick", "--foreground", "--run-id", launch.RunID} {
+		if !containsString(launchedArgs, want) {
+			t.Fatalf("launched args missing %q: %#v", want, launchedArgs)
+		}
+	}
+}
+
 func TestTickOptionsFromConfigWiresDomainRedLines(t *testing.T) {
 	cfg := config.Default()
 	cfg.Domain.RedLines = []config.DomainRedLine{{
@@ -3764,6 +7005,9 @@ func TestTickOptionsFromConfigWiresDomainRedLines(t *testing.T) {
 	}}
 	if !reflect.DeepEqual(opts.AdditionalRiskRedLines, want) {
 		t.Fatalf("AdditionalRiskRedLines = %#v, want %#v", opts.AdditionalRiskRedLines, want)
+	}
+	if !opts.WaitForChecks {
+		t.Fatal("trigger tick options must enable deterministic local check waiting")
 	}
 }
 
@@ -4110,6 +7354,7 @@ func TestDispatchRunsWithInjectedWorker(t *testing.T) {
 		"--issue-body", "Body",
 		"--model", "gpt-5",
 		"--effort", "high",
+		"--timeout", "2m",
 	}, &stdout, &stderr, Deps{
 		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
 			if opts.RepoPath != repo {
@@ -4118,7 +7363,7 @@ func TestDispatchRunsWithInjectedWorker(t *testing.T) {
 			if opts.IssueNumber != 101 || opts.IssueTitle != "Implement dispatch" || opts.IssueBody != "Body" {
 				t.Fatalf("dispatch opts issue fields = %#v", opts)
 			}
-			if opts.BaseBranch != "main" || opts.Provider != "codex" || opts.Model != "gpt-5" || opts.Effort != "high" {
+			if opts.BaseBranch != "main" || opts.Provider != "codex" || opts.Model != "gpt-5" || opts.Effort != "high" || opts.Timeout != 2*time.Minute {
 				t.Fatalf("dispatch opts defaults/pass-through = %#v", opts)
 			}
 			if opts.Stderr == nil {
@@ -4243,9 +7488,1481 @@ func TestDispatchJSONModeEmitsSingleJSONValueOnly(t *testing.T) {
 	if !got.OK || got.Status != "succeeded" || got.Report == nil {
 		t.Fatalf("dispatch JSON = %#v", got)
 	}
+	var payload struct {
+		SchemaVersion string `json:"schema_version"`
+		Observability struct {
+			SchemaVersion string `json:"schema_version"`
+			Command       string `json:"command"`
+			Items         []struct {
+				Kind     string `json:"kind"`
+				Status   string `json:"status"`
+				Provider string `json:"provider"`
+				Model    string `json:"model"`
+				Usage    struct {
+					TotalTokens *int64 `json:"total_tokens"`
+				} `json:"usage"`
+				SourceRefs []struct {
+					Table string `json:"table"`
+				} `json:"source_refs"`
+			} `json:"items"`
+		} `json:"observability"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("dispatch observability JSON did not parse: %v\n%s", err, stdout.String())
+	}
+	if payload.SchemaVersion != "loopcoder.dispatch_result.v1" || payload.Observability.SchemaVersion != "loopcoder.observability_render.v1" || payload.Observability.Command != "dispatch" {
+		t.Fatalf("dispatch observability schema = %#v", payload)
+	}
+	if len(payload.Observability.Items) != 1 || payload.Observability.Items[0].Kind != "worker" || payload.Observability.Items[0].Status != "succeeded" || payload.Observability.Items[0].Provider != "codex" || payload.Observability.Items[0].Model == "" {
+		t.Fatalf("dispatch observability item = %#v", payload.Observability.Items)
+	}
+	for _, forbidden := range []string{"/repo/.loopcoder", repo, ".attempt.json"} {
+		if strings.Contains(stdout.String(), forbidden) {
+			t.Fatalf("dispatch JSON leaked local path artifact %q:\n%s", forbidden, stdout.String())
+		}
+	}
 	for _, disallowed := range []string{"[reporter]", "loopcoder report:"} {
 		if strings.Contains(stdout.String(), disallowed) {
 			t.Fatalf("JSON mode stdout contains %q:\n%s", disallowed, stdout.String())
+		}
+	}
+}
+
+func TestDispatchJSONObservabilityUsesStableAttemptID(t *testing.T) {
+	clearPrettyEnv(t)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	record := validDispatchReport()
+	result := validDispatchResult(record)
+	result.AttemptPath = filepath.Join(repo, ".loopcoder", "runs", result.RunID, "workers", "job-101-1.attempt.json")
+
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--format", "json",
+		"--repo", repo,
+		"--issue-number", "101",
+		"--issue-title", "Implement dispatch",
+	}, &stdout, &stderr, Deps{
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			return result, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps returned exit code %d, stderr=%q", exitCode, stderr.String())
+	}
+	var payload struct {
+		AttemptPath   string `json:"attempt_path"`
+		Observability struct {
+			Items []struct {
+				SourceRefs []struct {
+					RecordID string `json:"record_id"`
+				} `json:"source_refs"`
+			} `json:"items"`
+		} `json:"observability"`
+	}
+	assertSingleJSONValue(t, stdout.String(), &payload)
+	if payload.AttemptPath != "job-101-1" {
+		t.Fatalf("attempt_path = %q, want stable attempt id", payload.AttemptPath)
+	}
+	if len(payload.Observability.Items) != 1 || len(payload.Observability.Items[0].SourceRefs) != 1 || payload.Observability.Items[0].SourceRefs[0].RecordID != "job-101-1" {
+		t.Fatalf("source refs = %#v, want stable attempt id", payload.Observability.Items)
+	}
+	if strings.Contains(stdout.String(), repo) || strings.Contains(stdout.String(), ".attempt.json") {
+		t.Fatalf("dispatch JSON leaked local attempt path:\n%s", stdout.String())
+	}
+}
+
+func TestDispatchDetachPersistsClaimBeforeStartingSupervisor(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 4, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	var launchedArgs []string
+	var launchedLog string
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--format", "json",
+		"--repo", repo,
+		"--issue-number", "898",
+		"--issue-title", "Detached supervision",
+		"--issue-body", "body with runtime canary secret",
+		"--run-id", "run-20260714T040000Z-issue-898",
+		"--detach",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now },
+		StartDetachedDispatch: func(_ context.Context, args []string, logPath string) (int, error) {
+			launchedArgs = append([]string(nil), args...)
+			launchedLog = logPath
+			store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+			if err != nil {
+				t.Fatalf("open store in launcher: %v", err)
+			}
+			defer store.Close()
+			record, err := detachedrun.Get(ctx, store, "run-20260714T040000Z-issue-898")
+			if err != nil {
+				t.Fatalf("launcher did not observe durable claim: %v", err)
+			}
+			if record.ProjectID != registered.Project.ProjectID || record.Status != detachedrun.StatusNotStarted {
+				t.Fatalf("claim before launcher = %#v", record)
+			}
+			return 4242, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps exit = %d stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	var launch struct {
+		Detached   bool   `json:"detached"`
+		RunID      string `json:"run_id"`
+		ProjectID  string `json:"project_id"`
+		Status     string `json:"status"`
+		PID        int    `json:"pid"`
+		Owner      string `json:"supervisor_owner"`
+		Generation int64  `json:"supervisor_generation"`
+	}
+	assertSingleJSONValue(t, stdout.String(), &launch)
+	if !launch.Detached || launch.RunID != "run-20260714T040000Z-issue-898" || launch.ProjectID != registered.Project.ProjectID || launch.Status != detachedrun.StatusRunning || launch.PID != 4242 || launch.Owner == "" || launch.Generation != 1 {
+		t.Fatalf("launch = %#v", launch)
+	}
+	if !containsString(launchedArgs, "--supervisor-run") || !containsString(launchedArgs, "--supervisor-owner") || !containsString(launchedArgs, launch.Owner) {
+		t.Fatalf("launched args missing supervisor fence: %#v", launchedArgs)
+	}
+	if containsString(launchedArgs, "body with runtime canary secret") || !containsString(launchedArgs, "--issue-body-file") {
+		t.Fatalf("launched args exposed issue body or omitted issue-body-file: %#v", launchedArgs)
+	}
+	if !strings.Contains(launchedLog, launch.RunID) || strings.Contains(launchedLog, repo) {
+		t.Fatalf("launched log path = %q, want machine-local redacted path containing run id only", launchedLog)
+	}
+	var launchRecord detachedLaunchRecord
+	assertSingleJSONValue(t, stdout.String(), &launchRecord)
+	if strings.Contains(launchRecord.StatusCommand, repo) || strings.Contains(launchRecord.AttachCommand, repo) {
+		t.Fatalf("launch commands expose repo path: %#v", launchRecord)
+	}
+	if strings.Contains(launchRecord.StatusCommand, "--supervisor-lease") || strings.Contains(launchRecord.AttachCommand, "--supervisor-lease") {
+		t.Fatalf("launch commands contain mutable supervisor lease: %#v", launchRecord)
+	}
+	if launchRecord.CancelCommand == "" || strings.Contains(launchRecord.CancelCommand, "--supervisor-lease") || strings.Contains(launchRecord.CancelCommand, repo) {
+		t.Fatalf("launch cancel command is missing, mutable, or leaks repo path: %#v", launchRecord)
+	}
+}
+
+func TestDispatchHostProfiledNonInteractiveDefaultsToDetached(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	profiles := []string{"paseo", "codex-cli", "claude-code", "generic-local"}
+	for _, profile := range profiles {
+		t.Run(profile, func(t *testing.T) {
+			t.Setenv("LOOPCODER_HOME", t.TempDir())
+			t.Setenv(hostprofile.EnvName, profile)
+			repo := t.TempDir()
+			now := time.Date(2026, 7, 14, 4, 5, 0, 0, time.UTC)
+			if _, err := registry.Register(context.Background(), registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps()); err != nil {
+				t.Fatalf("Register: %v", err)
+			}
+			var launchedArgs []string
+			var stdout, stderr bytes.Buffer
+			exitCode := RunWithDeps([]string{
+				"dispatch",
+				"--format", "json",
+				"--repo", repo,
+				"--issue-number", "964",
+				"--issue-title", "Default detached",
+			}, &stdout, &stderr, Deps{
+				Now: func() time.Time { return now },
+				Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+					t.Fatal("foreground dispatch should not run for host-profiled non-interactive default")
+					return worker.Result{}, nil
+				},
+				StartDetachedDispatch: func(_ context.Context, args []string, _ string) (int, error) {
+					launchedArgs = append([]string(nil), args...)
+					return 4242, nil
+				},
+			})
+			if exitCode != 0 {
+				t.Fatalf("dispatch exit=%d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+			}
+			var launch detachedLaunchRecord
+			assertSingleJSONValue(t, stdout.String(), &launch)
+			if !launch.Detached || launch.RunID != "run-20260714T040500Z-issue-964" || launch.CancelCommand == "" {
+				t.Fatalf("launch = %#v, want detached issue run with cancel command", launch)
+			}
+			if !containsString(launchedArgs, "--supervisor-run") {
+				t.Fatalf("launched args missing dispatch supervisor mode: %#v", launchedArgs)
+			}
+		})
+	}
+}
+
+func TestDispatchForegroundOverridesHostProfiledNonInteractiveDefault(t *testing.T) {
+	clearPrettyEnv(t)
+	t.Setenv(hostprofile.EnvName, "codex-cli")
+	repo := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	called := false
+	record := validDispatchReport()
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--foreground",
+		"--format", "json",
+		"--repo", repo,
+		"--issue-number", "964",
+		"--issue-title", "Foreground dispatch",
+	}, &stdout, &stderr, Deps{
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			called = true
+			return validDispatchResult(record), nil
+		},
+		StartDetachedDispatch: func(context.Context, []string, string) (int, error) {
+			t.Fatal("detached launcher should not run with --foreground")
+			return 0, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch exit=%d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	if !called {
+		t.Fatal("foreground dispatch was not called")
+	}
+}
+
+func TestDetachedAuthoritySurvivesLeaseRenewal(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 4, 30, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-stable-authority",
+		Owner:          "owner-stable",
+		LeaseExpiresAt: now.Add(time.Minute),
+		IssueNumber:    898,
+		Attempt:        1,
+		Provider:       "codex",
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	originalLease := claim.LeaseExpiresAt
+	if err := detachedSupervisorCadenceTick(ctx, store, worker.Options{RunID: claim.RunID}, claim.Fence(), Deps{Now: func() time.Time { return now.Add(5 * time.Minute) }}); err != nil {
+		t.Fatalf("cadence tick: %v", err)
+	}
+	renewed, err := detachedrun.Get(ctx, store, claim.RunID)
+	if err != nil {
+		t.Fatalf("Get renewed: %v", err)
+	}
+	if renewed.LeaseExpiresAt == originalLease {
+		t.Fatalf("lease did not renew: %s", renewed.LeaseExpiresAt)
+	}
+	store.Close()
+
+	var statusOut, statusErr bytes.Buffer
+	statusCode := RunWithDeps([]string{
+		"status",
+		"--repo", repo,
+		"--receipts",
+		"--run", claim.RunID,
+		"--supervisor-owner", claim.Owner,
+		"--supervisor-generation", "1",
+		"--supervisor-lease", originalLease,
+	}, &statusOut, &statusErr, Deps{Now: func() time.Time { return now.Add(6 * time.Minute) }})
+	if statusCode != 0 {
+		t.Fatalf("status with original lease after renewal exit=%d stderr=%q", statusCode, statusErr.String())
+	}
+
+	var cancelOut, cancelErr bytes.Buffer
+	cancelCode := RunWithDeps([]string{
+		"cancel",
+		"--repo", repo,
+		"--run", claim.RunID,
+		"--supervisor-owner", claim.Owner,
+		"--supervisor-generation", "1",
+		"--supervisor-lease", originalLease,
+		"--format", "json",
+	}, &cancelOut, &cancelErr, Deps{Now: func() time.Time { return now.Add(7 * time.Minute) }})
+	if cancelCode != 0 {
+		t.Fatalf("cancel with original lease after renewal exit=%d stderr=%q", cancelCode, cancelErr.String())
+	}
+	var cancelled detachedrun.Record
+	assertSingleJSONValue(t, cancelOut.String(), &cancelled)
+	if cancelled.Status != detachedrun.StatusCancelling || cancelled.Generation != 1 {
+		t.Fatalf("cancelled = %#v", cancelled)
+	}
+}
+
+func TestDetachedRecoverAcquiresGenerationAndLaunchesSupervisor(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 5, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-recover-detached",
+		Owner:          "owner-one",
+		LeaseExpiresAt: now.Add(time.Minute),
+		IssueNumber:    898,
+		Attempt:        1,
+		BaseBranch:     "pre-prod",
+		Provider:       "codex",
+		Payload: map[string]any{
+			"issue_title": "Recovered detached supervision",
+		},
+		Now: now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	store.Close()
+
+	var launchedArgs []string
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"recover",
+		"--repo", repo,
+		"--run-id", claim.RunID,
+		"--detached",
+		"--supervisor-owner", claim.Owner,
+		"--supervisor-generation", "1",
+		"--supervisor-lease", claim.LeaseExpiresAt,
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now.Add(2 * time.Minute) },
+		StartDetachedDispatch: func(_ context.Context, args []string, _ string) (int, error) {
+			launchedArgs = append([]string(nil), args...)
+			return 5151, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps exit = %d stderr=%q", exitCode, stderr.String())
+	}
+	var result detachedrun.StatusResult
+	assertSingleJSONValue(t, stdout.String(), &result)
+	if result.Record.Generation != 2 || result.Record.Owner == claim.Owner || result.Record.ProcessPID != 5151 || result.Record.LaunchPhase != detachedrun.PhaseSpawned {
+		t.Fatalf("recover result = %#v", result)
+	}
+	if !containsString(launchedArgs, "--supervisor-generation") || !containsString(launchedArgs, "2") {
+		t.Fatalf("recover launched args missing generation 2 fence: %#v", launchedArgs)
+	}
+}
+
+func TestDetachedRecoverRequiresProvenProcessDeathBeforeNewGeneration(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 5, 5, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-recover-kill-unproven",
+		Owner:          "owner-one",
+		LeaseExpiresAt: now.Add(time.Minute),
+		IssueNumber:    898,
+		Attempt:        1,
+		BaseBranch:     "pre-prod",
+		Provider:       "codex",
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if _, err := detachedrun.MarkSpawned(ctx, store, claim.Fence(), 9191, "authority-one", now.Add(time.Second)); err != nil {
+		t.Fatalf("MarkSpawned: %v", err)
+	}
+	store.Close()
+
+	var launched bool
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"recover",
+		"--repo", repo,
+		"--run-id", claim.RunID,
+		"--detached",
+		"--supervisor-owner", claim.Owner,
+		"--supervisor-generation", "1",
+		"--supervisor-lease", claim.LeaseExpiresAt,
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now:                    func() time.Time { return now.Add(2 * time.Minute) },
+		VerifyProcessAuthority: func(int, string) error { return nil },
+		KillProcessTree:        func(int) error { return nil },
+		ProcessAlive:           func(int) bool { return true },
+		StartDetachedDispatch: func(context.Context, []string, string) (int, error) {
+			launched = true
+			return 0, nil
+		},
+	})
+	if exitCode != 2 || launched {
+		t.Fatalf("recover exit=%d launched=%t stdout=%q stderr=%q", exitCode, launched, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "still appears alive") {
+		t.Fatalf("recover stderr = %q", stderr.String())
+	}
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(3 * time.Minute) }})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer store.Close()
+	record, err := detachedrun.Get(ctx, store, claim.RunID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if record.Generation != 1 || record.Status != detachedrun.StatusNeedsHuman || record.TerminalErrorCode != "recover-kill-unproven" {
+		t.Fatalf("record after unproven recovery kill = %#v", record)
+	}
+}
+
+func TestDetachedConcurrentStatusCancelRecoverAllowsOneExecutor(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 5, 10, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-concurrent-control",
+		Owner:          "owner-one",
+		LeaseExpiresAt: now.Add(time.Minute),
+		IssueNumber:    898,
+		Attempt:        1,
+		BaseBranch:     "pre-prod",
+		Provider:       "codex",
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	store.Close()
+
+	type commandResult struct {
+		name   string
+		code   int
+		stdout string
+		stderr string
+	}
+	recoverStart := make(chan struct{})
+	controlStart := make(chan struct{})
+	releaseLaunch := make(chan struct{})
+	launchedOnce := make(chan struct{}, 1)
+	results := make(chan commandResult, 4)
+	var wg sync.WaitGroup
+	var controlWG sync.WaitGroup
+	var mu sync.Mutex
+	var launched int
+	var launchedPIDs []int
+	run := func(name string, args []string, deps Deps, start <-chan struct{}, control bool) {
+		defer wg.Done()
+		if control {
+			defer controlWG.Done()
+		}
+		<-start
+		var stdout, stderr bytes.Buffer
+		code := RunWithDeps(args, &stdout, &stderr, deps)
+		results <- commandResult{name: name, code: code, stdout: stdout.String(), stderr: stderr.String()}
+	}
+	recoverDeps := Deps{
+		Now: func() time.Time { return now.Add(2 * time.Minute) },
+		StartDetachedDispatch: func(context.Context, []string, string) (int, error) {
+			mu.Lock()
+			launched++
+			pid := 6060 + launched
+			launchedPIDs = append(launchedPIDs, pid)
+			if launched == 1 {
+				select {
+				case launchedOnce <- struct{}{}:
+				default:
+				}
+			}
+			mu.Unlock()
+			<-releaseLaunch
+			return pid, nil
+		},
+		ProcessAuthority: func(pid int, observedAt time.Time) (string, error) {
+			return fmt.Sprintf("authority-%d-%s", pid, observedAt.Format(time.RFC3339Nano)), nil
+		},
+	}
+	recoverArgs := []string{
+		"recover", "--repo", repo, "--run-id", claim.RunID, "--detached",
+		"--supervisor-owner", claim.Owner, "--supervisor-generation", "1", "--supervisor-lease", claim.LeaseExpiresAt, "--format", "json",
+	}
+	wg.Add(4)
+	controlWG.Add(2)
+	go run("attach", []string{
+		"attach", "--repo", repo, "--run", claim.RunID,
+		"--supervisor-owner", claim.Owner, "--supervisor-generation", "1", "--supervisor-lease", claim.LeaseExpiresAt,
+		"--format", "jsonl", "--follow-for", "1ns", "--poll", "1ns",
+	}, Deps{Now: func() time.Time { return now.Add(2 * time.Minute) }}, controlStart, true)
+	go run("cancel", []string{
+		"cancel", "--repo", repo, "--run", claim.RunID,
+		"--supervisor-owner", claim.Owner, "--supervisor-generation", "1", "--supervisor-lease", claim.LeaseExpiresAt,
+		"--format", "json",
+	}, Deps{Now: func() time.Time { return now.Add(2 * time.Minute) }}, controlStart, true)
+	go run("recover-a", recoverArgs, recoverDeps, recoverStart, false)
+	go run("recover-b", recoverArgs, recoverDeps, recoverStart, false)
+	close(recoverStart)
+	waitForTestSignal(t, launchedOnce, "recover attempts did not launch any detached supervisor")
+	close(controlStart)
+	controlDone := make(chan struct{})
+	go func() {
+		controlWG.Wait()
+		close(controlDone)
+	}()
+	waitForTestSignal(t, controlDone, "old-generation attach/cancel did not complete while recovered launch was blocked")
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(2*time.Minute + time.Second) }})
+	if err != nil {
+		t.Fatalf("reopen store during blocked launch: %v", err)
+	}
+	inFlightRecord, err := detachedrun.Get(ctx, store, claim.RunID)
+	if err != nil {
+		store.Close()
+		t.Fatalf("Get during blocked launch: %v", err)
+	}
+	store.Close()
+	if inFlightRecord.Generation != 2 || inFlightRecord.LaunchPhase != detachedrun.PhaseClaimed || inFlightRecord.ProcessPID != 0 {
+		t.Fatalf("record during blocked launch = %#v, want claimed generation 2 without pid", inFlightRecord)
+	}
+	if inFlightRecord.LaunchPhase == detachedrun.PhaseTerminal || inFlightRecord.TerminalAt != "" || inFlightRecord.TerminalReceiptID != "" {
+		t.Fatalf("old-generation controls terminalized recovered generation during blocked launch: %#v", inFlightRecord)
+	}
+	close(releaseLaunch)
+	allDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(allDone)
+	}()
+	waitForTestSignal(t, allDone, "concurrent attach/cancel/recover commands did not complete")
+	close(results)
+
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(3 * time.Minute) }})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer store.Close()
+	record, err := detachedrun.Get(ctx, store, claim.RunID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	var gotResults []commandResult
+	resultsByName := make(map[string]commandResult)
+	recoverExecutors := 0
+	recoverResults := 0
+	for result := range results {
+		gotResults = append(gotResults, result)
+		if _, exists := resultsByName[result.name]; exists {
+			t.Fatalf("duplicate command result for %s: %#v", result.name, gotResults)
+		}
+		resultsByName[result.name] = result
+		if strings.HasPrefix(result.name, "recover-") {
+			if result.code == 0 {
+				var recovered detachedrun.StatusResult
+				assertSingleJSONValue(t, result.stdout, &recovered)
+				recoverResults++
+				if recovered.Execute || recovered.ReplayAction == "recovered" {
+					recoverExecutors++
+					if recovered.Record.Generation != 2 || recovered.Record.LaunchPhase != detachedrun.PhaseSpawned {
+						t.Fatalf("winning recovery result = %#v, want spawned generation 2", recovered)
+					}
+				} else if recovered.Execute || recovered.Record.Generation != 2 {
+					t.Fatalf("losing recovery result mutated or left recovered generation: %#v", recovered)
+				}
+			} else if !strings.Contains(result.stderr, "no longer matches") {
+				t.Fatalf("recover command failed without stale-fence evidence: %#v", result)
+			}
+		}
+	}
+	if len(gotResults) != 4 {
+		t.Fatalf("results = %d, want 4: %#v", len(gotResults), gotResults)
+	}
+	for _, name := range []string{"attach", "cancel", "recover-a", "recover-b"} {
+		if _, ok := resultsByName[name]; !ok {
+			t.Fatalf("missing command result %q in %#v", name, gotResults)
+		}
+	}
+	for _, name := range []string{"attach", "cancel"} {
+		result := resultsByName[name]
+		if result.code == 0 || !strings.Contains(result.stderr, "no longer matches") {
+			t.Fatalf("%s old-generation command result = %#v, want stale-fence failure", name, result)
+		}
+	}
+	if recoverResults == 0 || recoverExecutors != 1 {
+		t.Fatalf("recover results = %d executor wins = %d, want at least one result and exactly one executor: %#v", recoverResults, recoverExecutors, gotResults)
+	}
+	mu.Lock()
+	starts := launched
+	pids := append([]int(nil), launchedPIDs...)
+	mu.Unlock()
+	if starts != 1 {
+		t.Fatalf("launched supervisors = %d pids=%v, want exactly one", starts, pids)
+	}
+	if record.Generation != 2 || record.ProcessPID != pids[0] || record.LaunchPhase != detachedrun.PhaseSpawned {
+		t.Fatalf("record after recovery race = %#v, want exactly one spawned generation with pid %v", record, pids)
+	}
+	if record.LaunchPhase == detachedrun.PhaseTerminal || record.TerminalAt != "" || record.TerminalReceiptID != "" {
+		t.Fatalf("stale control race wrote terminal state: %#v", record)
+	}
+	beforeAttach := record
+	var attachOut, attachErr bytes.Buffer
+	attachCode := RunWithDeps([]string{
+		"attach", "--repo", repo, "--run", claim.RunID,
+		"--supervisor-owner", record.Owner, "--supervisor-generation", strconv.FormatInt(record.Generation, 10),
+		"--format", "jsonl", "--follow-for", "1ns", "--poll", "1ns",
+	}, &attachOut, &attachErr, Deps{Now: func() time.Time { return now.Add(4 * time.Minute) }})
+	if attachCode != 0 {
+		t.Fatalf("current attach exit=%d stdout=%q stderr=%q", attachCode, attachOut.String(), attachErr.String())
+	}
+	afterAttach, err := detachedrun.Get(ctx, store, claim.RunID)
+	if err != nil {
+		t.Fatalf("Get after attach: %v", err)
+	}
+	if !reflect.DeepEqual(beforeAttach, afterAttach) {
+		t.Fatalf("attach mutated detached supervisor record:\nbefore=%#v\nafter=%#v", beforeAttach, afterAttach)
+	}
+	var staleCancelOut, staleCancelErr bytes.Buffer
+	staleCancelCode := RunWithDeps([]string{
+		"cancel", "--repo", repo, "--run", claim.RunID,
+		"--supervisor-owner", claim.Owner, "--supervisor-generation", "1", "--supervisor-lease", claim.LeaseExpiresAt,
+	}, &staleCancelOut, &staleCancelErr, Deps{Now: func() time.Time { return now.Add(5 * time.Minute) }})
+	if staleCancelCode == 0 {
+		t.Fatalf("stale cancel unexpectedly succeeded stdout=%q stderr=%q", staleCancelOut.String(), staleCancelErr.String())
+	}
+	afterStaleCancel, err := detachedrun.Get(ctx, store, claim.RunID)
+	if err != nil {
+		t.Fatalf("Get after stale cancel: %v", err)
+	}
+	if !reflect.DeepEqual(afterAttach, afterStaleCancel) {
+		t.Fatalf("stale cancel mutated detached supervisor record:\nbefore=%#v\nafter=%#v", afterAttach, afterStaleCancel)
+	}
+}
+
+func TestDetachedDispatchHandlesClosedOutputWriters(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 5, 12, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	exitCode := RunWithDeps([]string{
+		"dispatch", "--format", "json", "--repo", repo, "--issue-number", "898", "--issue-title", "Detached closed stdout", "--run-id", "run-closed-stdout", "--detach",
+	}, errWriter{}, io.Discard, Deps{
+		Now: func() time.Time { return now },
+		StartDetachedDispatch: func(context.Context, []string, string) (int, error) {
+			return 4243, nil
+		},
+	})
+	if exitCode != 1 {
+		t.Fatalf("dispatch with closed stdout exit=%d, want 1", exitCode)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(30 * time.Second) }})
+	if err != nil {
+		t.Fatalf("reopen after closed stdout: %v", err)
+	}
+	stdoutRecord, err := detachedrun.Get(ctx, store, "run-closed-stdout")
+	if err != nil {
+		t.Fatalf("Get closed stdout record: %v", err)
+	}
+	if stdoutRecord.Status != detachedrun.StatusRunning || stdoutRecord.LaunchPhase != detachedrun.PhaseSpawned || stdoutRecord.ProcessPID != 4243 {
+		t.Fatalf("closed stdout launch record = %#v", stdoutRecord)
+	}
+	store.Close()
+
+	var supervisorOut, supervisorErr bytes.Buffer
+	supervisorCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "898",
+		"--issue-title", "Detached closed stdout",
+		"--run-id", stdoutRecord.RunID,
+		"--provider", "codex",
+		"--supervisor-run",
+		"--supervisor-owner", stdoutRecord.Owner,
+		"--supervisor-generation", strconv.FormatInt(stdoutRecord.Generation, 10),
+		"--format", "json",
+	}, &supervisorOut, &supervisorErr, Deps{
+		Now: func() time.Time { return now.Add(time.Minute) },
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			return worker.Result{OK: true, Status: "succeeded", Issue: 898, RunID: stdoutRecord.RunID}, nil
+		},
+	})
+	if supervisorCode != 0 {
+		t.Fatalf("supervisor after closed stdout exit=%d stdout=%q stderr=%q", supervisorCode, supervisorOut.String(), supervisorErr.String())
+	}
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(2 * time.Minute) }})
+	if err != nil {
+		t.Fatalf("reopen after supervisor: %v", err)
+	}
+	supervisedRecord, err := detachedrun.Get(ctx, store, stdoutRecord.RunID)
+	if err != nil {
+		t.Fatalf("Get supervised record: %v", err)
+	}
+	if supervisedRecord.Status != detachedrun.StatusSucceeded || supervisedRecord.TerminalReceiptID == "" || supervisedRecord.ProviderExposed || supervisedRecord.LaunchReceiptID != "" {
+		t.Fatalf("supervised record after closed stdout = %#v", supervisedRecord)
+	}
+	receipts, err := progress.ListReceipts(ctx, store, progress.ListFilter{ProjectID: registered.Project.ProjectID, DeliveryRunID: stdoutRecord.RunID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListReceipts after closed stdout supervisor: %v", err)
+	}
+	var sawWorkerStarted, sawTerminal bool
+	for _, receipt := range receipts {
+		switch receipt.Phase {
+		case "detached-worker-started":
+			sawWorkerStarted = true
+		case "detached-terminal":
+			sawTerminal = true
+		}
+	}
+	if !sawWorkerStarted || !sawTerminal {
+		t.Fatalf("closed stdout supervisor receipts missing worker-started or terminal: %#v", receipts)
+	}
+	store.Close()
+
+	exitCode = RunWithDeps([]string{
+		"dispatch", "--format", "json", "--repo", repo, "--issue-number", "898", "--issue-title", "Detached closed stderr", "--run-id", "run-closed-stderr", "--detach",
+	}, io.Discard, errWriter{}, Deps{
+		Now: func() time.Time { return now.Add(time.Minute) },
+		StartDetachedDispatch: func(context.Context, []string, string) (int, error) {
+			return 0, errors.New("start failed")
+		},
+	})
+	if exitCode != 1 {
+		t.Fatalf("dispatch with closed stderr exit=%d, want 1", exitCode)
+	}
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(3 * time.Minute) }})
+	if err != nil {
+		t.Fatalf("reopen after closed stderr: %v", err)
+	}
+	defer store.Close()
+	stderrRecord, err := detachedrun.Get(ctx, store, "run-closed-stderr")
+	if err != nil {
+		t.Fatalf("Get closed stderr record: %v", err)
+	}
+	if stderrRecord.Status != detachedrun.StatusFailed || stderrRecord.LaunchPhase != detachedrun.PhaseTerminal || stderrRecord.TerminalErrorCode != "spawn-failed" {
+		t.Fatalf("closed stderr record = %#v", stderrRecord)
+	}
+}
+
+func TestDispatchSupervisorFailsClosedWhenReceiptStoreFails(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 5, 14, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-receipt-store-failure",
+		Owner:          "owner-receipt-failure",
+		LeaseExpiresAt: now.Add(time.Hour),
+		IssueNumber:    898,
+		Attempt:        1,
+		BaseBranch:     "pre-prod",
+		Provider:       "codex",
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if _, err := detachedrun.MarkSpawned(ctx, store, claim.Fence(), 6162, "test-authority", now.Add(time.Second)); err != nil {
+		t.Fatalf("MarkSpawned: %v", err)
+	}
+	if err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		_, err := tx.Exec(ctx, `CREATE TRIGGER fail_detached_receipts BEFORE INSERT ON progress_receipts BEGIN SELECT RAISE(FAIL, 'receipt disk failure'); END`)
+		return err
+	}); err != nil {
+		t.Fatalf("install receipt failure trigger: %v", err)
+	}
+	store.Close()
+
+	var dispatchCalled bool
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "898",
+		"--issue-title", "Receipt store failure",
+		"--run-id", claim.RunID,
+		"--provider", "codex",
+		"--supervisor-run",
+		"--supervisor-owner", claim.Owner,
+		"--supervisor-generation", "1",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now.Add(2 * time.Minute) },
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			dispatchCalled = true
+			return worker.Result{OK: true, Status: "succeeded"}, nil
+		},
+	})
+	if exitCode != 1 || dispatchCalled {
+		t.Fatalf("dispatch supervisor exit=%d dispatchCalled=%t stdout=%q stderr=%q", exitCode, dispatchCalled, stdout.String(), stderr.String())
+	}
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(3 * time.Minute) }})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer store.Close()
+	record, err := detachedrun.Get(ctx, store, claim.RunID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if record.Status != detachedrun.StatusNeedsHuman || record.TerminalErrorCode != "worker-started-receipt-failed" {
+		t.Fatalf("record after receipt failure = %#v", record)
+	}
+}
+
+func TestDispatchSupervisorFailsClosedOnSQLiteBusyWriteBoundary(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 5, 14, 30, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-sqlite-busy-supervisor",
+		Owner:          "owner-sqlite-busy",
+		LeaseExpiresAt: now.Add(time.Minute),
+		IssueNumber:    898,
+		Attempt:        1,
+		BaseBranch:     "pre-prod",
+		Provider:       "codex",
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if _, err := detachedrun.MarkSpawned(ctx, store, claim.Fence(), 6163, "test-authority", now.Add(time.Second)); err != nil {
+		t.Fatalf("MarkSpawned: %v", err)
+	}
+	dbPath := store.Path()
+	store.Close()
+
+	lockDB, lockConn := beginCLISQLiteImmediateLock(t, ctx, dbPath)
+	var dispatchCalled bool
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "898",
+		"--issue-title", "SQLite busy supervisor",
+		"--run-id", claim.RunID,
+		"--provider", "codex",
+		"--supervisor-run",
+		"--supervisor-owner", claim.Owner,
+		"--supervisor-generation", "1",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now.Add(2 * time.Minute) },
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			dispatchCalled = true
+			return worker.Result{OK: true, Status: "succeeded"}, nil
+		},
+		DetachedStorageBusyTimeout: time.Millisecond,
+		DetachedStorageWriteTxRetry: storage.WriteTxRetryOptions{
+			MaxAttempts: 1,
+			MaxElapsed:  time.Millisecond,
+		},
+	})
+	if exitCode != 1 || dispatchCalled {
+		t.Fatalf("busy supervisor exit=%d dispatchCalled=%t stdout=%q stderr=%q", exitCode, dispatchCalled, stdout.String(), stderr.String())
+	}
+	if _, err := lockConn.ExecContext(ctx, `ROLLBACK`); err != nil {
+		t.Fatalf("release sqlite busy lock: %v", err)
+	}
+	if err := lockConn.Close(); err != nil {
+		t.Fatalf("close lock conn: %v", err)
+	}
+	if err := lockDB.Close(); err != nil {
+		t.Fatalf("close lock db: %v", err)
+	}
+
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(3 * time.Minute) }})
+	if err != nil {
+		t.Fatalf("reopen after sqlite busy: %v", err)
+	}
+	record, err := detachedrun.Get(ctx, store, claim.RunID)
+	if err != nil {
+		t.Fatalf("Get after sqlite busy: %v", err)
+	}
+	if record.Generation != 1 || record.LaunchPhase != detachedrun.PhaseSpawned || record.Status != detachedrun.StatusRunning || record.WorkerStartedAt != "" || record.ProviderExposed || record.LaunchReceiptID != "" || record.TerminalReceiptID != "" {
+		t.Fatalf("busy write boundary mutated execution state: %#v", record)
+	}
+	receipts, err := progress.ListReceipts(ctx, store, progress.ListFilter{ProjectID: registered.Project.ProjectID, DeliveryRunID: claim.RunID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListReceipts after sqlite busy: %v", err)
+	}
+	if len(receipts) != 0 {
+		t.Fatalf("busy write boundary created receipts: %#v", receipts)
+	}
+	reconciled, err := detachedrun.Reconcile(ctx, store, claim.RunID, now.Add(3*time.Minute))
+	if err != nil {
+		t.Fatalf("Reconcile after sqlite busy: %v", err)
+	}
+	if !reconciled.CanRecover || reconciled.ReplayAction != "retryable" || reconciled.Record.Generation != 1 {
+		t.Fatalf("reconcile after sqlite busy = %#v", reconciled)
+	}
+	store.Close()
+
+	var recoverOut, recoverErr bytes.Buffer
+	recoverCode := RunWithDeps([]string{
+		"recover",
+		"--repo", repo,
+		"--run-id", claim.RunID,
+		"--detached",
+		"--supervisor-owner", claim.Owner,
+		"--supervisor-generation", "1",
+		"--supervisor-lease", claim.LeaseExpiresAt,
+		"--format", "json",
+	}, &recoverOut, &recoverErr, Deps{
+		Now: func() time.Time { return now.Add(4 * time.Minute) },
+		VerifyProcessAuthority: func(int, string) error {
+			return nil
+		},
+		KillProcessTree: func(int) error {
+			return nil
+		},
+		ProcessAlive: func(int) bool {
+			return false
+		},
+		StartDetachedDispatch: func(context.Context, []string, string) (int, error) {
+			return 6263, nil
+		},
+		ProcessAuthority: func(pid int, observedAt time.Time) (string, error) {
+			return fmt.Sprintf("recovered-authority-%d", pid), nil
+		},
+	})
+	if recoverCode != 0 {
+		t.Fatalf("recover after sqlite busy exit=%d stdout=%q stderr=%q", recoverCode, recoverOut.String(), recoverErr.String())
+	}
+	var recovered detachedrun.StatusResult
+	assertSingleJSONValue(t, recoverOut.String(), &recovered)
+	if recovered.Record.Generation != 2 || recovered.Record.ProcessPID != 6263 || recovered.Record.LaunchPhase != detachedrun.PhaseSpawned {
+		t.Fatalf("recovered after sqlite busy = %#v", recovered)
+	}
+}
+
+func TestDetachedCancelRejectsStaleFenceWithoutKilling(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 5, 15, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-cancel-stale",
+		Owner:          "owner-one",
+		LeaseExpiresAt: now.Add(time.Minute),
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if _, err := detachedrun.MarkSpawned(ctx, store, claim.Fence(), 8181, "authority-one", now.Add(time.Second)); err != nil {
+		t.Fatalf("MarkSpawned: %v", err)
+	}
+	if _, err := detachedrun.AcquireRecovery(ctx, store, detachedrun.RecoveryRequest{
+		RunID:                  claim.RunID,
+		ExpectedOwner:          claim.Owner,
+		ExpectedGeneration:     claim.Generation,
+		ExpectedLeaseExpiresAt: claim.LeaseExpiresAt,
+		Owner:                  "owner-two",
+		LeaseExpiresAt:         now.Add(time.Hour),
+		Now:                    now.Add(2 * time.Minute),
+	}); err != nil {
+		t.Fatalf("AcquireRecovery: %v", err)
+	}
+	store.Close()
+
+	var killed bool
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"cancel",
+		"--repo", repo,
+		"--run", claim.RunID,
+		"--supervisor-owner", claim.Owner,
+		"--supervisor-generation", "1",
+		"--supervisor-lease", claim.LeaseExpiresAt,
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now.Add(3 * time.Minute) },
+		KillProcessTree: func(int) error {
+			killed = true
+			return nil
+		},
+	})
+	if exitCode == 0 || killed {
+		t.Fatalf("stale cancel exit=%d killed=%t stdout=%q stderr=%q", exitCode, killed, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "no longer matches") {
+		t.Fatalf("stale cancel stderr = %q", stderr.String())
+	}
+}
+
+func TestDetachedSupervisorRealSubprocessGatedDarwinArm64(t *testing.T) {
+	if os.Getenv("LOOPCODER_DETACHED_SUBPROCESS_SMOKE") != "1" {
+		t.Skip("detached subprocess smoke is opt-in; set LOOPCODER_DETACHED_SUBPROCESS_SMOKE=1")
+	}
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skipf("v0.8 detached subprocess smoke is scoped to darwin/arm64; got %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	home := t.TempDir()
+	t.Setenv("LOOPCODER_HOME", home)
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 5, 20, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-subprocess-host-exit",
+		Owner:          "owner-subprocess-host",
+		LeaseExpiresAt: now.Add(time.Hour),
+		IssueNumber:    898,
+		Attempt:        1,
+		BaseBranch:     "pre-prod",
+		Provider:       "codex",
+		Model:          "smoke-model",
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	store.Close()
+
+	logPath := filepath.Join(t.TempDir(), "detached-supervisor.log")
+	cmd := exec.Command(os.Args[0], "-test.run=TestDetachedSupervisorHostExitLauncherHelper", "--", "detached-host", repo, claim.RunID, claim.Owner, strconv.FormatInt(claim.Generation, 10), logPath)
+	cmd.Env = append(os.Environ(), "LOOPCODER_HOME="+home, "LOOPCODER_DETACHED_SUBPROCESS_SMOKE=1")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("host launcher failed: %v\n%s", err, string(output))
+	}
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(2 * time.Minute) }})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer store.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		record, err := detachedrun.Get(ctx, store, claim.RunID)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if record.Status == detachedrun.StatusSucceeded {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("detached worker did not complete after host exit: %#v", record)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	receipts, err := progress.ListReceipts(ctx, store, progress.ListFilter{ProjectID: registered.Project.ProjectID, DeliveryRunID: claim.RunID, Limit: 20})
+	if err != nil {
+		t.Fatalf("ListReceipts: %v", err)
+	}
+	var terminalReceipts int
+	for _, receipt := range receipts {
+		if receipt.Phase == "detached-terminal" {
+			terminalReceipts++
+		}
+	}
+	if terminalReceipts != 1 {
+		t.Fatalf("terminal receipt count = %d, want exactly 1: %#v", terminalReceipts, receipts)
+	}
+}
+
+func TestDetachedSupervisorHostExitLauncherHelper(t *testing.T) {
+	marker, args := detachedSubprocessMarkerArgs()
+	if marker != "detached-host" {
+		return
+	}
+	if len(args) != 5 {
+		fmt.Fprintf(os.Stderr, "detached-host: got %d args, want 5\n", len(args))
+		os.Exit(2)
+	}
+	repo, runID, owner, generationText, logPath := args[0], args[1], args[2], args[3], args[4]
+	generation, err := strconv.ParseInt(generationText, 10, 64)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "detached-host: parse generation: %v\n", err)
+		os.Exit(2)
+	}
+	ctx := context.Background()
+	pid, err := startDetachedDispatchProcess(ctx, []string{"-test.run=TestDetachedSupervisorHostExitWorkerHelper", "--", "detached-worker", repo, runID, owner, generationText}, logPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "detached-host: start worker: %v\n", err)
+		os.Exit(1)
+	}
+	authority, err := process.Authority(pid, time.Now().UTC())
+	if err != nil {
+		_ = process.KillTree(pid)
+		fmt.Fprintf(os.Stderr, "detached-host: authority: %v\n", err)
+		os.Exit(1)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{})
+	if err != nil {
+		_ = process.KillTree(pid)
+		fmt.Fprintf(os.Stderr, "detached-host: open store: %v\n", err)
+		os.Exit(1)
+	}
+	defer store.Close()
+	if _, err := detachedrun.MarkSpawned(ctx, store, detachedrun.Fence{RunID: runID, Owner: owner, Generation: generation}, pid, authority, time.Now().UTC()); err != nil {
+		_ = process.KillTree(pid)
+		fmt.Fprintf(os.Stderr, "detached-host: mark spawned: %v\n", err)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+func TestDetachedSupervisorHostExitWorkerHelper(t *testing.T) {
+	marker, args := detachedSubprocessMarkerArgs()
+	if marker != "detached-worker" {
+		return
+	}
+	if len(args) != 4 {
+		fmt.Fprintf(os.Stderr, "detached-worker: got %d args, want 4\n", len(args))
+		os.Exit(2)
+	}
+	repo, runID, owner, generationText := args[0], args[1], args[2], args[3]
+	generation, err := strconv.ParseInt(generationText, 10, 64)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "detached-worker: parse generation: %v\n", err)
+		os.Exit(2)
+	}
+	ctx := context.Background()
+	store, _, err := openDetachedStore(ctx, repo, Deps{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "detached-worker: open store: %v\n", err)
+		os.Exit(1)
+	}
+	defer store.Close()
+	fence := detachedrun.Fence{RunID: runID, Owner: owner, Generation: generation}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		record, err := detachedrun.Get(ctx, store, runID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "detached-worker: get record: %v\n", err)
+			os.Exit(1)
+		}
+		if record.LaunchPhase == detachedrun.PhaseSpawned {
+			break
+		}
+		if time.Now().After(deadline) {
+			fmt.Fprintf(os.Stderr, "detached-worker: timed out waiting for spawn marker\n")
+			os.Exit(1)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	now := time.Now().UTC()
+	if _, err := detachedrun.MarkWorkerStarted(ctx, store, fence, now); err != nil {
+		fmt.Fprintf(os.Stderr, "detached-worker: mark worker started: %v\n", err)
+		os.Exit(1)
+	}
+	record, err := detachedrun.Get(ctx, store, runID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "detached-worker: get started record: %v\n", err)
+		os.Exit(1)
+	}
+	if _, err := persistDetachedReceipt(ctx, store, record, "detached-worker-started", detachedrun.StatusRunning, false, now); err != nil {
+		fmt.Fprintf(os.Stderr, "detached-worker: persist worker receipt: %v\n", err)
+		os.Exit(1)
+	}
+	terminalReceiptID, err := persistDetachedReceipt(ctx, store, record, "detached-terminal", detachedrun.StatusSucceeded, true, now.Add(time.Second))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "detached-worker: persist terminal receipt: %v\n", err)
+		os.Exit(1)
+	}
+	if _, err := detachedrun.Complete(ctx, store, fence, detachedrun.StatusSucceeded, terminalReceiptID, "", "", now.Add(time.Second)); err != nil {
+		fmt.Fprintf(os.Stderr, "detached-worker: complete: %v\n", err)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+func detachedSubprocessMarkerArgs() (string, []string) {
+	for i, arg := range os.Args {
+		if arg == "--" && i+1 < len(os.Args) {
+			return os.Args[i+1], os.Args[i+2:]
+		}
+	}
+	return "", nil
+}
+
+func TestDispatchSupervisorPersistsWorkerStartedHeartbeatAndTerminalReceipts(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 5, 30, 0, 0, time.UTC)
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-supervisor-receipts",
+		Owner:          "owner-receipts",
+		LeaseExpiresAt: now.Add(time.Hour),
+		IssueNumber:    898,
+		Attempt:        1,
+		BaseBranch:     "pre-prod",
+		Provider:       "codex",
+		Model:          "gpt-test",
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if _, err := detachedrun.MarkSpawned(ctx, store, claim.Fence(), 6161, "test-authority", now.Add(time.Second)); err != nil {
+		t.Fatalf("MarkSpawned: %v", err)
+	}
+	store.Close()
+
+	var dispatchCalls int
+	dispatchStarted := make(chan struct{})
+	allowDispatchReturn := make(chan struct{})
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "898",
+		"--issue-title", "Supervisor receipts",
+		"--run-id", claim.RunID,
+		"--provider", "codex",
+		"--supervisor-run",
+		"--supervisor-owner", claim.Owner,
+		"--supervisor-generation", "1",
+		"--format", "json",
+	}, &stdout, &stderr, Deps{
+		Now:                       func() time.Time { return now.Add(2 * time.Minute) },
+		DetachedSupervisorCadence: 10 * time.Millisecond,
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			dispatchCalls++
+			close(dispatchStarted)
+			waitForDetachedReceiptCount(t, ctx, repo, registered.Project.ProjectID, claim.RunID, 2)
+			close(allowDispatchReturn)
+			return worker.Result{OK: true, Status: "succeeded", Issue: 898, RunID: claim.RunID}, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("RunWithDeps exit = %d stderr=%q stdout=%q", exitCode, stderr.String(), stdout.String())
+	}
+	if dispatchCalls != 1 {
+		t.Fatalf("dispatch calls = %d, want 1", dispatchCalls)
+	}
+	store, _, err = openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return now.Add(3 * time.Minute) }})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer store.Close()
+	record, err := detachedrun.Get(ctx, store, claim.RunID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if record.ProviderExposed || record.LaunchReceiptID != "" || record.TerminalReceiptID == "" || record.Status != detachedrun.StatusSucceeded {
+		t.Fatalf("supervisor record has false provider exposure or missing terminal receipt: %#v", record)
+	}
+	receipts, err := progress.ListReceipts(ctx, store, progress.ListFilter{ProjectID: registered.Project.ProjectID, DeliveryRunID: claim.RunID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListReceipts: %v", err)
+	}
+	if len(receipts) < 3 {
+		t.Fatalf("receipt count = %d, want at least worker-started, heartbeat, terminal: %#v", len(receipts), receipts)
+	}
+	var sawHeartbeat bool
+	for _, receipt := range receipts {
+		if receipt.Phase == "detached-provider-exposed" || receipt.Provider.ProviderConfidence == "exact" {
+			t.Fatalf("receipt falsely claims provider exposure/exact provider evidence: %#v", receipt)
+		}
+		if receipt.Phase == "detached-supervisor-heartbeat" {
+			sawHeartbeat = true
+		}
+	}
+	if !sawHeartbeat {
+		t.Fatalf("receipts missing heartbeat: %#v", receipts)
+	}
+	select {
+	case <-dispatchStarted:
+	case <-time.After(time.Second):
+		t.Fatal("dispatch did not start")
+	}
+	select {
+	case <-allowDispatchReturn:
+	case <-time.After(time.Second):
+		t.Fatal("dispatch did not observe cadence receipt")
+	}
+}
+
+func TestDetachedSupervisorCadenceTickBoundsTwentyMinuteSilence(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	repo := t.TempDir()
+	base := time.Date(2026, 7, 14, 5, 45, 0, 0, time.UTC)
+	current := base
+	ctx := context.Background()
+	registered, err := registry.Register(ctx, registry.Options{RepoPath: repo, Now: func() time.Time { return current }}, registry.DefaultDeps())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	store, _, err := openDetachedStore(ctx, repo, Deps{Now: func() time.Time { return current }})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+	claim, err := detachedrun.Claim(ctx, store, detachedrun.ClaimRequest{
+		ProjectID:      registered.Project.ProjectID,
+		RunID:          "run-cadence-20m",
+		Owner:          "owner-cadence",
+		LeaseExpiresAt: base.Add(time.Hour),
+		IssueNumber:    898,
+		Attempt:        1,
+		Provider:       "codex",
+		Now:            base,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if _, err := detachedrun.MarkWorkerStarted(ctx, store, claim.Fence(), base.Add(time.Second)); err != nil {
+		t.Fatalf("MarkWorkerStarted: %v", err)
+	}
+	opts := worker.Options{RunID: claim.RunID}
+	var providerDispatchCalls int
+	for step := 1; step <= 4; step++ {
+		current = base.Add(time.Duration(step*5) * time.Minute)
+		if err := detachedSupervisorCadenceTick(ctx, store, opts, claim.Fence(), Deps{
+			Now: func() time.Time { return current },
+			Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+				providerDispatchCalls++
+				return worker.Result{}, errors.New("cadence must not dispatch provider work")
+			},
+		}); err != nil {
+			t.Fatalf("cadence tick %d: %v", step, err)
+		}
+	}
+	if providerDispatchCalls != 0 {
+		t.Fatalf("cadence dispatched provider work %d times", providerDispatchCalls)
+	}
+	receipts, err := progress.ListReceipts(ctx, store, progress.ListFilter{ProjectID: registered.Project.ProjectID, DeliveryRunID: claim.RunID, Limit: 20})
+	if err != nil {
+		t.Fatalf("ListReceipts: %v", err)
+	}
+	record, err := detachedrun.Get(ctx, store, claim.RunID)
+	if err != nil {
+		t.Fatalf("Get after cadence: %v", err)
+	}
+	if record.ProviderExposed || record.LaunchReceiptID != "" {
+		t.Fatalf("cadence marked provider execution on supervisor record: %#v", record)
+	}
+	var heartbeatTimes []time.Time
+	for _, receipt := range receipts {
+		if receipt.Phase == "detached-provider-exposed" || receipt.Provider.ProviderConfidence == "exact" {
+			t.Fatalf("cadence created provider execution receipt: %#v", receipt)
+		}
+		if receipt.Phase != "detached-supervisor-heartbeat" {
+			continue
+		}
+		if receipt.Provider.ProviderConfidence != progress.Unknown || receipt.Progress.State != progress.KnownAliveNoMeaningfulProgress {
+			t.Fatalf("heartbeat receipt claimed provider execution/progress: %#v", receipt)
+		}
+		at, err := time.Parse(time.RFC3339Nano, receipt.OccurredAt)
+		if err != nil {
+			t.Fatalf("parse heartbeat receipt time %q: %v", receipt.OccurredAt, err)
+		}
+		heartbeatTimes = append(heartbeatTimes, at)
+	}
+	if len(heartbeatTimes) != 4 {
+		t.Fatalf("heartbeat count = %d, want 4: %#v", len(heartbeatTimes), receipts)
+	}
+	for i := 1; i < len(heartbeatTimes); i++ {
+		if gap := heartbeatTimes[i].Sub(heartbeatTimes[i-1]); gap > 5*time.Minute {
+			t.Fatalf("heartbeat gap = %s, want <= 5m", gap)
 		}
 	}
 }
@@ -4286,6 +9003,70 @@ func TestDispatchNeedsHumanReceiptUsesDispatchReasonAndExitCode(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("stderr missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestDispatchHarvestConductorReportWritesWorkerRelayRecord(t *testing.T) {
+	clearPrettyEnv(t)
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	record := validDispatchReport()
+	record.Role = reporter.RoleConductor
+	record.ModelSource = reporter.ModelSourceSelfReported
+	record.Permission = reporter.PermissionOrchestrate
+	record.Action = "harvest hung worker issue #101"
+	record.Verified = false
+	result := validDispatchResult(record)
+	result.Status = "needs-human"
+	result.Reason = "harvested hung worker needs human review"
+	result.NextAction = "human should review harvested partial work"
+	result.Summary = "harvested from hung/killed worker - possibly incomplete; needs human review"
+
+	exitCode := RunWithDeps([]string{
+		"dispatch",
+		"--repo", repo,
+		"--issue-number", "101",
+		"--issue-title", "Implement dispatch",
+	}, &stdout, &stderr, Deps{
+		IsTerminal: func(io.Writer) bool {
+			return false
+		},
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			return result, nil
+		},
+	})
+	if exitCode != 2 {
+		t.Fatalf("RunWithDeps returned exit code %d, want needs-human 2; stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty default text output", stdout.String())
+	}
+	got := stderr.String()
+	for _, want := range []string{
+		"loopcoder report: conductor needs human",
+		"- reason: harvested hung worker needs human review",
+		"- human should review harvested partial work",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("stderr missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "unsupported relay role") || strings.Contains(got, "write relay ledger") {
+		t.Fatalf("stderr contains relay write failure:\n%s", got)
+	}
+
+	pending := relaygate.Check(repo)
+	if len(pending) != 1 {
+		t.Fatalf("pending relay records = %d, want 1", len(pending))
+	}
+	if pending[0].Role != "worker" || pending[0].PRNumber != 101 || pending[0].Nonce != relaygate.Nonce(result.RunID, 101, "worker") {
+		t.Fatalf("pending relay record = %#v, want normalized worker PR 101 relay", pending[0])
+	}
+	if pending[0].Report == nil || pending[0].Report.Role != reporter.RoleConductor {
+		t.Fatalf("pending relay report = %#v, want original conductor report preserved", pending[0].Report)
+	}
+	if !strings.Contains(pending[0].Block, "loopcoder report: conductor needs human") {
+		t.Fatalf("pending relay block = %q, want conductor pretty block preserved", pending[0].Block)
 	}
 }
 
@@ -4625,6 +9406,83 @@ func TestEnforceNestedPlanScopeUsesPhysicalPathIdentity(t *testing.T) {
 	}
 }
 
+func TestEnforceNestedPlanScopeWindowsJunctionDistinctions(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows junction coverage")
+	}
+	repo := t.TempDir()
+	inRepoDir := filepath.Join(repo, "src")
+	if err := os.MkdirAll(inRepoDir, 0o755); err != nil {
+		t.Fatalf("mkdir in-repo dir: %v", err)
+	}
+	inRepoAlias := filepath.Join(repo, "alias-src")
+	createWindowsJunctionForCLITest(t, inRepoAlias, inRepoDir)
+
+	validAliasPlan := orchestration.ChildPlan{Items: []orchestration.ChildRunPlan{{
+		ChildKey:   "alias",
+		Permission: "write",
+		Scope:      orchestration.ChildScope{Repo: ".", Paths: []string{filepath.Join("alias-src", "future", "new.txt")}},
+	}}}
+	if err := enforceNestedPlanScope(repo, string(reporter.PermissionOrchestrate), &validAliasPlan); err != nil {
+		t.Fatalf("in-repo junction alias rejected: %v", err)
+	}
+
+	validMissingLeafPlan := orchestration.ChildPlan{Items: []orchestration.ChildRunPlan{{
+		ChildKey:   "missing-leaf",
+		Permission: "write",
+		Scope:      orchestration.ChildScope{Repo: ".", Paths: []string{filepath.Join("src", "future", "new.txt")}},
+	}}}
+	if err := enforceNestedPlanScope(repo, string(reporter.PermissionOrchestrate), &validMissingLeafPlan); err != nil {
+		t.Fatalf("in-repo missing leaf rejected: %v", err)
+	}
+
+	outside := t.TempDir()
+	escapeAlias := filepath.Join(repo, "escape")
+	createWindowsJunctionForCLITest(t, escapeAlias, outside)
+	escapePlan := orchestration.ChildPlan{Items: []orchestration.ChildRunPlan{{
+		ChildKey:   "escape",
+		Permission: "write",
+		Scope:      orchestration.ChildScope{Repo: ".", Paths: []string{filepath.Join("escape", "owned.txt")}},
+	}}}
+	err := enforceNestedPlanScope(repo, string(reporter.PermissionOrchestrate), &escapePlan)
+	if err == nil || !strings.Contains(err.Error(), "escapes approved repo scope") {
+		t.Fatalf("junction escape error = %v, want escape diagnostic", err)
+	}
+
+	foreignVolumePlan := orchestration.ChildPlan{Items: []orchestration.ChildRunPlan{{
+		ChildKey:   "foreign-volume",
+		Permission: "write",
+		Scope:      orchestration.ChildScope{Repo: ".", Paths: []string{`Z:\loopcoder-outside`}},
+	}}}
+	err = enforceNestedPlanScope(repo, string(reporter.PermissionOrchestrate), &foreignVolumePlan)
+	if err == nil || !strings.Contains(err.Error(), "escapes approved repo scope") {
+		t.Fatalf("foreign volume error = %v, want escape diagnostic", err)
+	}
+
+	foreignRepoPlan := orchestration.ChildPlan{Items: []orchestration.ChildRunPlan{{
+		ChildKey:   "foreign-repo",
+		Permission: "write",
+		Scope:      orchestration.ChildScope{Repo: `Z:\loopcoder-outside`, Paths: []string{"owned.txt"}},
+	}}}
+	err = enforceNestedPlanScope(repo, string(reporter.PermissionOrchestrate), &foreignRepoPlan)
+	if err == nil || !strings.Contains(err.Error(), "escapes parent repo") {
+		t.Fatalf("foreign repo error = %v, want escape diagnostic", err)
+	}
+}
+
+func createWindowsJunctionForCLITest(t *testing.T, link, target string) {
+	t.Helper()
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference = 'Stop'; New-Item -ItemType Junction -Path $env:LOOPCODER_JUNCTION_LINK -Target $env:LOOPCODER_JUNCTION_TARGET | Out-Null`)
+	cmd.Env = append(os.Environ(),
+		"LOOPCODER_JUNCTION_LINK="+link,
+		"LOOPCODER_JUNCTION_TARGET="+target,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("create Windows junction %q -> %q: %v: %s", link, target, err, strings.TrimSpace(string(output)))
+	}
+}
+
 func TestNestedRunRejectsPermissionEscalationBeforeDispatch(t *testing.T) {
 	t.Setenv("LOOPCODER_HOME", t.TempDir())
 	var stdout, stderr bytes.Buffer
@@ -4657,7 +9515,8 @@ func TestNestedRunRejectsPermissionEscalationBeforeDispatch(t *testing.T) {
 }
 
 func TestNestedRunTestSubprocessExecutesRealChildProcesses(t *testing.T) {
-	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	loopHome := t.TempDir()
+	t.Setenv("LOOPCODER_HOME", loopHome)
 	var stdout, stderr bytes.Buffer
 	repo := t.TempDir()
 	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
@@ -4665,6 +9524,24 @@ func TestNestedRunTestSubprocessExecutesRealChildProcesses(t *testing.T) {
 		nestedPlanItem("beta", 702, nil, true, "read-only", []string{"go env GOARCH"}),
 		nestedPlanItem("gamma", 703, []string{"alpha"}, false, "read-only", []string{"go env GOVERSION"}),
 	}, 2)
+	planData, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read nested test-subprocess plan: %v", err)
+	}
+	var plan orchestration.ChildPlan
+	if err := json.Unmarshal(planData, &plan); err != nil {
+		t.Fatalf("decode nested test-subprocess plan: %v", err)
+	}
+	for i := range plan.Items {
+		plan.Items[i].Metadata = nil
+	}
+	planData, err = json.MarshalIndent(plan, "", "  ")
+	if err != nil {
+		t.Fatalf("encode unbudgeted nested test-subprocess plan: %v", err)
+	}
+	if err := os.WriteFile(planPath, planData, 0o644); err != nil {
+		t.Fatalf("write unbudgeted nested test-subprocess plan: %v", err)
+	}
 
 	exitCode := RunWithDeps([]string{
 		"nested", "run",
@@ -4690,6 +9567,66 @@ func TestNestedRunTestSubprocessExecutesRealChildProcesses(t *testing.T) {
 	if len(attempts) != 1 || attempts[0].Provider != nestedTestSubprocessProvider || attempts[0].Report == nil {
 		t.Fatalf("attempts = %#v, want test-subprocess report", attempts)
 	}
+	store, err := storage.Open(context.Background(), storage.Options{Path: filepath.Join(loopHome, "data", "loopcoder.db"), Now: fixedCLINow})
+	if err != nil {
+		t.Fatalf("open nested test-subprocess storage: %v", err)
+	}
+	defer store.Close()
+	var budgetReservations int
+	if err := store.WithTx(context.Background(), func(tx storage.Tx) error {
+		return tx.QueryRow(context.Background(), `SELECT COUNT(*) FROM budget_reservations`).Scan(&budgetReservations)
+	}); err != nil {
+		t.Fatalf("count nested test-subprocess budget reservations: %v", err)
+	}
+	if budgetReservations != 0 {
+		t.Fatalf("test-subprocess created %d budget reservations, want 0", budgetReservations)
+	}
+}
+
+func TestNestedRunTestSubprocessRedactsOutputBeforePersistingAttempt(t *testing.T) {
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	repo := t.TempDir()
+	canary := "AKIA" + strings.Repeat("A", 16)
+	command := "printf '%s\n' '" + canary + "'; exit 1"
+	if runtime.GOOS == "windows" {
+		command = `Write-Output "` + canary + `"; exit 1`
+	}
+	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
+		nestedPlanItem("redact", 701, nil, true, "read-only", []string{command}),
+	}, 1)
+
+	exitCode := RunWithDeps([]string{
+		"nested", "run",
+		"--repo", repo,
+		"--plan", planPath,
+		"--provider", nestedTestSubprocessProvider,
+		"--format", "json",
+	}, &stdout, &stderr, Deps{Now: fixedCLINow})
+	if exitCode != 1 {
+		t.Fatalf("RunWithDeps returned exit code %d, want 1; stderr=%q stdout=%q", exitCode, stderr.String(), stdout.String())
+	}
+	var report orchestration.NestedScheduleReport
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatalf("stdout is not nested JSON: %v\n%s", err, stdout.String())
+	}
+	attempts, err := state.LoadAttempts(repo, report.Children[0].RunID)
+	if err != nil {
+		t.Fatalf("LoadAttempts: %v", err)
+	}
+	if len(attempts) != 1 || attempts[0].Error == "" {
+		t.Fatalf("attempts = %#v, want failed attempt with redacted error", attempts)
+	}
+	if strings.Contains(attempts[0].Error, canary) || strings.Contains(attempts[0].Error, "AKIA") {
+		t.Fatalf("attempt error retained credential canary: %q", attempts[0].Error)
+	}
+	data, err := os.ReadFile(attempts[0].Path)
+	if err != nil {
+		t.Fatalf("read attempt file: %v", err)
+	}
+	if strings.Contains(string(data), canary) || strings.Contains(string(data), "AKIA") {
+		t.Fatalf("attempt file retained credential canary: %s", data)
+	}
 }
 
 func TestNestedRunReplaysSamePlanFileWithOmittedChildRunIDsIdempotently(t *testing.T) {
@@ -4709,6 +9646,7 @@ func TestNestedRunReplaysSamePlanFileWithOmittedChildRunIDsIdempotently(t *testi
 			nestedPlanItem("alpha", 701, nil, true, "read-only", []string{"go env GOOS"}),
 		},
 	}
+	seedAndApplyCLINestedSchedulerAuthority(t, &plan)
 	planData, err := json.MarshalIndent(plan, "", "  ")
 	if err != nil {
 		t.Fatalf("marshal child plan: %v", err)
@@ -5321,6 +10259,7 @@ func TestDispatchWaveRunsFromReadySetWithInjectedDeps(t *testing.T) {
 		"--run-id", "run-test-wave",
 		"--model", "gpt-5.5",
 		"--effort", "high",
+		"--timeout", "3m",
 	}, &stdout, &stderr, Deps{
 		Stdin: strings.NewReader(`{"ready":[{"issue":201,"title":"Wave","reason":"ready"}]}`),
 		NewGitHubReader: func(string) orchestration.GitHubReader {
@@ -5363,13 +10302,56 @@ func TestDispatchWaveRunsFromReadySetWithInjectedDeps(t *testing.T) {
 	if dispatchOpts.IssueNumber != 201 || dispatchOpts.IssueTitle != "Wave" || dispatchOpts.IssueBody != "Body" {
 		t.Fatalf("dispatch opts issue fields = %#v", dispatchOpts)
 	}
-	if dispatchOpts.RunID != "run-test-wave" || dispatchOpts.Model != "gpt-5.5" || dispatchOpts.Effort != "high" {
+	if dispatchOpts.RunID != "run-test-wave" || dispatchOpts.Model != "gpt-5.5" || dispatchOpts.Effort != "high" || dispatchOpts.Timeout != 3*time.Minute {
 		t.Fatalf("dispatch opts run/model/effort = %#v", dispatchOpts)
 	}
 	text := stdout.String()
 	for _, want := range []string{"DISPATCH WAVE", "RunId: run-test-wave", "- #201 succeeded", "Verify successful PRs"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("stdout missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestDispatchWaveHostProfiledNonInteractiveDefaultsToDetached(t *testing.T) {
+	clearPrettyEnv(t)
+	clearGitSelectionEnvForFixture(t)
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	t.Setenv(hostprofile.EnvName, "paseo")
+	repo := t.TempDir()
+	now := time.Date(2026, 7, 14, 4, 6, 0, 0, time.UTC)
+	if _, err := registry.Register(context.Background(), registry.Options{RepoPath: repo, Now: func() time.Time { return now }}, registry.DefaultDeps()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	var launchedArgs []string
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"dispatch-wave",
+		"--format", "json",
+		"--repo", repo,
+		"--issue-numbers", "964,965",
+	}, &stdout, &stderr, Deps{
+		Now: func() time.Time { return now },
+		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
+			t.Fatal("foreground dispatch-wave should not dispatch workers")
+			return worker.Result{}, nil
+		},
+		StartDetachedDispatch: func(_ context.Context, args []string, _ string) (int, error) {
+			launchedArgs = append([]string(nil), args...)
+			return 4244, nil
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("dispatch-wave exit=%d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	var launch detachedLaunchRecord
+	assertSingleJSONValue(t, stdout.String(), &launch)
+	if !launch.Detached || launch.RunID != "run-20260714T040600Z-wave" || launch.CancelCommand == "" {
+		t.Fatalf("launch = %#v, want detached wave launch with cancel command", launch)
+	}
+	for _, want := range []string{"supervise", "dispatch-wave", "--foreground", "--run-id", launch.RunID} {
+		if !containsString(launchedArgs, want) {
+			t.Fatalf("launched args missing %q: %#v", want, launchedArgs)
 		}
 	}
 }
@@ -5945,6 +10927,193 @@ func readRepoFile(t *testing.T, rel string) string {
 	return string(data)
 }
 
+type cliNestedSchedulerAuthority struct {
+	ProjectID                string `json:"project_id"`
+	DeliveryRunID            string `json:"delivery_run_id"`
+	TaskID                   string `json:"task_id"`
+	AdapterID                string `json:"adapter_id"`
+	AccountProfileID         string `json:"account_profile_id,omitempty"`
+	ModelCapabilityID        string `json:"model_capability_id,omitempty"`
+	RoutingDecisionID        string `json:"routing_decision_id"`
+	RoutingFingerprint       string `json:"routing_fingerprint"`
+	PlanFingerprint          string `json:"plan_fingerprint"`
+	PolicyFingerprint        string `json:"policy_fingerprint"`
+	AuthorizationFingerprint string `json:"authorization_fingerprint"`
+	BudgetRequestedValue     int64  `json:"budget_requested_value"`
+	BudgetQuantityKind       string `json:"budget_quantity_kind,omitempty"`
+	BudgetUnit               string `json:"budget_unit,omitempty"`
+	BudgetWindowKind         string `json:"budget_window_kind,omitempty"`
+}
+
+type cliNestedBudgetScope struct {
+	ScopeKind         string `json:"scope_kind"`
+	ProjectID         string `json:"project_id,omitempty"`
+	DeliveryRunID     string `json:"delivery_run_id,omitempty"`
+	TaskID            string `json:"task_id,omitempty"`
+	WorkerID          string `json:"worker_id,omitempty"`
+	SubAgentID        string `json:"sub_agent_id,omitempty"`
+	AdapterID         string `json:"adapter_id,omitempty"`
+	AccountProfileID  string `json:"account_profile_id,omitempty"`
+	ModelCapabilityID string `json:"model_capability_id,omitempty"`
+}
+
+func seedAndApplyCLINestedSchedulerAuthority(t *testing.T, plan *orchestration.ChildPlan) {
+	t.Helper()
+	loopHome := strings.TrimSpace(os.Getenv("LOOPCODER_HOME"))
+	if loopHome == "" {
+		return
+	}
+	authority := cliNestedSchedulerAuthorityForPlan(plan.PlanID)
+	metadata := mustCLINestedSchedulerAuthorityJSON(t, authority)
+	for i := range plan.Items {
+		plan.Items[i].Metadata = metadata
+	}
+	store, err := storage.Open(context.Background(), storage.Options{Path: filepath.Join(loopHome, "data", "loopcoder.db"), Now: fixedCLINow})
+	if err != nil {
+		t.Fatalf("storage.Open authority seed: %v", err)
+	}
+	defer store.Close()
+	if err := seedCLINestedSchedulerAuthority(context.Background(), store, authority, 100); err != nil {
+		t.Fatalf("seed nested scheduler authority: %v", err)
+	}
+}
+
+func mustCLINestedSchedulerAuthorityJSON(t *testing.T, authority cliNestedSchedulerAuthority) json.RawMessage {
+	t.Helper()
+	if authority.BudgetQuantityKind == "" {
+		authority.BudgetQuantityKind = "local-policy"
+	}
+	if authority.BudgetUnit == "" {
+		authority.BudgetUnit = "local-policy-unit"
+	}
+	if authority.BudgetWindowKind == "" {
+		authority.BudgetWindowKind = "unbounded"
+	}
+	data, err := json.Marshal(authority)
+	if err != nil {
+		t.Fatalf("marshal scheduler authority: %v", err)
+	}
+	return data
+}
+
+func cliNestedSchedulerAuthorityForPlan(planID string) cliNestedSchedulerAuthority {
+	suffix := strings.Trim(strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r + ('a' - 'A')
+		case r >= '0' && r <= '9':
+			return r
+		default:
+			return '-'
+		}
+	}, planID), "-")
+	if suffix == "" {
+		suffix = "default"
+	}
+	return cliNestedSchedulerAuthority{
+		ProjectID:                "proj-" + suffix,
+		DeliveryRunID:            "drun-" + suffix,
+		TaskID:                   "task-" + suffix,
+		AdapterID:                "codex",
+		AccountProfileID:         "acct-" + suffix,
+		ModelCapabilityID:        "mcap-" + suffix,
+		RoutingDecisionID:        "route-" + suffix,
+		RoutingFingerprint:       "sha256:route-" + suffix,
+		PlanFingerprint:          "sha256:plan-" + suffix,
+		PolicyFingerprint:        "sha256:policy-" + suffix,
+		AuthorizationFingerprint: "sha256:auth-" + suffix,
+		BudgetRequestedValue:     1,
+	}
+}
+
+func seedCLINestedSchedulerAuthority(ctx context.Context, store storage.Store, authority cliNestedSchedulerAuthority, ceiling int64) error {
+	at := state.FormatTimestamp(fixedCLINow())
+	candidates, err := json.Marshal([]map[string]any{{
+		"routing_candidate_id":   "candidate-cli",
+		"task_id":                authority.TaskID,
+		"adapter_id":             authority.AdapterID,
+		"account_profile_id":     authority.AccountProfileID,
+		"model_capability_id":    authority.ModelCapabilityID,
+		"candidate_fingerprint":  "sha256:candidate-cli",
+		"invocation_profile_key": "default",
+	}})
+	if err != nil {
+		return err
+	}
+	projectScope := mustCLIBudgetScopeKey(cliNestedBudgetScope{ScopeKind: "project", ProjectID: authority.ProjectID})
+	providerScope := mustCLIBudgetScopeKey(cliNestedBudgetScope{
+		ScopeKind:         "provider-scope",
+		ProjectID:         authority.ProjectID,
+		AdapterID:         authority.AdapterID,
+		AccountProfileID:  authority.AccountProfileID,
+		ModelCapabilityID: authority.ModelCapabilityID,
+	})
+	policySuffix := strings.TrimPrefix(authority.ProjectID, "proj-")
+	return store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		if _, err := tx.Exec(ctx, `INSERT INTO projects(id, local_path, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`,
+			authority.ProjectID, "/tmp/"+authority.ProjectID, at, at); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT OR IGNORE INTO delivery_runs(
+			delivery_run_id, run_id, schema_version, record_version, project_id, root_run_id, parent_run_id,
+			state, intent_summary, input_fingerprint, policy_fingerprint, plan_fingerprint, authorization_fingerprint,
+			policy_version, max_side_effect_class, approval_status, override_status, created_at, updated_at,
+			created_by_json, updated_by_json, host_json)
+			VALUES (?, ?, 'loopcoder.delivery_run.v1', 1, ?, 'root-cli', '', 'approved', 'cli nested scheduler test',
+				'sha256:input-cli', ?, ?, ?, '0805.agent_federation.v1', 'repo-write', 'approved', 'none',
+				?, ?, '{}', '{}', '{}')`,
+			authority.DeliveryRunID, "delivery-cli", authority.ProjectID, authority.PolicyFingerprint,
+			authority.PlanFingerprint, authority.AuthorizationFingerprint, at, at); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT OR IGNORE INTO routing_decisions(
+			routing_decision_id, schema_version, record_version, project_id, delivery_run_id, task_id, task_requirement_id,
+			decision_key, decision_kind, routing_policy_profile_id, role_definition_id, plan_fingerprint, policy_fingerprint,
+			routing_fingerprint, candidate_generation_status, decision_status, chosen_candidate_id, terminal_error_code,
+			input_record_refs_json, eligible_candidates_json, rejected_candidates_json, scored_candidates_json,
+			rejected_summary_json, optimization_policy_json, payload_json, created_at, updated_at, decided_by_json, host_json)
+			VALUES (?, 'loopcoder.routing_decision.v1', 1, ?, ?, ?, 'treq-cli', 'route-cli', 'routing',
+				'rprofile-cli', '', ?, ?, ?, 'full', 'selected', 'candidate-cli', '',
+				'[]', ?, '[]', '[]', '{}', '{}', '{}', ?, ?, '{}', '{}')`,
+			authority.RoutingDecisionID, authority.ProjectID, authority.DeliveryRunID, authority.TaskID,
+			authority.PlanFingerprint, authority.PolicyFingerprint, authority.RoutingFingerprint, string(candidates), at, at); err != nil {
+			return err
+		}
+		for _, policy := range []struct {
+			id    string
+			scope string
+		}{
+			{id: "bpol-cli-project-" + policySuffix, scope: projectScope},
+			{id: "bpol-cli-provider-" + policySuffix, scope: providerScope},
+		} {
+			if _, err := tx.Exec(ctx, `INSERT OR IGNORE INTO budget_policies(
+				budget_policy_id, project_id, delivery_run_id, task_id, sub_agent_id, adapter_id, account_profile_id,
+				model_capability_id, scope_kind, scope_key, quantity_kind, unit, window_kind, policy_mode,
+				ceiling_value, active, policy_version, payload_json)
+				VALUES (?, ?, '', '', '', ?, ?, ?, '', ?, 'local-policy', 'local-policy-unit', 'unbounded', 'hard',
+					?, 1, '0805.agent_federation.v1', '{}')`,
+				policy.id, authority.ProjectID, authority.AdapterID, authority.AccountProfileID, authority.ModelCapabilityID, policy.scope, ceiling); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `INSERT OR IGNORE INTO budget_aggregates(budget_policy_id, reserved_value, committed_value, updated_at) VALUES (?, 0, 0, ?)`,
+				policy.id, at); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func mustCLIBudgetScopeKey(scope cliNestedBudgetScope) string {
+	data, err := json.Marshal(scope)
+	if err != nil {
+		panic(err)
+	}
+	return string(data)
+}
+
 func writeNestedPlanFixture(t *testing.T, repo string, items []orchestration.ChildRunPlan, maxConcurrency int) string {
 	t.Helper()
 	for i := range items {
@@ -5962,6 +11131,7 @@ func writeNestedPlanFixture(t *testing.T, repo string, items []orchestration.Chi
 		CreatedAt:      state.FormatTimestamp(fixedCLINow()),
 		Items:          items,
 	}
+	seedAndApplyCLINestedSchedulerAuthority(t, &plan)
 	data, err := json.MarshalIndent(plan, "", "  ")
 	if err != nil {
 		t.Fatalf("marshal child plan: %v", err)
@@ -5992,6 +11162,7 @@ func writeNestedPlanFixtureWithIDs(t *testing.T, repo, parentRunID, rootRunID st
 		CreatedAt:      state.FormatTimestamp(fixedCLINow()),
 		Items:          items,
 	}
+	seedAndApplyCLINestedSchedulerAuthority(t, &plan)
 	data, err := json.MarshalIndent(plan, "", "  ")
 	if err != nil {
 		t.Fatalf("marshal child plan: %v", err)
@@ -6088,6 +11259,7 @@ func runCLITestGit(t *testing.T, repo string, args ...string) {
 		cmdArgs = args
 		cmd := exec.Command("git", cmdArgs...)
 		cmd.Dir = repo
+		cmd.Env = gitutil.CleanEnv(os.Environ())
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, string(output))
@@ -6095,6 +11267,7 @@ func runCLITestGit(t *testing.T, repo string, args ...string) {
 		return
 	}
 	cmd := exec.Command("git", cmdArgs...)
+	cmd.Env = gitutil.CleanEnv(os.Environ())
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %s failed: %v\n%s", strings.Join(cmdArgs, " "), err, string(output))
@@ -6198,6 +11371,69 @@ type relayFlushAckSabotageWriter struct {
 	sabotaged bool
 }
 
+type errWriter struct{}
+
+func (errWriter) Write([]byte) (int, error) {
+	return 0, errors.New("writer closed")
+}
+
+type partialFailingWriter struct {
+	buf          bytes.Buffer
+	writes       int
+	failOnWrite  int
+	partialBytes int
+	err          error
+}
+
+func (w *partialFailingWriter) Write(p []byte) (int, error) {
+	w.writes++
+	if w.writes == w.failOnWrite {
+		n := w.partialBytes
+		if n < 0 {
+			n = 0
+		}
+		if n > len(p) {
+			n = len(p)
+		}
+		if n > 0 {
+			_, _ = w.buf.Write(p[:n])
+		}
+		if w.err != nil {
+			return n, w.err
+		}
+		return n, errors.New("partial write failed")
+	}
+	return w.buf.Write(p)
+}
+
+func (w *partialFailingWriter) String() string {
+	return w.buf.String()
+}
+
+func beginCLISQLiteImmediateLock(t *testing.T, ctx context.Context, path string) (*sql.DB, *sql.Conn) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open sqlite lock db: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.ExecContext(ctx, `PRAGMA busy_timeout = 1`); err != nil {
+		_ = db.Close()
+		t.Fatalf("set sqlite lock busy timeout: %v", err)
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("open sqlite lock conn: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		_ = conn.Close()
+		_ = db.Close()
+		t.Fatalf("begin sqlite immediate lock: %v", err)
+	}
+	return db, conn
+}
+
 func (w *relayFlushAckSabotageWriter) Write(p []byte) (int, error) {
 	if _, err := w.buf.Write(p); err != nil {
 		return 0, err
@@ -6284,6 +11520,27 @@ func validDispatchReport() reporter.Report {
 		},
 		Verified: true,
 	}
+}
+
+func waitForDetachedReceiptCount(t *testing.T, ctx context.Context, repo, projectID, runID string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		store, _, err := openDetachedStore(ctx, repo, Deps{})
+		if err != nil {
+			t.Fatalf("open detached store while waiting receipts: %v", err)
+		}
+		receipts, err := progress.ListReceipts(ctx, store, progress.ListFilter{ProjectID: projectID, DeliveryRunID: runID, Limit: 50})
+		_ = store.Close()
+		if err != nil {
+			t.Fatalf("list detached receipts while waiting: %v", err)
+		}
+		if len(receipts) >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d detached receipts", want)
 }
 
 func validDispatchResult(record reporter.Report) worker.Result {
@@ -6443,6 +11700,15 @@ func cliLabels(names []string) []gh.Label {
 		labels = append(labels, gh.Label{Name: name})
 	}
 	return labels
+}
+
+func containsPrefix(values []string, prefix string) bool {
+	for _, value := range values {
+		if strings.HasPrefix(value, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func cliApplyLabelChanges(labels []gh.Label, addLabels, removeLabels []string) []gh.Label {

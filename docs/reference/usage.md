@@ -12,29 +12,24 @@ GitHub, git worktrees, worker providers, and PR review.
 
 Use this flow to onboard an existing repository from zero to a driven
 loopcoder loop. One installed binary can serve many local repositories. Each
-repository keeps its own `.delivery.yml`; in v0.7.0 candidate builds,
-registered projects write new runtime payloads under `$LOOPCODER_HOME`
+repository keeps its own `.delivery.yml`; in v0.8.0, registered projects write
+new runtime payloads under `$LOOPCODER_HOME`
 instead of under the repository.
 
 Per-project prerequisites: `git`, authenticated `gh`, at least one
 authenticated provider CLI (`codex` and/or `claude`), and a GitHub remote with
 push access.
 
-1. Install the v0.6.1 binary once per machine, shared across all local
-   projects.
-
-   Unix-like systems:
+1. Install the v0.8.0 binary once per supported macOS Apple Silicon machine,
+   shared across all local projects.
 
    ```text
-   curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.6.1
+   curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.0
    ```
 
-   Windows PowerShell:
-
-   ```text
-   $env:LOOPCODER_VERSION = "0.6.1"
-   irm https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.ps1 | iex
-   ```
+   Windows, Linux, WSL, containers, and Intel macOS are not supported by the
+   v0.8.0 installer. Users who need those hosts should remain on the historical
+   v0.7.0 release.
 
    The installer puts `loopcoder` under `~/.loopcoder/bin`. Keep that directory
    on `PATH`, or set `LOOPCODER_BIN` to the full binary path.
@@ -90,7 +85,7 @@ push access.
    ```
 
    The conductor plans the work, dispatches workers, runs `loopreview`, and
-   reports promotion status. New v0.6.1 scaffolds use `human-merge`; projects
+   reports promotion status. New v0.8.0 scaffolds use `human-merge`; projects
    can opt into automatic production promotion with `loopcoder init --repo .
    --gate auto` or an explicit config edit.
 
@@ -103,11 +98,13 @@ Command side effects in the first-run path:
 | `loopcoder doctor --repo .` | Read-only diagnostics in the first-run path; use `--format json` for the machine-readable form. |
 | `loopcoder report --repo .` | Read-only local report query. |
 | `loopcoder status --repo .` | Read-only local run status. |
+| `loopcoder attach --repo . --run <run-id>` | Read-only durable detached run progress follow. |
+| `loopcoder cancel --repo . --run <run-id>` | Requests cancellation for a LoopCoder-owned detached run. |
 | `loopcoder state push --repo .` | Explicitly writes run summaries to the dedicated state branch. |
 | `loopcoder promote --repo .` | May change the configured production branch, subject to `adapters.gate` and the human command that invokes promotion. |
 
-v0.7.0 candidate binaries add an optional registry and migration step after
-`doctor`, but those commands are not part of the v0.6.1 stable quickstart:
+Register each checkout after the read-only first doctor pass, then preview any
+legacy repo-local import before applying it:
 
 ```text
 loopcoder projects register --repo .
@@ -124,7 +121,7 @@ identity links, run history, reports, legacy import records, and import status.
 `.loopcoder/` records into machine-local storage; it does not delete or rewrite
 those files.
 
-For registered v0.7.0 projects, new attempts, events, reports, relay records,
+For registered v0.8.0 projects, new attempts, events, reports, relay records,
 recovery briefs, lifecycle records, logs, and temporary worker scratch space
 are machine-local under `$LOOPCODER_HOME/projects/<project_id>/`,
 `$LOOPCODER_HOME/logs/`, and `$LOOPCODER_HOME/tmp/`. Repo-local `.loopcoder/`
@@ -142,40 +139,34 @@ default.
 - At least one supported provider CLI on `PATH`. `codex` is the default worker,
   `codex` and `claude` are verified worker and verifier providers, and
   `agy` is the Google Antigravity CLI used by provider key `antigravity`.
-  The older direct `gemini` worker adapter remains experimental and is not part
+  `grok` is the xAI worker provider and discovers its model catalog dynamically;
+  the older direct `gemini` worker adapter remains experimental and is not part
   of the static model registry.
 - A GitHub repository with a configured remote.
-- For the no-Go installer: `curl`, `tar`, `cosign`, and `sha256sum` or
-  `shasum` on Unix-like systems, or PowerShell and cosign on Windows. The
-  install scripts verify signed `SHA256SUMS` before trusting checksums. Go is
-  optional for developer installs and local source builds.
+- For the no-Go installer on native macOS Apple Silicon: `curl`, `tar`,
+  `cosign`, and `sha256sum` or `shasum`. The installer verifies signed
+  `SHA256SUMS` before trusting checksums. Go is optional for developer installs
+  and local source builds.
 
 ## Install
 
-The supported consumer distribution is GitHub Releases. Tagged releases publish
-Windows, macOS, and Linux archives for `amd64` and `arm64`, plus `SHA256SUMS`
-and signature material. The install scripts select the matching release asset,
-verify the `SHA256SUMS` signature with cosign before trusting checksums, install
-under `~/.loopcoder/bin`, and update or print PATH instructions. The scripts
-do not require Go.
-
-On Unix-like systems:
-
-```text
-curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.6.1
-```
-
-To choose a different release, replace `0.6.1` with the desired version.
-
-On Windows PowerShell:
+The supported v0.8.0 consumer distribution is GitHub Releases on native macOS
+Apple Silicon only. Tagged v0.8.0 releases publish
+`loopcoder_<version>_darwin_arm64.tar.gz`, plus `SHA256SUMS` and signature
+material. The installer rejects unsupported hosts before release lookup,
+download, temporary directory creation, install directory creation, binary
+replacement, or PATH/profile mutation. On the supported host, it verifies the
+`SHA256SUMS` signature with cosign before trusting checksums, installs under
+`~/.loopcoder/bin`, and updates or prints PATH instructions. The installer does
+not require Go.
 
 ```text
-$env:LOOPCODER_VERSION = "0.6.1"
-irm https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.ps1 | iex
+curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.0
 ```
 
-To choose a different release on Windows, set `LOOPCODER_VERSION` to the
-desired version before invoking the installer.
+To choose a different supported v0.8.x release, replace `0.8.0` with the
+desired version. v0.7.0 remains the final legacy multi-platform release for
+Windows, Linux, WSL, containers, and Intel macOS.
 
 After installation, confirm the selected binary:
 
@@ -186,7 +177,7 @@ loopcoder version
 `go install` remains available for users who already have Go:
 
 ```text
-go install github.com/jasonhnd/loopcoder/cmd/loopcoder@v0.6.1
+go install github.com/jasonhnd/loopcoder/cmd/loopcoder@v0.8.0
 ```
 
 From a source checkout, you can also build a development binary locally:
@@ -206,7 +197,7 @@ The conductor resolves the `loopcoder` binary before running mechanical work:
 
 1. `LOOPCODER_BIN` when set.
 2. `loopcoder` found on `PATH`.
-3. Otherwise, `loopcoder` is required on all platforms.
+3. Otherwise, `loopcoder` is required on the supported Darwin arm64 host.
 
 Use the resolved binary for dispatch, ready-set scheduling, status reporting,
 resume, recovery, local verification, state, and lease operations.
@@ -239,11 +230,11 @@ step before a delivery or merge turn can finish. The old
 alias during the reporter transition.
 `loopcoder hook conductor-relay-guard` enforces local visible relay of Worker
 and Verifier reports from `loopcoder dispatch`, `loopcoder dispatch-wave`,
-and `loopcoder loopreview`. Do not redirect, hide, or suppress `dispatch` or
-`loopreview` stderr, and keep foreground `dispatch-wave` stdout visible because
-each Worker pretty block streams there as that Worker completes. The relay guard
-covers Bash, PowerShell, and pwsh tool events and treats backgrounded command
-output as pending until the block is surfaced.
+and `loopcoder loopreview`. Do not redirect, hide, or suppress foreground
+`dispatch` or `loopreview` stderr, and keep foreground `dispatch-wave` stdout
+visible because each Worker pretty block streams there as that Worker completes.
+The relay guard covers Bash, PowerShell, and pwsh tool events and treats
+backgrounded command output as pending until the block is surfaced.
 
 The Go binary also hard-gates mechanical progress while pending local relay
 blocks are unacknowledged. A gated command exits with reserved code `4`, prints
@@ -260,13 +251,18 @@ loopcoder status --repo . --run <run-id>
 ```
 
 When `--run` is omitted, `status` selects the latest modified local run. The
-text output includes a readable local run status. In the v0.7.0 candidate,
+text output includes a readable local run status. Since v0.7.0,
 `status --format json` also exposes the additive `run_tree` object for machine
 consumers. Each node includes `project_id`,
 `run_id`, `parent_run_id`, `child_run_ids`, issue/PR metadata when observed,
 role, provider, model, effort, permission, claim owner/lease fields, lifecycle
 status/source, timestamps, last error, and report summary when those fields are
 present in local records.
+When provider-native children are registered, JSON output also includes an
+additive `agent_tree` object from machine-local SQLite. That tree, not opaque
+provider session state, is the restart/replay authority for child agent IDs,
+parent/run/task/attempt references, budget reservation IDs, ownership locks,
+claim generation, registration state, and federation fingerprints.
 The output is read-only and local-only: for registered projects it reads the
 global project payload root first, then legacy repo-local `.loopcoder/` only as
 a compatibility fallback. It must not be copied into PR bodies, issues,
@@ -537,6 +533,8 @@ loopcoder version=<version> commit=<commit> date=<build-date> go=<go-version> pl
 loopcoder doctor --repo .
 loopcoder doctor --repo . --format text
 loopcoder doctor --repo . --format json
+loopcoder providers refresh --repo .
+loopcoder providers refresh --repo . --format json
 ```
 
 It reports `[info]`, `[ok]`, `[warn]`, or `[fail]` checks for:
@@ -544,7 +542,7 @@ It reports `[info]`, `[ok]`, `[warn]`, or `[fail]` checks for:
 - `git` on `PATH`;
 - `gh` on `PATH` and `gh auth status`;
 - `.delivery.yml` presence and parse validity;
-- configured worker and verifier provider CLI availability;
+- configured worker and verifier provider CLI installation inventory;
 - repository `origin` and detectable default branch;
 - selected loopcoder binary path, version, commit, date, and release or
   development track;
@@ -560,7 +558,9 @@ It reports `[info]`, `[ok]`, `[warn]`, or `[fail]` checks for:
 - reportquery readability for local report/run/relay records;
 - storage permissions, storage health, and the current checkout's
   machine-local project registry identity, including ambiguity warnings;
-- migration status and nested run tree health for parent/child run records;
+- migration status, including concrete legacy surface identifiers,
+  classifications, and per-surface remediation when migration warnings are
+  present, plus nested run tree health for parent/child run records;
 - project Claude Code conductor hook settings, warning when the
   `loopcoder hook conductor-reporter` or `loopcoder hook conductor-relay-guard`
   command is missing or when `loopcoder` does not resolve on `PATH`;
@@ -568,31 +568,31 @@ It reports `[info]`, `[ok]`, `[warn]`, or `[fail]` checks for:
   `generic-local`) and conductor runtime responsibility, which remains
   user-provided by the active host.
 
-Provider authentication is reported only where loopcoder has a stable cheap
-probe. Today `doctor` checks `gh` authentication and provider CLI presence; it
-does not invent provider-authentication status when the provider has no stable
-probe.
+Provider installation is separate from provider authentication. Today `doctor`
+checks `gh` authentication and bounded provider CLI installation inventory; it
+does not infer provider-authentication status, account readiness, model
+authorization, quota, invocation readiness, or usable capacity from an installed
+CLI.
 
-On Unix-like systems, v0.7.0 creates and tightens `$LOOPCODER_HOME` and
-`$LOOPCODER_HOME/data` with owner-only directory permissions, and
+On the supported Darwin arm64 host, v0.8.0 creates and tightens
+`$LOOPCODER_HOME` and `$LOOPCODER_HOME/data` with owner-only directory
+permissions, and
 `$LOOPCODER_HOME/data/loopcoder.db` plus SQLite `-wal` and `-shm` sidecars with
 owner-only file permissions. The storage layer refuses symlink and non-regular
 database paths before chmod or SQLite open. `doctor --repo .` reports insecure
 existing modes without repairing them; `doctor --repo . --fix` tightens those
 paths in place without deleting or recreating the database.
 
-On Windows, v0.7.0 does not implement owner-only DACL hardening. The storage
-path is still resolved under the user profile or `LOOPCODER_HOME`, and unsafe
-symlink/non-regular storage paths are refused, but `doctor` warns that
-owner-only ACL protection is not enforced and `doctor --fix` cannot repair it in
-this version.
+Windows, Linux/Ubuntu, WSL, containers used as a LoopCoder runtime, Intel
+macOS, and Rosetta/amd64 macOS fail the v0.8.0 startup gate before storage is
+opened or migrated. v0.7.0 remains the historical fallback for those hosts.
 
 `doctor --format json` emits a stable support surface:
 
 ```json
 {
   "repo_path": "/absolute/repo",
-  "version": "0.6.1",
+  "version": "0.8.0",
   "commit": "abc123",
   "date": "2026-07-08T00:00:00Z",
   "exit_code": 0,
@@ -607,9 +607,9 @@ this version.
   "runtime": {
     "home_dir": "/home/user/.loopcoder",
     "database": {
-      "path": "/home/user/.loopcoder/data/loopcoder.db",
+      "path": "/Users/example/.loopcoder/data/loopcoder.db",
       "exists": true,
-      "schema_version": 5,
+      "schema_version": 30,
       "status": "ok",
       "message": "storage database is healthy"
     },
@@ -636,6 +636,21 @@ this version.
       "message": "run tree readable; 1 run(s), no nested edges"
     }
   },
+  "provider_inventory": {
+    "schema_version": "loopcoder.provider_inventory_json.v1",
+    "generated_at": "2026-07-12T00:00:00Z",
+    "inventory_fingerprint": "sha256:...",
+    "confidence": "exact",
+    "installations": [],
+    "probe_results": [],
+    "account_profiles": [],
+    "auth_readiness": [],
+    "model_catalog_snapshots": [],
+    "model_capabilities": [],
+    "quota_telemetry_sources": [],
+    "quota_snapshots": [],
+    "gap_reasons": []
+  },
   "checks": [
     {
       "name": "local-state exclude",
@@ -647,6 +662,158 @@ this version.
   ]
 }
 ```
+
+`loopcoder providers refresh --repo .` explicitly persists the same
+ProviderInstallation, ProbeResult, AccountProfile, AuthReadiness,
+ModelCatalogSnapshot, ModelCapability, QuotaTelemetrySource, and QuotaSnapshot
+inventory to the machine-local SQLite store. Refreshes append immutable probe
+history, immutable catalog snapshots, and immutable quota snapshots, and mark
+disappeared installations stale instead of deleting them. Probe and quota
+diagnostic output is bounded and redacted, raw absolute paths and profile
+references are redacted or hashed in JSON/human output, and command execution
+uses fixed argv arrays, no shell interpolation, and an explicit non-credential
+environment allowlist.
+The allowlist carries location and platform variables required by provider
+script shims, including Windows
+`LOCALAPPDATA`, `APPDATA`, `ProgramData`, `ProgramFiles`, `SystemRoot`,
+`ComSpec`, `PSModulePath`, `PATH`, `PATHEXT`, `TEMP`, `TMP`, `HOME`,
+`USERPROFILE`, `OS`, `PROCESSOR_ARCHITECTURE`, and Unix `TMPDIR`, `LANG`, and
+`LC_ALL`. A denylist still removes any variable whose name contains `key`,
+`secret`, `token`, `password`, `credential`, or `auth`.
+
+Auth readiness is independent of installation. Provider-supported readiness
+commands may produce `ready`, `not-authenticated`, `expired`, or `unknown`;
+unsupported providers return `unknown` with `auth-readiness-unsupported`.
+The built-in declarations are credential-blind: Codex runs local status text
+via `codex login status`; Claude runs local machine-readable status via
+`claude auth status --json`; Gemini checks only declared auth artifact and
+environment-name existence, so validity stays `unknown`; Antigravity declares
+`agy models` as network-capable and the probe is skipped by default.
+Readiness records can reference multiple credential-blind account profiles,
+using deterministic `acct_` IDs from the adapter, source, and reference hash.
+Profile displays are built only from allowlisted status structure such as a
+redacted email or short handle after a marker like `profile` or `as`; otherwise
+they fall back to `profile-<hash>`. If displays collide, policy must select the
+opaque account profile ID rather than display text. The implementation does not
+emit `expires_at` today because no current adapter exposes a credential-blind
+machine-readable expiry field.
+
+Network-declared auth probes are skipped by default. For example,
+Antigravity's `agy models` auth probe is persisted as an auth-readiness
+ProbeResult with `network_declared: true`, `network_permission: "denied"`, and
+`gap_reasons: ["network-permission-denied"]`; the matching AuthReadiness record
+is `unknown` and no network I/O is attempted.
+
+Model catalog snapshots are captured from LoopCoder-owned static declarations
+by default. Each ModelCapability records the exact snapshot ID, canonical model
+ID, aliases, lifecycle state, availability state, runtime capability fields
+(`read_only`, `json_output`, `nested_subagents`, `mcp_config`, `cancellation`,
+and `token_usage_reporting`), freshness, confidence, and entry provenance.
+Static catalog availability stays `unknown` because registry membership does
+not prove account authorization or quota. Catalog listing commands that may
+hit the network, such as Antigravity's `agy models`, are recorded as skipped
+with an explicit `network-permission-denied` gap unless a future permission path
+grants network access.
+
+Quota telemetry is allowlist-only. Supported source declarations are limited to
+official machine-readable provider APIs, official fixed-argv CLI JSON/status
+commands, documented provider export files, LoopCoder's local ledger, operator
+policy overlays, and fixtures. Private web UI scraping, copied browser cookies,
+reverse-engineered endpoints, credential-file parsing, shell interpolation, and
+environment value inspection are rejected instead of treated as best effort.
+When no current provider exposes a safe machine-readable quota source,
+`doctor` and JSON output still include a QuotaSnapshot with `confidence:
+"unavailable"`, `freshness_state: "not-applicable"`, `reset_semantics:
+"unknown"`, and `gap_reasons` such as `unsupported-source` and
+`not-collected`; this is intentional and must not be rendered as exact quota.
+Telemetry commands that declare possible network are skipped unless an explicit
+future policy grants network permission, producing typed `network-denied`
+evidence rather than performing network I/O.
+
+Operators can add explicit executable locations without scanning a disk:
+
+```yaml
+provider_inventory:
+  executables:
+    custom-provider:
+      - /opt/custom-provider/bin/custom-provider
+  profile_selection:
+    custom-provider: acct_abcdefghijklmnopqrstuvwxyz123456
+```
+
+Those paths are checked before PATH entries and rendered with
+`discovery_source: "explicit-config"` and redacted path output. Profile
+selection pins use opaque `acct_` IDs from prior inventory output; they are not
+display labels and do not copy provider config.
+
+`loopcoder doctor --repo . --format json` includes a `quota_usage_budget` root
+object. It summarizes the machine-local usage ledger and, when the persisted
+ledger has no rows for the project, conservatively derives a bounded summary
+from the same local report surfaces used by `loopcoder report`: imported
+reports, run attempt files, run JSON/JSONL records, relay ledgers, and pending
+relay records. That fallback is marked with gap reasons such as
+`persisted-ledger-empty`, `derived-from-reports-fallback`, and
+`loopcoder-local-ledger-not-provider-global`. It is local evidence only and
+must not be read as provider-global remaining quota.
+
+`loopcoder status --repo . --format json` includes `inventory_refs` and
+`quota_usage_refs`, not full raw inventory, quota, or usage history. When the
+selected run has local report usage, `quota_usage_refs.usage_record_ids` lists
+deterministic usage ledger record IDs and the confidence remains conservative
+because local reports do not cover work outside LoopCoder. Until a DeliveryRun
+binds inventory or quota records, unrelated arrays are empty and confidence is
+`unknown`.
+
+Hierarchical budget accounting is also machine-local. Budget policies can be
+recorded for machine, project, DeliveryRun, task, worker, sub-agent, and
+provider/account/model scopes, with `parent_budget_policy_ids` preserved for
+audit inheritance. A reservation checks every applicable policy in its supplied
+scope chain inside one SQLite `BEGIN IMMEDIATE` transaction, then either
+reserves the full requested value at every level or persists a typed refusal
+such as `ErrBudgetExhausted` without changing any aggregate. Hard ceiling
+breaches refuse the reservation. Soft ceiling breaches are explicit:
+`warn-only` reservations proceed with soft-breach gap reasons, while
+`requires-approval` breaches return `ErrBudgetApprovalRequired` unless the
+request includes an approval id. Commits, releases, cancellations, and stale
+lease expiry are generation-fenced; replay still checks the current generation
+before returning `replay: true` so stale callers cannot hide behind an old
+operation key.
+
+`doctor --format json` renders budget state under
+`quota_usage_budget.budget_summary[]`. Each summary includes the policy id,
+scope, quantity, effective ceiling, reserved value, committed value, available
+value, confidence, policy version, active reservation ids, denial code when
+present, soft-overflow gap reasons, and approval/override provenance. Budget
+reservation records use ids derived from
+`idempotency_key`, `budget_policy_id`, and `requester_id`, and persist
+`requester_id`, `authorization_fingerprint`, source estimate usage record ids,
+commit usage record ids, and release usage record ids for audit.
+
+Unknown or estimated requirements do not silently consume budget. Exact local
+accounting can reserve directly; estimated requirements require an explicit
+approval id and are marked with conservative gap reasons. Budget override or
+approval only changes accounting policy and is not a permission, safety, or
+provider-auth override.
+
+For a local zero-network smoke check, use:
+
+```text
+loopcoder budget smoke --repo . --project-id <project-id> --ceiling 100 --reserve 40 --commit 25 --format json
+```
+
+The command creates machine and project hard budget policies in the
+machine-local store by default, reserves capacity, commits observed usage,
+releases the unused reservation balance, and prints the resulting JSON
+accounting summary. Use `--policy-mode soft --overflow-behavior warn-only` to
+exercise soft-budget warning paths; text output prints budget warnings, and JSON
+output includes the same `gap_reasons`. Reusing the same `--idempotency-key`
+replays the same operation keys instead of reserving, committing, or releasing
+twice.
+
+When legacy migration surfaces are present, `runtime.migration.surfaces[]` and
+the `migration status` check's `legacy_surfaces[]` entries include `surface`,
+`identifier`, `classification`, `remediation`, and, where applicable, `legacy`,
+`current`, `location`, `detail`, and `conflict`.
 
 ## Security Audit
 
@@ -683,11 +850,15 @@ loopcoder models
 loopcoder models --provider codex
 loopcoder models --provider claude
 loopcoder models --provider antigravity
+loopcoder models --provider grok
 ```
 
 The registry provider key for Google Antigravity is `antigravity`; `agy` is the
 CLI executable name. `loopcoder models --provider agy` exits non-zero and hints
-to use `--provider antigravity`.
+to use `--provider antigravity`. Grok intentionally has no fabricated static
+model row: `loopcoder models --provider grok` identifies dynamic inventory, and
+`providers refresh` records the bounded catalog evidence available from the
+installed `grok` CLI.
 
 Worker and Verifier model selection is role-scoped. For each role, provider
 comes from the command flag, then `.delivery.yml` (`adapters.worker` or
@@ -705,6 +876,7 @@ The initial registry defaults are:
 | `codex` | `codex` | `gpt-5.5` | `high` |
 | `claude` | `claude` | `claude-opus-4-8[1m]` | `max` |
 | `antigravity` | `agy` | `Gemini 3.1 Pro` | `High` |
+| `grok` | `grok` | dynamic provider inventory | provider default |
 
 Configured model and depth values are exact and case-sensitive. By default,
 invalid provider, model, or depth selections warn and keep the selected
@@ -748,12 +920,15 @@ Antigravity setup uses the Google Antigravity CLI:
 ```text
 agy login
 agy models
+loopcoder providers refresh --repo .
 loopcoder doctor --repo .
 ```
 
 When the configured Worker or Verifier provider is `antigravity`, `doctor`
-looks for executable `agy` and runs `agy models` as a bounded OAuth readiness
-probe. The Antigravity Worker invocation uses this argv shape after
+and `providers refresh` look for executable `agy` through bounded installation
+probes and then record declared network auth/catalog probes as skipped by
+default. Auth readiness and model availability are never inferred from
+installation evidence. The Antigravity Worker invocation uses this argv shape after
 registry/default resolution:
 
 ```text
@@ -778,8 +953,7 @@ Documentation and code are intentionally not bundled in the same issue or PR.
 ## Binary Commands
 
 Use the native `loopcoder` commands as the helper interface. The stable
-inventory below matches the v0.6.1 binary installed by the current release
-commands:
+inventory below matches v0.8.0:
 
 ```text
 loopcoder version
@@ -791,6 +965,12 @@ loopcoder doctor --repo . --format json
 
 loopcoder models
 loopcoder models --provider antigravity
+loopcoder models --provider grok
+
+loopcoder providers refresh --repo .
+loopcoder providers refresh --repo . --format json
+
+loopcoder budget smoke --repo . --project-id <project-id> --format json
 
 loopcoder audit --repo . --layer sast
 loopcoder audit --repo . --layer all --provider claude --strict
@@ -814,7 +994,8 @@ loopcoder dispatch \
   --issue-title "<title>" \
   --issue-body "<body>" \
   --base-branch main \
-  --provider codex
+  --provider codex \
+  --foreground
 
 loopcoder dispatch \
   --repo . \
@@ -822,17 +1003,28 @@ loopcoder dispatch \
   --issue-title "<title>" \
   --provider codex \
   --strict \
-  --pretty
+  --pretty \
+  --foreground
+
+loopcoder dispatch \
+  --repo . \
+  --issue-number <number> \
+  --issue-title "<title>" \
+  --detach
 
 loopcoder dispatch-wave --repo . --base-branch main --issue-numbers <n1>,<n2> --strict
+loopcoder dispatch-wave --repo . --base-branch main --issue-numbers <n1>,<n2> --strict --foreground
 
 loopcoder tick --repo . --strict
+loopcoder tick --repo . --strict --foreground
 loopcoder trigger goal-loop --repo . --max-iterations <n> --strict
 loopcoder promote --repo .
 
 loopcoder status --repo .
 loopcoder status --repo . --run <run-id>
 loopcoder status --repo . --format json
+loopcoder attach --repo . --run <run-id>
+loopcoder cancel --repo . --run <run-id>
 loopcoder report --repo .
 loopcoder report --repo . --verbose
 loopcoder report --repo . --format json
@@ -878,7 +1070,7 @@ loopcoder state pull --repo .
 loopcoder lease acquire --repo . --run-id <run-id>
 loopcoder lease release --repo . --run-id <run-id>
 
-loopcoder upgrade --version 0.6.1
+loopcoder upgrade --version 0.8.0
 
 loopcoder hook conductor-reporter
 loopcoder hook conductor-relay-guard
@@ -887,9 +1079,8 @@ loopcoder kill --repo . --run <run-id>
 loopcoder kill --repo . --all
 ```
 
-The v0.7.0 candidate adds these commands and output forms. Use them only from a
-source build or staged v0.7.0 candidate binary until the signed v0.7.0 release
-is published:
+Machine-local registry, migration, nested-run, and DeliveryRun commands are
+part of the v0.8.0 command surface:
 
 ```text
 loopcoder projects register --repo .
@@ -901,21 +1092,55 @@ loopcoder migrate local-state --repo . --dry-run
 loopcoder migrate local-state --repo .
 loopcoder migrate local-state --repo . --format json
 
+loopcoder migrate storage --format text
+loopcoder migrate storage --format json
+loopcoder migrate storage --apply --format json
+
 loopcoder nested run --repo . --plan child-plan.json --provider codex --format json
 
 loopcoder status --repo . --format json
 loopcoder report --repo . --run <run-id> --format json
+
+loopcoder delivery plan --project-id <project-id> --run-id <run-id> --format json
+loopcoder delivery decide --project-id <project-id> --run-id <run-id> --action approve --expected-authorization-fingerprint <sha256:...>
+loopcoder delivery continue --project-id <project-id> --run-id <run-id> --expected-authorization-fingerprint <sha256:...>
 ```
 
 `hook` is for host hook integration rather than normal customer workflow.
 `discover`, `compile`, `trigger`, `state`, `lease`, `ps`, and `kill` are
-advanced/operator commands in v0.6.1. `projects`, `migrate`, and `nested` are
-v0.7.0 candidate commands before the v0.7.0 release is published. `state push`
-is the explicit
-state-branch publish path; `kill` only targets loopcoder-managed processes for
+advanced/operator commands. `state push` is the explicit state-branch publish
+path; `delivery` is the v0.8.0 approval-gating surface for DeliveryRun records;
+`kill` only targets loopcoder-managed processes for
 a run or repository and should not be used as a bare process-name terminator.
 
-### Nested Child Plans (v0.7.0 Candidate)
+### DeliveryRun Approval Gates (v0.8.0)
+
+`loopcoder delivery` is the host-safe v0.8 DeliveryRun approval surface for
+terminal users and JSON callers. It works against the machine-local storage
+database and takes explicit `--project-id` plus `--run-id` selectors.
+
+`loopcoder delivery plan` is side-effect-free at the DeliveryRun layer: it reads
+the persisted run, task, and dependency rows and returns a fingerprinted
+proposal without launching providers, dispatching workers, mutating worktrees,
+editing GitHub, changing credentials, or writing DeliveryRun rows. The response
+contains `input_fingerprint`, `policy_fingerprint`, `plan_fingerprint`, and
+`authorization_fingerprint`; callers should pass the authorization fingerprint
+back to `decide` and `continue` with
+`--expected-authorization-fingerprint`.
+
+`loopcoder delivery decide` records a fingerprint-bound decision in one write
+transaction. Supported actions are `approve`, `reject`, `edit`, `expire`, and
+`supersede`. An approval is valid only for the exact current proposal
+fingerprint; changed task requirements, scope, dependency graph, policy inputs,
+or run intent produce `ErrStaleApproval` and require a fresh `plan` response
+and decision.
+
+`loopcoder delivery continue` is approval-gated. It verifies that the current
+proposal still matches the expected fingerprint, that an active approval exists
+and is not expired, and only then advances the DeliveryRun to a schedulable
+state. It does not dispatch workers or launch providers.
+
+### Nested Child Plans
 
 `loopcoder nested run` is the supported boundary for v1 nested orchestration:
 
@@ -978,6 +1203,9 @@ remote provider.
   local-only Worker/Verifier blocks. Run `loopcoder relay flush --repo <path>`
   to print and acknowledge them, or `loopcoder relay list --repo <path>` to
   inspect without clearing.
+- `loopcoder delivery decide` and `loopcoder delivery continue` reserve `10`
+  for pending or expired approval, `11` for stale plan or stale approval, `12`
+  for rejection, and `13` for deterministic policy denial.
 
 ## Verifier Provider Status
 
@@ -1027,17 +1255,18 @@ the incomplete-report finding. Antigravity is a provider-scoped exception:
 Worker records use the selected `agy --model` string, such as `Gemini 3.1 Pro
 (High)`, as `model_source: self-reported` and accept absent token usage.
 Reporter surfaces are local-only:
-`dispatch` / `loopreview` stderr pretty blocks, foreground `dispatch-wave`
-stdout Worker pretty blocks, `dispatch` / `loopreview` result JSON, and
+foreground `dispatch` / `loopreview` stderr pretty blocks,
+`dispatch-wave --foreground` stdout Worker pretty blocks, `dispatch` /
+`loopreview` result JSON, and
 gitignored `.loopcoder/` run records. PR bodies, merge commits, and merge
 comments are not reporter surfaces and must not contain `[reporter]` headers
 or canonical JSON.
 
-## Local State Migration (v0.7.0 Candidate)
+## Local State And Storage Migration
 
 `loopcoder migrate local-state --repo .` imports v0.6.x repo-local
 `.loopcoder/` attempts, events, reports, recovery briefs, and relay records into
-the v0.7.0 machine-local SQLite store under `$LOOPCODER_HOME/data/loopcoder.db`.
+the machine-local SQLite store under `$LOOPCODER_HOME/data/loopcoder.db`.
 Use `--dry-run` first to scan the same sources and report the records that would
 be imported without registering the project or writing the database.
 
@@ -1060,13 +1289,39 @@ state, are not imported by `migrate local-state`, and an audit-only
 `.loopcoder/audit/` directory does not make `loopcoder doctor --repo .` require
 a local-state migration.
 
-To back up the v0.7.0 runtime state, copy `$LOOPCODER_HOME/data/loopcoder.db`
+To back up the v0.8.0 runtime state, copy `$LOOPCODER_HOME/data/loopcoder.db`
 and, when present, `$LOOPCODER_HOME/projects/`, `$LOOPCODER_HOME/logs/`, and
 `$LOOPCODER_HOME/tmp/` while no loopcoder command is running. To remove the
 machine-local runtime state completely, delete those same paths; the next
 loopcoder command recreates storage as needed. Removing machine-local runtime
 state does not delete repo-local `.loopcoder/` history, and deleting
 repo-local `.loopcoder/` is still a manual user action outside migration.
+
+Before any stateful v0.8.0 command opens v0.7 machine-local state, run
+`loopcoder migrate storage --format json`. Planning is the default and does not
+create or modify files. After reviewing the schema-9-to-schema-30 steps and
+rollback contract, stop all LoopCoder processes and run `loopcoder migrate
+storage --apply --format json`. The migration captures and verifies an
+owner-only schema-9 backup before the write transaction, then applies versions
+10 through 30 atomically. Repeated application is a `no-op`.
+See [`storage-migration.md`](storage-migration.md) for the exact backup,
+failure, and offline rollback contract. Backup images are local runtime state
+only: do not copy them into repositories, PR bodies, issue comments, commits,
+or tracked fixtures.
+
+The schema-v10 migration preserves legacy run identity but does not infer an
+approved v0.8 plan, approval, override, or plan fingerprint from logs or issue
+titles. Legacy non-terminal execution claims that cannot prove whether provider
+side effects launched are imported as `needs-human` with
+`ErrAmbiguousLegacyState`; inspect the legacy run, claim, provider receipt, and
+recovery context before continuing.
+
+Opening a database older than schema 16 with a v0.8 planner-capable binary also
+adds `task_requirements` and `task_requirement_overrides`. Operators can inspect
+these rows through future routing/status surfaces; until then they are local
+planner evidence. User corrections are stored as scoped overrides and are
+revalidated every time a later classification applies them, so corrections that
+would lower deterministic risk, permission, or side-effect floors fail closed.
 
 `loopcoder report` is the read-only query surface for those local records:
 
@@ -1337,13 +1592,34 @@ Design rationale: [`../specs/0567-reporter.md`](../specs/0567-reporter.md),
 [`../specs/0306-local-only-attestation.md`](../specs/0306-local-only-attestation.md),
 and [`../specs/0316-conductor-local-enforcement.md`](../specs/0316-conductor-local-enforcement.md).
 
+## Troubleshooting v0.8.0
+
+| Symptom | Meaning | Safe next action |
+| --- | --- | --- |
+| Exit `78` with `ErrUnsupportedPlatform` | The host is not native `darwin/arm64`; no startup side effect was allowed. | Use v0.7.0 on that host or move the v0.8.0 work to Apple Silicon macOS. Do not bypass the platform gate. |
+| `migrate storage` reports pending steps | A v0.7 schema-9 database has not been upgraded. | Stop all LoopCoder processes, save the JSON plan, then run `loopcoder migrate storage --apply --format json`. |
+| Migration apply fails | The write transaction did not reach a verified current schema. | Preserve the database, backup, and diagnostic; fix disk/path/permission conditions and rerun. Never edit `PRAGMA user_version` manually. |
+| A detached run appears quiet | The provider may be running, queued, waiting, or unable to deliver a host notification. | Run `loopcoder status --repo . --run <id>`, `loopcoder attach --repo . --run <id>`, and `loopcoder ps --repo .`. Active work should have no durable progress gap over five minutes. |
+| Recovery sees live or ambiguous provider authority | Redispatch could duplicate useful work or target a reused PID. | Keep the existing run, inspect `status`/`ps`, and follow the `needs-human` action. Do not launch another provider manually. |
+| Quota is unavailable or stale | The installed provider did not expose a supported fresh source, or network permission was not granted. | Run `loopcoder providers refresh --repo . --format json`; inspect gap reasons and reset evidence. LoopCoder will not guess capacity. |
+| One provider is exhausted | The routing decision must use another hard-eligible provider with fresh account/model/quota evidence. | Refresh inventory, then rerun planning/routing. If no eligible route exists, wait for the recorded reset or approve an explicit policy change. |
+| Grok is installed but has no selectable model | Dynamic `grok models` evidence was absent, unsupported, stale, or attributed to a non-xAI endpoint. | Run `grok version`, authenticate with the provider-owned flow, then `loopcoder providers refresh --repo .`; do not add a fabricated static model. |
+| Rollback to v0.7.0 is required | v0.7.0 cannot open schema 30. | Stop all LoopCoder processes and follow [`storage-migration.md`](storage-migration.md): copy the verified schema-9 backup into an offline home, select v0.7.0, and accept loss of v0.8-only state. |
+
+When reporting a failure, retain the stable error code, run ID, candidate
+version/commit, platform tuple, redacted doctor JSON, and local evidence paths.
+Do not paste credentials, raw provider sessions, reporter canonical JSON, or
+machine-local database contents into a public issue.
+
 ## Limits
 
-loopcoder v1 is intentionally small-batch and single-session. It is meant for a
-handful of issues in one open conductor session, not large unattended roadmaps.
-
-State lives in GitHub plus local `.loopcoder/` run records rendered by
-`loopcoder status` and the conductor's dependency DAG. If the session ends, a
-later session can re-read GitHub state, but v1 does not provide a fully
-stateless background conductor that automatically adopts orphaned workers. See
-[`architecture.md`](architecture.md) for the current architecture and limits.
+LoopCoder remains deliberately bounded: one conductor coordinates a small
+approved batch, and no autonomous cloud scheduler replaces the human release
+and production gates. Non-interactive worker execution can outlive the host
+turn through durable detached supervision, and a later conductor can inspect,
+attach, cancel, or reconcile it from machine-local state. Waiting for CI,
+approval, quota reset, outbox delivery, or worker terminalization is local and
+provider-free. Ambiguous external side effects still stop at `needs-human`;
+LoopCoder does not promise universal exactly-once behavior across arbitrary
+provider or GitHub failures. See [`architecture.md`](architecture.md) for the
+current architecture and limits.

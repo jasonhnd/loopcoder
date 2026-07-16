@@ -6,9 +6,121 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
+	"github.com/jasonhnd/loopcoder/internal/waitstate"
 )
+
+func TestEvaluateRiskGateWaitsLocallyForRequiredChecks(t *testing.T) {
+	reader := &sequencedRiskReader{
+		checks: [][]gh.Check{
+			{{Name: "verify", Bucket: "pending"}},
+			{{Name: "verify", Bucket: "pending"}},
+			{{Name: "verify", Bucket: "pass"}},
+		},
+	}
+	clock := &riskWaitClock{now: time.Date(2026, 7, 16, 6, 0, 0, 0, time.UTC)}
+	receipts := 0
+	decision, err := EvaluateRiskGate(context.Background(), RiskGateOptions{
+		Reader:         reader,
+		PRNumber:       967,
+		RequiredChecks: []string{"verify"},
+		WaitForChecks:  true,
+		WaitClock:      clock,
+		WaitPolicy: waitstate.Policy{
+			MinPollInterval: time.Second,
+			MaxPollInterval: time.Second,
+			ReceiptCadence:  5 * time.Minute,
+			Timeout:         time.Minute,
+		},
+		WaitReceipt: func(context.Context, waitstate.Receipt) error {
+			receipts++
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("EvaluateRiskGate: %v", err)
+	}
+	if decision.Status != RiskGateStatusClean || len(decision.RedLines) != 0 {
+		t.Fatalf("decision = %#v, want clean after local wait", decision)
+	}
+	if decision.Wait == nil || decision.Wait.ProviderInvocations != 0 || decision.Wait.WakeDecisions != 1 {
+		t.Fatalf("wait report = %#v", decision.Wait)
+	}
+	if reader.calls != 3 || len(clock.sleeps) != 1 || receipts != 1 {
+		t.Fatalf("calls=%d sleeps=%v receipts=%d, want deterministic initial read plus two probes", reader.calls, clock.sleeps, receipts)
+	}
+}
+
+func TestEvaluateRiskGateRejectsHeadChangedDuringCheckWait(t *testing.T) {
+	reader := &sequencedRiskReader{
+		checks: [][]gh.Check{
+			{{Name: "verify", Bucket: "pending"}},
+			{{Name: "verify", Bucket: "pass"}},
+		},
+		heads: []string{"old-head", "new-head"},
+	}
+	decision, err := EvaluateRiskGate(context.Background(), RiskGateOptions{
+		Reader:         reader,
+		PRNumber:       967,
+		RequiredChecks: []string{"verify"},
+		WaitForChecks:  true,
+		WaitClock:      &riskWaitClock{now: time.Date(2026, 7, 16, 6, 0, 0, 0, time.UTC)},
+		WaitPolicy: waitstate.Policy{
+			MinPollInterval: time.Second,
+			MaxPollInterval: time.Second,
+			Timeout:         time.Minute,
+		},
+	})
+	if err != nil {
+		t.Fatalf("EvaluateRiskGate: %v", err)
+	}
+	if decision.Status != RiskGateStatusNeedsHuman {
+		t.Fatalf("status = %q, want needs-human", decision.Status)
+	}
+	if len(decision.RedLines) != 1 || decision.RedLines[0].Category != RiskRedLineBuild ||
+		!strings.Contains(decision.RedLines[0].Detail, "head changed during check wait") {
+		t.Fatalf("red lines = %#v, want stale-head rejection", decision.RedLines)
+	}
+}
+
+func TestEvaluateRiskGateRejectsBaseChangedDuringCheckWait(t *testing.T) {
+	reader := &sequencedRiskReader{
+		checks: [][]gh.Check{
+			{{Name: "verify", Bucket: "pending"}},
+			{{Name: "verify", Bucket: "pass"}},
+		},
+		baseOIDs: []string{"old-base", "new-base"},
+	}
+	decision, err := EvaluateRiskGate(context.Background(), RiskGateOptions{
+		Reader: reader, PRNumber: 967, RequiredChecks: []string{"verify"}, WaitForChecks: true,
+		WaitClock:  &riskWaitClock{now: time.Date(2026, 7, 16, 6, 0, 0, 0, time.UTC)},
+		WaitPolicy: waitstate.Policy{MinPollInterval: time.Second, MaxPollInterval: time.Second, Timeout: time.Minute},
+	})
+	if err != nil {
+		t.Fatalf("EvaluateRiskGate: %v", err)
+	}
+	if decision.Status != RiskGateStatusNeedsHuman || len(decision.RedLines) != 1 ||
+		!strings.Contains(decision.RedLines[0].Detail, "base changed during check wait") {
+		t.Fatalf("decision = %#v, want stale-base rejection", decision)
+	}
+}
+
+func TestEvaluateRiskGateDoesNotWaitForSkippedRequiredCheck(t *testing.T) {
+	reader := &sequencedRiskReader{checks: [][]gh.Check{{{Name: "verify", Bucket: "skipping"}}}}
+	clock := &riskWaitClock{now: time.Date(2026, 7, 16, 6, 0, 0, 0, time.UTC)}
+	decision, err := EvaluateRiskGate(context.Background(), RiskGateOptions{
+		Reader: reader, PRNumber: 967, RequiredChecks: []string{"verify"},
+		WaitForChecks: true, WaitClock: clock,
+	})
+	if err != nil {
+		t.Fatalf("EvaluateRiskGate: %v", err)
+	}
+	if decision.Status != RiskGateStatusNeedsHuman || decision.Wait != nil || len(clock.sleeps) != 0 {
+		t.Fatalf("decision=%#v sleeps=%v, want immediate terminal non-pass", decision, clock.sleeps)
+	}
+}
 
 func TestEvaluateRiskGateCorePathNeedsHuman(t *testing.T) {
 	decision, err := EvaluateRiskGate(context.Background(), RiskGateOptions{
@@ -385,6 +497,10 @@ func TestRiskGateOptionsExposeNoCoreBypassSurface(t *testing.T) {
 		"PRNumber":           true,
 		"RequiredChecks":     true,
 		"AdditionalRedLines": true,
+		"WaitForChecks":      true,
+		"WaitPolicy":         true,
+		"WaitClock":          true,
+		"WaitReceipt":        true,
 	}
 	riskGateOptions := reflect.TypeOf(RiskGateOptions{})
 	for i := 0; i < riskGateOptions.NumField(); i++ {
@@ -401,4 +517,64 @@ func addedLineDiff(file, line string) string {
 		"+++ b/" + file + "\n" +
 		"@@ -0,0 +1 @@\n" +
 		"+" + line + "\n"
+}
+
+type sequencedRiskReader struct {
+	checks    [][]gh.Check
+	calls     int
+	heads     []string
+	headCalls int
+	baseOIDs  []string
+}
+
+func (r *sequencedRiskReader) PRChecks(context.Context, int) ([]gh.Check, error) {
+	index := r.calls
+	r.calls++
+	if index >= len(r.checks) {
+		index = len(r.checks) - 1
+	}
+	return append([]gh.Check(nil), r.checks[index]...), nil
+}
+
+func (*sequencedRiskReader) PRDiff(context.Context, int) (string, error) {
+	return modifiedDiff("README.md"), nil
+}
+
+func (*sequencedRiskReader) PRDiffNameOnly(context.Context, int) ([]string, error) {
+	return []string{"README.md"}, nil
+}
+
+func (r *sequencedRiskReader) ViewPR(context.Context, int) (gh.PullRequest, error) {
+	index := r.headCalls
+	r.headCalls++
+	head := "stable-head"
+	if len(r.heads) > 0 {
+		headIndex := index
+		if headIndex >= len(r.heads) {
+			headIndex = len(r.heads) - 1
+		}
+		head = r.heads[headIndex]
+	}
+	baseOID := "stable-base"
+	if len(r.baseOIDs) > 0 {
+		baseIndex := index
+		if baseIndex >= len(r.baseOIDs) {
+			baseIndex = len(r.baseOIDs) - 1
+		}
+		baseOID = r.baseOIDs[baseIndex]
+	}
+	return gh.PullRequest{HeadRefOID: head, BaseRefName: "pre-prod", BaseRefOID: baseOID}, nil
+}
+
+type riskWaitClock struct {
+	now    time.Time
+	sleeps []time.Duration
+}
+
+func (c *riskWaitClock) Now() time.Time { return c.now }
+
+func (c *riskWaitClock) Sleep(_ context.Context, delay time.Duration) error {
+	c.sleeps = append(c.sleeps, delay)
+	c.now = c.now.Add(delay)
+	return nil
 }

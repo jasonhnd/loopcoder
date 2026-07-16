@@ -78,11 +78,15 @@ type Options struct {
 	ConfigFromBase bool
 	Timeout        time.Duration
 	Stderr         io.Writer
+	// BeforeProviderCall runs after all provider-free preflight work and just
+	// before the verifier runner. Returning an error prevents provider launch.
+	BeforeProviderCall func() error
 }
 
 type Result struct {
-	Verdict  Verdict
-	ExitCode int
+	Verdict         Verdict
+	ExitCode        int
+	ProviderInvoked bool
 }
 
 type Verdict struct {
@@ -367,6 +371,12 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 	}
 
 	workID := fmt.Sprintf("loopreview-%d", opts.PRNumber)
+	providerInvoked := false
+	if opts.BeforeProviderCall != nil {
+		if err := opts.BeforeProviderCall(); err != nil {
+			return Result{}, fmt.Errorf("before verifier provider call: %w", agent.ProviderCallRefusedError{Err: err})
+		}
+	}
 	agentResult, agentErr := runner.Run(ctx, agent.Invocation{
 		WorktreePath: worktreePath,
 		Prompt:       prompt,
@@ -381,27 +391,34 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		RunID:        workID,
 		Role:         "verifier",
 		MCPServers:   mcpServers,
+		OnProviderLaunch: func(int) {
+			providerInvoked = true
+		},
+		OnProviderStart: func(agent.ProviderProcess) error {
+			providerInvoked = true
+			return nil
+		},
 	})
 	if agentResult.Hung {
 		verdict := verifierHungVerdict(opts.Provider, logPath, opts.Timeout, agentResult.HungReason)
-		return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict)}, nil
+		return Result{Verdict: verdict, ExitCode: ExitCodeForVerdict(verdict.Verdict), ProviderInvoked: providerInvoked}, nil
 	}
 	record := verifierReport(opts, agentResult, inputs, refs, worktreePath, workID)
 	fmt.Fprintln(warnings, record.Header())
 	if agentErr != nil {
 		verdict := needsHumanVerdict("error", "", providerFailureNote(logPath, fmt.Sprintf("%s verifier failed: %v", opts.Provider, agentErr)))
-		return resultWithReport(verdict, record), nil
+		return resultWithProviderEvidence(verdict, record, providerInvoked), nil
 	}
 	if agentResult.ExitCode != 0 {
 		verdict := needsHumanVerdict("error", "", providerFailureNote(logPath, fmt.Sprintf("%s verifier exited with code %d; see %s", opts.Provider, agentResult.ExitCode, logPath)))
-		return resultWithReport(verdict, record), nil
+		return resultWithProviderEvidence(verdict, record, providerInvoked), nil
 	}
 
 	verdict, err := ParseVerdict(agentResult.Summary)
 	if err != nil {
 		verdict = needsHumanVerdict("error", "", fmt.Sprintf("structured verdict parse failed: %v", err))
 		verdict.RenderedArtifacts = publicRenderedArtifacts(inputs.RenderedArtifacts)
-		return resultWithReport(verdict, record), nil
+		return resultWithProviderEvidence(verdict, record, providerInvoked), nil
 	}
 	verdict.RenderedArtifacts = publicRenderedArtifacts(inputs.RenderedArtifacts)
 	if inputs.Spec.ExpectedAbsent {
@@ -425,7 +442,13 @@ func Run(ctx context.Context, opts Options, deps Deps) (Result, error) {
 		appendVerdictEvidence(&verdict, note)
 	}
 	verdict.Findings = nonNilFindings(verdict.Findings)
-	return resultWithReport(verdict, record), nil
+	return resultWithProviderEvidence(verdict, record, providerInvoked), nil
+}
+
+func resultWithProviderEvidence(verdict Verdict, record reporter.Report, invoked bool) Result {
+	result := resultWithReport(verdict, record)
+	result.ProviderInvoked = invoked
+	return result
 }
 
 func verifierReport(opts Options, result agent.Result, inputs reviewInputs, refs reviewRefs, worktreePath, workID string) reporter.Report {
@@ -444,7 +467,7 @@ func verifierReport(opts Options, result agent.Result, inputs reviewInputs, refs
 		ModelSource: reporter.ModelSourceForProvider(opts.Provider),
 		Effort:      firstNonEmpty(opts.Effort, result.Effort),
 		Permission:  reporter.PermissionReadOnly,
-		Action:      fmt.Sprintf("review PR #%d", opts.PRNumber),
+		Action:      providerAttributedReviewAction(fmt.Sprintf("review PR #%d", opts.PRNumber), workID, result),
 		ExitCode:    result.ExitCode,
 		StartedAt:   result.StartedAt,
 		EndedAt:     result.EndedAt,
@@ -452,6 +475,26 @@ func verifierReport(opts Options, result agent.Result, inputs reviewInputs, refs
 		Usage:       result.Usage,
 		Verified:    true,
 	}
+}
+
+func providerAttributedReviewAction(action, attempt string, result agent.Result) string {
+	var parts []string
+	if strings.TrimSpace(result.AdapterVersion) != "" {
+		parts = append(parts, "adapter="+strings.TrimSpace(result.AdapterVersion))
+	}
+	if strings.TrimSpace(result.ExternalSessionRef) == "" && len(parts) == 0 {
+		return action
+	}
+	if strings.TrimSpace(attempt) != "" {
+		parts = append(parts, "attempt="+strings.TrimSpace(attempt))
+	}
+	if strings.TrimSpace(result.ExternalSessionRef) != "" {
+		parts = append(parts, "session="+strings.TrimSpace(result.ExternalSessionRef))
+	}
+	if len(parts) == 0 {
+		return action
+	}
+	return action + " [" + strings.Join(parts, " ") + "]"
 }
 
 func resultWithReport(verdict Verdict, record reporter.Report) Result {
@@ -1104,7 +1147,7 @@ Return only JSON matching this schema:
 `, opts.PRNumber, VerdictJSONSchema, formatReviewPacket(packet))
 }
 
-const VerdictJSONSchema = `{"type":"object","additionalProperties":false,"required":["verdict","findings","evidence","spec_conformance"],"properties":{"verdict":{"type":"string","enum":["pass","fail","needs-human"]},"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["severity","file","note"],"properties":{"severity":{"type":"string"},"file":{"type":"string"},"note":{"type":"string"}}}},"evidence":{"type":"string"},"spec_conformance":{"type":"string","enum":["pass","fail","not-applicable"]},"reason":{"type":"string"},"next_action":{"type":"string"}}}`
+const VerdictJSONSchema = `{"type":"object","additionalProperties":false,"required":["verdict","findings","evidence","spec_conformance"],"properties":{"verdict":{"type":"string","enum":["pass","fail","needs-human"]},"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["severity","file","note"],"properties":{"severity":{"type":"string"},"file":{"type":"string"},"note":{"type":"string"}}}},"evidence":{"type":"string"},"spec_conformance":{"type":"string","enum":["pass","fail","not-applicable"]}}}`
 
 func (limits ReviewPacketLimits) withDefaults() ReviewPacketLimits {
 	defaults := ReviewPacketLimits{

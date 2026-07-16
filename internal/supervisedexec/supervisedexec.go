@@ -3,6 +3,7 @@
 package supervisedexec
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+	"github.com/jasonhnd/loopcoder/internal/process"
 )
 
 // DefaultHardCap is the package-level fallback used when Options.HardCap is
@@ -58,7 +60,7 @@ type Outcome int
 
 const (
 	OutcomeCompleted Outcome = iota // process exited on its own (any exit code)
-	OutcomeStalled                  // killed: no log growth or worktree activity for StallTimeout
+	OutcomeStalled                  // killed: no meaningful log, worktree, or process-tree activity for StallTimeout
 	OutcomeDeadline                 // killed: exceeded HardCap
 )
 
@@ -81,6 +83,13 @@ type Options struct {
 	// a per-run kill-group (spec 0390, Decision 11). Both may be empty.
 	RunID string
 	Role  string
+	// OnStart is called after the provider process starts and is adopted into
+	// its kill-group, before Run reports any running state to callers.
+	// OnLaunch is called immediately after cmd.Start succeeds. Unlike OnStart,
+	// it does not depend on a successful process-identity snapshot.
+	OnLaunch func(pid int)
+	OnStart  func(StartedProcess) error
+	Guardian GuardianOptions
 }
 
 // Result reports the outcome of a supervised command.
@@ -89,6 +98,16 @@ type Result struct {
 	ExitCode int
 	Killed   bool
 	Elapsed  time.Duration
+}
+
+type StartedProcess struct {
+	PID                   int
+	PGID                  int
+	ProcessBirthIdentity  string
+	ExecutableIdentity    string
+	ObservedAt            time.Time
+	IdentityAmbiguous     bool
+	IdentityAmbiguityNote string
 }
 
 type waitResult struct {
@@ -148,10 +167,30 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 	_ = group.adopt(cmd)
 	managedPID := cmd.Process.Pid
 	registerProc(cmd, opts.RunID, opts.Role, group)
+	if opts.OnLaunch != nil {
+		opts.OnLaunch(managedPID)
+	}
 	defer func() {
 		deregisterProc(managedPID)
 		group.close()
 	}()
+	if opts.OnStart != nil {
+		started, snapshotErr := startedProcessSnapshot(managedPID, start)
+		if snapshotErr != nil {
+			_, _ = killAndDrain(start, group, cmd.Process, waitStartedProcess(cmd), OutcomeDeadline, snapshotErr)
+			return Result{Outcome: OutcomeDeadline, Killed: true, Elapsed: time.Since(start)}, snapshotErr
+		}
+		if err := opts.OnStart(started); err != nil {
+			_, _ = killAndDrain(start, group, cmd.Process, waitStartedProcess(cmd), OutcomeDeadline, err)
+			return Result{Outcome: OutcomeDeadline, Killed: true, Elapsed: time.Since(start)}, err
+		}
+	}
+	guardian, err := startGuardian(opts.Guardian)
+	if err != nil {
+		_, _ = killAndDrain(start, group, cmd.Process, waitStartedProcess(cmd), OutcomeDeadline, err)
+		return Result{Outcome: OutcomeDeadline, Killed: true, Elapsed: time.Since(start)}, err
+	}
+	defer guardian.Release()
 
 	waitCh := make(chan waitResult, 1)
 	go func() {
@@ -167,11 +206,18 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 	var lastLog logObservation
 	var lastWorktree worktreeObservation
 	var lastWorktreeWalk time.Time
+	var lastProcess processActivityObservation
+	var lastProcessPoll time.Time
 	var worktreeSignalDisabled bool
 	var worktreeWarningEmitted bool
+	processActivityEnabled := opts.LivenessMode == LivenessModeWorktreeMTime
 	lastProgress := start
 	if opts.StallTimeout > 0 {
 		lastLog = observeLog(opts.LogPath)
+		if processActivityEnabled {
+			lastProcess = group.activity()
+			lastProcessPoll = start
+		}
 		if opts.LivenessMode == LivenessModeWorktreeMTime {
 			lastWorktree = observeWorktree(opts.WorktreePath)
 			lastWorktreeWalk = start
@@ -186,6 +232,7 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 		stallC = stallTicks.C
 	}
 	worktreePoll := worktreePollInterval(opts.StallTimeout, stallPollInterval(opts.StallTimeout))
+	processPoll := processPollInterval(opts.StallTimeout, stallPollInterval(opts.StallTimeout))
 
 	for {
 		select {
@@ -204,7 +251,7 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 			}
 			currentLog := observeLog(opts.LogPath)
 			currentWorktree := lastWorktree
-			logProgress := currentLog.changedFrom(lastLog)
+			logProgress := meaningfulLogProgress(opts.LogPath, lastLog, currentLog)
 			worktreeProgress := false
 			if opts.LivenessMode == LivenessModeWorktreeMTime && !worktreeSignalDisabled && shouldWalkWorktree(now, lastWorktreeWalk, worktreePoll) {
 				currentWorktree = observeWorktreeAfter(opts.WorktreePath, lastWorktree.latestModTime)
@@ -216,6 +263,15 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 				} else {
 					worktreeProgress = currentWorktree.advancedFrom(lastWorktree)
 					lastWorktree = currentWorktree
+				}
+			}
+			processProgress := false
+			if processActivityEnabled && shouldObserveProcessActivity(now, lastProcessPoll, processPoll) {
+				currentProcess := group.activity()
+				lastProcessPoll = now
+				processProgress = currentProcess.changedFrom(lastProcess)
+				if currentProcess.available {
+					lastProcess = currentProcess
 				}
 			}
 			customProgress := false
@@ -231,7 +287,7 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 				}
 			}
 			lastLog = currentLog
-			if logProgress || worktreeProgress || customProgress {
+			if logProgress || worktreeProgress || processProgress || customProgress {
 				lastProgress = now
 				continue
 			}
@@ -241,6 +297,31 @@ func Run(ctx context.Context, cmd *exec.Cmd, opts Options) (Result, error) {
 			}
 		}
 	}
+}
+
+func startedProcessSnapshot(pid int, observedAt time.Time) (StartedProcess, error) {
+	identity, err := process.Snapshot(pid, observedAt)
+	if err != nil {
+		return StartedProcess{}, err
+	}
+	return StartedProcess{
+		PID:                   identity.PID,
+		PGID:                  identity.PGID,
+		ProcessBirthIdentity:  identity.ProcessBirthIdentity,
+		ExecutableIdentity:    identity.ExecutableIdentity,
+		ObservedAt:            identity.ObservedAt,
+		IdentityAmbiguous:     identity.Ambiguous,
+		IdentityAmbiguityNote: identity.AmbiguityReason,
+	}, nil
+}
+
+func waitStartedProcess(cmd *exec.Cmd) <-chan waitResult {
+	waitCh := make(chan waitResult, 1)
+	go func() {
+		err := cmd.Wait()
+		waitCh <- waitResult{err: err, state: cmd.ProcessState}
+	}()
+	return waitCh
 }
 
 func normalizeOptions(opts Options) Options {
@@ -258,6 +339,9 @@ func normalizeOptions(opts Options) Options {
 }
 
 func validateOptions(opts Options) error {
+	if err := validateGuardianOptions(opts.Guardian); err != nil {
+		return err
+	}
 	if opts.StallTimeout <= 0 {
 		return nil
 	}
@@ -377,8 +461,40 @@ func observeLog(path string) logObservation {
 	}
 }
 
-func (o logObservation) changedFrom(prev logObservation) bool {
-	return o.exists != prev.exists || o.size != prev.size || !o.modTime.Equal(prev.modTime)
+func meaningfulLogProgress(path string, prev, current logObservation) bool {
+	if !current.exists {
+		return false
+	}
+	if !prev.exists || current.size < prev.size {
+		return logContainsProviderProgress(path, 0)
+	}
+	if current.size > prev.size {
+		return logContainsProviderProgress(path, prev.size)
+	}
+	return !current.modTime.Equal(prev.modTime)
+}
+
+func logContainsProviderProgress(path string, offset int64) bool {
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	if offset > 0 {
+		if _, err := file.Seek(offset, io.SeekStart); err != nil {
+			return false
+		}
+	}
+	reader := bufio.NewReader(file)
+	for {
+		line, err := reader.ReadString('\n')
+		if strings.TrimSpace(line) != "" && !strings.HasPrefix(strings.TrimSpace(line), "[loopcoder]") {
+			return true
+		}
+		if err != nil {
+			return false
+		}
+	}
 }
 
 func observeWorktree(path string) worktreeObservation {
@@ -464,6 +580,10 @@ func shouldWalkWorktree(current, last time.Time, interval time.Duration) bool {
 		return true
 	}
 	return current.Sub(last) >= interval
+}
+
+func shouldObserveProcessActivity(current, last time.Time, interval time.Duration) bool {
+	return shouldWalkWorktree(current, last, interval)
 }
 
 func runCustomLivenessProbe(ctx context.Context, opts Options, remainingHardCap time.Duration) bool {
