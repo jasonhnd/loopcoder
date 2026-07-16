@@ -90,6 +90,9 @@ type NestedScheduleOptions struct {
 	Plan             *ChildPlan
 	Store            storage.Store
 	Progress         progress.Recorder
+	// AllowUnbudgetedLocalTest is reserved for the CLI's deterministic
+	// test-subprocess provider. Real provider routes must leave it false.
+	AllowUnbudgetedLocalTest bool
 
 	Execute                       ChildRunExecutor
 	RecordEvent                   RecordNestedEventFunc
@@ -1410,7 +1413,7 @@ func nestedSchedulerReservationRequest(opts NestedScheduleOptions, child ChildRu
 		BudgetValueScale:         authority.BudgetValueScale,
 		BudgetWindowKind:         authority.BudgetWindowKind,
 		AttachBudgetBinding:      strings.TrimSpace(native.AdapterID) != "",
-		RequireBudgetAuthority:   true,
+		RequireBudgetAuthority:   !opts.AllowUnbudgetedLocalTest,
 	}
 }
 

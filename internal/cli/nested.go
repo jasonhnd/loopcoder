@@ -287,16 +287,17 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}()
 
 	report, err := orchestration.ScheduleNestedRuns(ctx, orchestration.NestedScheduleOptions{
-		RepoPath:         resolvedRepo,
-		BaseBranch:       opts.BaseBranch,
-		Plan:             &plan,
-		Store:            store,
-		Budget:           cfg.Guardrails.Budget,
-		CircuitBreaker:   cfg.Guardrails.CircuitBreaker,
-		ConcurrencyLimit: plan.MaxConcurrency,
-		MaxDepth:         plan.MaxDepth,
-		Progress:         progressRecorder,
-		Execute:          executor,
+		RepoPath:                 resolvedRepo,
+		BaseBranch:               opts.BaseBranch,
+		Plan:                     &plan,
+		Store:                    store,
+		Budget:                   cfg.Guardrails.Budget,
+		CircuitBreaker:           cfg.Guardrails.CircuitBreaker,
+		ConcurrencyLimit:         plan.MaxConcurrency,
+		MaxDepth:                 plan.MaxDepth,
+		Progress:                 progressRecorder,
+		AllowUnbudgetedLocalTest: opts.Provider == nestedTestSubprocessProvider,
+		Execute:                  executor,
 	})
 	if err != nil {
 		if nestedReportHasContent(report) {
