@@ -26,6 +26,9 @@ func TestV080WorkflowPolicy(t *testing.T) {
 	if !workflowJobContains(workflow.Jobs["race"], "scripts/ci-race-changed.sh") {
 		t.Fatal("pull-request race job must run scripts/ci-race-changed.sh")
 	}
+	if !scriptContains(t, filepath.Join(root, "scripts", "ci-race-changed.sh"), "bash scripts/ci-full-race.sh") {
+		t.Fatal("pull-request race fallback must use scripts/ci-full-race.sh")
+	}
 }
 
 func TestV080ReleaseWorkflowPolicy(t *testing.T) {
@@ -35,9 +38,18 @@ func TestV080ReleaseWorkflowPolicy(t *testing.T) {
 	if err := validateV080ReleaseWorkflowPolicy(workflow); err != nil {
 		t.Fatal(err)
 	}
-	if !workflowJobContains(workflow.Jobs["build"], "go test -race -count=1 -timeout=20m ./...") {
-		t.Fatal("release build must run the full Go race suite before packaging")
+	if !workflowJobContains(workflow.Jobs["build"], "bash scripts/ci-full-race.sh") {
+		t.Fatal("release build must run scripts/ci-full-race.sh before packaging")
 	}
+}
+
+func scriptContains(t *testing.T, path, needle string) bool {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read script %s: %v", path, err)
+	}
+	return strings.Contains(string(data), needle)
 }
 
 func workflowJobContains(job workflowJobPolicy, needle string) bool {
