@@ -198,6 +198,28 @@ func TestV080LivingDocumentationRejectsUnsupportedCurrentClaims(t *testing.T) {
 	}
 }
 
+func TestV080SingleMaintainerReleaseApprovalPolicy(t *testing.T) {
+	root := repositoryPolicyRoot(t)
+	data, err := os.ReadFile(filepath.Join(root, "docs", "reference", "releasing.md"))
+	if err != nil {
+		t.Fatalf("read releasing reference: %v", err)
+	}
+	current := currentV080Documentation("docs/reference/releasing.md", string(data))
+	for _, want := range []string{
+		`"required_approving_review_count": 0`,
+		"still requires a pull request and all",
+		"release-publication` environment gate",
+		"repository owner as a required reviewer",
+	} {
+		if !strings.Contains(current, want) {
+			t.Errorf("v0.8 single-maintainer release policy is missing %q", want)
+		}
+	}
+	if strings.Contains(current, `"required_approving_review_count": 1`) {
+		t.Fatal("v0.8 release policy requires an impossible self-approval in the single-maintainer repository")
+	}
+}
+
 func TestV080FrozenHistoricalReleaseEvidenceRemainsTruthful(t *testing.T) {
 	root := repositoryPolicyRoot(t)
 	required := map[string][]string{

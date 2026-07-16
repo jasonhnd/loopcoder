@@ -112,6 +112,15 @@ set when no Go package changed. The release `build` job reruns the complete
 artifact. This keeps ordinary PR feedback bounded without weakening the final
 release race gate.
 
+This repository currently has one collaborator. GitHub does not allow a pull
+request author to approve their own pull request, so a positive branch-review
+count would make protected promotion impossible without adding a second trusted
+maintainer. Until that happens, `main` still requires a pull request and all
+four checks, but `required_approving_review_count` is `0`. The non-waivable
+human release approval is the separate `release-publication` environment gate,
+whose required reviewer is the repository owner. Do not disable that
+environment gate to compensate for the single-maintainer branch topology.
+
 Branch-protection changes are a human-controlled promotion boundary. Do not
 remove old required contexts from live protection until a fresh pull request has
 shown the four new contexts. Use this order so `main` is never left requiring
@@ -146,7 +155,10 @@ gh api \
   },
   "enforce_admins": true,
   "required_pull_request_reviews": {
-    "required_approving_review_count": 1
+    "dismiss_stale_reviews": false,
+    "require_code_owner_reviews": false,
+    "require_last_push_approval": false,
+    "required_approving_review_count": 0
   },
   "restrictions": null
 }
@@ -159,6 +171,13 @@ Verify the effective settings before GO:
 gh api "repos/OWNER/REPO/branches/main/protection"
 gh api "repos/OWNER/REPO/environments/release-publication"
 ```
+
+The branch-protection readback must show strict `verify`, `test`, `race`, and
+`security` checks, pull-request review protection enabled with approval count
+`0`, and admin enforcement enabled. The environment readback must independently
+show the repository owner as a required reviewer. If a second trusted
+maintainer is added later, raise the branch approval count in a separate,
+reviewed repository-policy change.
 
 ## v0.8.0 Self-Bootstrap Acceptance
 
