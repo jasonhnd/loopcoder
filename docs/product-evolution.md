@@ -44,7 +44,7 @@ scope. See [`v0.8.0-retrospective.md`](v0.8.0-retrospective.md) and
 ### Starting point
 
 Before the v0.6 transition, LoopCoder's execution evidence was primarily
-described as attestation. That terminology was precise for integrity and
+described with integrity-oriented terminology. That language was precise for
 provenance, but it required users to understand an internal security concept
 before they could answer ordinary questions such as:
 
@@ -56,8 +56,8 @@ before they could answer ordinary questions such as:
 
 ### Decision
 
-The shared execution record became a reporter-oriented surface while legacy
-attestation input remained readable during a compatibility window.
+The shared execution record became a reporter-oriented surface while the
+legacy evidence format remained readable during a compatibility window.
 
 The transition established several durable principles:
 
