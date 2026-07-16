@@ -9,7 +9,7 @@ if [[ -z "${base_sha}" || "${base_sha}" = "${zero_sha}" ]] || ! git cat-file -e 
     base_sha="HEAD^"
   else
     echo "No usable base commit; running the full race suite."
-    go test -race -count=1 -timeout=20m ./...
+    bash scripts/ci-full-race.sh
     exit
   fi
 fi
@@ -22,7 +22,7 @@ git diff --name-only "${base_sha}...HEAD" -- '*.go' go.mod go.sum >"${changed_fi
 
 if grep -Eq '^(go\.mod|go\.sum)$' "${changed_file}"; then
   echo "Go module metadata changed; running the full race suite."
-  go test -race -count=1 -timeout=20m ./...
+  bash scripts/ci-full-race.sh
   exit
 fi
 
