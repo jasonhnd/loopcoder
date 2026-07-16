@@ -232,6 +232,10 @@ func unsupportedPlatformNoSideEffectDeps(t *testing.T) Deps {
 			fail("MigrateLocalState")
 			return localmigrate.Result{}, errors.New("unexpected MigrateLocalState")
 		},
+		MigrateStorage: func(context.Context, storage.SchemaMigrationOptions) (storage.SchemaMigrationResult, error) {
+			fail("MigrateStorage")
+			return storage.SchemaMigrationResult{}, errors.New("unexpected MigrateStorage")
+		},
 		SkillInstall: func(context.Context, SkillInstallOptions) (SkillInstallResult, error) {
 			fail("SkillInstall")
 			return SkillInstallResult{}, errors.New("unexpected SkillInstall")
@@ -1271,6 +1275,100 @@ func TestMigrateLocalStateCommandRunsInjectedMigration(t *testing.T) {
 	}
 	if payload.ProjectID != "proj_test" || !payload.DryRun || payload.Status != "completed-with-warnings" || payload.MalformedCount != 1 || len(payload.Diagnostics) != 1 {
 		t.Fatalf("payload = %#v", payload)
+	}
+}
+
+func TestMigrateStorageCommandDefaultsToReadOnlyPlan(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "loopcoder.db")
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{"migrate", "storage", "--database", databasePath, "--format", "json"}, &stdout, &stderr, Deps{
+		Now: fixedCLINow,
+		MigrateStorage: func(_ context.Context, opts storage.SchemaMigrationOptions) (storage.SchemaMigrationResult, error) {
+			if opts.Path != databasePath {
+				t.Fatalf("Path = %q, want %q", opts.Path, databasePath)
+			}
+			if opts.Apply {
+				t.Fatal("Apply = true, want read-only plan by default")
+			}
+			if opts.Now == nil || !opts.Now().Equal(fixedCLINow()) {
+				t.Fatalf("Now clock did not return %s", fixedCLINow())
+			}
+			plan := storage.SchemaMigrationPlan{
+				SchemaVersion:       storage.SchemaMigrationContract,
+				DatabasePath:        databasePath,
+				SourceExists:        true,
+				SourceSchemaVersion: 9,
+				TargetSchemaVersion: storage.CurrentSchemaVersion,
+				Status:              "upgrade-required",
+				PlanFingerprint:     "sha256:test",
+			}
+			return storage.SchemaMigrationResult{
+				SchemaVersion: storage.SchemaMigrationContract,
+				Status:        "planned",
+				DryRun:        true,
+				Plan:          plan,
+			}, nil
+		},
+	})
+	if exitCode != 0 || stderr.Len() != 0 {
+		t.Fatalf("RunWithDeps exit=%d stderr=%q", exitCode, stderr.String())
+	}
+	var payload storage.SchemaMigrationResult
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
+	}
+	if payload.SchemaVersion != storage.SchemaMigrationContract || payload.Status != "planned" || !payload.DryRun || payload.Plan.SourceSchemaVersion != 9 {
+		t.Fatalf("payload = %#v", payload)
+	}
+}
+
+func TestMigrateStorageCommandApplyRendersVerifiedRecoveryPoint(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "loopcoder.db")
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{"migrate", "storage", "--database", databasePath, "--apply"}, &stdout, &stderr, Deps{
+		MigrateStorage: func(_ context.Context, opts storage.SchemaMigrationOptions) (storage.SchemaMigrationResult, error) {
+			if !opts.Apply {
+				t.Fatal("Apply = false, want true")
+			}
+			return storage.SchemaMigrationResult{
+				SchemaVersion: storage.SchemaMigrationContract,
+				Status:        "migrated",
+				Applied:       true,
+				Plan: storage.SchemaMigrationPlan{
+					DatabasePath:        databasePath,
+					SourceSchemaVersion: 9,
+					TargetSchemaVersion: storage.CurrentSchemaVersion,
+					Status:              "upgrade-required",
+					PlanFingerprint:     "sha256:plan",
+					BackupRequired:      true,
+				},
+				Backup: &storage.SchemaMigrationBackup{
+					Path:     databasePath + ".backup",
+					SHA256:   "abc123",
+					Verified: true,
+				},
+				Rollback: storage.SchemaRollbackPlan{
+					Supported:   true,
+					Strategy:    "offline-copy-verified-v0.7-backup",
+					Limitations: []string{"requires-all-loopcoder-processes-stopped"},
+				},
+			}, nil
+		},
+	})
+	if exitCode != 0 || stderr.Len() != 0 {
+		t.Fatalf("RunWithDeps exit=%d stderr=%q", exitCode, stderr.String())
+	}
+	for _, want := range []string{
+		"status: migrated",
+		"mode: apply",
+		"backup_verified: true",
+		"rollback_supported: true",
+		"requires-all-loopcoder-processes-stopped",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("text output missing %q:\n%s", want, stdout.String())
+		}
 	}
 }
 

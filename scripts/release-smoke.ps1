@@ -836,6 +836,103 @@ try {
         if (-not (Test-Path -LiteralPath $previousBinary)) {
             Fail "previous archive did not contain loopcoder binary"
         }
+
+        if ($previous.PlainVersion -eq "0.7.0") {
+            $migrationHome = Join-Path $tmp "v07-schema-migration-home"
+            New-Item -ItemType Directory -Path $migrationHome | Out-Null
+            Invoke-WithEnvironment -Values @{ "LOOPCODER_HOME" = $migrationHome } -Block {
+                $v07RegisterOutput = @(& $previousBinary projects register --repo $repoTmp --format json)
+                $v07RegisterOutput | ForEach-Object { Write-Host $_ }
+                if ($LASTEXITCODE -ne 0) {
+                    Fail "v0.7.0 schema fixture registration failed"
+                }
+                $v07Registered = ConvertFrom-JsonOutput $v07RegisterOutput "v0.7.0 schema fixture registration"
+                if (-not $v07Registered.project.project_id) {
+                    Fail "v0.7.0 schema fixture registration omitted project_id"
+                }
+
+                $migrationDatabase = Join-Path $migrationHome "data/loopcoder.db"
+                $migrationBackupDir = Join-Path $migrationHome "data/backups"
+                if (-not (Test-Path -LiteralPath $migrationDatabase)) {
+                    Fail "v0.7.0 schema fixture did not create $migrationDatabase"
+                }
+                if (Test-Path -LiteralPath $migrationBackupDir) {
+                    Fail "v0.7.0 schema fixture unexpectedly created a v0.8 backup directory"
+                }
+
+                $storagePlanOutput = @(& $binary migrate storage --format json)
+                $storagePlanOutput | ForEach-Object { Write-Host $_ }
+                if ($LASTEXITCODE -ne 0) {
+                    Fail "candidate storage migration plan failed"
+                }
+                $storagePlan = ConvertFrom-JsonOutput $storagePlanOutput "candidate storage migration plan"
+                if (-not $storagePlan.dry_run -or $storagePlan.applied -or $storagePlan.status -ne "planned") {
+                    Fail "candidate storage migration plan was not read-only"
+                }
+                if ($storagePlan.plan.source_schema_version -ne 9 -or $storagePlan.plan.target_schema_version -ne 30 -or $storagePlan.plan.status -ne "upgrade-required") {
+                    Fail "candidate storage migration plan did not describe schema 9 -> 30"
+                }
+                if (-not $storagePlan.plan.backup_required -or -not $storagePlan.rollback.supported -or -not $storagePlan.rollback.requires_offline) {
+                    Fail "candidate storage migration plan omitted backup or rollback requirements"
+                }
+                if (Test-Path -LiteralPath $migrationBackupDir) {
+                    Fail "read-only storage migration plan created $migrationBackupDir"
+                }
+
+                $storageApplyOutput = @(& $binary migrate storage --apply --format json)
+                $storageApplyOutput | ForEach-Object { Write-Host $_ }
+                if ($LASTEXITCODE -ne 0) {
+                    Fail "candidate storage migration apply failed"
+                }
+                $storageApply = ConvertFrom-JsonOutput $storageApplyOutput "candidate storage migration apply"
+                if ($storageApply.status -ne "migrated" -or -not $storageApply.applied -or $storageApply.health.schema_version -ne 30 -or -not $storageApply.health.ok) {
+                    Fail "candidate storage migration did not finish at healthy schema 30"
+                }
+                if (-not $storageApply.backup.verified -or -not (Test-Path -LiteralPath $storageApply.backup.path)) {
+                    Fail "candidate storage migration did not return a verified backup"
+                }
+                if ($storageApply.rollback.backup_path -ne $storageApply.backup.path -or $storageApply.rollback.backup_sha256 -ne $storageApply.backup.sha256) {
+                    Fail "candidate rollback metadata did not bind the verified backup"
+                }
+                if ((Get-DarwinFileMode $storageApply.backup.path) -ne "600") {
+                    Fail "candidate storage migration backup is not owner-only"
+                }
+
+                $storageRepeatOutput = @(& $binary migrate storage --apply --format json)
+                $storageRepeatOutput | ForEach-Object { Write-Host $_ }
+                if ($LASTEXITCODE -ne 0) {
+                    Fail "repeated candidate storage migration failed"
+                }
+                $storageRepeat = ConvertFrom-JsonOutput $storageRepeatOutput "repeated candidate storage migration"
+                if ($storageRepeat.status -ne "no-op" -or -not $storageRepeat.applied -or $storageRepeat.plan.status -ne "current") {
+                    Fail "repeated candidate storage migration was not an idempotent no-op"
+                }
+                if (@(Get-ChildItem -LiteralPath $migrationBackupDir -Filter "schema-v9-*.db" -File).Count -ne 1) {
+                    Fail "repeated candidate storage migration did not preserve exactly one v0.7 backup"
+                }
+
+                $rollbackHome = Join-Path $tmp "v07-schema-rollback-home"
+                $rollbackData = Join-Path $rollbackHome "data"
+                New-Item -ItemType Directory -Path $rollbackData -Force | Out-Null
+                Copy-Item -LiteralPath $storageApply.backup.path -Destination (Join-Path $rollbackData "loopcoder.db")
+                chmod 600 (Join-Path $rollbackData "loopcoder.db")
+                if ($LASTEXITCODE -ne 0) {
+                    Fail "failed to secure restored v0.7 database"
+                }
+                Invoke-WithEnvironment -Values @{ "LOOPCODER_HOME" = $rollbackHome } -Block {
+                    $restoredProjectOutput = @(& $previousBinary projects show --repo $repoTmp --format json)
+                    $restoredProjectOutput | ForEach-Object { Write-Host $_ }
+                    if ($LASTEXITCODE -ne 0) {
+                        Fail "v0.7.0 could not open the restored migration backup"
+                    }
+                    $restoredProject = ConvertFrom-JsonOutput $restoredProjectOutput "restored v0.7.0 project"
+                    if ($restoredProject.project.project_id -ne $v07Registered.project.project_id) {
+                        Fail "restored v0.7.0 backup did not preserve project identity"
+                    }
+                }
+            }
+        }
+
         Invoke-Checked "upgrade from $($previous.PlainVersion) to $plainVersion" {
             Invoke-WithMockReleaseApi -Server $mockReleaseApi -Block {
                 $script:previousUpgradeOutput = @(& $previousBinary upgrade --version $plainVersion)
