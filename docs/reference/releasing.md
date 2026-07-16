@@ -98,7 +98,12 @@ JSON
 Configure `main` to require pull requests and the documented checks. For
 v0.8.0, pull-request CI emits exactly four stable contexts: `verify`, `test`,
 `race`, and `security`, all running on pinned `macos-15` with a fail-fast
-`darwin/arm64` Go tuple assertion.
+`darwin/arm64` Go tuple assertion. The pull-request `race` context runs the
+race detector for Go packages changed by that PR, or a small concurrent sentinel
+set when no Go package changed. The release `build` job reruns the complete
+`go test -race -count=1 -timeout=20m ./...` suite before it packages the tagged
+artifact. This keeps ordinary PR feedback bounded without weakening the final
+release race gate.
 
 Branch-protection changes are a human-controlled promotion boundary. Do not
 remove old required contexts from live protection until a fresh pull request has
