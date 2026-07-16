@@ -98,11 +98,11 @@ type deliveryV10BackupHookForTest func(context.Context, deliveryV10BackupPhase, 
 
 // Health reports the local database state without exposing table internals.
 type Health struct {
-	Path          string
-	Exists        bool
-	SchemaVersion int
-	OK            bool
-	Message       string
+	Path          string `json:"path"`
+	Exists        bool   `json:"exists"`
+	SchemaVersion int    `json:"schema_version"`
+	OK            bool   `json:"ok"`
+	Message       string `json:"message"`
 }
 
 type sqliteStore struct {
