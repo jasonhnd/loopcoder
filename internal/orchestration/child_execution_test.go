@@ -363,6 +363,33 @@ func TestValidateChildExecutionResultRejectsImmutableContractMutations(t *testin
 	}
 }
 
+func TestValidateChildExecutionRequestRejectsMalformedPersistedWriteScope(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, "src"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	plan, child := childExecutionRequestFixture()
+	request, err := BuildChildExecutionRequest(repo, plan, child)
+	if err != nil {
+		t.Fatalf("BuildChildExecutionRequest: %v", err)
+	}
+	request.Issue = 0
+	request.Scope.Paths = []string{}
+	request.Scope.Issues = nil
+	request.CanonicalPaths = []string{}
+	request.MutationScope = ChildMutationScope{
+		Paths:        []string{},
+		Issues:       []int{},
+		PullRequests: []int{},
+		Data:         []string{},
+	}
+	request.ContractFingerprint = childExecutionRequestFingerprint(request)
+	err = ValidateChildExecutionRequest(request, false)
+	if err == nil || !strings.Contains(err.Error(), "write-capable permission requires bounded mutable scope") {
+		t.Fatalf("ValidateChildExecutionRequest error = %v, want bounded mutable scope rejection", err)
+	}
+}
+
 func childExecutionRequestFixture() (ChildPlan, ChildRunPlan) {
 	created := state.FormatTimestamp(childExecutionFixtureTime())
 	child := ChildRunPlan{

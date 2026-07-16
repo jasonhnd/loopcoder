@@ -237,6 +237,13 @@ func ValidateChildExecutionRequest(request ChildExecutionRequest, requireClaim b
 	if !validChildPermission(request.Permission) {
 		return fmt.Errorf("child execution request permission %q is invalid", request.Permission)
 	}
+	normalizedScope := normalizeStructuredScope(cloneChildScope(request.Scope), request.Issue, nil)
+	if !equalChildExecutionScope(normalizedScope, request.Scope) {
+		return fmt.Errorf("child execution request scope is not canonical")
+	}
+	if err := validateChildScope(request.ChildKey, request.Permission, request.Scope); err != nil {
+		return fmt.Errorf("child execution request scope: %w", err)
+	}
 	if request.RepositoryIdentity == "" || request.CheckoutIdentity == "" || request.ScopedRepositoryIdentity == "" {
 		return fmt.Errorf("child execution request repository and checkout identities are required")
 	}
@@ -356,7 +363,7 @@ func validateChildExecutionResult(request ChildExecutionRequest, result ChildRun
 	}
 	if !childScopeEmpty(result.Scope) {
 		got := normalizeStructuredScope(result.Scope, result.Issue, result.Scope.Issues)
-		if !reflect.DeepEqual(got, request.Scope) {
+		if !equalChildExecutionScope(got, request.Scope) {
 			return fmt.Errorf("child executor changed immutable scope for %q", request.ChildKey)
 		}
 	}
@@ -566,4 +573,13 @@ func equalExecutionInts(left, right []int) bool {
 		}
 	}
 	return true
+}
+
+func equalChildExecutionScope(left, right ChildScope) bool {
+	return left.Repo == right.Repo &&
+		equalExecutionStrings(left.Paths, right.Paths) &&
+		equalExecutionInts(left.Issues, right.Issues) &&
+		equalExecutionInts(left.PullRequests, right.PullRequests) &&
+		equalExecutionStrings(left.Commands, right.Commands) &&
+		equalExecutionStrings(left.Data, right.Data)
 }
