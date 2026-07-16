@@ -66,6 +66,48 @@ change is reviewed and merged separately.
 After code exists, verify the implementation against the document. Verification
 checks both that the code matches the spec and that it works.
 
+## 4. Apply the self-hosting gate
+
+When loopcoder develops or releases itself, the mandatory controls in
+[`self-hosting-playbook.md`](self-hosting-playbook.md) apply in addition to the
+doc-first sequence.
+
+Before dispatch:
+
+- keep the minor release within the documented version and dependency budget;
+- split each implementation issue to one primary behavior and a bounded Worker
+  attempt;
+- allow only one local provider at a time and disable provider-native
+  sub-agents by default;
+- keep full repository, full race, security, signing, packaging, migration, and
+  release smoke on remote runners; and
+- establish a user-visible five-minute progress destination and a hard local
+  timeout.
+
+After a failure:
+
+- classify it as implementation, test, provider, delivery, infrastructure,
+  waiting, or human-decision failure before retrying;
+- resume only the failed stage;
+- never repeat a successful provider call for a push, PR, report, or CI-wait
+  failure; and
+- stop after one automatic retry or when external side effects are ambiguous.
+
+During release-candidate freeze, accept only P0, P1, and release-contract
+corrections. Stop for human GO/NO-GO after two failed candidates. Use
+[`reference/development-release-checklist.md`](reference/development-release-checklist.md)
+as the evidence checklist from intake through post-publication cleanup.
+
+## 5. Close the operational loop
+
+Before declaring a unit complete, confirm that provider, test, and watcher
+processes have exited; worktree and branch ownership is explicit; delivery
+evidence is durable; local-only data remains private; and the final status is
+visible to the user.
+
+Code-complete, candidate-complete, and release-complete are different states.
+Name the state and its evidence rather than reporting an unqualified “done.”
+
 ## Hard rules
 
 - Never open a code issue before its design document is merged.
@@ -73,3 +115,9 @@ checks both that the code matches the spec and that it works.
 - Keep one concern per PR.
 - Never hand-write code outside this loop.
 - Never create a new spec with a `YYYY-MM-DD-` filename prefix.
+- Never run unapproved local full-suite or full-race work during self-hosting.
+- Never use a provider for deterministic waiting, heartbeat, progress, polling,
+  or delivery-only recovery.
+- Never restart implementation when a valid commit already exists and only a
+  delivery stage failed.
+- Never merge post-RC documentation or enhancements into a frozen candidate.

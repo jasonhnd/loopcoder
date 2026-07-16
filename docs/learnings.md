@@ -209,3 +209,63 @@ higher-authority source and report the conflict.
 - Candidate improvement: none
 - Confidence: high
 - Supersedes: none
+
+### 2026-07-16 - run v0.8.0-release-closeout - Provider cost budgets do not protect the local host
+
+- Scope: v0.8.0 self-hosting and release closeout; issue #968
+- Role: conductor
+- Observed: The orchestration-cost contract bounded model calls, reported tokens, retries, and deterministic waits, but overlapping local tests, provider processes, and status watchers could still exhaust host CPU, memory, and process capacity.
+- Evidence: issue #968; `docs/specs/0968-orchestration-cost-budget.md`; `docs/v0.8.0-retrospective.md`.
+- Learning: Every self-hosting run needs an aggregate local-host budget for CPU, RSS, child-process count, test concurrency, and process-tree lifetime in addition to token and provider-call budgets. Until the binary enforces it, the conductor must keep heavy tests remote and allow only one local provider at a time.
+- Applies to: PROCESS.md, scheduling, resilience, conductor
+- Candidate improvement: "resource governor: enforce aggregate local CPU, memory, process-count, concurrency, and lifetime budgets"
+- Confidence: high
+- Supersedes: none
+
+### 2026-07-16 - run v0.8.0-release-closeout - Resume the failed stage, not the completed task
+
+- Scope: issue #997 / PR #998 delivery after a successful implementation commit
+- Role: conductor
+- Observed: A Worker could complete code and focused verification, then fail during push or PR delivery. Re-running the Worker would duplicate useful provider work and repeat tests even though the implementation commit already existed.
+- Evidence: issue #997; PR #998; `docs/v0.8.0-retrospective.md`.
+- Learning: Classify implementation, test, provider, delivery, infrastructure, waiting, and human-decision failures before retry. When a valid commit exists, reconcile and resume push, PR creation, or report delivery only; never call the provider again for a delivery-only failure.
+- Applies to: conductor, dispatch, recovery, delivery
+- Candidate improvement: "delivery resume: persist and retry commit/push/PR/report stages independently"
+- Confidence: high
+- Supersedes: none
+
+### 2026-07-16 - run v0.8.0-release-closeout - Verification must be tiered by evidence boundary
+
+- Scope: v0.8.0 PR, promotion, integrated-main, and release verification
+- Role: conductor
+- Observed: Substantially overlapping focused tests, full tests, race tests, pre-push checks, PR checks, promotion checks, integrated-main checks, and release checks multiplied time and failure surface without providing proportionally independent evidence.
+- Evidence: PR #994; `docs/reference/releasing.md`; `docs/v0.8.0-retrospective.md`.
+- Learning: Worker runs format/compile/focused tests; PR CI owns normal test/race/verify/security evidence; promotion uses protected remote checks; the release workflow owns the single full-race, build, signing, and exact-artifact smoke. Do not repeat a remote full gate locally while it is pending or green.
+- Applies to: PROCESS.md, CI, hooks, worker prompts, release
+- Candidate improvement: "verification planner: select and deduplicate checks by evidence boundary"
+- Confidence: high
+- Supersedes: none
+
+### 2026-07-16 - run v0.8.0-release-closeout - Durable progress is not user-visible progress
+
+- Scope: issues #967 and #959; host progress delivery during long-running self-hosting work
+- Role: conductor
+- Observed: A run could persist progress receipts and remain healthy while the active host showed no useful update. Receipt generation, transport write, host acceptance, user visibility, and acknowledgment are separate states.
+- Evidence: issue #967; `docs/reference/progress-receipts.md`; `docs/reference/runtime-capabilities.md`.
+- Learning: Every active task longer than five minutes must surface a bounded status packet with stage, elapsed time, last evidence, provider activity, local process count, remote gate, next timeout, and next action. A live PID, CPU activity, or unchanged pending check is not evidence of useful progress.
+- Applies to: host adapters, reporter, conductor, progress delivery
+- Candidate improvement: "progress visibility gate: require five-minute host-visible status or stop/detach"
+- Confidence: high
+- Supersedes: none
+
+### 2026-07-16 - run v0.8.0-release-closeout - Release quality needs a stopping rule
+
+- Scope: v0.8.0 release-candidate stabilization; issues #869 and #997
+- Role: conductor
+- Observed: Repeated audits can continue discovering real edge cases after feature completion. Without a frozen blocker definition and candidate limit, each finding can extend the same release indefinitely.
+- Evidence: issue #869; issue #997; `docs/reference/v0.8.0-go-no-go.md`; `docs/v0.8.0-retrospective.md`.
+- Learning: Enter RC only after planned implementation is complete; permit only P0, P1, and release-contract corrections; defer lower-severity findings; and stop for a human GO/NO-GO decision after two failed candidates. Quality is defined by explicit acceptance and residual-risk ownership, not by an unbounded search for another possible defect.
+- Applies to: PROCESS.md, roadmap, release, conductor
+- Candidate improvement: "release state: enforce RC freeze, blocker classes, and a two-candidate stop gate"
+- Confidence: high
+- Supersedes: none
