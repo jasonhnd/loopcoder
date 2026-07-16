@@ -1323,6 +1323,75 @@ func TestMigrateStorageCommandDefaultsToReadOnlyPlan(t *testing.T) {
 	}
 }
 
+func TestMigrateStorageCommandApplyJSONUsesSnakeCaseHealthKeys(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "loopcoder.db")
+	var stdout, stderr bytes.Buffer
+
+	exitCode := RunWithDeps([]string{"migrate", "storage", "--database", databasePath, "--apply", "--format", "json"}, &stdout, &stderr, Deps{
+		MigrateStorage: func(_ context.Context, opts storage.SchemaMigrationOptions) (storage.SchemaMigrationResult, error) {
+			if opts.Path != databasePath {
+				t.Fatalf("Path = %q, want %q", opts.Path, databasePath)
+			}
+			if !opts.Apply {
+				t.Fatal("Apply = false, want true")
+			}
+			return storage.SchemaMigrationResult{
+				SchemaVersion: storage.SchemaMigrationContract,
+				Status:        "migrated",
+				Applied:       true,
+				Plan: storage.SchemaMigrationPlan{
+					SchemaVersion:       storage.SchemaMigrationContract,
+					DatabasePath:        databasePath,
+					SourceExists:        true,
+					SourceSchemaVersion: 9,
+					TargetSchemaVersion: storage.CurrentSchemaVersion,
+					Status:              "upgrade-required",
+					PlanFingerprint:     "sha256:plan",
+					BackupRequired:      true,
+				},
+				Health: &storage.Health{
+					Path:          databasePath,
+					Exists:        true,
+					SchemaVersion: storage.CurrentSchemaVersion,
+					OK:            true,
+					Message:       "storage database is healthy",
+				},
+			}, nil
+		},
+	})
+	if exitCode != 0 || stderr.Len() != 0 {
+		t.Fatalf("RunWithDeps exit=%d stderr=%q", exitCode, stderr.String())
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
+	}
+	health, ok := payload["health"].(map[string]any)
+	if !ok {
+		t.Fatalf("health payload = %#v, want object in %s", payload["health"], stdout.String())
+	}
+	if got := health["schema_version"]; got != float64(storage.CurrentSchemaVersion) {
+		t.Fatalf("health.schema_version = %#v, want %d\n%s", got, storage.CurrentSchemaVersion, stdout.String())
+	}
+	if got := health["ok"]; got != true {
+		t.Fatalf("health.ok = %#v, want true\n%s", got, stdout.String())
+	}
+	for _, key := range []string{"SchemaVersion", "OK"} {
+		if _, exists := health[key]; exists {
+			t.Fatalf("health contains PascalCase key %q: %#v", key, health)
+		}
+	}
+	for _, key := range []string{"path", "exists", "schema_version", "ok", "message"} {
+		if _, exists := health[key]; !exists {
+			t.Fatalf("health missing canonical key %q: %#v", key, health)
+		}
+	}
+	if len(health) != 5 {
+		t.Fatalf("health keys = %#v, want only canonical snake_case keys", health)
+	}
+}
+
 func TestMigrateStorageCommandApplyRendersVerifiedRecoveryPoint(t *testing.T) {
 	databasePath := filepath.Join(t.TempDir(), "loopcoder.db")
 	var stdout, stderr bytes.Buffer
