@@ -1,7 +1,6 @@
 package providerinventory
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -54,6 +53,17 @@ type CodexAppServerResult struct {
 type codexProtocolStdoutEvent struct {
 	line string
 	err  error
+}
+
+// codexProtocolCapture lets os/exec drain stdout before Wait returns. Using
+// Cmd.StdoutPipe while Wait runs concurrently can lose a fast process's final
+// protocol frame when Wait closes the pipe first.
+type codexProtocolCapture struct {
+	ctx      context.Context
+	events   chan codexProtocolStdoutEvent
+	retained *boundedBuffer
+	pending  []byte
+	terminal bool
 }
 
 type jsonRPCMessage struct {
@@ -281,25 +291,31 @@ func runCodexAppServer(ctx context.Context, req CodexAppServerRequest) (CodexApp
 	if err != nil {
 		return CodexAppServerResult{ExitCode: -1}, err
 	}
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return CodexAppServerResult{ExitCode: -1}, err
-	}
 	cmd.Stderr = stderr
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	captureCtx, stopCapture := context.WithCancel(runCtx)
+	defer stopCapture()
+	capture := &codexProtocolCapture{
+		ctx:      captureCtx,
+		events:   make(chan codexProtocolStdoutEvent, 16),
+		retained: stdout,
+	}
+	cmd.Stdout = capture
 	runCh := make(chan struct {
 		result supervisedexec.Result
 		err    error
 	}, 1)
 	go func() {
 		result, err := supervisedexec.Run(runCtx, cmd, supervisedexec.Options{HardCap: req.Timeout, LivenessMode: supervisedexec.LivenessModeLogOnly, Role: "codex-quota-app-server"})
+		capture.close()
 		runCh <- struct {
 			result supervisedexec.Result
 			err    error
 		}{result: result, err: err}
 	}()
-	protocolErr := driveCodexAppServerProtocol(runCtx, stdin, stdoutPipe, stdout)
+	protocolErr := driveCodexAppServerProtocolEvents(runCtx, stdin, capture.events)
+	stopCapture()
 	_ = stdin.Close()
 	if protocolErr != nil {
 		cancel()
@@ -330,43 +346,64 @@ func runCodexAppServer(ctx context.Context, req CodexAppServerRequest) (CodexApp
 	return out, err
 }
 
-func driveCodexAppServerProtocol(ctx context.Context, stdin io.Writer, stdout io.Reader, retained *boundedBuffer) error {
-	events := scanCodexAppServerStdout(ctx, stdout, retained)
-	return driveCodexAppServerProtocolEvents(ctx, stdin, events)
-}
-
-func scanCodexAppServerStdout(ctx context.Context, stdout io.Reader, retained *boundedBuffer) <-chan codexProtocolStdoutEvent {
-	events := make(chan codexProtocolStdoutEvent, 16)
-	send := func(event codexProtocolStdoutEvent) bool {
-		select {
-		case events <- event:
-			return true
-		case <-ctx.Done():
-			return false
+func (c *codexProtocolCapture) Write(data []byte) (int, error) {
+	written := len(data)
+	if c == nil || c.terminal || c.ctx.Err() != nil {
+		return written, nil
+	}
+	c.pending = append(c.pending, data...)
+	for {
+		newline := bytes.IndexByte(c.pending, '\n')
+		if newline < 0 {
+			break
+		}
+		line := append([]byte(nil), c.pending[:newline]...)
+		c.pending = c.pending[newline+1:]
+		if !c.emitLine(line) {
+			return written, nil
 		}
 	}
-	go func() {
-		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(make([]byte, 0, 4096), codexQuotaLineBytes)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" {
-				continue
-			}
-			if retained != nil {
-				_, _ = retained.Write([]byte(line + "\n"))
-			}
-			if !send(codexProtocolStdoutEvent{line: line}) {
-				return
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			_ = send(codexProtocolStdoutEvent{err: fmt.Errorf("%w: jsonl read: %v", ErrCodexQuotaMalformed, err)})
-			return
-		}
-		_ = send(codexProtocolStdoutEvent{err: io.EOF})
-	}()
-	return events
+	if len(c.pending) > codexQuotaLineBytes {
+		c.pending = nil
+		c.terminal = true
+		c.send(codexProtocolStdoutEvent{err: fmt.Errorf("%w: oversized jsonl line", ErrCodexQuotaMalformed)})
+	}
+	return written, nil
+}
+
+func (c *codexProtocolCapture) close() {
+	if c == nil || c.terminal || c.ctx.Err() != nil {
+		return
+	}
+	if len(c.pending) > 0 && !c.emitLine(c.pending) {
+		return
+	}
+	c.pending = nil
+	c.send(codexProtocolStdoutEvent{err: io.EOF})
+}
+
+func (c *codexProtocolCapture) emitLine(raw []byte) bool {
+	line := strings.TrimSpace(string(raw))
+	if line == "" {
+		return true
+	}
+	if len(line) > codexQuotaLineBytes {
+		c.terminal = true
+		return c.send(codexProtocolStdoutEvent{err: fmt.Errorf("%w: oversized jsonl line", ErrCodexQuotaMalformed)})
+	}
+	if c.retained != nil {
+		_, _ = c.retained.Write([]byte(line + "\n"))
+	}
+	return c.send(codexProtocolStdoutEvent{line: line})
+}
+
+func (c *codexProtocolCapture) send(event codexProtocolStdoutEvent) bool {
+	select {
+	case c.events <- event:
+		return true
+	case <-c.ctx.Done():
+		return false
+	}
 }
 
 func driveCodexAppServerProtocolEvents(ctx context.Context, stdin io.Writer, events <-chan codexProtocolStdoutEvent) error {
