@@ -58,6 +58,15 @@ Provider-free adoption and reconciliation run before this boundary. Budgeted
 provider launches are advanced one at a time so a completed usage report can
 reconcile the durable reservation before the next call is admitted.
 
+A durable provider reservation without a terminal report is an unresolved
+in-flight call and blocks every later provider launch. A terminal provider
+report may truthfully leave token usage `unknown` when that provider does not
+expose usage metadata. In that case the next useful worker or verifier call may
+proceed under `max_model_calls`; LoopCoder records the explicit
+`model-call-cap-fallback` evidence and never invents a token value. Unknown
+token usage remains ineligible for automatic release and requires human review
+at the release gate.
+
 ## Output and persistence
 
 Tick text and JSON include the same normalized summary, role rows, budget
@@ -81,6 +90,8 @@ normalization and reload.
 
 - Unit tests prove every deterministic wait class reports zero calls/tokens.
 - Unknown external-host and missing provider token usage render `unknown`.
+- An unresolved provider reservation blocks another launch, while a terminal
+  report with unknown usage falls back to the model-call cap.
 - Retry classes and packet bytes remain independently visible.
 - Call/token exhaustion blocks the next provider without cancelling completed
   work or invoking a fallback.

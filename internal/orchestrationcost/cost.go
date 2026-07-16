@@ -373,13 +373,38 @@ func checkBeforeModelCall(report Report, proposedCalls int) Decision {
 	if report.Totals.ModelCalls+proposedCalls > report.Policy.MaxModelCalls {
 		return blocked("model-call-budget", fmt.Sprintf("%d+%d", report.Totals.ModelCalls, proposedCalls), fmt.Sprint(report.Policy.MaxModelCalls), "increase orchestration.cost_budget.max_model_calls or continue manually")
 	}
+	if hasPendingProviderReservation(report.Events) {
+		return blocked("provider-call-usage-pending", "provider call reserved without a terminal report", "one in-flight provider call", "reconcile the current provider call before launching another provider")
+	}
 	if report.Totals.UsageState == UsageUnknown {
-		return blocked("token-budget-unknown", "unknown", fmt.Sprint(report.Policy.MaxTokens), "supply exact provider token usage or continue manually")
+		return Decision{
+			Status:      StatusAllowed,
+			Allowed:     true,
+			Reason:      "within orchestration call budget; token usage unknown",
+			Observed:    fmt.Sprintf("calls=%d tokens=%s", report.Totals.ModelCalls, UsageUnknown),
+			Limit:       fmt.Sprintf("calls=%d tokens=%d", report.Policy.MaxModelCalls, report.Policy.MaxTokens),
+			Evidence:    []string{"loopcoder-owned-usage-unknown", "model-call-cap-fallback"},
+			Remediation: "automatic release still requires human review of unknown token usage",
+		}
 	}
 	if report.Totals.Tokens != nil && *report.Totals.Tokens >= report.Policy.MaxTokens {
 		return blocked("token-budget-exhausted", fmt.Sprint(*report.Totals.Tokens), fmt.Sprint(report.Policy.MaxTokens), "increase orchestration.cost_budget.max_tokens or continue manually")
 	}
 	return Decision{Status: StatusAllowed, Allowed: true, Reason: "within orchestration cost budget", Observed: fmt.Sprintf("calls=%d tokens=%s", report.Totals.ModelCalls, tokenDisplay(report.Totals.Tokens)), Limit: fmt.Sprintf("calls=%d tokens=%d", report.Policy.MaxModelCalls, report.Policy.MaxTokens), Evidence: []string{"loopcoder-owned-usage-only"}, Remediation: "none"}
+}
+
+func hasPendingProviderReservation(events []Event) bool {
+	for _, event := range events {
+		if event.Activity != ActivityModelCall || event.ModelCalls == 0 {
+			continue
+		}
+		for _, evidence := range event.Evidence {
+			if strings.TrimSpace(evidence) == "provider-call-reserved" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func CheckReleaseGate(report Report) Decision {

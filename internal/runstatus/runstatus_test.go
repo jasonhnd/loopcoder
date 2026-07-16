@@ -100,7 +100,7 @@ func TestLoadRegisteredRunningAttemptWithoutProviderAuthorityReportsMissingRow(t
 	}
 	runID := "run-missing-authority"
 	pid := os.Getpid()
-	if _, err := state.WriteAttempt(repo, runID, state.AttemptRecord{
+	attemptPath, err := state.WriteAttempt(repo, runID, state.AttemptRecord{
 		Version:        1,
 		JobID:          "job-missing-authority",
 		Issue:          909,
@@ -113,8 +113,13 @@ func TestLoadRegisteredRunningAttemptWithoutProviderAuthorityReportsMissingRow(t
 		HeartbeatAt:    "2026-07-01T00:00:01Z",
 		LastProgressAt: "2026-07-01T00:00:01Z",
 		LogBytes:       1,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("WriteAttempt: %v", err)
+	}
+	fixtureTime := fixedRunstatusNow()
+	if err := os.Chtimes(attemptPath, fixtureTime, fixtureTime); err != nil {
+		t.Fatalf("Chtimes attempt: %v", err)
 	}
 	report, err := Load(Options{RepoPath: repo, RunID: runID, Now: fixedRunstatusNow})
 	if err != nil {

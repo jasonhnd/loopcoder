@@ -934,8 +934,16 @@ func recordDispatchWaveResultCost(tickReport *TickReport, result DispatchWaveIss
 	}
 	return upsertTickCostEvent(tickReport, orchestrationcost.EventFromReport(
 		eventID, orchestrationcost.RoleWorker, true, result.Report,
-		fmt.Sprintf("issue=%d", result.Issue), fmt.Sprintf("status=%s", result.Status),
+		providerCallEvidence(result.Report, fmt.Sprintf("issue=%d", result.Issue), fmt.Sprintf("status=%s", result.Status))...,
 	))
+}
+
+func providerCallEvidence(record *reporter.Report, evidence ...string) []string {
+	result := append([]string(nil), evidence...)
+	if record == nil {
+		result = append(result, "provider-call-reserved")
+	}
+	return result
 }
 
 func recordRecoveryCost(tickReport *TickReport, issue int, result recovery.Result, providerCallsRecorded bool) {
@@ -947,7 +955,7 @@ func recordRecoveryCost(tickReport *TickReport, issue int, result recovery.Resul
 				recorded = true
 				recordTickCostEvent(tickReport, orchestrationcost.EventFromReport(
 					fmt.Sprintf("recovery:issue-%d:attempt-%d:worker", issue, attempt.Attempt), orchestrationcost.RoleRecovery, false, attempt.DispatchResult.Report,
-					fmt.Sprintf("strategy=%s", attempt.Strategy), fmt.Sprintf("status=%s", attempt.Status),
+					providerCallEvidence(attempt.DispatchResult.Report, fmt.Sprintf("strategy=%s", attempt.Strategy), fmt.Sprintf("status=%s", attempt.Status))...,
 				))
 			}
 			if attempt.Review != nil && attempt.Review.Report != nil {
@@ -962,13 +970,13 @@ func recordRecoveryCost(tickReport *TickReport, issue int, result recovery.Resul
 		if !recorded && result.DispatchResult != nil && result.DispatchResult.ProviderInvoked {
 			recordTickCostEvent(tickReport, orchestrationcost.EventFromReport(
 				fmt.Sprintf("recovery:issue-%d:worker", issue), orchestrationcost.RoleRecovery, false, result.DispatchResult.Report,
-				"recovery worker call",
+				providerCallEvidence(result.DispatchResult.Report, "recovery worker call")...,
 			))
 		}
 		if !reviewRecorded && result.ReviewResult != nil && result.ReviewResult.ProviderInvoked {
 			recordTickCostEvent(tickReport, orchestrationcost.EventFromReport(
 				fmt.Sprintf("recovery:issue-%d:verifier", issue), orchestrationcost.RoleRecovery, false, result.ReviewResult.Verdict.Report,
-				"recovery verifier call",
+				providerCallEvidence(result.ReviewResult.Verdict.Report, "recovery verifier call")...,
 			))
 		}
 	}
@@ -1051,7 +1059,10 @@ func runTickCostedLoopreview(
 		if reservationEventID == "" {
 			reservationEventID = nextTickCostEventID(tickReport.OrchestrationCost.Events, eventID)
 		}
-		costErr := upsertTickCostEventInMemory(tickReport, orchestrationcost.EventFromReport(reservationEventID, role, useful, result.Verdict.Report, evidence...))
+		costErr := upsertTickCostEventInMemory(tickReport, orchestrationcost.EventFromReport(
+			reservationEventID, role, useful, result.Verdict.Report,
+			providerCallEvidence(result.Verdict.Report, evidence...)...,
+		))
 		if costErr == nil {
 			tickReport.OrchestrationCost = orchestrationcost.MarkBudgetDecisionConsumed(tickReport.OrchestrationCost, prNumber)
 			costErr = persistTickCostReport(tickReport)
@@ -1192,7 +1203,7 @@ func runTickRecoverFailure(ctx context.Context, opts TickOptions, tickReport *Ti
 				orchestrationcost.RoleRecovery,
 				false,
 				providerReport,
-				fmt.Sprintf("provider_kind=%s", kind),
+				providerCallEvidence(providerReport, fmt.Sprintf("provider_kind=%s", kind))...,
 			))
 			pendingProviderEventID = ""
 		},
