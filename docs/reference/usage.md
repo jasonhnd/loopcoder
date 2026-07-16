@@ -1,12 +1,15 @@
 # loopcoder Usage
 
-loopcoder turns one delivery need into a small GitHub-issue batch,
-provider-pluggable worker PRs, independent `loopreview` verification, chat
-progress, and user-directed merges.
+loopcoder provides commands and a conductor playbook for turning one delivery
+need into GitHub issues, provider-backed worktree changes, pull requests,
+`loopreview` verdicts, durable status, and user-directed merges.
 
-Use it when you want one conductor chat to plan, dispatch, review, and merge a
-small batch of repository work without manually relaying every step between
-GitHub, git worktrees, worker providers, and PR review.
+v0.8.0 is a controlled-canary/development release. A command, schema, or
+adapter declaration is not by itself a production-support promise. Before
+using a provider or orchestration mode, read the binding
+[`v0.8.0 capability and support matrix`](v0.8.0-capability-matrix.md), which
+separates implemented code from reachable product paths, deterministic tests,
+real-provider evidence, and production support.
 
 ## Quickstart (new project)
 
@@ -84,10 +87,10 @@ push access.
    /loopcoder <your need>
    ```
 
-   The conductor plans the work, dispatches workers, runs `loopreview`, and
-   reports promotion status. New v0.8.0 scaffolds use `human-merge`; projects
-   can opt into automatic production promotion with `loopcoder init --repo .
-   --gate auto` or an explicit config edit.
+   For v0.8.0, keep `human-merge`, select Worker and Verifier providers
+   explicitly, and treat the flow as a human-controlled canary. Do not enable
+   automatic promotion until the repository's own gates and every required
+   capability in the support matrix are satisfied.
 
 Command side effects in the first-run path:
 
@@ -136,17 +139,20 @@ default.
 - A conductor host session that follows `SKILL.md`, `AGENTS.md`, or `GEMINI.md`.
 - `git` on `PATH`.
 - `gh` on `PATH`, authenticated for the target GitHub repository.
-- At least one supported provider CLI on `PATH`. `codex` is the default worker,
-  `codex` and `claude` are verified worker and verifier providers, and
-  `agy` is the Google Antigravity CLI used by provider key `antigravity`.
-  `grok` is the xAI worker provider and discovers its model catalog dynamically;
-  the older direct `gemini` worker adapter remains experimental and is not part
-  of the static model registry.
+- At least one registered provider CLI on `PATH`. `codex` is the default
+  worker; `agy` is used by provider key `antigravity`; and `grok` discovers its
+  model catalog dynamically. Registration does not establish authentication,
+  usable capacity, role safety, or exact-release real-provider evidence.
+  Codex and Claude have historical Worker/Verifier mechanism smokes,
+  Antigravity has no read-only Verifier mode, and direct `gemini` remains
+  experimental outside the static model registry.
 - A GitHub repository with a configured remote.
 - For the no-Go installer on native macOS Apple Silicon: `curl`, `tar`,
-  `cosign`, and `sha256sum` or `shasum`. The installer verifies signed
-  `SHA256SUMS` before trusting checksums. Go is optional for developer installs
-  and local source builds.
+  `cosign`, and `sha256sum` or `shasum`. The installer verifies the
+  Sigstore-signed `SHA256SUMS` before trusting checksums. This establishes
+  archive integrity, not Apple Gatekeeper trust: the v0.8.0 Mach-O is not
+  Developer ID signed or notarized. Go is optional for developer installs and
+  local source builds.
 
 ## Install
 
@@ -159,6 +165,11 @@ replacement, or PATH/profile mutation. On the supported host, it verifies the
 `SHA256SUMS` signature with cosign before trusting checksums, installs under
 `~/.loopcoder/bin`, and updates or prints PATH instructions. The installer does
 not require Go.
+
+The default install directory is the supported documented path. v0.8.0 can
+place the binary in an absolute `LOOPCODER_INSTALL_DIR`, but its PATH/profile
+guidance still targets `~/.loopcoder/bin`; custom-directory setup is therefore
+not supported as a complete installer flow.
 
 ```text
 curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.0
@@ -1080,7 +1091,8 @@ loopcoder kill --repo . --all
 ```
 
 Machine-local registry, migration, nested-run, and DeliveryRun commands are
-part of the v0.8.0 command surface:
+part of the v0.8.0 command inventory. Inventory does not imply that every mode
+is a supported product path:
 
 ```text
 loopcoder projects register --repo .
@@ -1142,7 +1154,8 @@ state. It does not dispatch workers or launch providers.
 
 ### Nested Child Plans
 
-`loopcoder nested run` is the supported boundary for v1 nested orchestration:
+`loopcoder nested run` is the v1 nested-plan command, but no real-provider
+nested execution mode is supported in v0.8.0:
 
 ```text
 loopcoder nested run --repo . --plan child-plan.json --provider codex
@@ -1150,10 +1163,10 @@ loopcoder nested run --repo . --plan child-plan.json --provider claude --format 
 ```
 
 The plan file must use `schema_version: "loopcoder.child_plan.v1"`. The command
-strictly validates child keys, dependencies, depth, fan-out, declared scope,
-permission, and aggregation policy before launching child work. It persists the
-accepted plan and parent/child run graph in `$LOOPCODER_HOME/data/loopcoder.db`,
-then schedules ready children with dependency-aware fan-out/fan-in. Re-running
+validates child keys, dependencies, depth, fan-out, declared scope, permission,
+and aggregation policy before scheduling child work. It persists the accepted
+plan and parent/child run graph in `$LOOPCODER_HOME/data/loopcoder.db`.
+Re-running
 the same `plan_id` first resolves child identity from the durable SQL
 `(plan_id, child_key)` edge: terminal children are reported from durable state
 without relaunching the provider, queued/running/interrupted children are
@@ -1174,15 +1187,14 @@ active, but it does not promise universal exactly-once external side effects
 after a crash; ambiguous side effects must be resolved with receipts,
 idempotency keys, or `needs-human`.
 
-For production providers, loopcoder launches write-capable child runs through
-the existing Worker dispatch adapter path. That means `codex` and `claude`
-children get normal worktrees, attempt records, reports, recovery briefs, and
-provider selection behavior; unsupported read-only child dispatch fails with an
-explicit error instead of silently using a mutating worker. Loopcoder remains the
-authority for child identity, permission ceilings, budget/circuit checks,
-persistence, cancellation, timeout, and recovery. Native provider sub-agent
-features are not a replacement for the child plan and are not allowed to create
-untracked children outside loopcoder.
+In v0.8.0, production-provider `write` and `orchestrate` children are refused
+before dispatch. The command accepts a `read-only` child but sends it through
+the ordinary Worker adapter without an enforceable mutation-free permission,
+so that accepted path is also unsafe for real providers. Do not use Codex,
+Claude, Grok, Antigravity, Gemini, or any other real provider with `nested run`
+in v0.8.0. The command's plan, scheduler, persistence, claim, recovery, and
+permission records are implementation inventory and deterministic-test
+infrastructure, not proof of a safe product bridge.
 
 The reserved `test-subprocess` provider exists only for deterministic local and
 release smoke tests. It executes each child item's `scope.commands` as real local

@@ -3,12 +3,15 @@
 This living reference describes loopcoder's 0.x compatibility policy for
 project configuration, documented commands, and documented GitHub labels.
 
-Current release candidate: `0.8.0`.
+Current public release: `0.8.0`.
 
-v0.8.0 becomes the customer install target only when its tag, signed checksums,
-single Darwin arm64 archive, provenance, staged smoke, publication approval,
-and completed go/no-go record all exist. Candidate documentation is not proof
-that publication occurred.
+The v0.8.0 tag, Sigstore-signed checksums, single Darwin arm64 archive, staged
+smoke, publication approval, and completed go/no-go record are public. Those
+facts establish release identity and integrity, not support for every internal
+contract. The binding product-path status is the
+[`v0.8.0 capability and support matrix`](v0.8.0-capability-matrix.md): v0.8.0
+is for controlled canary and development use, not unattended end-to-end
+production orchestration.
 
 v0.8.0 supports native macOS Apple Silicon (`darwin/arm64`) only. Windows,
 Linux/Ubuntu, WSL, containers used as a LoopCoder runtime, Intel macOS, and
@@ -143,7 +146,9 @@ requirements must record that change in the changelog.
 - [`0884-macos-arm64-only.md`](../specs/0884-macos-arm64-only.md): binding
   v0.8.0 platform, installer, upgrade, CI, release, and historical-evidence
   contract.
-- [`v0.8.0-go-no-go.md`](v0.8.0-go-no-go.md): current release-candidate gates
-  and evidence record.
+- [`v0.8.0-capability-matrix.md`](v0.8.0-capability-matrix.md): binding
+  post-publication capability, reachability, evidence, and support status.
+- [`v0.8.0-go-no-go.md`](v0.8.0-go-no-go.md): completed publication gates and
+  historical evidence record.
 - [`v0.7.0-go-no-go.md`](v0.7.0-go-no-go.md): release-readiness evidence and
   completed historical gate record for v0.7.0.

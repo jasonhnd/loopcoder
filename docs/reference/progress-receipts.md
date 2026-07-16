@@ -6,6 +6,12 @@ in project-scoped SQLite schema v25 as an append-only, redacted
 attempt, correlation, phase, status, provider, model, heartbeat age, and
 progress age.
 
+This document describes the durable record, outbox, and transport contracts.
+It does not claim that every v0.8.0 command wires them into active work or that
+the initiating host receives unsolicited progress. The binding shipped status
+is in the
+[`v0.8.0 capability and support matrix`](v0.8.0-capability-matrix.md).
+
 Duplicate writes with the same project, delivery run, correlation ID, and
 semantic fingerprint are idempotent. Distinct phase, status, count, evidence,
 quota/budget, blocker, next-action, heartbeat, or progress transitions produce
@@ -22,6 +28,11 @@ CI, waiting for approval, quota blocked, fallback in progress, host offline, or
 delivery pending. A generated receipt is not evidence of worker progress, host
 delivery, user visibility, delivery acknowledgment, or renewal of any lease,
 claim, reservation, budget, quota window, or stall watchdog deadline.
+
+In v0.8.0, durable inspection through `status` and `attach` is available, but
+the active delivery path lacks exact-artifact proof of an attached progress
+sink and host visibility. The five-minute policy and persistence mechanics are
+therefore not a promise of unsolicited user-visible receipts for every run.
 
 Rollback behavior is fail-closed. Schema v25 is committed atomically with its
 migration row, and older binaries that only support v24 reject the database as a
