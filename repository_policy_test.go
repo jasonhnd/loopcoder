@@ -26,6 +26,9 @@ func TestV080WorkflowPolicy(t *testing.T) {
 	if !workflowJobContains(workflow.Jobs["race"], "scripts/ci-race-changed.sh") {
 		t.Fatal("pull-request race job must run scripts/ci-race-changed.sh")
 	}
+	if !scriptContains(t, filepath.Join(root, "scripts", "ci-race-changed.sh"), "bash scripts/ci-full-race.sh") {
+		t.Fatal("pull-request race fallback must use scripts/ci-full-race.sh")
+	}
 }
 
 func TestV080ReleaseWorkflowPolicy(t *testing.T) {
@@ -35,9 +38,65 @@ func TestV080ReleaseWorkflowPolicy(t *testing.T) {
 	if err := validateV080ReleaseWorkflowPolicy(workflow); err != nil {
 		t.Fatal(err)
 	}
-	if !workflowJobContains(workflow.Jobs["build"], "go test -race -count=1 -timeout=20m ./...") {
-		t.Fatal("release build must run the full Go race suite before packaging")
+	if !workflowJobContains(workflow.Jobs["build"], "bash scripts/ci-full-race.sh") {
+		t.Fatal("release build must run scripts/ci-full-race.sh before packaging")
 	}
+	if workflowJobContains(workflow.Jobs["build"], "go test -race -count=1 -timeout=20m ./...") {
+		t.Fatal("release build must not drift back to the superseded monolithic race command")
+	}
+}
+
+func TestV080ReleaseRaceDocumentationPolicy(t *testing.T) {
+	root := repositoryPolicyRoot(t)
+	docsRequiringHelper := []string{
+		"docs/reference/releasing.md",
+		"docs/reference/v0.8.0-go-no-go.md",
+	}
+	for _, name := range docsRequiringHelper {
+		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
+		if err != nil {
+			t.Fatalf("read release race documentation %s: %v", name, err)
+		}
+		current := currentV080Documentation(name, string(data))
+		for _, want := range []string{
+			"bash scripts/ci-full-race.sh",
+			"go list ./...",
+			"-race -count=1 -timeout=20m",
+			"internal/storage",
+			"internal/routing",
+			"internal/supervisedexec",
+		} {
+			if !strings.Contains(current, want) {
+				t.Errorf("%s does not document release race helper detail %q", name, want)
+			}
+		}
+	}
+
+	releaseOperatorDocs := []string{
+		"CHANGELOG.md",
+		".github/release-notes/v0.8.0.md",
+		"docs/reference/releasing.md",
+		"docs/reference/v0.8.0-go-no-go.md",
+	}
+	for _, name := range releaseOperatorDocs {
+		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
+		if err != nil {
+			t.Fatalf("read release/operator documentation %s: %v", name, err)
+		}
+		current := currentV080Documentation(name, string(data))
+		if strings.Contains(current, "go test -race -count=1 -timeout=20m ./...") {
+			t.Errorf("%s still documents the superseded monolithic release race command", name)
+		}
+	}
+}
+
+func scriptContains(t *testing.T, path, needle string) bool {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read script %s: %v", path, err)
+	}
+	return strings.Contains(string(data), needle)
 }
 
 func workflowJobContains(job workflowJobPolicy, needle string) bool {

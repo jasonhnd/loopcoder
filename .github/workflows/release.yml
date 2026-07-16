@@ -44,7 +44,7 @@ jobs:
           test "${actual_goarch}" = "arm64"
 
       - name: Full Go race suite
-        run: go test -race -count=1 -timeout=20m ./...
+        run: bash scripts/ci-full-race.sh
 
       - name: Build archive
         env:
