@@ -1,10 +1,11 @@
 #!/usr/bin/env pwsh
 param(
-    [string]$Version = "0.7.0",
-    [string]$PreviousVersion = "0.6.1",
+    [string]$Version = "0.8.0",
+    [string]$PreviousVersion = "0.7.0",
     [string]$Repo = "jasonhnd/loopcoder",
     [string]$GitHubBaseUrl = "https://github.com",
-    [string]$GitHubApiUrl = "https://api.github.com"
+    [string]$GitHubApiUrl = "https://api.github.com",
+    [switch]$KeepArtifacts
 )
 
 Set-StrictMode -Version Latest
@@ -610,6 +611,8 @@ $tag = if ($Version.StartsWith("v")) { $Version } else { "v$Version" }
 $plainVersion = $tag.TrimStart("v")
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("loopcoder-release-smoke-" + [System.Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $tmp | Out-Null
+$artifactDir = Join-Path $tmp "artifacts"
+New-Item -ItemType Directory -Path $artifactDir | Out-Null
 $oldHome = [Environment]::GetEnvironmentVariable("LOOPCODER_HOME", "Process")
 $oldUpgradeRepo = [Environment]::GetEnvironmentVariable("LOOPCODER_UPGRADE_REPO", "Process")
 $oldGitHubBaseUrl = [Environment]::GetEnvironmentVariable("GITHUB_BASE_URL", "Process")
@@ -624,6 +627,20 @@ New-Item -ItemType Directory -Path $loopcoderHome | Out-Null
 $scriptRoot = Split-Path -Parent $PSCommandPath
 $sourceRepo = (Resolve-Path -LiteralPath (Join-Path $scriptRoot "..")).Path
 $mockReleaseApi = $null
+$script:migrationEvidence = [ordered]@{
+    attempted = $false
+    source_schema_version = $null
+    target_schema_version = $null
+    backup_verified = $false
+    backup_sha256 = ""
+    rollback_opened_by_previous = $false
+}
+$script:upgradeEvidence = [ordered]@{
+    attempted = $false
+    from_version = ""
+    to_version = $plainVersion
+    installed_candidate_sha256 = ""
+}
 
 try {
     $release = Get-ReleaseArchive $plainVersion "candidate" $true
@@ -678,21 +695,21 @@ try {
     if (-not (Test-Path -LiteralPath $dbPath)) {
         Fail "projects register did not create $dbPath"
     }
-    Assert-OutsideRepo -Path $dbPath -RepoPath $repoTmp -Label "v0.7.0 database"
+    Assert-OutsideRepo -Path $dbPath -RepoPath $repoTmp -Label "v$plainVersion database"
     $projectRoot = Join-Path $loopcoderHome ("projects/" + $registered.project.project_id)
     foreach ($payloadRel in @("runs", "relay", "recovery", "audit")) {
         $payloadPath = Join-Path $projectRoot $payloadRel
         if (-not (Test-Path -LiteralPath $payloadPath)) {
             Fail "projects register did not create project payload directory $payloadPath"
         }
-        Assert-OutsideRepo -Path $payloadPath -RepoPath $repoTmp -Label "v0.7.0 project payload $payloadRel"
+        Assert-OutsideRepo -Path $payloadPath -RepoPath $repoTmp -Label "v$plainVersion project payload $payloadRel"
     }
     foreach ($homeRel in @("logs", "tmp")) {
         $homeRuntimePath = Join-Path $loopcoderHome $homeRel
         if (-not (Test-Path -LiteralPath $homeRuntimePath)) {
             Fail "projects register did not create home runtime directory $homeRuntimePath"
         }
-        Assert-OutsideRepo -Path $homeRuntimePath -RepoPath $repoTmp -Label "v0.7.0 home runtime $homeRel"
+        Assert-OutsideRepo -Path $homeRuntimePath -RepoPath $repoTmp -Label "v$plainVersion home runtime $homeRel"
     }
 
     Invoke-Checked "loopcoder projects show" {
@@ -762,7 +779,7 @@ try {
         Fail "doctor JSON reported unexpected database path: $($doctorPayload.runtime.database.path)"
     }
     if (-not $doctorPayload.runtime.database.exists -or $doctorPayload.runtime.database.status -ne "ok") {
-        Fail "doctor JSON did not report healthy v0.7.0 storage"
+        Fail "doctor JSON did not report healthy v$plainVersion storage"
     }
     if (-not $doctorPayload.runtime.project_registry.registered -or $doctorPayload.runtime.project_registry.project_id -ne $registered.project.project_id) {
         Fail "doctor JSON did not report the registered smoke project"
@@ -780,7 +797,7 @@ try {
         $doctorPayload.runtime.project_registry.tmp_root
     )) {
         if ([string]::IsNullOrWhiteSpace($runtimePath)) {
-            Fail "doctor JSON omitted a v0.7.0 runtime payload path"
+            Fail "doctor JSON omitted a v$plainVersion runtime payload path"
         }
         Assert-OutsideRepo -Path $runtimePath -RepoPath $repoTmp -Label "doctor runtime payload path"
     }
@@ -823,8 +840,8 @@ try {
     if (-not (Test-Path -LiteralPath $selfBootstrapScript)) {
         Fail "self-bootstrap smoke script not found at $selfBootstrapScript"
     }
-    Invoke-Checked "v0.7.0 self-bootstrap acceptance smoke" {
-        & $selfBootstrapScript -Repo $sourceRepo -Binary $binary -Version $plainVersion | Out-Host
+    Invoke-Checked "v$plainVersion self-bootstrap acceptance smoke" {
+        & $selfBootstrapScript -Repo $sourceRepo -Binary $binary -Version $plainVersion -KeepArtifacts:$KeepArtifacts | Out-Host
     }
 
     if (-not [string]::IsNullOrWhiteSpace($PreviousVersion) -and $PreviousVersion.TrimStart("v") -ne $plainVersion) {
@@ -930,6 +947,14 @@ try {
                         Fail "restored v0.7.0 backup did not preserve project identity"
                     }
                 }
+                $script:migrationEvidence = [ordered]@{
+                    attempted = $true
+                    source_schema_version = $storagePlan.plan.source_schema_version
+                    target_schema_version = $storageApply.health.schema_version
+                    backup_verified = $storageApply.backup.verified
+                    backup_sha256 = $storageApply.backup.sha256
+                    rollback_opened_by_previous = $true
+                }
             }
         }
 
@@ -944,9 +969,42 @@ try {
         }
         $upgradedStableBinary = Join-Path $loopcoderHome "bin/loopcoder"
         Assert-CandidateInstalledBinary -BinaryPath $upgradedStableBinary -ExpectedHash $candidateBinaryHash -ExpectedVersion $plainVersion -Label "previous-version upgrade from staged candidate"
+        $script:upgradeEvidence = [ordered]@{
+            attempted = $true
+            from_version = $previous.PlainVersion
+            to_version = $plainVersion
+            installed_candidate_sha256 = (Get-SHA256 $upgradedStableBinary)
+        }
     }
 
+    $releaseEvidence = [ordered]@{
+        schema_version = "loopcoder.release_smoke_evidence.v1"
+        version = $plainVersion
+        previous_version = $PreviousVersion.TrimStart("v")
+        host_tuple = "darwin/arm64"
+        candidate = [ordered]@{
+            archive = $release.Asset
+            binary_sha256 = $candidateBinaryHash
+            installed_binary = $binary
+            installed_binary_sha256 = (Get-SHA256 $binary)
+        }
+        self_bootstrap = [ordered]@{
+            provider = "test-subprocess"
+            paid_provider_calls = 0
+            completed = $true
+        }
+        migration = $script:migrationEvidence
+        upgrade = $script:upgradeEvidence
+    }
+    $releaseEvidenceJson = $releaseEvidence | ConvertTo-Json -Depth 8
+    $releaseEvidencePath = Join-Path $artifactDir "release-smoke-evidence.json"
+    $releaseEvidenceJson | Set-Content -LiteralPath $releaseEvidencePath -Encoding utf8
+    Write-Host "release smoke evidence JSON:"
+    $releaseEvidenceJson | Write-Host
     Write-Host "release smoke verification passed for $tag"
+    if ($KeepArtifacts) {
+        Write-Host "retained release smoke artifacts: $artifactDir"
+    }
 }
 finally {
     Stop-LocalReleaseApi $mockReleaseApi
@@ -955,5 +1013,7 @@ finally {
     [Environment]::SetEnvironmentVariable("GITHUB_BASE_URL", $oldGitHubBaseUrl, "Process")
     [Environment]::SetEnvironmentVariable("GITHUB_API_URL", $oldGitHubApiUrl, "Process")
     [Environment]::SetEnvironmentVariable("LOOPCODER_COSIGN_IDENTITY", $oldCosignIdentity, "Process")
-    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    if (-not $KeepArtifacts) {
+        Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }

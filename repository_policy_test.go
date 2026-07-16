@@ -57,6 +57,8 @@ func TestV080ReleaseSmokeUsesInstallerBackedCandidate(t *testing.T) {
 	}
 	script := string(data)
 	for _, want := range []string{
+		`[string]$Version = "0.8.0"`,
+		`[string]$PreviousVersion = "0.7.0"`,
 		`Join-Path $scriptRoot "install.sh"`,
 		`Invoke-CandidateInstall -Server $mockReleaseApi`,
 		`Assert-CandidateInstalledBinary -BinaryPath $binary`,
@@ -67,6 +69,9 @@ func TestV080ReleaseSmokeUsesInstallerBackedCandidate(t *testing.T) {
 		`LOOPCODER_SMOKE_MV_READY`,
 		`Stop-Process -Id ([int]$mvPid)`,
 		`Assert-CandidateInstalledBinary -BinaryPath $upgradedStableBinary`,
+		`loopcoder.release_smoke_evidence.v1`,
+		`release-smoke-evidence.json`,
+		`-KeepArtifacts:$KeepArtifacts`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("release smoke does not contain required candidate-backed installer seam %q", want)
@@ -81,6 +86,51 @@ func TestV080ReleaseSmokeUsesInstallerBackedCandidate(t *testing.T) {
 	selfBootstrapIndex := strings.Index(script, `& $selfBootstrapScript -Repo $sourceRepo -Binary $binary`)
 	if selfBootstrapIndex < 0 || installIndex > selfBootstrapIndex {
 		t.Fatalf("release smoke must install the staged candidate before self-bootstrap smoke")
+	}
+}
+
+func TestV080SelfBootstrapSmokeContract(t *testing.T) {
+	root := repositoryPolicyRoot(t)
+	data, err := os.ReadFile(filepath.Join(root, "scripts", "self-bootstrap-smoke.ps1"))
+	if err != nil {
+		t.Fatalf("read self-bootstrap smoke script: %v", err)
+	}
+	script := string(data)
+	for _, want := range []string{
+		`[string]$Version = "0.8.0"`,
+		`$hostTuple = Assert-DarwinArm64Host`,
+		`RuntimeInformation]::OSArchitecture`,
+		`RuntimeInformation]::ProcessArchitecture`,
+		`Get-FileHash -Algorithm SHA256`,
+		`& $binaryPath version`,
+		`platform=darwin/arm64`,
+		`--provider test-subprocess`,
+		`migrate storage --format json`,
+		`status.txt`,
+		`status.json`,
+		`report.txt`,
+		`report.json`,
+		`self-bootstrap-evidence.json`,
+		`paid_provider_calls = 0`,
+		`Assert-InventoryUnchanged -Before $repoRuntimeBefore`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("self-bootstrap smoke does not contain required v0.8 seam %q", want)
+		}
+	}
+
+	platformIndex := strings.Index(script, `$hostTuple = Assert-DarwinArm64Host`)
+	tempStateIndex := strings.Index(script, `$tmp = Join-Path`)
+	if platformIndex < 0 || tempStateIndex < 0 || platformIndex > tempStateIndex {
+		t.Fatal("self-bootstrap smoke must reject unsupported hosts before creating temporary state")
+	}
+	for _, forbidden := range []string{
+		`Remove-Item -LiteralPath $parentDir`,
+		`Remove-Item -LiteralPath $childDir`,
+	} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("self-bootstrap smoke must not delete repository-local runtime state: found %q", forbidden)
+		}
 	}
 }
 

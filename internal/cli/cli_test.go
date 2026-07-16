@@ -9515,7 +9515,8 @@ func TestNestedRunRejectsPermissionEscalationBeforeDispatch(t *testing.T) {
 }
 
 func TestNestedRunTestSubprocessExecutesRealChildProcesses(t *testing.T) {
-	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	loopHome := t.TempDir()
+	t.Setenv("LOOPCODER_HOME", loopHome)
 	var stdout, stderr bytes.Buffer
 	repo := t.TempDir()
 	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
@@ -9523,6 +9524,24 @@ func TestNestedRunTestSubprocessExecutesRealChildProcesses(t *testing.T) {
 		nestedPlanItem("beta", 702, nil, true, "read-only", []string{"go env GOARCH"}),
 		nestedPlanItem("gamma", 703, []string{"alpha"}, false, "read-only", []string{"go env GOVERSION"}),
 	}, 2)
+	planData, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read nested test-subprocess plan: %v", err)
+	}
+	var plan orchestration.ChildPlan
+	if err := json.Unmarshal(planData, &plan); err != nil {
+		t.Fatalf("decode nested test-subprocess plan: %v", err)
+	}
+	for i := range plan.Items {
+		plan.Items[i].Metadata = nil
+	}
+	planData, err = json.MarshalIndent(plan, "", "  ")
+	if err != nil {
+		t.Fatalf("encode unbudgeted nested test-subprocess plan: %v", err)
+	}
+	if err := os.WriteFile(planPath, planData, 0o644); err != nil {
+		t.Fatalf("write unbudgeted nested test-subprocess plan: %v", err)
+	}
 
 	exitCode := RunWithDeps([]string{
 		"nested", "run",
@@ -9547,6 +9566,20 @@ func TestNestedRunTestSubprocessExecutesRealChildProcesses(t *testing.T) {
 	}
 	if len(attempts) != 1 || attempts[0].Provider != nestedTestSubprocessProvider || attempts[0].Report == nil {
 		t.Fatalf("attempts = %#v, want test-subprocess report", attempts)
+	}
+	store, err := storage.Open(context.Background(), storage.Options{Path: filepath.Join(loopHome, "data", "loopcoder.db"), Now: fixedCLINow})
+	if err != nil {
+		t.Fatalf("open nested test-subprocess storage: %v", err)
+	}
+	defer store.Close()
+	var budgetReservations int
+	if err := store.WithTx(context.Background(), func(tx storage.Tx) error {
+		return tx.QueryRow(context.Background(), `SELECT COUNT(*) FROM budget_reservations`).Scan(&budgetReservations)
+	}); err != nil {
+		t.Fatalf("count nested test-subprocess budget reservations: %v", err)
+	}
+	if budgetReservations != 0 {
+		t.Fatalf("test-subprocess created %d budget reservations, want 0", budgetReservations)
 	}
 }
 
