@@ -4,6 +4,11 @@ This document describes the worker adapter as built in `loopcoder dispatch`,
 the native `loopcoder` binary subcommand. The adapter is provider-pluggable
 and uses the shared provider registry plus the static model/depth registry.
 
+Provider registration and adapter behavior are implementation facts, not a
+blanket production-support claim. The binding v0.8.0 provider evidence and
+role status is in the
+[`capability and support matrix`](v0.8.0-capability-matrix.md).
+
 ## Purpose
 
 The worker adapter turns one approved GitHub issue into a pull request. The
@@ -15,21 +20,22 @@ The selected provider only edits files in the fresh worktree. It does not
 commit, push, or open the PR; loopcoder owns those VCS steps. The worker prompt
 requires the provider's final summary to be in English.
 
-## Supported worker providers
+## Registered Worker Providers
 
 The worker is provider-pluggable. The adapter step is delegated to a provider
 registry. The registered worker providers are:
 
-- `codex` (default; verified)
-- `claude` (verified)
+- `codex` (direct default; historical mechanism smoke)
+- `claude` (historical mechanism smoke)
 - `antigravity` (Google Antigravity CLI path through executable `agy`)
 - `grok` (Grok Build CLI ordinary Worker/Verifier path)
 - `gemini` (experimental/unverified)
 
-`loopcoder models` exposes the static model registry for `codex`, `claude`,
-`antigravity`, and Grok's built-in default model entry. Grok inventory can also
-discover the operator's currently available models through the official
-`grok models` surface when an explicit network inventory grant is provided.
+`loopcoder models` exposes static model entries for `codex`, `claude`, and
+`antigravity`; Grok is a dynamic-inventory provider without a fabricated
+static model default. Grok inventory can discover the operator's currently
+available models through the official `grok models` surface when an explicit
+network inventory grant is provided.
 The older direct `gemini` worker adapter code is still present and registered,
 but it is experimental and is not part of the static model registry because
 the Antigravity provider is the current Gemini-family target path.
@@ -40,6 +46,12 @@ LoopCoder does not install, update, log in to, or provision subscription access
 for provider CLIs. Operators own Grok Build installation and authentication
 outside loopcoder; loopcoder only probes declared, bounded status/catalog
 commands and launches the selected local executable.
+
+v0.8.0 has no protected exact-artifact real-provider canary. Codex and Claude
+mechanism smokes predate the final artifact; Grok and Antigravity have
+deterministic adapter coverage. Use an explicitly pinned provider only as a
+human-controlled canary, and do not treat unpinned Codex fallback as automatic
+routing.
 
 `--model` and `--effort` are provider-specific overrides. When either value is
 absent, loopcoder resolves it from `.delivery.yml` and then from the static

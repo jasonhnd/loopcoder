@@ -5,6 +5,12 @@ native binary expects from provider CLIs that run Worker, Verifier, and audit
 LLM invocations, and what it expects from agent hosts that invoke `loopcoder` as
 the Conductor.
 
+This is a static declaration and compatibility contract. A `yes` capability or
+`supported` compatibility row does not prove a reachable v0.8.0 product path,
+a successful real-provider invocation, or production support. The binding
+release status is the
+[`v0.8.0 capability and support matrix`](v0.8.0-capability-matrix.md).
+
 This contract is separate from Worker and Verifier model selection. Provider,
 model, and depth still resolve from command flags, `.delivery.yml`, and the
 static model registry. Runtime capabilities describe whether the selected
@@ -98,14 +104,12 @@ from the runtime capability contract. Each entry has `provider`, `host`, `role`,
 The matrix is local and static; it does not log in, launch paid remote calls, or
 try to automate provider authentication.
 
-Provider-native sub-agent eligibility is stricter than a static adapter claim:
-the live scheduler requires fresh durable provider inventory, task requirement,
-budget reservation, scope, ownership-lock, and plan/policy fingerprint authority
-before a native child can launch. `codex`, `gemini`, `antigravity`, and `grok`
-remain unsupported for provider-native sub-agents in the live matrix until a
-future provider passes the same conformance suite with accepted capability
-evidence. Grok's ordinary-worker conformance does not imply native federation
-or provider-native subagent support.
+Provider-native sub-agent eligibility is stricter than a static adapter claim.
+An approved future product bridge requires fresh durable provider inventory,
+task requirements, budget reservation, scope, ownership lock, and plan/policy
+fingerprint authority before a native child may launch. No provider-native
+child path is approved in v0.8.0. Grok's ordinary-worker conformance does not
+imply native federation or provider-native subagent support.
 
 `doctor --format json` also includes `provider_inventory`, and
 `loopcoder providers refresh --repo .` persists the same bounded installation,
@@ -148,15 +152,15 @@ provenance and freshness. Unknown or stale values do not satisfy hard
 requirements; routing policies must use the exact `model_catalog_snapshot_id`
 and `model_capability_id` when they consume catalog evidence.
 
-Support levels:
+Static compatibility levels used by `doctor`:
 
 | Level | Meaning |
 | --- | --- |
-| `supported` | The provider and host combination satisfies the local capability contract for that role. |
+| `supported` | The provider and host combination satisfies the static local capability contract for that role; this is not a release support decision. |
 | `experimental` | The combination is usable but still has known limitations or is not part of the fully verified path. |
 | `unsupported` | The combination must fail closed before provider launch when selected for that role. |
 
-Current role matrix:
+Current static role-compatibility matrix:
 
 | Provider | Worker | Verifier / read-only | Nested sub-agents |
 | --- | --- | --- | --- |
@@ -166,7 +170,13 @@ Current role matrix:
 | `antigravity` | experimental | unsupported | unsupported |
 | `grok` | experimental | experimental | unsupported |
 
-Current host matrix:
+In particular, the `claude` nested declaration is adapter capability metadata;
+it does not make real-provider nested execution supported in v0.8.0. Codex and
+Claude Worker/Verifier rows describe local invocation compatibility and
+historical mechanism evidence, not protected exact-artifact canaries or routed
+Verifier independence.
+
+Current host-invocation compatibility matrix:
 
 | Host profile | Support level | Notes |
 | --- | --- | --- |
@@ -174,6 +184,10 @@ Current host matrix:
 | `claude-code` | supported | Project hook install writes conductor reporter and relay guard commands. |
 | `paseo-style` | supported | The host owns session lifetime and stderr visibility. |
 | `generic-local` | experimental | Fallback when no explicit host profile or known host signal is available. |
+
+These host rows mean the foreground subprocess contract can be represented.
+They do not prove callback, targeted wake, user visibility, acknowledgment, or
+unsolicited delivery during detached work.
 
 Doctor adds selected-provider checks for the active Worker and Verifier roles.
 Those checks distinguish `missing_executable`, `unauthenticated_provider`,

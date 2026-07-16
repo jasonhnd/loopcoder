@@ -28,6 +28,7 @@ Every document is exactly one of these types:
 - [`reference/stability-policy.md`](reference/stability-policy.md): 0.x stability policy.
 - [`reference/storage-migration.md`](reference/storage-migration.md): v0.7-to-v0.8 storage planning, backup, and rollback contract.
 - [`reference/task-requirement-classification.md`](reference/task-requirement-classification.md): v0.8 planner task requirement classification.
+- [`reference/v0.8.0-capability-matrix.md`](reference/v0.8.0-capability-matrix.md): binding v0.8.0 capability, reachability, evidence, and production-support status.
 - [`reference/v0.8.0-go-no-go.md`](reference/v0.8.0-go-no-go.md): current v0.8.0 release evidence and go/no-go record.
 - [`reference/v0.7.0-go-no-go.md`](reference/v0.7.0-go-no-go.md): completed historical v0.7.0 release record.
 - [`reference/worker.md`](reference/worker.md): current worker adapter behavior.
