@@ -862,19 +862,6 @@ func childScopeSummary(scope orchestration.ChildScope) string {
 	return string(data)
 }
 
-func decodeNestedChildMetadata(raw json.RawMessage) (nestedChildMetadata, error) {
-	if len(strings.TrimSpace(string(raw))) == 0 {
-		return nestedChildMetadata{}, nil
-	}
-	var metadata nestedChildMetadata
-	if err := json.Unmarshal(raw, &metadata); err != nil {
-		return nestedChildMetadata{}, fmt.Errorf("decode child metadata: %w", err)
-	}
-	metadata.IssueBody = boundedNestedText(metadata.IssueBody)
-	metadata.Prompt = boundedNestedText(metadata.Prompt)
-	return metadata, nil
-}
-
 func boundedNestedText(value string) string {
 	value = strings.TrimSpace(value)
 	if len(value) <= nestedPromptBudgetBytes {
