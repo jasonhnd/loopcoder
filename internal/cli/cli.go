@@ -4788,8 +4788,10 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 			fmt.Fprintf(stderr, "dispatch: route decision provider %q does not honor explicit pin %q\n", opts.Provider, explicitProvider)
 			return 1
 		}
-		fmt.Fprintf(commandWarningsWriter(outputMode, stderr), "dispatch: route decision %s provider=%s model=%s effort=%s replayed=%t\n",
-			opts.RoutingDecisionID, opts.Provider, opts.Model, opts.Effort, routeResult.Replayed)
+		if outputMode.Format == "text" {
+			fmt.Fprintf(stderr, "dispatch: route decision %s provider=%s model=%s effort=%s replayed=%t\n",
+				opts.RoutingDecisionID, opts.Provider, opts.Model, opts.Effort, routeResult.Replayed)
+		}
 	} else {
 		// Partial test deps without a route resolver: require an explicit pin.
 		// Never invent empty-provider Codex. Config model/effort may still apply
