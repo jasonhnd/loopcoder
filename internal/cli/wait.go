@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jasonhnd/loopcoder/internal/routing"
 	"github.com/jasonhnd/loopcoder/internal/waitstate"
 )
 
@@ -70,7 +69,7 @@ func runWaitQuotaReset(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "wait quota-reset: parse --until: %v\n", err)
 		return 2
 	}
-	plan := routing.PlanQuotaResetWaitFromTimes([]time.Time{resetAt}, nil, deps.Now())
+	plan := waitstate.PlanQuotaResetWaitFromTimes([]time.Time{resetAt}, nil, deps.Now())
 	if !plan.Applicable {
 		fmt.Fprintf(stderr, "wait quota-reset: not applicable: %s\n", plan.Reason)
 		return 2

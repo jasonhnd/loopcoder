@@ -1,4 +1,4 @@
-package routing
+package waitstate
 
 import (
 	"testing"
@@ -30,12 +30,5 @@ func TestPlanQuotaResetWaitFromTimesUnknownWhenNoFuture(t *testing.T) {
 	plan := PlanQuotaResetWaitFromTimes([]time.Time{now.Add(-time.Minute), {}}, nil, now)
 	if plan.Applicable {
 		t.Fatalf("plan = %#v, want not applicable", plan)
-	}
-}
-
-func TestPlanQuotaResetWaitWithoutQuotaRejects(t *testing.T) {
-	plan := PlanQuotaResetWait(RoutingDecision{}, time.Now())
-	if plan.Applicable {
-		t.Fatalf("empty decision should not plan wait: %#v", plan)
 	}
 }
