@@ -176,6 +176,30 @@ func TestSessionDetectsIgnoredUntrackedMutation(t *testing.T) {
 	}
 }
 
+func TestSessionExcludesAuthorizedCheckoutStateAcrossPhysicalAliases(t *testing.T) {
+	repo := initRepository(t)
+	projectState := filepath.Join(repo, ".loopcoder")
+	excludedRun := filepath.Join(projectState, "runs", "authorized-sibling")
+	if err := os.MkdirAll(filepath.Dir(excludedRun), 0o700); err != nil {
+		t.Fatalf("MkdirAll project state: %v", err)
+	}
+	opts := enforcementOptions(t, repo)
+	opts.ProjectStatePaths = []string{projectState}
+	opts.ExcludedPaths = []string{excludedRun}
+	session, _, err := Begin(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if err := os.MkdirAll(excludedRun, 0o700); err != nil {
+		t.Fatalf("MkdirAll excluded run: %v", err)
+	}
+	mustWrite(t, filepath.Join(excludedRun, "events.jsonl"), "{}\n")
+	audit, err := session.Finish(context.Background(), "provider-completed")
+	if err != nil || audit.Verification != VerificationPassed {
+		t.Fatalf("authorized alias audit=%#v error=%v", audit, err)
+	}
+}
+
 func TestSessionRecoversInterruptedBaselineBeforeRelaunch(t *testing.T) {
 	t.Run("unchanged recovery", func(t *testing.T) {
 		repo := initRepository(t)

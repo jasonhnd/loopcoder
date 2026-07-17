@@ -563,14 +563,14 @@ func classifyEntry(key, before, after string) (string, string) {
 }
 
 func normalizeOptions(opts Options) Options {
-	opts.RepoPath = filepath.Clean(strings.TrimSpace(opts.RepoPath))
-	opts.EvidencePath = filepath.Clean(strings.TrimSpace(opts.EvidencePath))
+	opts.RepoPath = normalizePhysicalPath(opts.RepoPath)
+	opts.EvidencePath = normalizePhysicalPath(opts.EvidencePath)
 	opts.ContractFingerprint = strings.TrimSpace(opts.ContractFingerprint)
 	cleaned := make([]string, 0, len(opts.ProjectStatePaths))
 	seen := map[string]bool{}
 	for _, path := range opts.ProjectStatePaths {
-		path = filepath.Clean(strings.TrimSpace(path))
-		if path == "." || path == "" || seen[path] {
+		path = normalizePhysicalPath(path)
+		if path == "" || seen[path] {
 			continue
 		}
 		seen[path] = true
@@ -581,8 +581,8 @@ func normalizeOptions(opts Options) Options {
 	excluded := make([]string, 0, len(opts.ExcludedPaths))
 	seen = map[string]bool{}
 	for _, path := range opts.ExcludedPaths {
-		path = filepath.Clean(strings.TrimSpace(path))
-		if path == "." || path == "" || seen[path] {
+		path = normalizePhysicalPath(path)
+		if path == "" || seen[path] {
 			continue
 		}
 		seen[path] = true
@@ -591,6 +591,18 @@ func normalizeOptions(opts Options) Options {
 	sort.Strings(excluded)
 	opts.ExcludedPaths = excluded
 	return opts
+}
+
+func normalizePhysicalPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	canonical, err := pathid.Canonicalize(path)
+	if err == nil && strings.TrimSpace(canonical.Identity) != "" {
+		return filepath.Clean(canonical.Identity)
+	}
+	return filepath.Clean(path)
 }
 
 func validateOptions(opts Options) error {
