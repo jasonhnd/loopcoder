@@ -2280,23 +2280,6 @@ func assertRoutingDecisionCount(t *testing.T, ctx context.Context, store storage
 	}
 }
 
-func latestRoutingDecision(ctx context.Context, store storage.Store, projectID, deliveryRunID, decisionKey string) (RoutingDecision, error) {
-	var payload string
-	err := store.WithTx(ctx, func(tx storage.Tx) error {
-		return tx.QueryRow(ctx, `SELECT payload_json FROM routing_decisions
-			WHERE project_id = ? AND delivery_run_id = ? AND decision_key = ?
-			ORDER BY created_at DESC, routing_decision_id DESC LIMIT 1`, projectID, deliveryRunID, decisionKey).Scan(&payload)
-	})
-	if err != nil {
-		return RoutingDecision{}, err
-	}
-	var decision RoutingDecision
-	if err := json.Unmarshal([]byte(payload), &decision); err != nil {
-		return RoutingDecision{}, err
-	}
-	return decision, nil
-}
-
 func refreshResultHasRefreshedProvider(result providerinventory.RefreshResult, adapterID string) bool {
 	for _, provider := range result.Providers {
 		if provider.AdapterID == adapterID && provider.Refreshed && provider.ErrorCode == "" {

@@ -2102,13 +2102,6 @@ func nonNilOverrideProvenance(values []OverrideProvenance) []OverrideProvenance 
 	return values
 }
 
-func nonNilPolicyInputRecords(values []PolicyInputRecord) []PolicyInputRecord {
-	if values == nil {
-		return []PolicyInputRecord{}
-	}
-	return values
-}
-
 func hasRoutingPolicyProfile(profile RoutingPolicyProfile) bool {
 	return strings.TrimSpace(profile.RoutingPolicyProfileID) != "" ||
 		strings.TrimSpace(profile.ProfileKey) != "" ||
