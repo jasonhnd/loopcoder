@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/availability"
 	"github.com/jasonhnd/loopcoder/internal/budget"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/delivery"
@@ -898,6 +900,177 @@ func TestManualOverrideProvenanceIsRedactedInExplain(t *testing.T) {
 	}
 }
 
+func TestExplainJSONRedactsNestedStringsBeforeCanonicalEncoding(t *testing.T) {
+	assignment := "token=" + strings.Repeat("K", 24)
+	personalPath := "/Users/tester/private/route.json"
+	decision := RoutingDecision{
+		SchemaVersion:      DecisionSchema,
+		RecordVersion:      1,
+		ChosenReason:       assignment,
+		OptimizationPolicy: OptimizationPolicy{TargetUtilizationBP: 9007199254740993},
+		EligibleCandidates: []Candidate{{
+			CapabilitySummary: map[string]any{
+				"nested": []any{"password:" + strings.Repeat("P", 24), personalPath, "safe\x00value"},
+			},
+		}},
+	}
+
+	first, err := ExplainJSON(decision)
+	if err != nil {
+		t.Fatalf("ExplainJSON: %v", err)
+	}
+	second, err := ExplainJSON(decision)
+	if err != nil {
+		t.Fatalf("ExplainJSON repeat: %v", err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatalf("ExplainJSON is not deterministic:\nfirst=%s\nsecond=%s", first, second)
+	}
+	if !json.Valid(first) {
+		t.Fatalf("ExplainJSON returned invalid JSON: %s", first)
+	}
+	output := string(first)
+	if strings.Contains(output, assignment) || strings.Contains(output, personalPath) || strings.ContainsAny(output, "\x00\x1b") {
+		t.Fatalf("ExplainJSON leaked a nested canary: %s", output)
+	}
+	if !strings.Contains(output, "[REDACTED_SECRET]") || !strings.Contains(output, "[REDACTED_PATH]") {
+		t.Fatalf("ExplainJSON is missing structured redaction markers: %s", output)
+	}
+	if !strings.Contains(output, `"target_utilization_basis_points":9007199254740993`) {
+		t.Fatalf("ExplainJSON changed an integer above IEEE-754 exact range: %s", output)
+	}
+}
+
+func TestExplainJSONRedactsDynamicMapKeysWithoutCollisions(t *testing.T) {
+	secretKeyA := "sk-" + strings.Repeat("A", 24)
+	secretKeyB := "sk-" + strings.Repeat("B", 24)
+	personalPathKey := "/Users/tester/private/dynamic-key"
+	decision := RoutingDecision{
+		EligibleCandidates: []Candidate{{
+			CapabilitySummary: map[string]any{
+				secretKeyA:              "secret-a-value",
+				secretKeyB:              "secret-b-value",
+				"[REDACTED_API_KEY]#2":  "reserved-value",
+				personalPathKey:         "path-value",
+				"unsafe\x00dynamic-key": "control-value",
+			},
+		}},
+	}
+
+	first, err := ExplainJSON(decision)
+	if err != nil {
+		t.Fatalf("ExplainJSON: %v", err)
+	}
+	second, err := ExplainJSON(decision)
+	if err != nil {
+		t.Fatalf("ExplainJSON repeat: %v", err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatalf("dynamic-key redaction is not deterministic:\nfirst=%s\nsecond=%s", first, second)
+	}
+	output := string(first)
+	for _, canary := range []string{secretKeyA, secretKeyB, personalPathKey, "\x00"} {
+		if strings.Contains(output, canary) {
+			t.Fatalf("ExplainJSON leaked dynamic key %q: %s", canary, output)
+		}
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(first, &decoded); err != nil {
+		t.Fatalf("decode ExplainJSON: %v", err)
+	}
+	eligible, ok := decoded["eligible_candidates"].([]any)
+	if !ok || len(eligible) != 1 {
+		t.Fatalf("eligible candidates = %#v, want one JSON object", decoded["eligible_candidates"])
+	}
+	candidate, ok := eligible[0].(map[string]any)
+	if !ok {
+		t.Fatalf("eligible candidate = %#v, want JSON object", eligible[0])
+	}
+	got, ok := candidate["capability_summary"].(map[string]any)
+	if !ok {
+		t.Fatalf("capability summary = %#v, want JSON object", candidate["capability_summary"])
+	}
+	for _, key := range []string{"[REDACTED_API_KEY]", "[REDACTED_API_KEY]#2", "[REDACTED_API_KEY]#3", "[REDACTED_PATH]", "unsafedynamic-key"} {
+		if _, ok := got[key]; !ok {
+			t.Fatalf("redacted dynamic map missing key %q: %#v", key, got)
+		}
+	}
+	wantValues := map[string]bool{
+		"secret-a-value": false,
+		"secret-b-value": false,
+		"reserved-value": false,
+		"path-value":     false,
+		"control-value":  false,
+	}
+	for _, value := range got {
+		if text, ok := value.(string); ok {
+			if _, expected := wantValues[text]; expected {
+				wantValues[text] = true
+			}
+		}
+	}
+	for value, found := range wantValues {
+		if !found {
+			t.Fatalf("redacted dynamic map lost value %q: %#v", value, got)
+		}
+	}
+}
+
+func TestRoutingDecisionPersistsOnlySafePolicyInputProjection(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	secret := "sk-" + strings.Repeat("S", 24)
+	personalPath := "/Users/tester/private/prompt.txt"
+	input := replayDecisionInput(fixture)
+	input.PolicyInputRecords = []PolicyInputRecord{{
+		SchemaVersion: PolicyInputSchema, RecordVersion: 1, RoutingPolicyInputID: "rpin-sensitive",
+		InputKind: PolicyInputKindPin, ProjectID: input.ProjectID, DeliveryRunID: input.DeliveryRunID,
+		RoutingPolicyProfileID: DefaultProfileID, PolicyFingerprint: input.PolicyFingerprint,
+		Scope: "task:" + input.Inputs.Requirement.TaskID, Reason: "private prompt body " + secret + " " + personalPath,
+		Status: PolicyInputStatusActive, Constraint: CandidateConstraint{AdapterID: "codex"}, ValidationStatus: ValidationStatusValid,
+		Diagnostics: []PolicyDiagnostic{{Message: secret, Value: personalPath}},
+		Actor:       delivery.Actor{ActorKind: "user", ActorID: "owner", Display: secret, DecisionAuthority: "user", Source: personalPath},
+		Host:        delivery.Host{HostKind: "cli", HostID: "host", SessionID: secret, ProcessID: 42, Platform: personalPath},
+	}}
+
+	decision, err := BuildRoutingDecision(input)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision: %v", err)
+	}
+	if len(decision.PolicyInputRecords) != 1 {
+		t.Fatalf("safe policy input projection count = %d", len(decision.PolicyInputRecords))
+	}
+	projected := decision.PolicyInputRecords[0]
+	if projected.RoutingPolicyInputID != "rpin-sensitive" || projected.Constraint.AdapterID != "codex" {
+		t.Fatalf("safe policy input projection lost authority fields: %#v", projected)
+	}
+	if projected.Reason != "" || len(projected.Diagnostics) != 0 || projected.Actor.ActorID != "" || projected.Host.HostID != "" {
+		t.Fatalf("safe policy input projection retained private provenance: %#v", projected)
+	}
+
+	store, err := storage.Open(ctx, storage.Options{Path: tempDB(t), Now: func() time.Time { return fixture.now }})
+	if err != nil {
+		t.Fatalf("Open storage: %v", err)
+	}
+	defer store.Close()
+	seedRoutingDecisionStore(t, ctx, store, fixture.now)
+	if err := PersistRoutingDecision(ctx, store, decision); err != nil {
+		t.Fatalf("PersistRoutingDecision: %v", err)
+	}
+	var payload string
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		return tx.QueryRow(ctx, `SELECT payload_json FROM routing_decisions WHERE routing_decision_id = ?`, decision.RoutingDecisionID).Scan(&payload)
+	}); err != nil {
+		t.Fatalf("load persisted decision payload: %v", err)
+	}
+	for _, canary := range []string{"private prompt body", secret, personalPath} {
+		if strings.Contains(payload, canary) {
+			t.Fatalf("persisted routing decision leaked %q: %s", canary, payload)
+		}
+	}
+}
+
 func TestManualOverrideProvenanceRedactsSecretPathAndControlCanaries(t *testing.T) {
 	fixture := newFixture(t)
 	candidate := fixture.candidate("codex", "acct-a", "codex-good")
@@ -1092,6 +1265,7 @@ func TestTaskBoundaryHandlerReevaluatesRouteThroughNestedSchedulerEvent(t *testi
 		t.Fatalf("ReevaluateRoute seed: %v", err)
 	}
 	var callbackCount int
+	var reexamined ReevaluateRouteResult
 	report, err := orchestration.ScheduleNestedRuns(ctx, orchestration.NestedScheduleOptions{
 		RepoPath:         t.TempDir(),
 		ParentRunID:      "run-20260713T120000Z-wave",
@@ -1117,7 +1291,8 @@ func TestTaskBoundaryHandlerReevaluatesRouteThroughNestedSchedulerEvent(t *testi
 			if event.Status != orchestration.NestedStatusSucceeded || event.ChildKey == "" {
 				t.Fatalf("task boundary event = %#v", event)
 			}
-			_, err := ReevaluateRoute(ctx, store, ReevaluateRouteInput{DecisionInput: input, Trigger: ReevaluateAtTaskBoundary})
+			var err error
+			reexamined, err = ReevaluateRoute(ctx, store, ReevaluateRouteInput{DecisionInput: input, Trigger: ReevaluateAtTaskBoundary})
 			return err
 		},
 	})
@@ -1128,11 +1303,11 @@ func TestTaskBoundaryHandlerReevaluatesRouteThroughNestedSchedulerEvent(t *testi
 		t.Fatalf("report/callback = %#v/%d, want succeeded with one task-boundary callback", report, callbackCount)
 	}
 	assertRoutingDecisionCount(t, ctx, store, input.ProjectID, input.DeliveryRunID, input.DecisionKey, 2)
-	latest, err := latestRoutingDecision(ctx, store, input.ProjectID, input.DeliveryRunID, input.DecisionKey)
+	persisted, err := LoadRoutingDecision(ctx, store, reexamined.Decision.RoutingDecisionID)
 	if err != nil {
-		t.Fatalf("latestRoutingDecision: %v", err)
+		t.Fatalf("LoadRoutingDecision task boundary result: %v", err)
 	}
-	if latest.RoutingFingerprint == first.Decision.RoutingFingerprint {
+	if !reexamined.Changed || persisted.RoutingFingerprint != reexamined.Decision.RoutingFingerprint || persisted.RoutingFingerprint == first.Decision.RoutingFingerprint {
 		t.Fatalf("task boundary callback did not persist a new routing fingerprint")
 	}
 	dry, err := ReevaluateRoute(ctx, store, ReevaluateRouteInput{DecisionInput: input, Trigger: ReevaluateAtTaskBoundary, DryRun: true})
@@ -1180,6 +1355,194 @@ func TestRouteDecisionRejectsPolicyFingerprintMismatch(t *testing.T) {
 	input.PolicyFingerprint = testFingerprint("wrong-policy")
 	if _, err := BuildRoutingDecision(input); !errors.Is(err, taskrequirements.ErrRoutingFingerprintMismatch) {
 		t.Fatalf("BuildRoutingDecision error = %v, want ErrRoutingFingerprintMismatch", err)
+	}
+}
+
+func TestRoutingFingerprintBindsAuthorizationAndScoringEvidence(t *testing.T) {
+	fixture := newFixture(t)
+	input := replayDecisionInput(fixture)
+	input.AuthorizationFingerprint = testFingerprint("route-authorization-a")
+	baseline, err := BuildRoutingDecision(input)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision baseline: %v", err)
+	}
+
+	authorizationChanged := input
+	authorizationChanged.AuthorizationFingerprint = testFingerprint("route-authorization-b")
+	changedAuth, err := BuildRoutingDecision(authorizationChanged)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision authorization change: %v", err)
+	}
+	if changedAuth.RoutingFingerprint == baseline.RoutingFingerprint || changedAuth.RoutingDecisionID == baseline.RoutingDecisionID {
+		t.Fatal("routing authority did not change when delivery authorization changed")
+	}
+
+	budgetChanged := input
+	budgetChanged.Inputs.Budgets = append([]budget.Summary(nil), input.Inputs.Budgets...)
+	budgetChanged.Inputs.Budgets[0].AvailableValue--
+	changedBudget, err := BuildRoutingDecision(budgetChanged)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision budget change: %v", err)
+	}
+	if changedBudget.RoutingFingerprint == baseline.RoutingFingerprint || changedBudget.RoutingDecisionID == baseline.RoutingDecisionID {
+		t.Fatal("routing authority did not change when budget scoring evidence changed")
+	}
+
+	availabilityChanged := input
+	availabilityChanged.Inputs.Availability = append([]availability.Score(nil), input.Inputs.Availability...)
+	availabilityChanged.Inputs.Availability[0].Score--
+	changedAvailability, err := BuildRoutingDecision(availabilityChanged)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision availability change: %v", err)
+	}
+	if changedAvailability.RoutingFingerprint == baseline.RoutingFingerprint || changedAvailability.RoutingDecisionID == baseline.RoutingDecisionID {
+		t.Fatal("routing authority did not change when availability scoring evidence changed")
+	}
+}
+
+func TestRoutingFingerprintIgnoresInventoryGeneratedAtAndReferencesInventoryEvidence(t *testing.T) {
+	fixture := newFixture(t)
+	input := replayDecisionInput(fixture)
+	input.Inputs.Inventory.ModelCatalogSnapshots = []providerinventory.ModelCatalogSnapshot{{
+		SchemaVersion:          providerinventory.ModelCatalogSnapshotSchema,
+		RecordVersion:          1,
+		ModelCatalogSnapshotID: "mcats-codex",
+		AdapterID:              "codex",
+		InventoryFingerprint:   testFingerprint("catalog-inventory"),
+	}}
+
+	baseline, err := BuildRoutingDecision(input)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision baseline: %v", err)
+	}
+	generatedAtChanged := input
+	generatedAtChanged.Inputs.Inventory.GeneratedAt = delivery.CanonicalTimestamp(fixture.now.Add(37 * time.Minute))
+	repeated, err := BuildRoutingDecision(generatedAtChanged)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision generated_at change: %v", err)
+	}
+	if repeated.RoutingFingerprint != baseline.RoutingFingerprint || repeated.RoutingDecisionID != baseline.RoutingDecisionID {
+		t.Fatalf("provider inventory generated_at changed route authority: baseline=%s repeated=%s", baseline.RoutingFingerprint, repeated.RoutingFingerprint)
+	}
+
+	for _, want := range []struct {
+		kind string
+		id   string
+	}{
+		{kind: "provider_installation", id: "pinst-codex"},
+		{kind: "account_profile", id: "acct-a"},
+		{kind: "auth_readiness", id: "auth-acct-a"},
+		{kind: "model_catalog_snapshot", id: "mcats-codex"},
+		{kind: "model_capability", id: "codex-good"},
+	} {
+		ref, ok := findInputRecordRef(baseline.InputRecordRefs, want.kind, want.id)
+		if !ok || !validFingerprint(ref.Fingerprint) {
+			t.Fatalf("input refs missing fingerprinted %s/%s: %#v", want.kind, want.id, baseline.InputRecordRefs)
+		}
+	}
+	inventoryRef, ok := firstInputRecordRefOfKind(baseline.InputRecordRefs, "provider_inventory")
+	if !ok || !validFingerprint(inventoryRef.RecordID) || inventoryRef.Fingerprint != inventoryRef.RecordID {
+		t.Fatalf("provider inventory ref = %#v, want stable evidence fingerprint identity", inventoryRef)
+	}
+
+	evidenceChanged := input
+	evidenceChanged.Inputs.Inventory.Installations = append([]providerinventory.ProviderInstallation(nil), input.Inputs.Inventory.Installations...)
+	evidenceChanged.Inputs.Inventory.Installations[0].Version = "changed-version"
+	changed, err := BuildRoutingDecision(evidenceChanged)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision evidence change: %v", err)
+	}
+	if changed.RoutingFingerprint == baseline.RoutingFingerprint || changed.RoutingDecisionID == baseline.RoutingDecisionID {
+		t.Fatal("provider inventory evidence change did not change route authority")
+	}
+	changedInventoryRef, ok := firstInputRecordRefOfKind(changed.InputRecordRefs, "provider_inventory")
+	if !ok || changedInventoryRef.Fingerprint == inventoryRef.Fingerprint {
+		t.Fatalf("provider inventory evidence ref did not change: baseline=%#v changed=%#v", inventoryRef, changedInventoryRef)
+	}
+}
+
+func TestRoutingFingerprintUsesSafePolicyInputAndOverrideProjections(t *testing.T) {
+	fixture := newFixture(t)
+	input := replayDecisionInput(fixture)
+	input.AuthorizationFingerprint = testFingerprint("auth")
+	candidate := fixture.candidate("codex", "acct-a", "codex-good")
+	input.Inputs.Candidates = []Candidate{candidate}
+	secretA := "sk-" + strings.Repeat("A", 24)
+	secretB := "sk-" + strings.Repeat("B", 24)
+	input.PolicyInputRecords = []PolicyInputRecord{{
+		SchemaVersion:          PolicyInputSchema,
+		RecordVersion:          1,
+		RoutingPolicyInputID:   "rpin-fingerprint-projection",
+		InputKind:              PolicyInputKindPin,
+		ProjectID:              input.ProjectID,
+		DeliveryRunID:          input.DeliveryRunID,
+		RoutingPolicyProfileID: DefaultProfileID,
+		PolicyFingerprint:      testFingerprint("policy-input-authority"),
+		Scope:                  "task:" + input.Inputs.Requirement.TaskID,
+		DecisionKey:            input.DecisionKey,
+		Reason:                 "private note " + secretA,
+		Status:                 PolicyInputStatusActive,
+		Constraint:             CandidateConstraint{AdapterID: "codex"},
+		ValidationStatus:       ValidationStatusValid,
+		Diagnostics:            []PolicyDiagnostic{{Message: secretA}},
+		Actor:                  delivery.Actor{ActorKind: "user", ActorID: "owner", Display: secretA},
+		Host:                   delivery.Host{HostKind: "cli", HostID: "host", SessionID: secretA},
+	}}
+	override := manualResetOverride(fixture, candidate, fixture.now.Add(2*time.Hour))
+	override.Reason = "private override " + secretA
+	override.Source = "private source " + secretA
+	input.OverrideProvenance = []OverrideProvenance{override}
+
+	baseline, err := BuildRoutingDecision(input)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision baseline: %v", err)
+	}
+	policyRef, ok := findInputRecordRef(baseline.InputRecordRefs, "routing_policy_input", "rpin-fingerprint-projection")
+	if !ok || !validFingerprint(policyRef.Fingerprint) || policyRef.Fingerprint == input.PolicyInputRecords[0].PolicyFingerprint {
+		t.Fatalf("routing policy input ref does not bind safe record projection: %#v", policyRef)
+	}
+	overrideRef, ok := findInputRecordRef(baseline.InputRecordRefs, "override", override.OverrideID)
+	if !ok || !validFingerprint(overrideRef.Fingerprint) || overrideRef.Fingerprint == override.PolicyFingerprint {
+		t.Fatalf("override ref does not bind redacted record projection: %#v", overrideRef)
+	}
+
+	privateTextChanged := input
+	privateTextChanged.PolicyInputRecords = append([]PolicyInputRecord(nil), input.PolicyInputRecords...)
+	privateTextChanged.PolicyInputRecords[0].Reason = "different private note " + secretB
+	privateTextChanged.PolicyInputRecords[0].Diagnostics = []PolicyDiagnostic{{Message: secretB}}
+	privateTextChanged.PolicyInputRecords[0].Actor.Display = secretB
+	privateTextChanged.PolicyInputRecords[0].Host.SessionID = secretB
+	privateTextChanged.OverrideProvenance = append([]OverrideProvenance(nil), input.OverrideProvenance...)
+	privateTextChanged.OverrideProvenance[0].Reason = "private override " + secretB
+	privateTextChanged.OverrideProvenance[0].Source = "private source " + secretB
+	repeated, err := BuildRoutingDecision(privateTextChanged)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision private projection change: %v", err)
+	}
+	if repeated.RoutingFingerprint != baseline.RoutingFingerprint || repeated.RoutingDecisionID != baseline.RoutingDecisionID {
+		t.Fatalf("redacted private fields changed route authority: baseline=%s repeated=%s", baseline.RoutingFingerprint, repeated.RoutingFingerprint)
+	}
+
+	policyAuthorityChanged := input
+	policyAuthorityChanged.PolicyInputRecords = append([]PolicyInputRecord(nil), input.PolicyInputRecords...)
+	policyAuthorityChanged.PolicyInputRecords[0].Constraint.ModelCapabilityID = "codex-good"
+	changedPolicy, err := BuildRoutingDecision(policyAuthorityChanged)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision policy authority change: %v", err)
+	}
+	if changedPolicy.RoutingFingerprint == baseline.RoutingFingerprint {
+		t.Fatal("safe policy input authority change did not change routing fingerprint")
+	}
+
+	overrideAuthorityChanged := input
+	overrideAuthorityChanged.OverrideProvenance = append([]OverrideProvenance(nil), input.OverrideProvenance...)
+	overrideAuthorityChanged.OverrideProvenance[0].ManualResetAt = fixture.now.Add(3 * time.Hour).Format(time.RFC3339Nano)
+	changedOverride, err := BuildRoutingDecision(overrideAuthorityChanged)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision override authority change: %v", err)
+	}
+	if changedOverride.RoutingFingerprint == baseline.RoutingFingerprint {
+		t.Fatal("redacted override authority change did not change routing fingerprint")
 	}
 }
 
@@ -1436,6 +1799,243 @@ func TestDecideAndPersistRouteMissingDurableInventoryFailsClosed(t *testing.T) {
 	if decision.DecisionStatus != DecisionStatusNoEligible || len(decision.EligibleCandidates) != 0 || len(decision.ScoredCandidates) != 0 {
 		t.Fatalf("missing cached inventory decision = %#v", decision)
 	}
+	if decision.CandidateGenerationStatus != CandidateGenerationNeedsHuman || decision.ChosenReason != CandidateGenerationZeroReason {
+		t.Fatalf("missing inventory diagnostic = status %q reason %q", decision.CandidateGenerationStatus, decision.ChosenReason)
+	}
+	stable, explainErr := ExplainJSON(decision)
+	if explainErr != nil {
+		t.Fatalf("ExplainJSON missing inventory: %v", explainErr)
+	}
+	for _, output := range []string{string(stable), ExplainHuman(decision)} {
+		if !strings.Contains(output, "loopcoder providers refresh --repo . --format json") {
+			t.Fatalf("missing inventory explanation is not actionable: %s", output)
+		}
+	}
+	if !strings.Contains(string(stable), `"candidate_generation_status":"needs-human"`) || !strings.Contains(ExplainHuman(decision), "candidate generation: needs-human") {
+		t.Fatalf("missing inventory generation status not rendered: json=%s human=%s", stable, ExplainHuman(decision))
+	}
+}
+
+func TestRouteDecisionGeneratesCandidatesFromInventoryBeforeClassifyingGenerationStatus(t *testing.T) {
+	fixture := newFixture(t)
+	input := replayDecisionInput(fixture)
+	input.Inputs.Candidates = nil
+
+	decision, err := BuildRoutingDecision(input)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision generated candidates: %v", err)
+	}
+	if decision.DecisionStatus != DecisionStatusSelected || decision.CandidateGenerationStatus != CandidateGenerationFull || len(decision.ScoredCandidates) == 0 {
+		t.Fatalf("generated candidate decision = status %q generation %q scored %d", decision.DecisionStatus, decision.CandidateGenerationStatus, len(decision.ScoredCandidates))
+	}
+}
+
+func TestRoutingFingerprintBindsCandidateGenerationStatusAndReason(t *testing.T) {
+	fixture := newFixture(t)
+	input := replayDecisionInput(fixture)
+	budgetClass, deadlineClass, err := resolveTaskFitClasses(input.Inputs.Requirement, "", "")
+	if err != nil {
+		t.Fatalf("resolveTaskFitClasses: %v", err)
+	}
+	input.Inputs.BudgetClass = budgetClass
+	input.Inputs.DeadlineClass = deadlineClass
+	policy, err := normalizeOptimizationPolicy(input.OptimizationPolicy, input.RoutingPolicyProfileID)
+	if err != nil {
+		t.Fatalf("normalizeOptimizationPolicy: %v", err)
+	}
+	input.Inputs.OptimizationPolicy = policy
+	input.Inputs.Now = input.Now
+	result := FilterHardEligibility(input.Inputs)
+	refs := inputRefs(input, result)
+	scored := scoreCandidates(result.Eligible, input.Inputs, policy, input.Now)
+
+	complete, err := routingFingerprint(input, policy, result, scored, refs, CandidateGenerationFull, "")
+	if err != nil {
+		t.Fatalf("routingFingerprint complete: %v", err)
+	}
+	needsHuman, err := routingFingerprint(input, policy, result, scored, refs, CandidateGenerationNeedsHuman, CandidateGenerationZeroReason)
+	if err != nil {
+		t.Fatalf("routingFingerprint needs-human: %v", err)
+	}
+	changedReason, err := routingFingerprint(input, policy, result, scored, refs, CandidateGenerationNeedsHuman, CandidateGenerationZeroReason+" changed")
+	if err != nil {
+		t.Fatalf("routingFingerprint changed reason: %v", err)
+	}
+	if complete == needsHuman || needsHuman == changedReason || complete == changedReason {
+		t.Fatalf("generation diagnostic fingerprints collided: complete=%s needs-human=%s changed=%s", complete, needsHuman, changedReason)
+	}
+}
+
+func TestRouteTaskFitClassesDefaultToLegacyRequirementClass(t *testing.T) {
+	fixture := newFixture(t)
+	implicit := replayDecisionInput(fixture)
+	implicit.Inputs.Candidates = implicit.Inputs.Candidates[:1]
+
+	implicitDecision, err := BuildRoutingDecision(implicit)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision implicit classes: %v", err)
+	}
+	if implicitDecision.BudgetClass != BudgetClassShort || implicitDecision.DeadlineClass != DeadlineClassShort {
+		t.Fatalf("resolved implicit classes = %q/%q, want short/short", implicitDecision.BudgetClass, implicitDecision.DeadlineClass)
+	}
+
+	explicit := implicit
+	explicit.Inputs.BudgetClass = BudgetClassShort
+	explicit.Inputs.DeadlineClass = DeadlineClassShort
+	explicitDecision, err := BuildRoutingDecision(explicit)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision explicit legacy classes: %v", err)
+	}
+	if explicitDecision.RoutingFingerprint != implicitDecision.RoutingFingerprint || explicitDecision.RoutingDecisionID != implicitDecision.RoutingDecisionID {
+		t.Fatalf("explicit legacy classes changed identity: implicit=%s explicit=%s", implicitDecision.RoutingFingerprint, explicitDecision.RoutingFingerprint)
+	}
+	payload, err := ExplainJSON(explicitDecision)
+	if err != nil {
+		t.Fatalf("ExplainJSON: %v", err)
+	}
+	for _, want := range []string{`"budget_class":"short"`, `"deadline_class":"short"`} {
+		if !strings.Contains(string(payload), want) {
+			t.Fatalf("decision JSON missing %s: %s", want, payload)
+		}
+	}
+}
+
+func TestRouteBudgetClassOnlyChangesExistingTaskHeadroomScore(t *testing.T) {
+	fixture := newFixture(t)
+	light := routeClassDecisionInput(t, fixture, 80, 2*time.Hour)
+	light.Inputs.BudgetClass = BudgetClassVeryShort
+	light.Inputs.DeadlineClass = DeadlineClassVeryShort
+	lightDecision, err := BuildRoutingDecision(light)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision very-short budget: %v", err)
+	}
+
+	heavy := light
+	heavy.Inputs.BudgetClass = BudgetClassMedium
+	heavyDecision, err := BuildRoutingDecision(heavy)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision medium budget: %v", err)
+	}
+	if lightDecision.OptimizationPolicy.PolicyFingerprint != heavyDecision.OptimizationPolicy.PolicyFingerprint {
+		t.Fatal("per-task budget class changed the routing policy fingerprint")
+	}
+	if lightDecision.RoutingFingerprint == heavyDecision.RoutingFingerprint {
+		t.Fatal("budget class was not bound into the routing fingerprint")
+	}
+	lightHeadroom := componentByName(t, lightDecision.ScoredCandidates[0].Components, ComponentTaskHeadroom)
+	heavyHeadroom := componentByName(t, heavyDecision.ScoredCandidates[0].Components, ComponentTaskHeadroom)
+	if lightHeadroom.BudgetClass != BudgetClassVeryShort || heavyHeadroom.BudgetClass != BudgetClassMedium {
+		t.Fatalf("headroom budget classes = %q/%q", lightHeadroom.BudgetClass, heavyHeadroom.BudgetClass)
+	}
+	if lightHeadroom.DeadlineClass != DeadlineClassVeryShort || heavyHeadroom.DeadlineClass != DeadlineClassVeryShort {
+		t.Fatalf("budget class changed deadline factor: %#v / %#v", lightHeadroom, heavyHeadroom)
+	}
+	if lightHeadroom.Score <= heavyHeadroom.Score {
+		t.Fatalf("existing task-equivalent headroom score did not reflect 10/70 task units: light=%d heavy=%d", lightHeadroom.Score, heavyHeadroom.Score)
+	}
+	lightExpiry := componentByName(t, lightDecision.ScoredCandidates[0].Components, ComponentExpiryUrgency)
+	heavyExpiry := componentByName(t, heavyDecision.ScoredCandidates[0].Components, ComponentExpiryUrgency)
+	if lightExpiry.Score != heavyExpiry.Score || lightExpiry.DeadlineClass != heavyExpiry.DeadlineClass {
+		t.Fatalf("budget class changed expiry/reset scoring: %#v / %#v", lightExpiry, heavyExpiry)
+	}
+}
+
+func TestRouteDeadlineClassOnlyChangesResetCompatibility(t *testing.T) {
+	fixture := newFixture(t)
+	veryShort := routeClassDecisionInput(t, fixture, 100, 10*time.Minute)
+	veryShort.Inputs.BudgetClass = BudgetClassVeryShort
+	veryShort.Inputs.DeadlineClass = DeadlineClassVeryShort
+	selected, err := BuildRoutingDecision(veryShort)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision very-short deadline: %v", err)
+	}
+	if selected.DecisionStatus != DecisionStatusSelected {
+		t.Fatalf("very-short deadline decision = %#v", selected)
+	}
+	expiry := componentByName(t, selected.ScoredCandidates[0].Components, ComponentExpiryUrgency)
+	if expiry.DeadlineClass != DeadlineClassVeryShort || expiry.ResetWindow != "under-15m" {
+		t.Fatalf("expiry factor = %#v", expiry)
+	}
+
+	short := veryShort
+	short.Inputs.DeadlineClass = DeadlineClassShort
+	blocked, err := BuildRoutingDecision(short)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision short deadline: %v", err)
+	}
+	if blocked.DecisionStatus != DecisionStatusNoEligible || !rejectedHas(Result{Rejected: blocked.RejectedCandidates}, selected.EligibleCandidates[0].RoutingCandidateID, RejectQuotaResetIncompatible) {
+		t.Fatalf("short deadline did not fail reset compatibility: %#v", blocked)
+	}
+	if selected.RoutingFingerprint == blocked.RoutingFingerprint {
+		t.Fatal("deadline class was not bound into the routing fingerprint")
+	}
+}
+
+func TestRouteTaskFitClassesRejectUnknownAndWeakerThanRequirementFloor(t *testing.T) {
+	fixture := newFixture(t)
+	base := replayDecisionInput(fixture)
+	req := base.Inputs.Requirement
+	req.RiskTier = taskrequirements.RiskHigh
+	req.QualityFloor = taskrequirements.QualityStandard
+	req.NestedAllowed = false
+	req = decisionRequirement(t, fixture, req, req.TaskRequirementID, base.PlanFingerprint)
+	base.Inputs.Requirement = req
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*DecisionInput)
+	}{
+		{name: "unknown budget", mutate: func(input *DecisionInput) { input.Inputs.BudgetClass = BudgetClass("huge") }},
+		{name: "unknown deadline", mutate: func(input *DecisionInput) { input.Inputs.DeadlineClass = DeadlineClass("instant") }},
+		{name: "weaker budget", mutate: func(input *DecisionInput) { input.Inputs.BudgetClass = BudgetClassShort }},
+		{name: "weaker deadline", mutate: func(input *DecisionInput) { input.Inputs.DeadlineClass = DeadlineClassShort }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input := base
+			tc.mutate(&input)
+			if _, err := BuildRoutingDecision(input); !errors.Is(err, taskrequirements.ErrInvalidRecord) {
+				t.Fatalf("BuildRoutingDecision error = %v, want ErrInvalidRecord", err)
+			}
+		})
+	}
+}
+
+func TestSmallBudgetClassCannotBypassHardBudgetPolicy(t *testing.T) {
+	fixture := newFixture(t)
+	input := routeClassDecisionInput(t, fixture, 100, 2*time.Hour)
+	input.Inputs.BudgetClass = BudgetClassVeryShort
+	input.Inputs.DeadlineClass = DeadlineClassVeryShort
+	for i := range input.Inputs.Budgets {
+		if input.Inputs.Budgets[i].BudgetPolicyID == "bpol-codex-a" {
+			input.Inputs.Budgets[i].AvailableValue = 0
+			input.Inputs.Budgets[i].Denial = "ErrBudgetExhausted"
+		}
+	}
+	decision, err := BuildRoutingDecision(input)
+	if err != nil {
+		t.Fatalf("BuildRoutingDecision: %v", err)
+	}
+	if decision.DecisionStatus != DecisionStatusNoEligible || !rejectedHas(Result{Rejected: decision.RejectedCandidates}, input.Inputs.Candidates[0].RoutingCandidateID, RejectBudgetExhausted) {
+		t.Fatalf("small budget class bypassed hard budget evidence: %#v", decision)
+	}
+}
+
+func routeClassDecisionInput(t *testing.T, fixture hardFixture, remaining int64, reset time.Duration) DecisionInput {
+	t.Helper()
+	input := replayDecisionInput(fixture)
+	req := input.Inputs.Requirement
+	req.RiskTier = taskrequirements.RiskLow
+	req.QualityFloor = taskrequirements.QualityStandard
+	req.NestedAllowed = false
+	req = decisionRequirement(t, fixture, req, req.TaskRequirementID, input.PlanFingerprint)
+	input.Inputs.Requirement = req
+	candidate := fixture.candidate("codex", "acct-a", "codex-good")
+	snapshot := quotaWithReset("qsnap-route-class", "codex", "pinst-codex", "acct-a", "codex-good", providerinventory.ConfidenceExact, providerinventory.FreshnessFresh, remaining, fixture.now, fixture.now.Add(reset))
+	candidate.QuotaSnapshotIDs = []string{snapshot.QuotaSnapshotID}
+	candidate.BudgetPolicyIDs = []string{"bpol-codex-a"}
+	input.Inputs.Candidates = []Candidate{candidate}
+	input.Inputs.Inventory.QuotaSnapshots = append(input.Inputs.Inventory.QuotaSnapshots, snapshot)
+	return input
 }
 
 func replayDecisionInput(fixture hardFixture) DecisionInput {
@@ -1747,12 +2347,26 @@ func containsScoredCandidate(candidates []ScoredCandidate, id string) bool {
 }
 
 func hasInputRecordRef(refs []InputRecordRef, kind, id string) bool {
+	_, ok := findInputRecordRef(refs, kind, id)
+	return ok
+}
+
+func findInputRecordRef(refs []InputRecordRef, kind, id string) (InputRecordRef, bool) {
 	for _, ref := range refs {
 		if ref.RecordKind == kind && ref.RecordID == id {
-			return true
+			return ref, true
 		}
 	}
-	return false
+	return InputRecordRef{}, false
+}
+
+func firstInputRecordRefOfKind(refs []InputRecordRef, kind string) (InputRecordRef, bool) {
+	for _, ref := range refs {
+		if ref.RecordKind == kind {
+			return ref, true
+		}
+	}
+	return InputRecordRef{}, false
 }
 
 func hasRejectionCode(reasons []RejectionReason, code RejectionCode) bool {

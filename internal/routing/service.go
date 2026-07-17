@@ -2,7 +2,7 @@ package routing
 
 import (
 	"context"
-	"encoding/json"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -37,6 +37,8 @@ type StoredRouteRequest struct {
 	TaskRequirementID       string
 	DecisionKey             string
 	RoutingPolicyProfileKey string
+	BudgetClass             BudgetClass
+	DeadlineClass           DeadlineClass
 	HostName                string
 	Pin                     *CandidateConstraint
 	PinReason               string
@@ -57,7 +59,8 @@ type RouteOperationResult struct {
 }
 
 // ExplainStoredRoute calculates a current route from durable local evidence
-// without persisting profiles, pins, or routing decisions.
+// without persisting profiles, pins, or routing decisions. When a first-route
+// authority exists, the current explanation binds it as prior decision state.
 func ExplainStoredRoute(ctx context.Context, store storage.Store, request StoredRouteRequest) (RouteOperationResult, error) {
 	request, profile, err := normalizeStoredRouteRequest(store, request, RouteOperationExplain)
 	if err != nil {
@@ -66,15 +69,24 @@ func ExplainStoredRoute(ctx context.Context, store storage.Store, request Stored
 	var result RouteOperationResult
 	err = store.WithTx(ctx, func(tx storage.Tx) error {
 		txStore := routeTransactionStore{parent: store, tx: tx, now: store.Now()}
+		prior, found, _, err := loadRouteAttemptPrior(ctx, txStore, request.ProjectID, request.DeliveryRunID, request.DecisionKey, request.HostName)
+		if err != nil {
+			return err
+		}
+		if found {
+			if err := validateStoredRouteReplay(ctx, txStore, request, profile, prior); err != nil {
+				return err
+			}
+		}
 		input, err := assembleStoredRouteInput(ctx, txStore, request, profile)
 		if err != nil {
 			return err
 		}
-		decision, err := BuildRoutingDecision(input)
-		if err != nil {
-			return err
+		if found {
+			input.PriorRoutingDecisionID = prior.RoutingDecisionID
+			input.PriorRoutingFingerprint = prior.RoutingFingerprint
 		}
-		prior, found, err := loadRoutingDecisionByKey(ctx, txStore, request.ProjectID, request.DeliveryRunID, request.DecisionKey)
+		decision, err := BuildRoutingDecision(input)
 		if err != nil {
 			return err
 		}
@@ -116,16 +128,18 @@ func DecideStoredRoute(ctx context.Context, store storage.Store, request StoredR
 }
 
 func decideStoredRouteInTransaction(ctx context.Context, store storage.Store, request StoredRouteRequest, profile RoutingPolicyProfile) (RouteOperationResult, error) {
-	prior, found, err := loadRoutingDecisionByKey(ctx, store, request.ProjectID, request.DeliveryRunID, request.DecisionKey)
+	prior, found, mapped, err := loadRouteAttemptPrior(ctx, store, request.ProjectID, request.DeliveryRunID, request.DecisionKey, request.HostName)
 	if err != nil {
 		return RouteOperationResult{}, err
 	}
 	if found {
-		if prior.TaskRequirementID != request.TaskRequirementID || prior.RoutingPolicyProfileID != profile.RoutingPolicyProfileID {
-			return RouteOperationResult{}, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "stored routing decision authority does not match replay request"}
+		if err := validateStoredRouteReplay(ctx, store, request, profile, prior); err != nil {
+			return RouteOperationResult{}, err
 		}
-		if request.Pin != nil && !decisionContainsPin(prior, *request.Pin) {
-			return RouteOperationResult{}, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "stored routing decision cannot be replaced by a different explicit pin"}
+		if !mapped {
+			if err := claimRouteAttemptAuthority(ctx, store, prior); err != nil {
+				return RouteOperationResult{}, err
+			}
 		}
 		result := routeOperationResult(RouteOperationDecide, true, true, prior)
 		if prior.TerminalErrorCode != "" {
@@ -152,6 +166,7 @@ func decideStoredRouteInTransaction(ctx context.Context, store storage.Store, re
 			RoutingPolicyProfileID: profile.RoutingPolicyProfileID,
 			PolicyFingerprint:      profile.PolicyFingerprint,
 			Scope:                  "task:" + input.Inputs.Requirement.TaskID,
+			DecisionKey:            request.DecisionKey,
 			Reason:                 sanitize.Text(request.PinReason),
 			Constraint:             *request.Pin,
 			Actor:                  request.PinActor,
@@ -161,12 +176,22 @@ func decideStoredRouteInTransaction(ctx context.Context, store storage.Store, re
 		}
 	}
 
-	// The authoritative decision path reloads the persisted pin set and cached
-	// inventory. Do not let a transient caller copy become authority.
-	input.Inputs.Pins = nil
-	decision, routeErr := DecideAndPersistRoute(ctx, store, input)
+	// Reload after any pin write so the persisted, scoped evidence is the only
+	// decision authority. Do not let either the transient pin or the unscoped
+	// cached inventory reload in the generic decision path replace it.
+	authoritativeRequest := request
+	authoritativeRequest.Pin = nil
+	authoritativeRequest.PinReason = ""
+	input, err = assembleStoredRouteInput(ctx, store, authoritativeRequest, profile)
+	if err != nil {
+		return RouteOperationResult{}, err
+	}
+	decision, routeErr := buildAndPersistStoredRoute(ctx, store, input)
 	if decision.RoutingDecisionID == "" {
 		return RouteOperationResult{}, routeErr
+	}
+	if err := claimRouteAttemptAuthority(ctx, store, decision); err != nil {
+		return RouteOperationResult{}, err
 	}
 	result := routeOperationResult(RouteOperationDecide, true, false, decision)
 	return result, routeErr
@@ -193,6 +218,9 @@ func (s routeTransactionStore) Health(ctx context.Context) (storage.Health, erro
 }
 
 func (s routeTransactionStore) WithTx(_ context.Context, fn func(storage.Tx) error) error {
+	if !s.writable {
+		return fn(routeReadOnlyTransaction{tx: s.tx})
+	}
 	return fn(s.tx)
 }
 
@@ -201,6 +229,22 @@ func (s routeTransactionStore) WithWriteTx(_ context.Context, fn func(storage.Tx
 		return errors.New("route explain transaction is read-only")
 	}
 	return fn(s.tx)
+}
+
+type routeReadOnlyTransaction struct {
+	tx storage.Tx
+}
+
+func (tx routeReadOnlyTransaction) Exec(context.Context, string, ...any) (sql.Result, error) {
+	return nil, fmt.Errorf("route explain transaction: %w", storage.ErrReadOnlyStore)
+}
+
+func (tx routeReadOnlyTransaction) Query(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return tx.tx.Query(ctx, query, args...)
+}
+
+func (tx routeReadOnlyTransaction) QueryRow(ctx context.Context, query string, args ...any) *sql.Row {
+	return tx.tx.QueryRow(ctx, query, args...)
 }
 
 func normalizeStoredRouteRequest(store storage.Store, request StoredRouteRequest, operation string) (StoredRouteRequest, RoutingPolicyProfile, error) {
@@ -212,10 +256,18 @@ func normalizeStoredRouteRequest(store storage.Store, request StoredRouteRequest
 	request.TaskRequirementID = strings.TrimSpace(request.TaskRequirementID)
 	request.DecisionKey = strings.TrimSpace(request.DecisionKey)
 	request.RoutingPolicyProfileKey = strings.TrimSpace(request.RoutingPolicyProfileKey)
+	request.BudgetClass = BudgetClass(strings.TrimSpace(string(request.BudgetClass)))
+	request.DeadlineClass = DeadlineClass(strings.TrimSpace(string(request.DeadlineClass)))
 	request.HostName = strings.TrimSpace(request.HostName)
 	request.PinReason = strings.TrimSpace(request.PinReason)
 	if request.ProjectID == "" || request.DeliveryRunID == "" || request.TaskRequirementID == "" || request.DecisionKey == "" {
 		return request, RoutingPolicyProfile{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "project_id, delivery_run_id, task_requirement_id, and decision_key are required"}
+	}
+	if request.BudgetClass != "" && !ValidBudgetClass(request.BudgetClass) {
+		return request, RoutingPolicyProfile{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: fmt.Sprintf("unknown budget_class %q", request.BudgetClass)}
+	}
+	if request.DeadlineClass != "" && !ValidDeadlineClass(request.DeadlineClass) {
+		return request, RoutingPolicyProfile{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: fmt.Sprintf("unknown deadline_class %q", request.DeadlineClass)}
 	}
 	if request.RoutingPolicyProfileKey == "" {
 		request.RoutingPolicyProfileKey = ProfileKeyBalanced
@@ -226,6 +278,9 @@ func normalizeStoredRouteRequest(store storage.Store, request StoredRouteRequest
 	}
 	if request.HostName == "" {
 		request.HostName = "generic-local"
+	}
+	if sanitize.Text(request.HostName) != request.HostName {
+		return request, RoutingPolicyProfile{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "runtime host name contains a credential, personal path, or control character"}
 	}
 	if request.DecidedBy.ActorID == "" {
 		request.DecidedBy = delivery.Actor{ActorKind: "system", ActorID: "route-service", DecisionAuthority: "router", Source: "loopcoder route " + operation}
@@ -266,6 +321,10 @@ func assembleStoredRouteInput(ctx context.Context, store storage.Store, request 
 	if requirement.ProjectID != request.ProjectID || requirement.DeliveryRunID != request.DeliveryRunID {
 		return DecisionInput{}, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "task requirement does not belong to the requested project and delivery run"}
 	}
+	budgetClass, deadlineClass, err := resolveTaskFitClasses(requirement, request.BudgetClass, request.DeadlineClass)
+	if err != nil {
+		return DecisionInput{}, err
+	}
 	authorizationFingerprint, err := loadRunAuthorizationFingerprint(ctx, store, request.ProjectID, request.DeliveryRunID)
 	if err != nil {
 		return DecisionInput{}, err
@@ -285,6 +344,8 @@ func assembleStoredRouteInput(ctx context.Context, store storage.Store, request 
 	}
 	inputs, err := InputsWithCachedInventory(ctx, store, Inputs{
 		Requirement:        requirement,
+		BudgetClass:        budgetClass,
+		DeadlineClass:      deadlineClass,
 		RoleDefinitions:    roles,
 		Availability:       availabilityResult.Scores,
 		CircuitBreakers:    availabilityResult.CircuitBreakers,
@@ -298,6 +359,10 @@ func assembleStoredRouteInput(ctx context.Context, store storage.Store, request 
 	if err != nil {
 		return DecisionInput{}, err
 	}
+	inputs, err = isolateStoredRouteEvidence(inputs, requirement)
+	if err != nil {
+		return DecisionInput{}, err
+	}
 	if len(inputs.Candidates) > maxRouteServiceCandidates {
 		return DecisionInput{}, &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: fmt.Sprintf("route candidate count %d exceeds limit %d", len(inputs.Candidates), maxRouteServiceCandidates)}
 	}
@@ -305,7 +370,7 @@ func assembleStoredRouteInput(ctx context.Context, store storage.Store, request 
 	if err != nil {
 		return DecisionInput{}, err
 	}
-	records = policyInputsForTask(records, requirement.TaskID)
+	records = policyInputsForTask(records, requirement.TaskID, request.DecisionKey)
 	pins, exclusions := constraintsFromPolicyInputRecords(records)
 	if request.Pin != nil {
 		transient := Pin{
@@ -319,7 +384,17 @@ func assembleStoredRouteInput(ctx context.Context, store storage.Store, request 
 		if diagnostics := ValidatePolicyInputs(inputs.Inventory, []Pin{transient}, nil, profile.PolicyFingerprint, now); len(diagnostics) > 0 {
 			return DecisionInput{}, &taskrequirements.TypedError{Code: diagnostics[0].Code, Message: diagnostics[0].Message}
 		}
-		pins = append(pins, transient)
+		// An explicit request pin is exact authority for this decision. Keeping
+		// legacy task-wide pins here would turn hard eligibility into an OR and
+		// could select a different provider than the caller requested.
+		pins = []Pin{transient}
+		filteredRecords := records[:0]
+		for _, record := range records {
+			if record.InputKind != PolicyInputKindPin {
+				filteredRecords = append(filteredRecords, record)
+			}
+		}
+		records = filteredRecords
 	}
 	inputs.Pins = pins
 	inputs.Exclusions = exclusions
@@ -347,6 +422,17 @@ func assembleStoredRouteInput(ctx context.Context, store storage.Store, request 
 	return input, nil
 }
 
+func resolveStoredRouteClasses(ctx context.Context, store storage.Store, request StoredRouteRequest) (BudgetClass, DeadlineClass, error) {
+	requirement, err := taskrequirements.LoadTaskRequirement(ctx, store, request.TaskRequirementID)
+	if err != nil {
+		return "", "", err
+	}
+	if requirement.ProjectID != request.ProjectID || requirement.DeliveryRunID != request.DeliveryRunID {
+		return "", "", &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "task requirement does not belong to the requested project and delivery run"}
+	}
+	return resolveTaskFitClasses(requirement, request.BudgetClass, request.DeadlineClass)
+}
+
 func routeOperationResult(operation string, persisted, replayed bool, decision RoutingDecision) RouteOperationResult {
 	outcome := RouteOutcomeSelected
 	if decision.DecisionStatus == DecisionStatusNoEligible {
@@ -360,41 +446,6 @@ func routeOperationResult(operation string, persisted, replayed bool, decision R
 		Replayed:      replayed,
 		Decision:      decision,
 	}
-}
-
-func loadRoutingDecisionByKey(ctx context.Context, store storage.Store, projectID, deliveryRunID, decisionKey string) (RoutingDecision, bool, error) {
-	var payloads []string
-	err := store.WithTx(ctx, func(tx storage.Tx) error {
-		rows, err := tx.Query(ctx, `SELECT payload_json FROM routing_decisions
-			WHERE project_id = ? AND delivery_run_id = ? AND decision_key = ?
-			ORDER BY created_at, routing_decision_id LIMIT 2`, projectID, deliveryRunID, decisionKey)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var payload string
-			if err := rows.Scan(&payload); err != nil {
-				return err
-			}
-			payloads = append(payloads, payload)
-		}
-		return rows.Err()
-	})
-	if err != nil {
-		return RoutingDecision{}, false, err
-	}
-	if len(payloads) == 0 {
-		return RoutingDecision{}, false, nil
-	}
-	if len(payloads) > 1 {
-		return RoutingDecision{}, false, &taskrequirements.TypedError{Code: taskrequirements.ErrRoutingFingerprintMismatchCode, Message: "multiple first routing decisions exist for one execution attempt"}
-	}
-	var decision RoutingDecision
-	if err := json.Unmarshal([]byte(payloads[0]), &decision); err != nil {
-		return RoutingDecision{}, false, err
-	}
-	return decision, true, nil
 }
 
 func decisionContainsPin(decision RoutingDecision, constraint CandidateConstraint) bool {

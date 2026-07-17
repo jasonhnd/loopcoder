@@ -1159,9 +1159,13 @@ a provider or refreshing provider telemetry. Both operations require stable
 `project`, `DeliveryRun`, immutable `TaskRequirement`, and execution-attempt
 decision identities. The referenced TaskRequirement supplies the authoritative
 role, permission, side-effect, capability, network, quality, and task-fit
-requirements. Durable budget summaries, quota reset windows, and the selected
-policy profile supply budget and deadline fit; the CLI does not accept prompt
-text or weaker copies of those fields.
+requirements. `--budget-class` and `--deadline-class` optionally select the
+existing `very-short`, `short`, or `medium` task-fit bands; omitted values use
+the TaskRequirement-derived floor, and an explicit weaker value is rejected.
+The budget class only parameterizes existing task-equivalent quota-headroom
+scoring. The deadline class only gates quota-reset compatibility and expiry
+scoring; it is not an absolute execution deadline. Durable hard budget policy
+remains authoritative, and the CLI does not accept prompt text.
 
 ```text
 loopcoder route explain \
@@ -1170,6 +1174,8 @@ loopcoder route explain \
   --task-requirement-id <task-requirement-id> \
   --decision-key worker-attempt-1 \
   --profile balanced-v1 \
+  --budget-class short \
+  --deadline-class short \
   --format json
 
 loopcoder route decide \
@@ -1183,30 +1189,42 @@ loopcoder route decide \
   --format json
 ```
 
-`route explain` is read-only and safe to repeat. It loads the cached provider
-inventory and model catalog, quota telemetry, availability and circuit-breaker
-state, budget summaries, active policy inputs, runtime capabilities, and any
-prior first decision. An optional pin narrows only that explanation and is not
-persisted.
+`route explain` opens an existing current-schema database through fail-closed
+read-only storage. It does not create paths, repair permissions, apply
+migrations, or write. It loads the scoped cached provider inventory and model
+catalog, quota telemetry, availability and circuit-breaker state, budget
+summaries, task- and decision-key-applicable policy inputs, runtime
+capabilities, and any prior first-decision authority. It calculates the current
+route, reports the prior decision ID separately, and fingerprint-binds that
+prior authority without replacing the current evaluation. An optional pin
+narrows only that explanation and is not persisted.
 
-`route decide` validates the same evidence, persists an optional provenance-
-bound pin, and records one immutable first routing decision before any caller
-may launch a provider. Reusing the same decision key returns the stored
-decision. A changed task requirement, policy profile, or explicit pin fails
-with `ErrRoutingFingerprintMismatch`; it never silently falls back to Codex.
-Unknown pin references, unsupported permissions, disabled or unusable
-providers, and unknown or stale hard telemetry remain explicit candidate
-rejections.
+`route decide` validates the same evidence and, in one write transaction,
+persists an optional provenance-bound task- and decision-key-scoped pin, one
+immutable first routing decision, and its durable first-authority mapping for a
+caller to consume before launch. It does not gate legacy dispatch. Reusing the
+same decision key returns the first authority even if later re-evaluation
+history exists. A changed task requirement, delivery-run authorization, policy
+profile or fingerprint, resolved class, runtime host, or explicit pin fails with
+`ErrRoutingFingerprintMismatch`; it never silently falls back to Codex. An
+unknown pin reference fails before persistence with a typed missing-reference
+error. A known but hard-ineligible pin produces a typed `no_route`.
+Unsupported permissions, disabled or unusable providers, and unknown or stale
+hard telemetry remain explicit candidate rejections. Zero generated candidates
+return `needs-human` generation status and an actionable inventory refresh and
+configuration diagnostic.
 
-Text is the default output. `--format json` emits one bounded
-`loopcoder.route_operation.v1` value with deterministic candidate and rejection
-details plus `provider_calls: 0`. A valid selection exits `0`, invalid input
-exits `2`, typed storage/routing failures exit `1`, and a complete typed
+Text is the default output. `--format json` emits exactly one bounded JSON
+object: `loopcoder.route_operation.v1` for a route result or
+`loopcoder.route_error.v1` for input, storage, service-invariant, or rendering
+failure. Both carry `provider_calls: 0`. A valid selection exits `0`, invalid
+input exits `2`, typed storage/routing failures exit `1`, and a complete typed
 `no_route` result exits `20`. Output is capped at 1 MiB and redacts credentials,
-personal paths, and control characters. It carries record identities and
-bounded diagnostics rather than raw provider responses or prompt bodies.
-Refresh telemetry separately with `loopcoder providers refresh`; neither route
-operation performs discovery, network access, or provider login.
+personal paths, control characters, and sensitive dynamic JSON keys. It carries
+record identities and bounded diagnostics rather than raw provider responses
+or prompt bodies. Refresh telemetry separately with
+`loopcoder providers refresh --repo . --format json`; neither route operation
+performs discovery, network access, provider login, or provider invocation.
 
 ### Nested Child Plans
 

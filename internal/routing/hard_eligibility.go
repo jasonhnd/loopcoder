@@ -129,8 +129,50 @@ type Policy struct {
 	AllowHalfOpenBreakerProbe   bool
 }
 
+// BudgetClass is the policy-approved task-equivalent consumption band used by
+// the existing headroom scorer. It does not replace typed budget policy units
+// or authorize paid overage.
+type BudgetClass string
+
+const (
+	BudgetClassVeryShort BudgetClass = "very-short"
+	BudgetClassShort     BudgetClass = "short"
+	BudgetClassMedium    BudgetClass = "medium"
+)
+
+// DeadlineClass is the policy-approved task-fit band used by the existing
+// quota reset compatibility gate and expiry-urgency scorer. It is not an
+// absolute execution deadline.
+type DeadlineClass string
+
+const (
+	DeadlineClassVeryShort DeadlineClass = "very-short"
+	DeadlineClassShort     DeadlineClass = "short"
+	DeadlineClassMedium    DeadlineClass = "medium"
+)
+
+func ValidBudgetClass(value BudgetClass) bool {
+	switch BudgetClass(strings.TrimSpace(string(value))) {
+	case BudgetClassVeryShort, BudgetClassShort, BudgetClassMedium:
+		return true
+	default:
+		return false
+	}
+}
+
+func ValidDeadlineClass(value DeadlineClass) bool {
+	switch DeadlineClass(strings.TrimSpace(string(value))) {
+	case DeadlineClassVeryShort, DeadlineClassShort, DeadlineClassMedium:
+		return true
+	default:
+		return false
+	}
+}
+
 type Inputs struct {
 	Requirement        taskrequirements.TaskRequirement
+	BudgetClass        BudgetClass
+	DeadlineClass      DeadlineClass
 	RoleDefinitions    []RoleDefinition
 	Candidates         []Candidate
 	Inventory          providerinventory.Report
@@ -274,7 +316,11 @@ func FilterHardEligibility(inputs Inputs) Result {
 		}
 		reasons = append(reasons, evaluatePermissionAndSideEffects(requirement, candidate, roleDef, hasRoleDef)...)
 		reasons = append(reasons, evaluateRuntimeCompatibility(contract, hostName, requirement, candidate, roleDef, hasRoleDef)...)
-		reasons = append(reasons, evaluateQuota(requirement, candidate, quotaByID, policy, inputs.OptimizationPolicy, inputs.Now)...)
+		deadlineClass := inputs.DeadlineClass
+		if deadlineClass == "" {
+			deadlineClass = DeadlineClass(taskClassForRequirement(requirement))
+		}
+		reasons = append(reasons, evaluateQuota(requirement, deadlineClass, candidate, quotaByID, policy, inputs.OptimizationPolicy, inputs.Now)...)
 		reasons = append(reasons, evaluateBudgets(candidate, budgetByID, policy)...)
 		reasons = append(reasons, evaluateAvailability(candidate, scoreByID, scoreByCandidate, policy)...)
 		reasons = append(reasons, evaluateBreakers(candidate, breakerByID, policy)...)
@@ -574,7 +620,7 @@ func evaluateRuntimeCompatibility(contract runtimecap.Contract, hostName string,
 	return nil
 }
 
-func evaluateQuota(requirement taskrequirements.TaskRequirement, candidate Candidate, quotaByID map[string]providerinventory.QuotaSnapshot, policy Policy, optimization OptimizationPolicy, now time.Time) []RejectionReason {
+func evaluateQuota(requirement taskrequirements.TaskRequirement, deadlineClass DeadlineClass, candidate Candidate, quotaByID map[string]providerinventory.QuotaSnapshot, policy Policy, optimization OptimizationPolicy, now time.Time) []RejectionReason {
 	var reasons []RejectionReason
 	var sawFreshExact bool
 	var sawFreshEstimate bool
@@ -583,7 +629,9 @@ func evaluateQuota(requirement taskrequirements.TaskRequirement, candidate Candi
 		return []RejectionReason{reason(RejectQuotaConfidenceInsufficient, taskrequirements.ErrRequirementConfidenceInsufficientCode, "fresh quota capacity evidence is required", nil, nil)}
 	}
 	optimization = normalizeHardOptimizationPolicy(optimization)
-	taskClass := taskClassForRequirement(requirement)
+	if deadlineClass == "" {
+		deadlineClass = DeadlineClass(taskClassForRequirement(requirement))
+	}
 	for _, id := range candidate.QuotaSnapshotIDs {
 		snapshot, ok := quotaByID[id]
 		if !ok {
@@ -626,8 +674,8 @@ func evaluateQuota(requirement taskrequirements.TaskRequirement, candidate Candi
 				snapshotUsable = false
 			} else {
 				band := resetBandForDuration(optimization.ResetBands, resetAt.Sub(now.UTC()))
-				if !taskClassAllowedInBand(taskClass, band.MaxTaskClass) {
-					reasons = append(reasons, reason(RejectQuotaResetIncompatible, taskrequirements.ErrCapabilityUnsupportedCode, "task class "+taskClass+" exceeds reset window "+band.Name+" max "+band.MaxTaskClass, nil, []string{snapshot.QuotaSnapshotID}))
+				if !taskClassAllowedInBand(string(deadlineClass), band.MaxTaskClass) {
+					reasons = append(reasons, reason(RejectQuotaResetIncompatible, taskrequirements.ErrCapabilityUnsupportedCode, "deadline class "+string(deadlineClass)+" exceeds reset window "+band.Name+" max "+band.MaxTaskClass, nil, []string{snapshot.QuotaSnapshotID}))
 					snapshotUsable = false
 				}
 			}

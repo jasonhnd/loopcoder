@@ -208,6 +208,48 @@ func TestPolicyInputPersistenceFailsInvalidPinWithActionableDiagnostic(t *testin
 	}
 }
 
+func TestNormalizePolicyInputPreservesLegacyIdentityWithoutDecisionKey(t *testing.T) {
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	for _, inputKind := range []string{PolicyInputKindPin, PolicyInputKindExclusion} {
+		record := PolicyInputRecord{
+			InputKind:         inputKind,
+			ProjectID:         "proj-routing",
+			DeliveryRunID:     "drun-routing",
+			PolicyFingerprint: testFingerprint("policy"),
+			Scope:             "task:task-a",
+			Reason:            "legacy task-wide constraint",
+			Constraint:        CandidateConstraint{AdapterID: "codex"},
+		}
+		legacyID := "rpin_" + digestBase32(
+			record.ProjectID,
+			record.DeliveryRunID,
+			record.InputKind,
+			record.PolicyFingerprint,
+			record.Scope,
+			record.Reason,
+			constraintKey(record.Constraint),
+		)[:32]
+		if inputKind == PolicyInputKindExclusion {
+			legacyID = "rexcl_" + strings.TrimPrefix(legacyID, "rpin_")
+		}
+		if got := normalizePolicyInput(record, now).RoutingPolicyInputID; got != legacyID {
+			t.Fatalf("legacy %s id = %q, want preserved %q", inputKind, got, legacyID)
+		}
+
+		scoped := record
+		scoped.DecisionKey = "attempt-2"
+		scopedID := normalizePolicyInput(scoped, now).RoutingPolicyInputID
+		if scopedID == legacyID {
+			t.Fatalf("decision-scoped %s reused legacy id %q", inputKind, scopedID)
+		}
+		other := record
+		other.DecisionKey = "attempt-3"
+		if otherID := normalizePolicyInput(other, now).RoutingPolicyInputID; otherID == scopedID {
+			t.Fatalf("different decision keys reused %s id %q", inputKind, scopedID)
+		}
+	}
+}
+
 func TestOverrideProvenanceCannotBypassHardGates(t *testing.T) {
 	diagnostics := ValidateOverrideProvenance([]OverrideProvenance{{
 		OverrideID:               "ovr-permission",

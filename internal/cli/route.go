@@ -7,12 +7,15 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"runtime"
 	"strings"
 
 	"github.com/jasonhnd/loopcoder/internal/delivery"
+	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/routing"
 	"github.com/jasonhnd/loopcoder/internal/sanitize"
+	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/taskrequirements"
 )
 
@@ -37,6 +40,8 @@ func printRouteHelp(w io.Writer) {
 	fmt.Fprintln(w, "  --task-requirement-id string      immutable task requirement id (required)")
 	fmt.Fprintln(w, "  --decision-key string             stable execution-attempt route key (required)")
 	fmt.Fprintln(w, "  --profile string                  fast-v1, balanced-v1, or deep-v1 (default \"balanced-v1\")")
+	fmt.Fprintln(w, "  --budget-class string             optional task budget class: very-short, short, or medium")
+	fmt.Fprintln(w, "  --deadline-class string           optional task deadline class: very-short, short, or medium")
 	fmt.Fprintln(w, "  --host-name string                runtime capability host name (default \"generic-local\")")
 	fmt.Fprintln(w, "  --pin-provider string             optional adapter id constraint")
 	fmt.Fprintln(w, "  --pin-installation string         optional provider installation id constraint")
@@ -69,8 +74,7 @@ func runRoute(args []string, stdout, stderr io.Writer, deps Deps) int {
 	case routing.RouteOperationDecide:
 		return runRouteOperation(routing.RouteOperationDecide, args[1:], stdout, stderr, deps)
 	default:
-		fmt.Fprintf(stderr, "route: unknown subcommand %q\n", args[0])
-		return 2
+		return renderRouteRequestFailure(stdout, stderr, routeRequestedFormat(args[1:]), args[0], fmt.Errorf("unknown route subcommand %q", args[0]))
 	}
 }
 
@@ -81,6 +85,8 @@ type routeFlags struct {
 	TaskRequirementID string
 	DecisionKey       string
 	ProfileKey        string
+	BudgetClass       string
+	DeadlineClass     string
 	HostName          string
 	PinProvider       string
 	PinInstallation   string
@@ -99,6 +105,8 @@ func (f *routeFlags) bind(fs *flag.FlagSet) {
 	fs.StringVar(&f.TaskRequirementID, "task-requirement-id", "", "task requirement id")
 	fs.StringVar(&f.DecisionKey, "decision-key", "", "stable route decision key")
 	fs.StringVar(&f.ProfileKey, "profile", routing.ProfileKeyBalanced, "routing policy profile key")
+	fs.StringVar(&f.BudgetClass, "budget-class", "", "task budget class")
+	fs.StringVar(&f.DeadlineClass, "deadline-class", "", "task deadline class")
 	fs.StringVar(&f.HostName, "host-name", "generic-local", "runtime capability host name")
 	fs.StringVar(&f.PinProvider, "pin-provider", "", "pinned adapter id")
 	fs.StringVar(&f.PinInstallation, "pin-installation", "", "pinned provider installation id")
@@ -117,6 +125,8 @@ func (f *routeFlags) normalize() {
 	f.TaskRequirementID = strings.TrimSpace(f.TaskRequirementID)
 	f.DecisionKey = strings.TrimSpace(f.DecisionKey)
 	f.ProfileKey = strings.TrimSpace(f.ProfileKey)
+	f.BudgetClass = strings.ToLower(strings.TrimSpace(f.BudgetClass))
+	f.DeadlineClass = strings.ToLower(strings.TrimSpace(f.DeadlineClass))
 	f.HostName = strings.TrimSpace(f.HostName)
 	f.PinProvider = strings.TrimSpace(f.PinProvider)
 	f.PinInstallation = strings.TrimSpace(f.PinInstallation)
@@ -146,6 +156,12 @@ func (f routeFlags) validate(operation string) error {
 	case routing.ProfileKeyFast, routing.ProfileKeyBalanced, routing.ProfileKeyDeep:
 	default:
 		return fmt.Errorf("route %s: invalid --profile %q; want fast-v1, balanced-v1, or deep-v1", operation, f.ProfileKey)
+	}
+	if f.BudgetClass != "" && !routing.ValidBudgetClass(routing.BudgetClass(f.BudgetClass)) {
+		return fmt.Errorf("route %s: invalid --budget-class %q; want very-short, short, or medium", operation, f.BudgetClass)
+	}
+	if f.DeadlineClass != "" && !routing.ValidDeadlineClass(routing.DeadlineClass(f.DeadlineClass)) {
+		return fmt.Errorf("route %s: invalid --deadline-class %q; want very-short, short, or medium", operation, f.DeadlineClass)
 	}
 	for _, field := range []struct{ name, value string }{
 		{name: "project id", value: f.ProjectID},
@@ -185,6 +201,8 @@ func (f routeFlags) request(operation string, deps Deps) routing.StoredRouteRequ
 		TaskRequirementID:       f.TaskRequirementID,
 		DecisionKey:             f.DecisionKey,
 		RoutingPolicyProfileKey: f.ProfileKey,
+		BudgetClass:             routing.BudgetClass(f.BudgetClass),
+		DeadlineClass:           routing.DeadlineClass(f.DeadlineClass),
 		HostName:                f.HostName,
 		PinReason:               f.PinReason,
 		PinActor:                deliveryActor(f.ActorID),
@@ -211,22 +229,29 @@ func routeHost(deps Deps) delivery.Host {
 
 func runRouteOperation(operation string, args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs := flag.NewFlagSet("route "+operation, flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	requestedFormat := routeRequestedFormat(args)
+	if requestedFormat == "json" {
+		fs.SetOutput(io.Discard)
+	} else {
+		fs.SetOutput(stderr)
+	}
 	flags := routeFlags{}
 	flags.bind(fs)
 	if err := fs.Parse(args); err != nil {
-		return 2
+		if errors.Is(err, flag.ErrHelp) {
+			printRouteHelp(stderr)
+			return 0
+		}
+		return renderRouteRequestFailure(stdout, stderr, requestedFormat, operation, err)
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintf(stderr, "route %s: unexpected argument %q\n", operation, fs.Arg(0))
-		return 2
+		return renderRouteRequestFailure(stdout, stderr, requestedFormat, operation, fmt.Errorf("unexpected argument %q", fs.Arg(0)))
 	}
 	flags.normalize()
 	if err := flags.validate(operation); err != nil {
-		fmt.Fprintln(stderr, err)
-		return 2
+		return renderRouteRequestFailure(stdout, stderr, flags.Format, operation, err)
 	}
-	store, closeStore, err := openDeliveryStoreForCLI(context.Background(), flags.DBPath, deps)
+	store, closeStore, err := openRouteStoreForCLI(context.Background(), operation, flags.DBPath, deps)
 	if err != nil {
 		return renderRouteFailure(stdout, stderr, flags.Format, operation, err)
 	}
@@ -249,8 +274,7 @@ func runRouteOperation(operation string, args []string, stdout, stderr io.Writer
 	}
 	if result.Decision.RoutingDecisionID != "" {
 		if renderErr := renderRouteResult(stdout, flags.Format, result); renderErr != nil {
-			fmt.Fprintf(stderr, "route %s: %s\n", operation, sanitize.Text(renderErr.Error()))
-			return 1
+			return renderRouteFailure(stdout, stderr, flags.Format, operation, fmt.Errorf("render route result: %w", renderErr))
 		}
 		if err != nil {
 			fmt.Fprintf(stderr, "route %s: %s\n", operation, sanitize.Text(err.Error()))
@@ -266,8 +290,45 @@ func runRouteOperation(operation string, args []string, stdout, stderr io.Writer
 	if err != nil {
 		return renderRouteFailure(stdout, stderr, flags.Format, operation, err)
 	}
-	fmt.Fprintf(stderr, "route %s: route service returned no decision\n", operation)
-	return 1
+	return renderRouteFailure(stdout, stderr, flags.Format, operation, errors.New("route service returned no decision"))
+}
+
+func routeRequestedFormat(args []string) string {
+	format := "text"
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--format" || arg == "-format":
+			if i+1 < len(args) {
+				format = strings.ToLower(strings.TrimSpace(args[i+1]))
+				i++
+			}
+		case strings.HasPrefix(arg, "--format="):
+			format = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(arg, "--format=")))
+		case strings.HasPrefix(arg, "-format="):
+			format = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(arg, "-format=")))
+		}
+	}
+	return format
+}
+
+func openRouteStoreForCLI(ctx context.Context, operation, dbPath string, deps Deps) (storage.Store, func(), error) {
+	if operation != routing.RouteOperationExplain {
+		return openDeliveryStoreForCLI(ctx, dbPath, deps)
+	}
+	dbPath = strings.TrimSpace(dbPath)
+	if dbPath == "" {
+		layout, err := home.Resolve(home.Deps{Getenv: os.Getenv, UserHomeDir: os.UserHomeDir})
+		if err != nil {
+			return nil, nil, err
+		}
+		dbPath = layout.DatabasePath()
+	}
+	store, err := storage.OpenReadOnly(ctx, storage.Options{Path: dbPath, Now: deps.Now})
+	if err != nil {
+		return nil, nil, err
+	}
+	return store, func() { _ = store.Close() }, nil
 }
 
 type routeJSONResult struct {
@@ -322,18 +383,27 @@ type routeJSONError struct {
 }
 
 func renderRouteFailure(stdout, stderr io.Writer, format, operation string, err error) int {
+	renderRouteJSONFailure(stdout, format, operation, routeErrorCode(err), err)
+	fmt.Fprintf(stderr, "route %s: %s\n", sanitize.Text(operation), sanitize.Text(err.Error()))
+	return 1
+}
+
+func renderRouteRequestFailure(stdout, stderr io.Writer, format, operation string, err error) int {
+	renderRouteJSONFailure(stdout, format, operation, "invalid_request", err)
+	fmt.Fprintf(stderr, "route %s: %s\n", sanitize.Text(operation), sanitize.Text(err.Error()))
+	return 2
+}
+
+func renderRouteJSONFailure(stdout io.Writer, format, operation, code string, err error) {
 	message := sanitize.Text(err.Error())
-	code := routeErrorCode(err)
 	if format == "json" {
 		payload, marshalErr := json.Marshal(routeJSONError{
-			SchemaVersion: RouteFailureSchema, Operation: operation, Outcome: "error", Code: code, Message: message, ProviderCalls: 0,
+			SchemaVersion: RouteFailureSchema, Operation: sanitize.Text(operation), Outcome: "error", Code: code, Message: message, ProviderCalls: 0,
 		})
 		if marshalErr == nil && len(payload)+1 <= routeOutputMaxBytes {
 			_, _ = stdout.Write(append(payload, '\n'))
 		}
 	}
-	fmt.Fprintf(stderr, "route %s: %s\n", operation, message)
-	return 1
 }
 
 const RouteFailureSchema = "loopcoder.route_error.v1"

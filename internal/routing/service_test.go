@@ -126,6 +126,61 @@ func TestDecideStoredRoutePersistsPinAndTypedNoRoute(t *testing.T) {
 	}
 }
 
+func TestStoredRouteExplicitPinOverridesLegacyTaskPinWithoutLeakingAcrossDecisionKeys(t *testing.T) {
+	ctx := context.Background()
+	store, request := openStoredRouteServiceFixture(t, ctx)
+	profile, ok := BuiltInRoutingPolicyProfile(ProfileKeyBalanced, store.Now())
+	if !ok {
+		t.Fatal("balanced routing profile is unavailable")
+	}
+	legacy, err := PersistPolicyInput(ctx, store, PolicyInputRecord{
+		InputKind:              PolicyInputKindPin,
+		ProjectID:              request.ProjectID,
+		DeliveryRunID:          request.DeliveryRunID,
+		RoutingPolicyProfileID: profile.RoutingPolicyProfileID,
+		PolicyFingerprint:      profile.PolicyFingerprint,
+		Scope:                  "task:task-a",
+		Reason:                 "legacy task-wide route",
+		Constraint:             CandidateConstraint{AdapterID: "claude"},
+		Actor:                  userActor(),
+		Host:                   routingHost(),
+	})
+	if err != nil {
+		t.Fatalf("PersistPolicyInput legacy pin: %v", err)
+	}
+
+	explicit := request
+	explicit.DecisionKey = "route-explicit-codex"
+	explicit.Pin = &CandidateConstraint{AdapterID: "codex", ModelCapabilityID: "codex-good"}
+	explicit.PinReason = "exact provider requested for this execution attempt"
+	result, err := DecideStoredRoute(ctx, store, explicit)
+	if err != nil {
+		t.Fatalf("DecideStoredRoute explicit pin: %v decision=%#v", err, result.Decision)
+	}
+	if got := chosenAdapterID(result.Decision); got != "codex" {
+		t.Fatalf("explicit route adapter = %q, want codex", got)
+	}
+	if len(result.Decision.PolicyInputRecords) != 1 || result.Decision.PolicyInputRecords[0].DecisionKey != explicit.DecisionKey {
+		t.Fatalf("explicit decision policy inputs = %#v, want only decision-scoped pin", result.Decision.PolicyInputRecords)
+	}
+	if result.Decision.PolicyInputRecords[0].RoutingPolicyInputID == legacy.RoutingPolicyInputID {
+		t.Fatalf("explicit decision retained legacy task pin: %#v", result.Decision.PolicyInputRecords)
+	}
+
+	legacyRequest := request
+	legacyRequest.DecisionKey = "route-legacy-claude"
+	legacyResult, err := ExplainStoredRoute(ctx, store, legacyRequest)
+	if err != nil {
+		t.Fatalf("ExplainStoredRoute legacy pin: %v", err)
+	}
+	if legacyResult.Outcome != RouteOutcomeNoRoute {
+		t.Fatalf("legacy claude pin outcome = %q, want no_route", legacyResult.Outcome)
+	}
+	if len(legacyResult.Decision.PolicyInputRecords) != 1 || legacyResult.Decision.PolicyInputRecords[0].RoutingPolicyInputID != legacy.RoutingPolicyInputID {
+		t.Fatalf("legacy decision policy inputs = %#v, want only legacy task pin", legacyResult.Decision.PolicyInputRecords)
+	}
+}
+
 func TestStoredRouteRejectsUnknownPinBeforePersistingIt(t *testing.T) {
 	ctx := context.Background()
 	store, request := openStoredRouteServiceFixture(t, ctx)
@@ -280,6 +335,49 @@ func TestExplainStoredRouteSurfacesUnsupportedPermission(t *testing.T) {
 	}
 }
 
+func TestStoredRouteValidatesAndBindsBudgetAndDeadlineClassesOnReplay(t *testing.T) {
+	ctx := context.Background()
+	store, request := openStoredRouteServiceFixture(t, ctx)
+	request.DecisionKey = "route-explicit-task-fit-classes"
+	request.BudgetClass = BudgetClassMedium
+	request.DeadlineClass = DeadlineClassShort
+
+	first, err := DecideStoredRoute(ctx, store, request)
+	if err != nil {
+		t.Fatalf("DecideStoredRoute explicit classes: %v", err)
+	}
+	if first.Decision.BudgetClass != BudgetClassMedium || first.Decision.DeadlineClass != DeadlineClassShort {
+		t.Fatalf("persisted classes = %q/%q", first.Decision.BudgetClass, first.Decision.DeadlineClass)
+	}
+	replay, err := DecideStoredRoute(ctx, store, request)
+	if err != nil || !replay.Replayed || replay.Decision.RoutingDecisionID != first.Decision.RoutingDecisionID {
+		t.Fatalf("same-class replay = %#v err=%v", replay, err)
+	}
+
+	changed := request
+	changed.DeadlineClass = DeadlineClassMedium
+	if _, err := DecideStoredRoute(ctx, store, changed); !errors.Is(err, taskrequirements.ErrRoutingFingerprintMismatch) {
+		t.Fatalf("changed deadline replay error = %v, want ErrRoutingFingerprintMismatch", err)
+	}
+	changed = request
+	changed.BudgetClass = BudgetClassShort
+	if _, err := DecideStoredRoute(ctx, store, changed); !errors.Is(err, taskrequirements.ErrRoutingFingerprintMismatch) {
+		t.Fatalf("changed budget replay error = %v, want ErrRoutingFingerprintMismatch", err)
+	}
+
+	invalid := request
+	invalid.DecisionKey = "route-invalid-task-fit-class"
+	invalid.BudgetClass = BudgetClass("unbounded")
+	if _, err := ExplainStoredRoute(ctx, store, invalid); !errors.Is(err, taskrequirements.ErrInvalidRecord) {
+		t.Fatalf("invalid budget class error = %v, want ErrInvalidRecord", err)
+	}
+	invalid.BudgetClass = ""
+	invalid.DeadlineClass = DeadlineClass("instant")
+	if _, err := ExplainStoredRoute(ctx, store, invalid); !errors.Is(err, taskrequirements.ErrInvalidRecord) {
+		t.Fatalf("invalid deadline class error = %v, want ErrInvalidRecord", err)
+	}
+}
+
 type routeServiceCounts struct {
 	Roles     int
 	Profiles  int
@@ -386,6 +484,15 @@ func routeDecisionHasRejection(decision RoutingDecision, want RejectionCode) boo
 		}
 	}
 	return false
+}
+
+func chosenAdapterID(decision RoutingDecision) string {
+	for _, candidate := range decision.EligibleCandidates {
+		if candidate.RoutingCandidateID == decision.ChosenCandidateID {
+			return candidate.AdapterID
+		}
+	}
+	return ""
 }
 
 func mutateRouteQuotaEvidence(t *testing.T, ctx context.Context, store storage.Store, confidence providerinventory.Confidence, freshness providerinventory.FreshnessState) {

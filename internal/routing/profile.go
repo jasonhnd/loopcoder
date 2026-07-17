@@ -128,6 +128,7 @@ type PolicyInputRecord struct {
 	RoutingPolicyProfileID string              `json:"routing_policy_profile_id"`
 	PolicyFingerprint      string              `json:"policy_fingerprint"`
 	Scope                  string              `json:"scope"`
+	DecisionKey            string              `json:"decision_key,omitempty"`
 	Reason                 string              `json:"reason"`
 	Status                 string              `json:"status"`
 	ExpiresAt              string              `json:"expires_at,omitempty"`
@@ -873,6 +874,7 @@ func routingProfileID(key, version, policyVersion string) string {
 }
 
 func normalizePolicyInput(record PolicyInputRecord, now time.Time) PolicyInputRecord {
+	record.DecisionKey = strings.TrimSpace(record.DecisionKey)
 	if record.SchemaVersion == "" {
 		record.SchemaVersion = PolicyInputSchema
 	}
@@ -892,7 +894,7 @@ func normalizePolicyInput(record PolicyInputRecord, now time.Time) PolicyInputRe
 		record.UpdatedAt = record.CreatedAt
 	}
 	if record.RoutingPolicyInputID == "" {
-		record.RoutingPolicyInputID = "rpin_" + digestBase32(record.ProjectID, record.DeliveryRunID, record.InputKind, record.PolicyFingerprint, record.Scope, record.Reason, constraintKey(record.Constraint))[:32]
+		record.RoutingPolicyInputID = policyInputID(record)
 		if record.InputKind == PolicyInputKindExclusion {
 			record.RoutingPolicyInputID = "rexcl_" + strings.TrimPrefix(record.RoutingPolicyInputID, "rpin_")
 		}
@@ -901,6 +903,24 @@ func normalizePolicyInput(record PolicyInputRecord, now time.Time) PolicyInputRe
 		record.Diagnostics = []PolicyDiagnostic{}
 	}
 	return record
+}
+
+func policyInputID(record PolicyInputRecord) string {
+	parts := []string{
+		record.ProjectID,
+		record.DeliveryRunID,
+		record.InputKind,
+		record.PolicyFingerprint,
+		record.Scope,
+	}
+	// Preserve the pre-v0.8.1 identity for task-wide policy inputs. Only
+	// decision-scoped inputs add the new dimension, so an upgrade cannot insert
+	// a second row for an already persisted legacy pin or exclusion.
+	if record.DecisionKey != "" {
+		parts = append(parts, record.DecisionKey)
+	}
+	parts = append(parts, record.Reason, constraintKey(record.Constraint))
+	return "rpin_" + digestBase32(parts...)[:32]
 }
 
 func validatePolicyInput(record PolicyInputRecord) error {
@@ -1179,20 +1199,36 @@ func constraintsFromPolicyInputRecords(records []PolicyInputRecord) ([]Pin, []Ex
 	return pins, exclusions
 }
 
-func policyInputsForTask(records []PolicyInputRecord, taskID string) []PolicyInputRecord {
+func policyInputsForTask(records []PolicyInputRecord, taskID, decisionKey string) []PolicyInputRecord {
 	taskID = strings.TrimSpace(taskID)
-	if taskID == "" {
-		return append([]PolicyInputRecord(nil), records...)
-	}
+	decisionKey = strings.TrimSpace(decisionKey)
 	out := make([]PolicyInputRecord, 0, len(records))
+	hasDecisionPin := false
 	for _, record := range records {
 		scope := strings.TrimSpace(record.Scope)
-		if strings.HasPrefix(scope, "task:") && strings.TrimSpace(strings.TrimPrefix(scope, "task:")) != taskID {
+		if taskID != "" && strings.HasPrefix(scope, "task:") && strings.TrimSpace(strings.TrimPrefix(scope, "task:")) != taskID {
 			continue
+		}
+		recordDecisionKey := strings.TrimSpace(record.DecisionKey)
+		if recordDecisionKey != "" && recordDecisionKey != decisionKey {
+			continue
+		}
+		if record.InputKind == PolicyInputKindPin && recordDecisionKey != "" {
+			hasDecisionPin = true
 		}
 		out = append(out, record)
 	}
-	return out
+	if !hasDecisionPin {
+		return out
+	}
+	filtered := out[:0]
+	for _, record := range out {
+		if record.InputKind == PolicyInputKindPin && strings.TrimSpace(record.DecisionKey) == "" {
+			continue
+		}
+		filtered = append(filtered, record)
+	}
+	return filtered
 }
 
 func pinsForRecord(record PolicyInputRecord) []Pin {

@@ -391,14 +391,20 @@ Codex and no shipped route-explain/route-decide service made a persisted routing
 decision authoritative.
 
 The v0.8.1 candidate adds a narrow product boundary at `loopcoder route`.
-`route explain` builds a provider-neutral decision from the referenced durable
-TaskRequirement, cached inventory and model catalog, quota, availability,
-budget, active policy, runtime, and prior-decision state without writing.
-`route decide` persists the optional validated pin and one immutable first
-decision before provider launch; replay uses that authority and rejects a
-changed pin or task/profile authority identity. Both paths return explicit
-candidate rejection reasons and a typed `no_route` rather than selecting Codex
-by default.
+`route explain` opens an existing current-schema store read-only and builds a
+provider-neutral current decision from the referenced durable TaskRequirement,
+scoped cached inventory and model catalog, quota, availability, budget, active
+policy, runtime, and task-fit classes without creating, migrating, repairing,
+or writing the database. A prior first-decision authority is exposed separately
+and fingerprint-bound to the explanation rather than substituted for current
+state. `route decide` atomically persists the optional validated task- and
+decision-key-scoped pin, one immutable first decision, and a durable authority
+mapping; replay uses that first authority and rejects changed pin, task,
+profile/policy, delivery-run authorization, resolved class, or runtime-host
+identity. When
+candidate generation completes, both paths return explicit rejection reasons
+and a typed `no_route` rather than selecting Codex by default. Zero generated
+candidates return an actionable `needs-human` inventory diagnostic.
 They do not refresh telemetry or launch providers. Wiring that authority into
 legacy dispatch is a separate release item, so the v0.8.0 dispatch behavior
 above remains historical fact rather than an implied automatic route.
