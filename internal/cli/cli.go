@@ -72,53 +72,57 @@ type BuildInfo struct {
 }
 
 type Deps struct {
-	NewGitHubReader             func(repoPath string) orchestration.GitHubReader
-	NewIssueWriter              func(repoPath string) compiler.IssueWriter
-	NewPreProdWriter            func(repoPath string) orchestration.PreProdWriter
-	NewPromoteWriter            func(repoPath string) orchestration.PromotionWriter
-	ProcessAlive                func(pid int) bool
-	Now                         func() time.Time
-	RuntimeGOOS                 string
-	RuntimeGOARCH               string
-	IsTerminal                  func(w io.Writer) bool
-	TerminalWidth               func(w io.Writer) int
-	Stdin                       io.Reader
-	BuildInfo                   BuildInfo
-	ComputeReadySet             func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
-	Tick                        func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
-	Discover                    func(ctx context.Context, opts perception.Options) (perception.Report, error)
-	Compile                     func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
-	Dispatch                    func(ctx context.Context, opts worker.Options) (worker.Result, error)
-	AgentLookup                 func(provider string) (agent.Runner, error)
-	Loopreview                  func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
-	Promote                     func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
-	Recover                     func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
-	Verify                      func(ctx context.Context, opts verify.Options) verify.Result
-	Audit                       func(ctx context.Context, opts audit.Options) (audit.Result, error)
-	Doctor                      func(ctx context.Context, opts doctor.Options) doctor.Report
-	ProviderInventory           func(ctx context.Context, opts providerinventory.Options) (providerinventory.Report, error)
-	ProviderInventoryRefresh    func(ctx context.Context, report providerinventory.Report, now time.Time) error
-	ProviderQuotaRefresh        func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.RefreshResult, error)
-	ProviderQuotaStatus         func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error)
-	RouteExplain                func(ctx context.Context, store storage.Store, request routing.StoredRouteRequest) (routing.RouteOperationResult, error)
-	RouteDecide                 func(ctx context.Context, store storage.Store, request routing.StoredRouteRequest) (routing.RouteOperationResult, error)
-	Init                        func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
-	Upgrade                     func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
-	MigrateLocalState           func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error)
-	MigrateStorage              func(ctx context.Context, opts storage.SchemaMigrationOptions) (storage.SchemaMigrationResult, error)
-	SkillInstall                func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
-	StatePush                   func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
-	StatePull                   func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
-	LeaseAcquire                func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
-	LeaseRelease                func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
-	StartDetachedDispatch       func(ctx context.Context, args []string, logPath string) (int, error)
-	KillProcessTree             func(pid int) error
-	KillProcessGroup            func(pgid int) error
-	ProcessAuthority            func(pid int, observedAt time.Time) (string, error)
-	VerifyProcessAuthority      func(pid int, authority string) error
-	DetachedSupervisorCadence   time.Duration
-	DetachedStorageBusyTimeout  time.Duration
-	DetachedStorageWriteTxRetry storage.WriteTxRetryOptions
+	NewGitHubReader          func(repoPath string) orchestration.GitHubReader
+	NewIssueWriter           func(repoPath string) compiler.IssueWriter
+	NewPreProdWriter         func(repoPath string) orchestration.PreProdWriter
+	NewPromoteWriter         func(repoPath string) orchestration.PromotionWriter
+	ProcessAlive             func(pid int) bool
+	Now                      func() time.Time
+	RuntimeGOOS              string
+	RuntimeGOARCH            string
+	IsTerminal               func(w io.Writer) bool
+	TerminalWidth            func(w io.Writer) int
+	Stdin                    io.Reader
+	BuildInfo                BuildInfo
+	ComputeReadySet          func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
+	Tick                     func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
+	Discover                 func(ctx context.Context, opts perception.Options) (perception.Report, error)
+	Compile                  func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
+	Dispatch                 func(ctx context.Context, opts worker.Options) (worker.Result, error)
+	AgentLookup              func(provider string) (agent.Runner, error)
+	Loopreview               func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
+	Promote                  func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
+	Recover                  func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
+	Verify                   func(ctx context.Context, opts verify.Options) verify.Result
+	Audit                    func(ctx context.Context, opts audit.Options) (audit.Result, error)
+	Doctor                   func(ctx context.Context, opts doctor.Options) doctor.Report
+	ProviderInventory        func(ctx context.Context, opts providerinventory.Options) (providerinventory.Report, error)
+	ProviderInventoryRefresh func(ctx context.Context, report providerinventory.Report, now time.Time) error
+	ProviderQuotaRefresh     func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.RefreshResult, error)
+	ProviderQuotaStatus      func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error)
+	RouteExplain             func(ctx context.Context, store storage.Store, request routing.StoredRouteRequest) (routing.RouteOperationResult, error)
+	RouteDecide              func(ctx context.Context, store storage.Store, request routing.StoredRouteRequest) (routing.RouteOperationResult, error)
+	// ResolveVerifierDispatchRoute selects an independent read-only verifier
+	// from a persisted route decision. Production default never reuses the
+	// worker silently when independence policy fails.
+	ResolveVerifierDispatchRoute func(ctx context.Context, input VerifierDispatchRouteInput) (VerifierDispatchRouteResult, error)
+	Init                         func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
+	Upgrade                      func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
+	MigrateLocalState            func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error)
+	MigrateStorage               func(ctx context.Context, opts storage.SchemaMigrationOptions) (storage.SchemaMigrationResult, error)
+	SkillInstall                 func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
+	StatePush                    func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
+	StatePull                    func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
+	LeaseAcquire                 func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	LeaseRelease                 func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	StartDetachedDispatch        func(ctx context.Context, args []string, logPath string) (int, error)
+	KillProcessTree              func(pid int) error
+	KillProcessGroup             func(pgid int) error
+	ProcessAuthority             func(pid int, observedAt time.Time) (string, error)
+	VerifyProcessAuthority       func(pid int, authority string) error
+	DetachedSupervisorCadence    time.Duration
+	DetachedStorageBusyTimeout   time.Duration
+	DetachedStorageWriteTxRetry  storage.WriteTxRetryOptions
 }
 
 var commands = []Command{
@@ -263,6 +267,9 @@ func DefaultDeps() Deps {
 		},
 		RouteExplain: routing.ExplainStoredRoute,
 		RouteDecide:  routing.DecideStoredRoute,
+		ResolveVerifierDispatchRoute: func(ctx context.Context, input VerifierDispatchRouteInput) (VerifierDispatchRouteResult, error) {
+			return resolveVerifierDispatchRouteProduction(ctx, input, routing.DecideStoredRoute)
+		},
 		Init: func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error) {
 			return scaffold.Init(ctx, opts, scaffold.DefaultDeps())
 		},
@@ -6157,24 +6164,94 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "loopreview: %v\n", err)
 		return loopreviewCommandFailureExitCode
 	}
-	selection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
-		Role:           "verifier",
-		Provider:       opts.Provider,
-		Model:          opts.Model,
-		Effort:         opts.Effort,
-		ConfigProvider: cfg.Adapters.Verifier,
-		ConfigModel:    cfg.Verifier.Model,
-		ConfigEffort:   cfg.Verifier.ReasoningEffort,
-		Strict:         cfg.Models.Strict || strict,
-		Warnings:       commandWarningsWriter(outputMode, stderr),
-	})
-	if !ok {
-		return loopreviewCommandFailureExitCode
-	}
-	opts.Provider = selection.Provider
-	opts.Model = selection.Model
-	opts.Effort = selection.Effort
+	explicitProvider := strings.TrimSpace(opts.Provider)
+	explicitModel := strings.TrimSpace(opts.Model)
+	explicitEffort := strings.TrimSpace(opts.Effort)
 	workerProvider := strings.TrimSpace(cfg.Adapters.Worker)
+	resolveVerifier := deps.ResolveVerifierDispatchRoute
+	if resolveVerifier == nil && deps.RouteDecide != nil {
+		decide := deps.RouteDecide
+		resolveVerifier = func(ctx context.Context, input VerifierDispatchRouteInput) (VerifierDispatchRouteResult, error) {
+			return resolveVerifierDispatchRouteProduction(ctx, input, decide)
+		}
+	}
+	if resolveVerifier != nil {
+		routeResult, routeErr := resolveVerifier(context.Background(), VerifierDispatchRouteInput{
+			RepoPath:         resolvedRepo,
+			PRNumber:         opts.PRNumber,
+			WorkerProvider:   workerProvider,
+			WorkerModel:      strings.TrimSpace(cfg.Worker.Model),
+			ExplicitProvider: explicitProvider,
+			ExplicitModel:    explicitModel,
+			ExplicitEffort:   explicitEffort,
+			HostName:         "loopcoder-cli",
+			Now:              deps.Now(),
+		})
+		if routeErr != nil {
+			if routeResult.Outcome == routing.RouteOutcomeNoRoute || strings.Contains(routeErr.Error(), "no_route") {
+				fmt.Fprintf(stderr, "loopreview: needs-human: %v\n", routeErr)
+				if routeResult.RoutingDecisionID != "" {
+					fmt.Fprintf(stderr, "loopreview: routing_decision_id=%s decision_key=%s\n", routeResult.RoutingDecisionID, routeResult.DecisionKey)
+				}
+				return 2 // clean needs-human for independent-verifier unavailability
+			}
+			fmt.Fprintf(stderr, "loopreview: route decide: %v\n", routeErr)
+			return loopreviewCommandFailureExitCode
+		}
+		opts.Provider = routeResult.Provider
+		opts.Model = routeResult.Model
+		opts.Effort = routeResult.Effort
+		selection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
+			Role:           "verifier",
+			Provider:       opts.Provider,
+			Model:          opts.Model,
+			Effort:         opts.Effort,
+			ConfigProvider: opts.Provider,
+			ConfigModel:    opts.Model,
+			ConfigEffort:   opts.Effort,
+			Strict:         cfg.Models.Strict || strict,
+			Warnings:       commandWarningsWriter(outputMode, stderr),
+		})
+		if !ok {
+			return loopreviewCommandFailureExitCode
+		}
+		opts.Provider = selection.Provider
+		opts.Model = selection.Model
+		opts.Effort = selection.Effort
+		if explicitProvider != "" && !strings.EqualFold(opts.Provider, explicitProvider) {
+			fmt.Fprintf(stderr, "loopreview: route decision provider %q does not honor explicit pin %q\n", opts.Provider, explicitProvider)
+			return loopreviewCommandFailureExitCode
+		}
+		if workerProvider != "" && strings.EqualFold(opts.Provider, workerProvider) {
+			fmt.Fprintf(stderr, "loopreview: needs-human: verifier %q is not independent of worker %q\n", opts.Provider, workerProvider)
+			return 2
+		}
+		fmt.Fprintf(commandWarningsWriter(outputMode, stderr), "loopreview: route decision %s provider=%s model=%s effort=%s replayed=%t\n",
+			routeResult.RoutingDecisionID, opts.Provider, opts.Model, opts.Effort, routeResult.Replayed)
+	} else {
+		// Partial test deps: require explicit pin; never invent empty→claude.
+		if explicitProvider == "" {
+			fmt.Fprintln(stderr, "loopreview: unpinned verifier requires a route decision; pass --provider for an explicit pin or use production deps with RouteDecide")
+			return loopreviewCommandFailureExitCode
+		}
+		selection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
+			Role:           "verifier",
+			Provider:       explicitProvider,
+			Model:          explicitModel,
+			Effort:         explicitEffort,
+			ConfigProvider: explicitProvider,
+			ConfigModel:    cfg.Verifier.Model,
+			ConfigEffort:   cfg.Verifier.ReasoningEffort,
+			Strict:         cfg.Models.Strict || strict,
+			Warnings:       commandWarningsWriter(outputMode, stderr),
+		})
+		if !ok {
+			return loopreviewCommandFailureExitCode
+		}
+		opts.Provider = selection.Provider
+		opts.Model = selection.Model
+		opts.Effort = selection.Effort
+	}
 	if warning := config.ReviewerNotWorkerWarning(config.Adapters{
 		Worker:   workerProvider,
 		Verifier: opts.Provider,
