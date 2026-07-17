@@ -6243,6 +6243,15 @@ adapters:
 		"--repo", repo,
 		"--pr-number", "152",
 	}, &stdout, &stderr, Deps{
+		ResolveVerifierDispatchRoute: func(context.Context, VerifierDispatchRouteInput) (VerifierDispatchRouteResult, error) {
+			return VerifierDispatchRouteResult{
+				Provider:          "claude",
+				Model:             "claude-opus-4-8[1m]",
+				Effort:            "max",
+				RoutingDecisionID: "rd-verifier-config",
+				Outcome:           "selected",
+			}, nil
+		},
 		Loopreview: func(_ context.Context, opts loopreview.Options) (loopreview.Result, error) {
 			called = true
 			if opts.Provider != "claude" || opts.Model != "claude-opus-4-8[1m]" || opts.Effort != "max" {

@@ -806,6 +806,11 @@ func handoffObsoleteReservations(ctx context.Context, store storage.Store, child
 	return reservations, err
 }
 
+// SelectedCandidate returns the chosen candidate from a routing decision.
+func SelectedCandidate(decision RoutingDecision) Candidate {
+	return selectedCandidate(decision)
+}
+
 func selectedCandidate(decision RoutingDecision) Candidate {
 	for _, scored := range decision.ScoredCandidates {
 		if scored.RoutingCandidateID == decision.ChosenCandidateID {
