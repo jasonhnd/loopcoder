@@ -48,9 +48,11 @@ flowchart LR
 ```
 
 This diagram is the intended loop, not a claim that every edge is production
-supported in v0.8.0. The worker defaults to `codex`; `codex`, `claude`, `grok`,
-and `antigravity` have registered Worker adapters with different evidence and
-permission limits. The older direct `gemini` adapter remains experimental.
+supported in v0.8.0. Frozen v0.8.0 worker defaults to `codex`; the v0.8.1
+candidate routes unpinned workers through `route decide`. `codex`, `claude`,
+`grok`, and `antigravity` have registered Worker adapters with different
+evidence and permission limits. The older direct `gemini` adapter remains
+experimental.
 The verifier is configured separately and should differ from the worker, but
 v0.8.0 does not route or enforce that independence automatically. At runtime,
 an empty or missing production gate normalizes to `auto` for legacy
@@ -366,11 +368,11 @@ During the 0.6.x transition window, readers accept legacy `[attestation]` header
 - Conductor: a configured agent session that coordinates available commands
   and keeps the final human gate.
 - Worker: `loopcoder dispatch` can run one explicitly selected registered
-  provider for one issue in a fresh git worktree, then open a PR. Unpinned
-  dispatch defaults directly to Codex in v0.8.0; automatic product routing is
-  not wired. The v0.8.1 candidate adds `loopcoder route explain` and
-  `loopcoder route decide` as provider-neutral planning primitives, but this
-  issue does not change the legacy `dispatch` default.
+  provider for one issue in a fresh git worktree, then open a PR. On the
+  v0.8.1 candidate, unpinned Worker dispatch persists a route decision before
+  launch and uses that selection as the only provider/model/effort authority;
+  explicit `--provider` is a durable pin. Frozen v0.8.0 still defaults unpinned
+  dispatch directly to Codex.
 - Nested orchestration: `loopcoder nested run --plan <file.json>` persists and
   schedules bounded child-plan records. The read-only executor supports Codex,
   Claude, and Grok through explicit provider read-only modes, then compares a

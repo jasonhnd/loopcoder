@@ -102,6 +102,10 @@ type Deps struct {
 	ProviderQuotaStatus      func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error)
 	RouteExplain             func(ctx context.Context, store storage.Store, request routing.StoredRouteRequest) (routing.RouteOperationResult, error)
 	RouteDecide              func(ctx context.Context, store storage.Store, request routing.StoredRouteRequest) (routing.RouteOperationResult, error)
+	// ResolveWorkerDispatchRoute selects provider/model/effort for ordinary
+	// Worker dispatch from a persisted route decision. Production default never
+	// falls back to an empty-provider Codex default.
+	ResolveWorkerDispatchRoute func(ctx context.Context, input WorkerDispatchRouteInput) (WorkerDispatchRouteResult, error)
 	// ResolveVerifierDispatchRoute selects an independent read-only verifier
 	// from a persisted route decision. Production default never reuses the
 	// worker silently when independence policy fails.
@@ -267,6 +271,9 @@ func DefaultDeps() Deps {
 		},
 		RouteExplain: routing.ExplainStoredRoute,
 		RouteDecide:  routing.DecideStoredRoute,
+		ResolveWorkerDispatchRoute: func(ctx context.Context, input WorkerDispatchRouteInput) (WorkerDispatchRouteResult, error) {
+			return resolveWorkerDispatchRouteProduction(ctx, input, routing.DecideStoredRoute)
+		},
 		ResolveVerifierDispatchRoute: func(ctx context.Context, input VerifierDispatchRouteInput) (VerifierDispatchRouteResult, error) {
 			return resolveVerifierDispatchRouteProduction(ctx, input, routing.DecideStoredRoute)
 		},
@@ -722,7 +729,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --run-id string             run id (default generated)")
 		fmt.Fprintln(w, "  --attempt int               attempt number (default 1)")
 		fmt.Fprintln(w, "  --recovery-context string   prior recovery context to append to the prompt")
-		fmt.Fprintln(w, "  --provider string           worker provider (default \"codex\")")
+		fmt.Fprintln(w, "  --provider string           explicit worker provider pin (unpinned work uses route decide)")
 		fmt.Fprintln(w, "  --model string              optional worker model override for this run")
 		fmt.Fprintln(w, "  --effort string             optional worker reasoning effort override for this run")
 		fmt.Fprintln(w, "  --timeout duration          optional worker hard-cap override for this dispatch")
@@ -4706,23 +4713,111 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "dispatch: %v\n", err)
 		return 1
 	}
-	selection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
-		Role:           "worker",
-		Provider:       opts.Provider,
-		Model:          opts.Model,
-		Effort:         opts.Effort,
-		ConfigProvider: cfg.Adapters.Worker,
-		ConfigModel:    cfg.Worker.Model,
-		ConfigEffort:   cfg.Worker.ReasoningEffort,
-		Strict:         cfg.Models.Strict || strict,
-		Warnings:       commandWarningsWriter(outputMode, stderr),
-	})
-	if !ok {
-		return 1
+
+	// Capture explicit CLI pins before route resolution. Config adapter defaults
+	// are not treated as production pins; unpinned work must go through route
+	// decide and never fall back to empty-provider Codex.
+	explicitProvider := strings.TrimSpace(opts.Provider)
+	explicitModel := strings.TrimSpace(opts.Model)
+	explicitEffort := strings.TrimSpace(opts.Effort)
+	resolveRoute := deps.ResolveWorkerDispatchRoute
+	if resolveRoute == nil && deps.RouteDecide != nil {
+		// Production-shaped deps: build durable evidence then decide.
+		decide := deps.RouteDecide
+		resolveRoute = func(ctx context.Context, input WorkerDispatchRouteInput) (WorkerDispatchRouteResult, error) {
+			return resolveWorkerDispatchRouteProduction(ctx, input, decide)
+		}
 	}
-	opts.Provider = selection.Provider
-	opts.Model = selection.Model
-	opts.Effort = selection.Effort
+	if resolveRoute != nil {
+		routeResult, routeErr := resolveRoute(context.Background(), WorkerDispatchRouteInput{
+			RepoPath:         resolvedRepo,
+			RunID:            opts.RunID,
+			IssueNumber:      opts.IssueNumber,
+			IssueTitle:       opts.IssueTitle,
+			IssueBody:        opts.IssueBody,
+			Attempt:          opts.Attempt,
+			ExplicitProvider: explicitProvider,
+			ExplicitModel:    explicitModel,
+			ExplicitEffort:   explicitEffort,
+			HostName:         "loopcoder-cli",
+			Now:              deps.Now(),
+		})
+		if routeErr != nil {
+			if routeResult.Outcome == routing.RouteOutcomeNoRoute || strings.Contains(routeErr.Error(), "no_route") {
+				fmt.Fprintf(stderr, "dispatch: no_route: %v\n", routeErr)
+				if routeResult.RoutingDecisionID != "" {
+					fmt.Fprintf(stderr, "dispatch: routing_decision_id=%s decision_key=%s\n", routeResult.RoutingDecisionID, routeResult.DecisionKey)
+				}
+				return 20
+			}
+			fmt.Fprintf(stderr, "dispatch: route decide: %v\n", routeErr)
+			return 1
+		}
+		if routeResult.Outcome == routing.RouteOutcomeNoRoute {
+			fmt.Fprintf(stderr, "dispatch: no_route: no eligible worker provider for this task\n")
+			if routeResult.RoutingDecisionID != "" {
+				fmt.Fprintf(stderr, "dispatch: routing_decision_id=%s decision_key=%s\n", routeResult.RoutingDecisionID, routeResult.DecisionKey)
+			}
+			return 20
+		}
+		opts.Provider = routeResult.Provider
+		opts.Model = routeResult.Model
+		opts.Effort = routeResult.Effort
+		opts.RoutingDecisionID = routeResult.RoutingDecisionID
+		if strings.TrimSpace(opts.RunID) == "" && strings.TrimSpace(routeResult.DeliveryRunID) != "" {
+			opts.RunID = routeResult.DeliveryRunID
+		}
+		selection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
+			Role:           "worker",
+			Provider:       opts.Provider,
+			Model:          opts.Model,
+			Effort:         opts.Effort,
+			ConfigProvider: opts.Provider,
+			ConfigModel:    opts.Model,
+			ConfigEffort:   opts.Effort,
+			Strict:         cfg.Models.Strict || strict,
+			Warnings:       commandWarningsWriter(outputMode, stderr),
+		})
+		if !ok {
+			return 1
+		}
+		opts.Provider = selection.Provider
+		opts.Model = selection.Model
+		opts.Effort = selection.Effort
+		if explicitProvider != "" && !strings.EqualFold(opts.Provider, explicitProvider) {
+			fmt.Fprintf(stderr, "dispatch: route decision provider %q does not honor explicit pin %q\n", opts.Provider, explicitProvider)
+			return 1
+		}
+		if outputMode.Format == "text" {
+			fmt.Fprintf(stderr, "dispatch: route decision %s provider=%s model=%s effort=%s replayed=%t\n",
+				opts.RoutingDecisionID, opts.Provider, opts.Model, opts.Effort, routeResult.Replayed)
+		}
+	} else {
+		// Partial test deps without a route resolver: require an explicit pin.
+		// Never invent empty-provider Codex. Config model/effort may still apply
+		// under the pinned provider.
+		if explicitProvider == "" {
+			fmt.Fprintln(stderr, "dispatch: unpinned worker requires a route decision; pass --provider for an explicit pin or use production deps with RouteDecide")
+			return 2
+		}
+		selection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
+			Role:           "worker",
+			Provider:       explicitProvider,
+			Model:          explicitModel,
+			Effort:         explicitEffort,
+			ConfigProvider: explicitProvider,
+			ConfigModel:    cfg.Worker.Model,
+			ConfigEffort:   cfg.Worker.ReasoningEffort,
+			Strict:         cfg.Models.Strict || strict,
+			Warnings:       commandWarningsWriter(outputMode, stderr),
+		})
+		if !ok {
+			return 1
+		}
+		opts.Provider = selection.Provider
+		opts.Model = selection.Model
+		opts.Effort = selection.Effort
+	}
 
 	if !detach && !foreground && !supervisorRun {
 		defaultDetached, err := shouldDefaultDetachedForHost(cfg, stdout, stderr, deps)

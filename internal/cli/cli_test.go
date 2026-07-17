@@ -330,7 +330,8 @@ func TestDoctorJSONStdoutIsMachineReadable(t *testing.T) {
 
 func TestUnsupportedPlatformHumanDiagnosticGolden(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	exitCode := RunWithDeps([]string{"dispatch", "--repo", t.TempDir()}, &stdout, &stderr, unsupportedPlatformNoSideEffectDeps(t))
+	exitCode := RunWithDeps([]string{"dispatch",
+		"--provider", "codex", "--repo", t.TempDir()}, &stdout, &stderr, unsupportedPlatformNoSideEffectDeps(t))
 	if exitCode != platform.UnsupportedExitCode {
 		t.Fatalf("exit = %d, want %d", exitCode, platform.UnsupportedExitCode)
 	}
@@ -2235,7 +2236,8 @@ func TestRelayGateExemptsEscapeAndInspectionCommands(t *testing.T) {
 	})
 	t.Run("help", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
-		exitCode := RunWithDeps([]string{"dispatch", "--help"}, &stdout, &stderr, Deps{})
+		exitCode := RunWithDeps([]string{"dispatch",
+		"--provider", "codex", "--help"}, &stdout, &stderr, Deps{})
 		if exitCode != 0 {
 			t.Fatalf("help exit = %d, stderr=%q", exitCode, stderr.String())
 		}
@@ -2918,6 +2920,7 @@ func TestDispatchReplaysCodexOriginProgressBeforeWorkerAndKeepsJSONStdoutPure(t 
 		"--repo", repo,
 		"--issue-number", "899",
 		"--issue-title", "Codex replay",
+		"--provider", "codex",
 		"--run-id", runID,
 		"--format", "json",
 	}, &stdout, &stderr, Deps{
@@ -3034,6 +3037,7 @@ func TestDispatchWithoutRunIDReplaysPriorCodexOriginBeforeWorker(t *testing.T) {
 		"--repo", repo,
 		"--issue-number", "900",
 		"--issue-title", "Next invocation replay",
+		"--provider", "codex",
 		"--format", "json",
 	}, &stdout, &stderr, Deps{
 		Now: func() time.Time { return time.Date(2026, 7, 13, 12, 2, 0, 0, time.UTC) },
@@ -3339,6 +3343,7 @@ func TestDispatchWithoutRunIDBoundedReplayProgressesPastExhaustedAndUnrelatedCan
 		"--repo", repo,
 		"--issue-number", "903",
 		"--issue-title", "Over limit replay",
+		"--provider", "codex",
 		"--format", "json",
 	}, &stdout, &stderr, Deps{
 		Now: func() time.Time { return time.Date(2026, 7, 13, 12, 2, 0, 0, time.UTC) },
@@ -3405,6 +3410,7 @@ func TestDispatchDoesNotReplayPriorCodexOriginMismatch(t *testing.T) {
 		"--repo", repo,
 		"--issue-number", "901",
 		"--issue-title", "Origin mismatch",
+		"--provider", "codex",
 		"--format", "json",
 	}, &stdout, &stderr, Deps{
 		Now:      func() time.Time { return time.Date(2026, 7, 13, 12, 2, 0, 0, time.UTC) },
@@ -3466,6 +3472,7 @@ func TestDispatchReplaysClaudeOriginProgressBeforeWorkerAndKeepsJSONStdoutPure(t
 		"--repo", repo,
 		"--issue-number", "900",
 		"--issue-title", "Claude replay",
+		"--provider", "codex",
 		"--run-id", runID,
 		"--format", "json",
 	}, &stdout, &stderr, Deps{
@@ -3516,6 +3523,7 @@ func TestDispatchWithoutRunIDReplaysPriorClaudeOriginExactlyOnce(t *testing.T) {
 		"--repo", repo,
 		"--issue-number", "900",
 		"--issue-title", "Claude next invocation replay",
+		"--provider", "codex",
 		"--format", "json",
 	}, &stdout, &stderr, Deps{
 		Now: func() time.Time { return time.Date(2026, 7, 14, 12, 2, 0, 0, time.UTC) },
@@ -3585,6 +3593,7 @@ func TestDispatchClaudeOriginMismatchThenOriginalSessionReplaysExactlyOnce(t *te
 		"--repo", repo,
 		"--issue-number", "900",
 		"--issue-title", "Claude session B",
+		"--provider", "codex",
 		"--format", "json",
 	}, &stdoutB, &stderrB, Deps{
 		Now: func() time.Time { return time.Date(2026, 7, 14, 12, 2, 0, 0, time.UTC) },
@@ -3617,6 +3626,7 @@ func TestDispatchClaudeOriginMismatchThenOriginalSessionReplaysExactlyOnce(t *te
 		"--repo", repo,
 		"--issue-number", "900",
 		"--issue-title", "Claude session A return",
+		"--provider", "codex",
 		"--format", "json",
 	}, &stdoutA, &stderrA, Deps{
 		Now: func() time.Time { return time.Date(2026, 7, 14, 12, 3, 0, 0, time.UTC) },
@@ -3705,6 +3715,7 @@ func TestDispatchPaseoOriginMismatchThenOriginalAgentReplaysExactlyOnce(t *testi
 		"--repo", repo,
 		"--issue-number", "901",
 		"--issue-title", "Paseo agent B",
+		"--provider", "codex",
 		"--format", "json",
 	}, &stdoutB, &stderrB, Deps{
 		Now: func() time.Time { return time.Date(2026, 7, 14, 12, 2, 0, 0, time.UTC) },
@@ -3740,6 +3751,7 @@ func TestDispatchPaseoOriginMismatchThenOriginalAgentReplaysExactlyOnce(t *testi
 		"--repo", repo,
 		"--issue-number", "901",
 		"--issue-title", "Paseo agent A return",
+		"--provider", "codex",
 		"--format", "json",
 	}, &stdoutA, &stderrA, Deps{
 		Now: func() time.Time { return time.Date(2026, 7, 14, 12, 3, 0, 0, time.UTC) },
@@ -4177,6 +4189,7 @@ func TestDispatchReplaysCancelledDetachedRunAndLeavesUnacknowledged(t *testing.T
 		"--repo", repo,
 		"--issue-number", "902",
 		"--issue-title", "After cancelled detached",
+		"--provider", "codex",
 		"--format", "json",
 	}, &stdout, &stderr, Deps{
 		Now: func() time.Time { return now.Add(2 * time.Minute) },
@@ -4280,6 +4293,7 @@ func TestDispatchReplaysCancelledDetachedRunForClaudeHostAndLeavesCancellationUn
 		"--repo", repo,
 		"--issue-number", "901",
 		"--issue-title", "After Claude cancelled detached",
+		"--provider", "codex",
 		"--format", "json",
 	}, &stdout, &stderr, Deps{
 		Now: func() time.Time { return now.Add(2 * time.Minute) },
@@ -4386,6 +4400,7 @@ func TestDispatchReplaysCancelledDetachedRunForPaseoHostAndLeavesCancellationUnk
 		"--repo", repo,
 		"--issue-number", "903",
 		"--issue-title", "After Paseo cancelled detached",
+		"--provider", "codex",
 		"--format", "json",
 	}, &stdout, &stderr, Deps{
 		Now: func() time.Time { return now.Add(2 * time.Minute) },
@@ -4555,6 +4570,7 @@ func TestDispatchPaseoHostMarkerOnlyFallsBackWithoutReplayOrAck(t *testing.T) {
 		"--repo", repo,
 		"--issue-number", "904",
 		"--issue-title", "After Paseo marker-only fallback",
+		"--provider", "codex",
 		"--format", "json",
 	}, &stdout, &stderr, Deps{
 		Now: func() time.Time { return now.Add(2 * time.Minute) },
@@ -7432,6 +7448,7 @@ func TestDispatchRunsWithInjectedWorker(t *testing.T) {
 		"--repo", repo,
 		"--issue-number", "101",
 		"--issue-title", "Implement dispatch",
+		"--provider", "codex",
 		"--issue-body", "Body",
 		"--model", "gpt-5",
 		"--effort", "high",
@@ -7553,6 +7570,7 @@ func TestDispatchJSONModeEmitsSingleJSONValueOnly(t *testing.T) {
 		"--repo", repo,
 		"--issue-number", "101",
 		"--issue-title", "Implement dispatch",
+		"--provider", "codex",
 	}, &stdout, &stderr, Deps{
 		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
 			return result, nil
@@ -7623,6 +7641,7 @@ func TestDispatchJSONObservabilityUsesStableAttemptID(t *testing.T) {
 		"--repo", repo,
 		"--issue-number", "101",
 		"--issue-title", "Implement dispatch",
+		"--provider", "codex",
 	}, &stdout, &stderr, Deps{
 		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
 			return result, nil
@@ -7674,6 +7693,7 @@ func TestDispatchDetachPersistsClaimBeforeStartingSupervisor(t *testing.T) {
 		"--repo", repo,
 		"--issue-number", "898",
 		"--issue-title", "Detached supervision",
+		"--provider", "codex",
 		"--issue-body", "body with runtime canary secret",
 		"--run-id", "run-20260714T040000Z-issue-898",
 		"--detach",
@@ -7759,6 +7779,7 @@ func TestDispatchHostProfiledNonInteractiveDefaultsToDetached(t *testing.T) {
 				"--repo", repo,
 				"--issue-number", "964",
 				"--issue-title", "Default detached",
+		"--provider", "codex",
 			}, &stdout, &stderr, Deps{
 				Now: func() time.Time { return now },
 				Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
@@ -7799,6 +7820,7 @@ func TestDispatchForegroundOverridesHostProfiledNonInteractiveDefault(t *testing
 		"--repo", repo,
 		"--issue-number", "964",
 		"--issue-title", "Foreground dispatch",
+		"--provider", "codex",
 	}, &stdout, &stderr, Deps{
 		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
 			called = true
@@ -8275,7 +8297,8 @@ func TestDetachedDispatchHandlesClosedOutputWriters(t *testing.T) {
 		t.Fatalf("Register: %v", err)
 	}
 	exitCode := RunWithDeps([]string{
-		"dispatch", "--format", "json", "--repo", repo, "--issue-number", "898", "--issue-title", "Detached closed stdout", "--run-id", "run-closed-stdout", "--detach",
+		"dispatch", "--format", "json", "--repo", repo, "--issue-number", "898", "--issue-title", "Detached closed stdout",
+		"--provider", "codex", "--run-id", "run-closed-stdout", "--detach",
 	}, errWriter{}, io.Discard, Deps{
 		Now: func() time.Time { return now },
 		StartDetachedDispatch: func(context.Context, []string, string) (int, error) {
@@ -8349,7 +8372,8 @@ func TestDetachedDispatchHandlesClosedOutputWriters(t *testing.T) {
 	store.Close()
 
 	exitCode = RunWithDeps([]string{
-		"dispatch", "--format", "json", "--repo", repo, "--issue-number", "898", "--issue-title", "Detached closed stderr", "--run-id", "run-closed-stderr", "--detach",
+		"dispatch", "--format", "json", "--repo", repo, "--issue-number", "898", "--issue-title", "Detached closed stderr",
+		"--provider", "codex", "--run-id", "run-closed-stderr", "--detach",
 	}, io.Discard, errWriter{}, Deps{
 		Now: func() time.Time { return now.Add(time.Minute) },
 		StartDetachedDispatch: func(context.Context, []string, string) (int, error) {
@@ -9063,6 +9087,7 @@ func TestDispatchNeedsHumanReceiptUsesDispatchReasonAndExitCode(t *testing.T) {
 		"--repo", repo,
 		"--issue-number", "101",
 		"--issue-title", "Implement dispatch",
+		"--provider", "codex",
 	}, &stdout, &stderr, Deps{
 		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
 			return result, nil
@@ -9108,6 +9133,7 @@ func TestDispatchHarvestConductorReportWritesWorkerRelayRecord(t *testing.T) {
 		"--repo", repo,
 		"--issue-number", "101",
 		"--issue-title", "Implement dispatch",
+		"--provider", "codex",
 	}, &stdout, &stderr, Deps{
 		IsTerminal: func(io.Writer) bool {
 			return false
@@ -10388,6 +10414,7 @@ func TestDispatchPrettyDefaultNonInteractiveWritesPlainToStderrWithoutChangingSt
 		"--repo", repo,
 		"--issue-number", "101",
 		"--issue-title", "Implement dispatch",
+		"--provider", "codex",
 	}, &stdout, &stderr, Deps{
 		IsTerminal: func(io.Writer) bool {
 			return false
@@ -10439,6 +10466,7 @@ func TestDispatchWritesRelayLedger(t *testing.T) {
 		"--repo", repo,
 		"--issue-number", "101",
 		"--issue-title", "Implement dispatch",
+		"--provider", "codex",
 	}, &stdout, &stderr, Deps{
 		Now: func() time.Time {
 			return now
@@ -10502,6 +10530,7 @@ func TestDispatchPrettyWritesEmojiToStderrWhenInteractive(t *testing.T) {
 		"--repo", repo,
 		"--issue-number", "101",
 		"--issue-title", "Implement dispatch",
+		"--provider", "codex",
 	}, &stdout, &stderr, Deps{
 		IsTerminal: func(io.Writer) bool {
 			return true
@@ -10552,6 +10581,7 @@ func TestDispatchPrettyEnvOptInWritesEmojiToStderrWithoutChangingStdout(t *testi
 		"--repo", repo,
 		"--issue-number", "101",
 		"--issue-title", "Implement dispatch",
+		"--provider", "codex",
 	}, &stdout, &stderr, Deps{
 		IsTerminal: func(io.Writer) bool {
 			return false
@@ -10590,6 +10620,7 @@ func TestDispatchPrettyFlagHonorsNoColorPlainFallback(t *testing.T) {
 		"--repo", repo,
 		"--issue-number", "101",
 		"--issue-title", "Implement dispatch",
+		"--provider", "codex",
 	}, &stdout, &stderr, Deps{
 		IsTerminal: func(io.Writer) bool {
 			return true
@@ -10636,6 +10667,7 @@ func TestDispatchNoPrettySuppressesStderrWithoutChangingStdout(t *testing.T) {
 		"--repo", repo,
 		"--issue-number", "101",
 		"--issue-title", "Implement dispatch",
+		"--provider", "codex",
 	}, &stdout, &stderr, Deps{
 		IsTerminal: func(io.Writer) bool {
 			return false
@@ -10669,6 +10701,7 @@ func TestDispatchNoPrettyEnvSuppressesStderrWithoutChangingStdout(t *testing.T) 
 		"--repo", repo,
 		"--issue-number", "101",
 		"--issue-title", "Implement dispatch",
+		"--provider", "codex",
 	}, &stdout, &stderr, Deps{
 		IsTerminal: func(io.Writer) bool {
 			return false
@@ -10702,6 +10735,7 @@ func TestDispatchNoPrettyFlagBeatsPrettyFlag(t *testing.T) {
 		"--repo", repo,
 		"--issue-number", "101",
 		"--issue-title", "Implement dispatch",
+		"--provider", "codex",
 	}, &stdout, &stderr, Deps{
 		IsTerminal: func(io.Writer) bool {
 			return false
@@ -10832,12 +10866,23 @@ adapters:
 		t.Fatalf("write delivery config: %v", err)
 	}
 
+	// Config adapters.worker is not a production pin; unpinned dispatch must
+	// consume a route decision. Inject the selected worker route explicitly.
 	exitCode := RunWithDeps([]string{
 		"dispatch",
 		"--repo", repo,
 		"--issue-number", "101",
 		"--issue-title", "Implement dispatch",
 	}, &stdout, &stderr, Deps{
+		ResolveWorkerDispatchRoute: func(context.Context, WorkerDispatchRouteInput) (WorkerDispatchRouteResult, error) {
+			return WorkerDispatchRouteResult{
+				Provider:          "claude",
+				Model:             "claude-opus-4-8[1m]",
+				Effort:            "max",
+				RoutingDecisionID: "rd-config-worker-route",
+				Outcome:           "selected",
+			}, nil
+		},
 		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
 			if opts.Provider != "claude" || opts.Model != "claude-opus-4-8[1m]" || opts.Effort != "max" {
 				t.Fatalf("dispatch opts provider/model/effort = %#v", opts)
@@ -10872,6 +10917,7 @@ worker:
 		"--repo", repo,
 		"--issue-number", "101",
 		"--issue-title", "Implement dispatch",
+		"--provider", "codex",
 	}, &stdout, &stderr, Deps{
 		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
 			called = true
@@ -10879,7 +10925,7 @@ worker:
 		},
 	})
 	if exitCode != 1 {
-		t.Fatalf("RunWithDeps returned exit code %d, want 1", exitCode)
+		t.Fatalf("RunWithDeps returned exit code %d, want 1; stderr=%s", exitCode, stderr.String())
 	}
 	if called {
 		t.Fatal("Dispatch dependency was called despite strict model rejection")
@@ -10898,6 +10944,7 @@ func TestDispatchDoesNotRenderSuccessJSONWithoutReport(t *testing.T) {
 		"--repo", repo,
 		"--issue-number", "101",
 		"--issue-title", "Implement dispatch",
+		"--provider", "codex",
 	}, &stdout, &stderr, Deps{
 		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
 			return worker.Result{
