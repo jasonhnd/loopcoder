@@ -136,6 +136,7 @@ var commands = []Command{
 	{Name: "projects", Summary: "manage the machine-local project registry"},
 	{Name: "providers", Summary: "refresh bounded provider CLI installation inventory"},
 	{Name: "route", Summary: "explain or persist a provider-neutral route decision"},
+	{Name: "wait", Summary: "provider-free local waits (quota-reset, …)"},
 	{Name: "delivery", Summary: "plan and gate v0.8 DeliveryRun approvals"},
 	{Name: "budget", Summary: "exercise local quota usage budget accounting"},
 	{Name: "audit", Summary: "run a read-only repository security audit"},
@@ -483,6 +484,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "route" {
 		return runRoute(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "wait" {
+		return runWait(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "delivery" {
 		return runDelivery(args[1:], stdout, stderr, deps)
