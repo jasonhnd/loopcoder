@@ -560,6 +560,10 @@ func Compare(before, after Snapshot) []Violation {
 
 func classifyEntry(key, before, after string) (string, string) {
 	switch {
+	case key == "external:git-global-config":
+		return "git_global_config_modified", "global-config"
+	case strings.HasPrefix(key, "external:git-credential-state:"):
+		return "git_credentials_modified", "credentials"
 	case strings.HasPrefix(key, "project-state:"):
 		return "loopcoder_project_state_modified", "project-state"
 	case key == "git:refs" || strings.HasPrefix(key, "git:authority:packed-refs") || strings.HasPrefix(key, "git:authority:HEAD"):

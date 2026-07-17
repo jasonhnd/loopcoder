@@ -24,15 +24,16 @@ func TestDefaultContractRepresentsExistingProviders(t *testing.T) {
 		provider   string
 		executable string
 		readOnly   bool
+		bounded    bool
 		mcp        bool
 		json       bool
 		usage      bool
 	}{
-		{provider: "codex", executable: "codex", readOnly: true, mcp: true, json: true, usage: true},
+		{provider: "codex", executable: "codex", readOnly: true, bounded: true, mcp: true, json: true, usage: true},
 		{provider: "claude", executable: "claude", readOnly: true, mcp: true, json: true, usage: true},
 		{provider: "gemini", executable: "gemini", readOnly: true, mcp: true, json: true, usage: true},
 		{provider: "antigravity", executable: "agy", readOnly: false, mcp: false, json: false, usage: false},
-		{provider: "grok", executable: "grok", readOnly: true, mcp: false, json: true, usage: true},
+		{provider: "grok", executable: "grok", readOnly: true, bounded: true, mcp: false, json: true, usage: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.provider, func(t *testing.T) {
@@ -42,6 +43,7 @@ func TestDefaultContractRepresentsExistingProviders(t *testing.T) {
 			}
 			if provider.Executable != tt.executable ||
 				provider.Supports(runtimecap.ProviderReadOnly) != tt.readOnly ||
+				provider.Supports(runtimecap.ProviderBoundedWrite) != tt.bounded ||
 				provider.Supports(runtimecap.ProviderMCPConfig) != tt.mcp ||
 				provider.Supports(runtimecap.ProviderJSONOutput) != tt.json ||
 				provider.Supports(runtimecap.ProviderTokenUsage) != tt.usage {

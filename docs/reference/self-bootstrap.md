@@ -65,6 +65,11 @@ The smoke proves all of the following:
   target schema without creating a backup for a fresh schema-30 database;
 - a deterministic three-child graph executes with dependency-aware fan-out and
   fan-in, durable parent/child identity, and no remote provider call;
+- a forbidden read-only mutation returns the typed policy outcome and remains
+  preserved for diagnosis instead of being reset or deleted;
+- an allowed write runs in exactly one detached machine-local worktree, leaves
+  the parent file hash unchanged, emits a passed bounded mutation manifest, and
+  is cleaned up explicitly by the smoke harness after evidence is recorded;
 - `status` and `report` both produce representative human output and valid JSON
   for the same run tree;
 - progress, report, and doctor artifacts are retained only under the temporary

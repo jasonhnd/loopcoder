@@ -202,6 +202,32 @@ func nestedObservability(report orchestration.NestedScheduleReport) observabilit
 				})
 			}
 		}
+		if manifest := child.MutationManifest; manifest != nil {
+			severity := "info"
+			if manifest.Verification != "passed" {
+				severity = "error"
+			}
+			evidence = append(evidence, observability.Evidence{
+				Type: "bounded-write-manifest", Code: manifest.Verification, Severity: severity,
+				Section: "nested", Kind: manifest.Mode,
+				Message: fmt.Sprintf("base=%s manifest=%s changes=%d violations=%d recovered=%t", manifest.BaseRevision, manifest.ManifestFingerprint, len(manifest.Changes), len(manifest.Violations), manifest.Recovered),
+				SourceRefs: []observability.SourceRef{{
+					Table: "mutation_manifest", RecordID: child.RunID,
+					DeliveryRunID: child.RunID, Provenance: "durable-bounded-write-audit",
+				}},
+			})
+			for _, violation := range manifest.Violations {
+				evidence = append(evidence, observability.Evidence{
+					Type: "bounded-write-policy-violation", Code: violation.Code, Severity: "error",
+					Section: "nested", Kind: violation.Surface,
+					Message: fmt.Sprintf("target=%s before=%s after=%s", violation.TargetID, violation.BeforeHash, violation.AfterHash),
+					SourceRefs: []observability.SourceRef{{
+						Table: "mutation_manifest", RecordID: violation.TargetID,
+						DeliveryRunID: child.RunID, Field: violation.Surface, Provenance: "durable-bounded-write-audit",
+					}},
+				})
+			}
+		}
 		if report.Outcome == orchestration.NestedOutcomePermissionNotEnforceable {
 			provider := ""
 			if report.ExecutorCapability != nil {

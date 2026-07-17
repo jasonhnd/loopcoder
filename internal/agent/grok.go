@@ -148,6 +148,9 @@ func (r GrokRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	if strings.TrimSpace(inv.LogPath) == "" {
 		return Result{ExitCode: -1}, errors.New("grok log path is required")
 	}
+	if inv.ReadOnly && inv.BoundedWrite {
+		return Result{ExitCode: -1}, errors.New("grok invocation cannot be both read-only and bounded-write")
+	}
 	if _, err := mcpServersForInvocation(inv); err != nil {
 		return Result{ExitCode: -1}, fmt.Errorf("grok MCP configuration: %w", err)
 	}
@@ -1039,6 +1042,12 @@ func grokBoundedEnv(environ []string, inv Invocation, runtimeRoot string) []stri
 	}
 	if strings.TrimSpace(inv.Role) != "" {
 		values["LOOPCODER_ROLE"] = strings.TrimSpace(inv.Role)
+	}
+	for key, value := range inv.Environment {
+		key = strings.TrimSpace(key)
+		if key != "" && !strings.Contains(key, "=") {
+			values[key] = value
+		}
 	}
 	keys := make([]string, 0, len(values))
 	for key := range values {

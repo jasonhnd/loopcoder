@@ -346,6 +346,14 @@ type nestedPolicyViolationTestError struct{}
 func (nestedPolicyViolationTestError) Error() string                  { return "guarded state changed" }
 func (nestedPolicyViolationTestError) ChildExecutionPolicyViolation() {}
 
+type nestedWritePolicyViolationTestError struct{}
+
+func (nestedWritePolicyViolationTestError) Error() string                  { return "write scope changed" }
+func (nestedWritePolicyViolationTestError) ChildExecutionPolicyViolation() {}
+func (nestedWritePolicyViolationTestError) ChildExecutionPolicyOutcome() string {
+	return NestedOutcomeWriteScopePolicyViolation
+}
+
 func TestScheduleNestedRunsNeverReportsReadOnlyPolicyViolationAsSuccess(t *testing.T) {
 	for _, required := range []bool{true, false} {
 		t.Run(fmt.Sprintf("required=%t", required), func(t *testing.T) {
@@ -396,6 +404,57 @@ func TestScheduleNestedRunsNeverReportsReadOnlyPolicyViolationAsSuccess(t *testi
 				t.Fatalf("child enforcement audit = %#v", child.ReadOnlyEnforcement)
 			}
 		})
+	}
+}
+
+func TestScheduleNestedRunsNeverReportsWriteScopePolicyViolationAsSuccess(t *testing.T) {
+	repo := t.TempDir()
+	now := nestedTestNow()
+	audit := &state.MutationManifestAudit{
+		Mode:                "isolated-bounded-write-v1",
+		Verification:        "policy-violation",
+		WorktreeID:          "sha256:worktree",
+		BaseRevision:        "deadbeef",
+		BaselineFingerprint: "sha256:before",
+		PostRunFingerprint:  "sha256:after",
+		Violations: []state.MutationManifestViolation{{
+			Code:       "path_outside_scope",
+			TargetID:   "sha256:target",
+			BeforeHash: "absent",
+			AfterHash:  "sha256:content",
+		}},
+	}
+
+	report, err := ScheduleNestedRuns(context.Background(), NestedScheduleOptions{
+		RepoPath:         repo,
+		ParentRunID:      "run-20260709T000000Z-write-policy",
+		ConcurrencyLimit: 1,
+		MaxChildren:      1,
+		Now:              now,
+		Clock:            func() time.Time { return now },
+		Children: []ChildRunPlan{{
+			ID: "write-child", Issue: 1, Permission: "write", Required: true,
+		}},
+		Execute: func(context.Context, ChildExecutionRequest) (ChildRunResult, error) {
+			return ChildRunResult{
+				Status:           NestedStatusSucceeded,
+				MutationManifest: audit,
+				WorktreePath:     "/private/evidence/worktree",
+			}, nestedWritePolicyViolationTestError{}
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleNestedRuns returned error: %v", err)
+	}
+	if report.Status != NestedStatusNeedsHuman || report.Outcome != NestedOutcomeWriteScopePolicyViolation || len(report.Children) != 1 {
+		t.Fatalf("report = %#v, want one needs-human child", report)
+	}
+	child := report.Children[0]
+	if child.Status != NestedStatusNeedsHuman || child.Outcome != NestedOutcomeWriteScopePolicyViolation {
+		t.Fatalf("child status/outcome = %q/%q", child.Status, child.Outcome)
+	}
+	if child.MutationManifest == nil || child.MutationManifest.Verification != "policy-violation" || child.WorktreePath == "" {
+		t.Fatalf("child mutation evidence = %#v worktree=%q", child.MutationManifest, child.WorktreePath)
 	}
 }
 
@@ -2551,7 +2610,19 @@ func TestScheduleNestedRunsSuppressesFinishedEventsForStaleOwner(t *testing.T) {
 			if _, err := storage.ClaimChildRunExecution(ctx, store, plan.ParentRunID, child.RunID, "takeover-executor", time.Now().UTC(), time.Now().Add(time.Minute).UTC()); err != nil {
 				t.Fatalf("take over stale claim: %v", err)
 			}
-			return ChildRunResult{Status: NestedStatusSucceeded}, nil
+			return ChildRunResult{
+				Status:              NestedStatusSucceeded,
+				Outcome:             NestedOutcomeWriteScopePolicyViolation,
+				ProviderReceipt:     "stale-receipt",
+				AttemptPath:         "/private/stale-attempt.json",
+				RecoveryContextPath: "/private/stale-recovery.json",
+				Report:              &reporter.Report{WorkID: child.RunID},
+				ReadOnlyEnforcement: &state.ReadOnlyEnforcementAudit{Mode: "stale"},
+				WorktreePath:        "/private/stale-worktree",
+				MutationManifest: &state.MutationManifestAudit{
+					Mode: "isolated-bounded-write-v1",
+				},
+			}, nil
 		},
 	})
 	if err != nil {
@@ -2559,6 +2630,10 @@ func TestScheduleNestedRunsSuppressesFinishedEventsForStaleOwner(t *testing.T) {
 	}
 	if got := report.Children[0].Status; got != NestedStatusNeedsHuman {
 		t.Fatalf("stale owner result status = %q, want needs-human", got)
+	}
+	staleResult := report.Children[0]
+	if staleResult.MutationManifest != nil || staleResult.ReadOnlyEnforcement != nil || staleResult.Report != nil || staleResult.WorktreePath != "" || staleResult.ProviderReceipt != "" || staleResult.AttemptPath != "" || staleResult.RecoveryContextPath != "" || staleResult.Outcome != "" || staleResult.FinishedAt != "" {
+		t.Fatalf("stale owner published execution evidence: %#v", staleResult)
 	}
 	childEvents := readNestedEvents(t, repo, report.Children[0].RunID)
 	if strings.Contains(childEvents, NestedEventChildFinished) {

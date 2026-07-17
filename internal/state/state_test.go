@@ -263,6 +263,13 @@ func TestWriteAttemptWritesCompactSidecar(t *testing.T) {
 		BaselineFingerprint: "sha256:before", PostRunFingerprint: "sha256:before",
 		Violations: []ReadOnlyEnforcementViolation{},
 	}
+	manifest := &MutationManifestAudit{
+		Mode: "isolated-worktree+bounded-manifest-v1", Verification: "passed",
+		WorktreeID: "worktree-1", BaseRevision: "base-1",
+		BaselineFingerprint: "sha256:before", PostRunFingerprint: "sha256:after", ManifestFingerprint: "sha256:manifest",
+		Changes:    []MutationManifestChange{{Path: "allowed.txt", Kind: "modified", BeforeHash: "sha256:before", AfterHash: "sha256:after"}},
+		Violations: []MutationManifestViolation{},
+	}
 
 	path, err := WriteAttempt(repo, "run-test", AttemptRecord{
 		Version:             1,
@@ -285,6 +292,8 @@ func TestWriteAttemptWritesCompactSidecar(t *testing.T) {
 		Report:              &reportRecord,
 		CostUSD:             &costUSD,
 		ReadOnlyEnforcement: enforcement,
+		MutationManifest:    manifest,
+		WorktreePath:        "/private/isolated-worktree",
 	})
 	if err != nil {
 		t.Fatalf("WriteAttempt returned error: %v", err)
@@ -304,7 +313,7 @@ func TestWriteAttemptWritesCompactSidecar(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatalf("attempt JSON invalid: %v", err)
 	}
-	for _, key := range []string{"version", "job_id", "issue", "attempt", "provider", "pid", "phase", "status", "branch", "started_at", "heartbeat_at", "last_progress_at", "log_bytes", "exit_code", "error", "usage", "report", "cost_usd", "read_only_enforcement"} {
+	for _, key := range []string{"version", "job_id", "issue", "attempt", "provider", "pid", "phase", "status", "branch", "started_at", "heartbeat_at", "last_progress_at", "log_bytes", "exit_code", "error", "usage", "report", "cost_usd", "read_only_enforcement", "mutation_manifest", "worktree_path"} {
 		if _, ok := got[key]; !ok {
 			t.Fatalf("attempt JSON missing key %q: %s", key, string(data))
 		}
@@ -313,7 +322,7 @@ func TestWriteAttemptWritesCompactSidecar(t *testing.T) {
 		t.Fatalf("branch = %#v", got["branch"])
 	}
 	attempts, err := LoadAttempts(repo, "run-test")
-	if err != nil || len(attempts) != 1 || attempts[0].Summary != "fixture summary" || attempts[0].ReadOnlyEnforcement == nil || attempts[0].ReadOnlyEnforcement.Verification != "passed" {
+	if err != nil || len(attempts) != 1 || attempts[0].Summary != "fixture summary" || attempts[0].ReadOnlyEnforcement == nil || attempts[0].ReadOnlyEnforcement.Verification != "passed" || attempts[0].MutationManifest == nil || attempts[0].MutationManifest.ManifestFingerprint != "sha256:manifest" || attempts[0].WorktreePath != "/private/isolated-worktree" {
 		t.Fatalf("LoadAttempts enforcement round trip = %#v, error=%v", attempts, err)
 	}
 	reportField, ok := got["report"].(map[string]any)

@@ -46,6 +46,7 @@ Each provider runtime is represented internally with these fields:
 | `name` | Stable provider key used by loopcoder commands, such as `codex`. |
 | `executable` | Local command that must resolve on `PATH`, such as `codex` or `agy`. |
 | `read_only` | Provider has a verified local read-only mode suitable for `loopreview` and audit review. |
+| `bounded_write` | Provider has a registered isolated-edit mode suitable for the nested bounded-write executor. |
 | `nested_subagents` | Provider can expose nested sub-agent behavior when loopcoder intentionally enables it. |
 | `json_output` | Provider can return machine-readable JSON or accept schema-enforced structured output for verifier-style calls. |
 | `mcp_config` | Provider adapter can inject selected MCP server configuration for the invocation. |
@@ -61,13 +62,13 @@ capability, supporting alternatives when known, and the local fix.
 
 ## Provider Compatibility
 
-| Provider | Executable | Read-only | Nested sub-agents | JSON output | MCP config | Cancellation | Token usage | Auth probe | Notes |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `codex` | `codex` | yes | no | yes | yes | yes | yes | `codex login status` | Default Worker provider; local status text only. |
-| `claude` | `claude` | yes | yes | yes | yes | yes | yes | `claude auth status --json` | Verified Worker and Verifier provider; local machine-readable status fields only. |
-| `gemini` | `gemini` | yes | no | yes | yes | yes | yes | reference existence only | Experimental direct Gemini path; checks declared auth artifact and environment-name existence without reading values. |
-| `antigravity` | `agy` | no | no | no | no | yes | no | `agy models` | Worker-only path. Declared network probe is skipped by default. |
-| `grok` | `grok` | yes | no | yes | no | yes | yes | `grok models` | Official Grok Build CLI only; auth/catalog probing is network-declared and skipped unless explicitly granted. |
+| Provider | Executable | Read-only | Bounded write | Nested sub-agents | JSON output | MCP config | Cancellation | Token usage | Auth probe | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `codex` | `codex` | yes | yes | no | yes | yes | yes | yes | `codex login status` | Default Worker provider; nested write uses ephemeral workspace-write with network, temp write exceptions, MCP, rules, login shells, and multi-agent execution disabled. |
+| `claude` | `claude` | yes | no | yes | yes | yes | yes | yes | `claude auth status --json` | Bounded write is not registered because inherited project settings and hooks cannot be proven isolated. |
+| `gemini` | `gemini` | yes | no | no | yes | yes | yes | yes | reference existence only | Experimental direct Gemini path; checks declared auth artifact and environment-name existence without reading values. |
+| `antigravity` | `agy` | no | no | no | no | no | yes | no | `agy models` | Worker-only path. Declared network probe is skipped by default. |
+| `grok` | `grok` | yes | yes | no | yes | no | yes | yes | `grok models` | Official Grok Build CLI only; bounded write uses strict edit-only isolation without Bash, web, MCP, memory, or sub-agents. |
 
 `antigravity` is the clearest partial provider today. If selected for a
 read-only invocation, an MCP-backed invocation, or schema-enforced JSON output,

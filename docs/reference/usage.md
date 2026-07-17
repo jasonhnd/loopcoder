@@ -1188,11 +1188,11 @@ active, but it does not promise universal exactly-once external side effects
 after a crash; ambiguous side effects must be resolved with receipts,
 idempotency keys, or `needs-human`.
 
-Production-provider `write` and `orchestrate` children are refused before
-launch. A read-only child consumes the persisted immutable execution contract,
-requires a registered provider/host combination, and invokes the provider with
-the adapter's explicit read-only mode. It does not route through Worker
-dispatch and does not create a branch, worktree, commit, or pull request.
+`orchestrate` children are refused before launch. A read-only child consumes
+the persisted immutable execution contract, requires a registered provider/host
+combination, and invokes the provider with the adapter's explicit read-only
+mode. It does not route through Worker dispatch and does not create a branch,
+worktree, commit, or pull request.
 
 Immediately before launch, LoopCoder persists a private baseline outside the
 checkout. The baseline distinguishes existing user dirt and fingerprints the
@@ -1206,6 +1206,41 @@ executor never calls the result successful and never attempts remediation.
 Interrupted baselines are verified before any relaunch; prior violations remain
 blocked for human review.
 
+A `write` child is registered only for Codex, Grok, and the deterministic test
+provider. Claude remains read-only because its inherited project settings and
+hooks cannot currently be proven isolated. A bounded-write claim resolves and
+pins the exact `origin/<base-branch>` commit, then creates or adopts one
+detached worktree below the machine-local LoopCoder temporary root. Every claim
+generation has its own private enforcement record and worktree. The executor
+rejects an empty path scope, branch authority, pull-request or data mutation
+scope, network capability, delegation, and unsupported providers before
+launch. Issue numbers may remain descriptive scope metadata; they do not grant
+remote mutation authority.
+
+Codex runs with its ephemeral workspace-write sandbox, network and both default
+temporary-directory write exceptions disabled, user configuration and
+repository rules ignored, MCP and login shells disabled, and multi-agent
+execution disabled. Its generated shell inherits only the core environment,
+keeps the default secret-name filter, and receives the trusted Git overrides
+explicitly. Grok runs in its strict edit-only sandbox with Bash, web, MCP, and
+sub-agents disabled. Both receive private Git configuration that disables
+interactive credentials and transport protocols and installs deny hooks for
+commit, merge, rebase, and push. These launch controls are defense in depth;
+post-run verification remains authoritative.
+
+The bounded-write verifier compares the complete isolated worktree tree and the
+guarded parent/sibling/Git/project surfaces captured before launch. Only changes
+under the contract's exact canonical path scope enter the content-free
+`mutation_manifest`; changes to any other file, parent or sibling worktree,
+index, ref, hook, local/global config, remote, credential file, or LoopCoder
+state produce `needs-human` with outcome `write_scope_policy_violation`.
+Allowed changes are never staged, committed, pushed, merged, tagged, released,
+or copied back automatically. The detached worktree and local attempt remain
+available for inspection. A successful attempt is reusable only when its
+private evidence, pinned base, worktree identity, and original contract still
+match; a widened replay or stale claim generation cannot publish a manifest or
+terminal completion.
+
 Gemini, Antigravity, unknown adapters, unsupported host profiles,
 provider-native delegation, and per-child provider overrides without a matching
 executor registration fail before launch. In particular, Gemini's current safe
@@ -1213,11 +1248,13 @@ mode disables the repository-inspection tools needed by this executor, while
 Antigravity has no supported read-only adapter.
 
 The reserved `test-subprocess` provider exists only for deterministic local and
-release smoke tests. It executes each child item's `scope.commands` as real local
-subprocesses without calling a remote provider, but it uses the same baseline,
-post-run verification, typed policy failure, and durable audit path. Release
-smoke includes a real mutation attempt and requires the packaged binary to
-reject it without deleting the mutation fixture.
+release smoke tests. It executes each child item's `scope.commands` as real
+local subprocesses without calling a remote provider. Read-only children use
+the guarded baseline audit; write children run in the same detached worktree
+and bounded-manifest path as production adapters. Release smoke includes both a
+forbidden read-only mutation and an allowed bounded-write mutation. The
+packaged binary must reject the former without deleting evidence and must keep
+the latter out of the parent checkout while reporting its manifest.
 
 ## Exit Codes
 

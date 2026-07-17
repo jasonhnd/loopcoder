@@ -64,6 +64,8 @@ type Attempt struct {
 	CostUSD             *float64                  `json:"cost_usd,omitempty"`
 	ArtifactDecision    *ArtifactDecision         `json:"artifact_decision,omitempty"`
 	ReadOnlyEnforcement *ReadOnlyEnforcementAudit `json:"read_only_enforcement,omitempty"`
+	MutationManifest    *MutationManifestAudit    `json:"mutation_manifest,omitempty"`
+	WorktreePath        string                    `json:"worktree_path,omitempty"`
 	Path                string                    `json:"path,omitempty"`
 	LastWriteUTC        time.Time                 `json:"-"`
 }
@@ -91,6 +93,8 @@ type AttemptRecord struct {
 	CostUSD             *float64                  `json:"cost_usd,omitempty"`
 	ArtifactDecision    *ArtifactDecision         `json:"artifact_decision,omitempty"`
 	ReadOnlyEnforcement *ReadOnlyEnforcementAudit `json:"read_only_enforcement,omitempty"`
+	MutationManifest    *MutationManifestAudit    `json:"mutation_manifest,omitempty"`
+	WorktreePath        string                    `json:"worktree_path,omitempty"`
 }
 
 // ReadOnlyEnforcementAudit is the path-free, durable public evidence that a
@@ -106,6 +110,38 @@ type ReadOnlyEnforcementAudit struct {
 }
 
 type ReadOnlyEnforcementViolation struct {
+	Code       string `json:"code"`
+	Surface    string `json:"surface"`
+	TargetID   string `json:"target_id"`
+	BeforeHash string `json:"before_hash"`
+	AfterHash  string `json:"after_hash"`
+}
+
+// MutationManifestAudit is the bounded, content-free public projection of one
+// isolated nested write worktree. Full tree and protected-state snapshots stay
+// in the private enforcement record; the preserved worktree path is carried as
+// a separate local diagnostic field.
+type MutationManifestAudit struct {
+	Mode                string                      `json:"mode"`
+	Verification        string                      `json:"verification"`
+	WorktreeID          string                      `json:"worktree_id"`
+	BaseRevision        string                      `json:"base_revision"`
+	BaselineFingerprint string                      `json:"baseline_fingerprint"`
+	PostRunFingerprint  string                      `json:"post_run_fingerprint,omitempty"`
+	ManifestFingerprint string                      `json:"manifest_fingerprint,omitempty"`
+	Recovered           bool                        `json:"recovered_after_interruption"`
+	Changes             []MutationManifestChange    `json:"changes"`
+	Violations          []MutationManifestViolation `json:"violations"`
+}
+
+type MutationManifestChange struct {
+	Path       string `json:"path"`
+	Kind       string `json:"kind"`
+	BeforeHash string `json:"before_hash"`
+	AfterHash  string `json:"after_hash"`
+}
+
+type MutationManifestViolation struct {
 	Code       string `json:"code"`
 	Surface    string `json:"surface"`
 	TargetID   string `json:"target_id"`
@@ -585,6 +621,8 @@ type attemptJSON struct {
 	CostUSD             json.RawMessage           `json:"cost_usd"`
 	ArtifactDecision    *ArtifactDecision         `json:"artifact_decision"`
 	ReadOnlyEnforcement *ReadOnlyEnforcementAudit `json:"read_only_enforcement"`
+	MutationManifest    *MutationManifestAudit    `json:"mutation_manifest"`
+	WorktreePath        string                    `json:"worktree_path"`
 }
 
 func readAttempt(path, fileName string) (Attempt, bool) {
@@ -609,7 +647,7 @@ func readAttempt(path, fileName string) (Attempt, bool) {
 	}
 
 	branch := strings.TrimSpace(raw.Branch)
-	if branch == "" && raw.Phase != "nested_read_only_verified" {
+	if branch == "" && raw.Phase != "nested_read_only_verified" && raw.Phase != "nested_write_verified" {
 		if attemptNumber > 1 {
 			branch = fmt.Sprintf("loop/issue-%d-retry-%d", issue, attemptNumber)
 		} else {
@@ -655,9 +693,21 @@ func readAttempt(path, fileName string) (Attempt, bool) {
 		CostUSD:             rawFloat64Ptr(raw.CostUSD),
 		ArtifactDecision:    cloneArtifactDecision(raw.ArtifactDecision),
 		ReadOnlyEnforcement: cloneReadOnlyEnforcement(raw.ReadOnlyEnforcement),
+		MutationManifest:    cloneMutationManifest(raw.MutationManifest),
+		WorktreePath:        strings.TrimSpace(raw.WorktreePath),
 		Path:                path,
 		LastWriteUTC:        lastWrite,
 	}, true
+}
+
+func cloneMutationManifest(manifest *MutationManifestAudit) *MutationManifestAudit {
+	if manifest == nil {
+		return nil
+	}
+	clone := *manifest
+	clone.Changes = append([]MutationManifestChange(nil), manifest.Changes...)
+	clone.Violations = append([]MutationManifestViolation(nil), manifest.Violations...)
+	return &clone
 }
 
 func cloneReadOnlyEnforcement(audit *ReadOnlyEnforcementAudit) *ReadOnlyEnforcementAudit {
