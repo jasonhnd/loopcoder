@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- **Worker dispatch route authority** - ordinary unpinned `loopcoder dispatch`
+  persists a route decision before provider launch and uses the selected
+  adapter/model/effort exactly. Explicit `--provider` is a durable pin.
+  Empty-provider Codex defaults are removed from the worker prepare path.
+  `no_route` returns exit code 20 with zero provider launches.
+
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]

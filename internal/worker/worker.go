@@ -53,10 +53,14 @@ type Options struct {
 	Provider        string
 	Model           string
 	Effort          string
-	Timeout         time.Duration
-	ConfigFromBase  bool
-	KeepWorktree    bool
-	Stderr          io.Writer
+	// RoutingDecisionID is the persisted route decision that authorized this
+	// worker launch. Empty only when a test or legacy caller injects an
+	// already-selected provider without going through route decide.
+	RoutingDecisionID string
+	Timeout           time.Duration
+	ConfigFromBase    bool
+	KeepWorktree      bool
+	Stderr            io.Writer
 	// BeforeProviderCall runs after provider-free adoption/reconciliation and
 	// immediately before the provider runner. Callers use it to durably reserve
 	// a budget slot; returning an error prevents the provider launch.
@@ -272,7 +276,7 @@ func prepareDispatch(ctx context.Context, opts Options, deps Deps) (*dispatchCon
 		return nil, errors.New("issue title is required")
 	}
 	if strings.TrimSpace(opts.Provider) == "" {
-		opts.Provider = "codex"
+		return nil, errors.New("provider is required; unpinned worker dispatch must resolve a persisted route decision before launch")
 	}
 	agentRunner, lookupErr := deps.AgentLookup(opts.Provider)
 	if lookupErr != nil {

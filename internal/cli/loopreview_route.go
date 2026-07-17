@@ -229,7 +229,7 @@ func resolveVerifierDispatchRouteProduction(ctx context.Context, input VerifierD
 		return out, fmt.Errorf("no_route: verifier %q is not independent of worker %q", candidate.AdapterID, worker)
 	}
 	out.Provider = candidate.AdapterID
-	out.Model = firstNonEmptyStringValues(candidate.CanonicalModelID, candidate.ModelCapabilityID)
+	out.Model = firstNonEmpty(candidate.CanonicalModelID, candidate.ModelCapabilityID)
 	out.Effort = mapInvocationProfileToEffort(candidate.InvocationProfileKey, input.ExplicitEffort)
 	out.Outcome = routing.RouteOutcomeSelected
 	return out, nil
@@ -243,45 +243,3 @@ func verifierRouteFingerprint(kind, projectID string, parts ...any) string {
 	}
 	return "sha256:" + hex.EncodeToString(h.Sum(nil))
 }
-
-func mapEffortToInvocationProfile(effort string) string {
-	switch strings.TrimSpace(strings.ToLower(effort)) {
-	case "":
-		return ""
-	case "xhigh", "max", "deep":
-		return "deep"
-	case "high", "standard", "default", "medium":
-		return "default"
-	case "low", "fast", "minimal":
-		return "fast"
-	default:
-		return strings.TrimSpace(effort)
-	}
-}
-
-func mapInvocationProfileToEffort(profile, explicit string) string {
-	if e := strings.TrimSpace(explicit); e != "" {
-		return e
-	}
-	switch strings.TrimSpace(strings.ToLower(profile)) {
-	case "deep":
-		return "xhigh"
-	case "fast":
-		return "low"
-	case "default", "":
-		return "high"
-	default:
-		return profile
-	}
-}
-
-func firstNonEmptyStringValues(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
-}
-
-type routeDecideFunc func(context.Context, storage.Store, routing.StoredRouteRequest) (routing.RouteOperationResult, error)

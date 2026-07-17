@@ -807,6 +807,8 @@ func handoffObsoleteReservations(ctx context.Context, store storage.Store, child
 }
 
 // SelectedCandidate returns the chosen candidate from a routing decision.
+// Callers that launch providers must use this selection as the only authority
+// for adapter, model, and invocation profile after a successful decide.
 func SelectedCandidate(decision RoutingDecision) Candidate {
 	return selectedCandidate(decision)
 }

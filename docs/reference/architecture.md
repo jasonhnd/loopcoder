@@ -405,9 +405,12 @@ identity. When
 candidate generation completes, both paths return explicit rejection reasons
 and a typed `no_route` rather than selecting Codex by default. Zero generated
 candidates return an actionable `needs-human` inventory diagnostic.
-They do not refresh telemetry or launch providers. Wiring that authority into
-legacy dispatch is a separate release item, so the v0.8.0 dispatch behavior
-above remains historical fact rather than an implied automatic route.
+They do not refresh telemetry or launch providers. On the v0.8.1 `pre-prod`
+candidate, ordinary unpinned Worker `dispatch` calls `route decide` before
+provider launch: the persisted decision is the only source of
+provider/model/effort, explicit `--provider` pins are durable route constraints,
+and `no_route` launches zero providers. The v0.8.0 empty-provider Codex default
+remains historical fact for the frozen public release.
 
 ### Self-Improvement
 
