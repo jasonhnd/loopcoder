@@ -47,6 +47,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/reportquery"
+	"github.com/jasonhnd/loopcoder/internal/routing"
 	"github.com/jasonhnd/loopcoder/internal/runstatus"
 	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 	"github.com/jasonhnd/loopcoder/internal/scaffold"
@@ -99,6 +100,8 @@ type Deps struct {
 	ProviderInventoryRefresh    func(ctx context.Context, report providerinventory.Report, now time.Time) error
 	ProviderQuotaRefresh        func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.RefreshResult, error)
 	ProviderQuotaStatus         func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error)
+	RouteExplain                func(ctx context.Context, store storage.Store, request routing.StoredRouteRequest) (routing.RouteOperationResult, error)
+	RouteDecide                 func(ctx context.Context, store storage.Store, request routing.StoredRouteRequest) (routing.RouteOperationResult, error)
 	Init                        func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
 	Upgrade                     func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
 	MigrateLocalState           func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error)
@@ -124,6 +127,7 @@ var commands = []Command{
 	{Name: "models", Summary: "list static provider model and depth registry entries"},
 	{Name: "projects", Summary: "manage the machine-local project registry"},
 	{Name: "providers", Summary: "refresh bounded provider CLI installation inventory"},
+	{Name: "route", Summary: "explain or persist a provider-neutral route decision"},
 	{Name: "delivery", Summary: "plan and gate v0.8 DeliveryRun approvals"},
 	{Name: "budget", Summary: "exercise local quota usage budget accounting"},
 	{Name: "audit", Summary: "run a read-only repository security audit"},
@@ -257,6 +261,8 @@ func DefaultDeps() Deps {
 		ProviderQuotaStatus: func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error) {
 			return quotaLifecycle.Status(ctx, req)
 		},
+		RouteExplain: routing.ExplainStoredRoute,
+		RouteDecide:  routing.DecideStoredRoute,
 		Init: func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error) {
 			return scaffold.Init(ctx, opts, scaffold.DefaultDeps())
 		},
@@ -460,6 +466,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "providers" {
 		return runProviders(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "route" {
+		return runRoute(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "delivery" {
 		return runDelivery(args[1:], stdout, stderr, deps)
@@ -669,6 +678,10 @@ func PrintCommandHelp(w io.Writer, command Command) {
 	}
 	if command.Name == "providers" {
 		printProvidersHelp(w)
+		return
+	}
+	if command.Name == "route" {
+		printRouteHelp(w)
 		return
 	}
 	if command.Name == "delivery" {

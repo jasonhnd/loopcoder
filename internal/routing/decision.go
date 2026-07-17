@@ -564,6 +564,7 @@ func prepareDecisionInputFromStore(ctx context.Context, store storage.Store, inp
 	if err != nil {
 		return input, err
 	}
+	records = policyInputsForTask(records, input.Inputs.Requirement.TaskID)
 	if err := validateStoredPolicyInputsForDecision(records, input, profileID, activeFingerprint); err != nil {
 		return input, err
 	}
@@ -827,7 +828,15 @@ func loadRunAuthorizationFingerprint(ctx context.Context, store storage.Store, p
 }
 
 func ExplainJSON(decision RoutingDecision) ([]byte, error) {
-	return delivery.CanonicalJSON(decision)
+	payload, err := delivery.CanonicalJSON(decision)
+	if err != nil {
+		return nil, err
+	}
+	redacted := []byte(sanitize.Text(string(payload)))
+	if !json.Valid(redacted) {
+		return nil, errors.New("routing explain redaction produced invalid JSON")
+	}
+	return redacted, nil
 }
 
 func ExplainHuman(decision RoutingDecision) string {
@@ -877,7 +886,7 @@ func ExplainHuman(decision RoutingDecision) string {
 	for _, rejected := range decision.RejectedCandidates {
 		fmt.Fprintf(&b, "- %s: %s\n", rejected.Candidate.RoutingCandidateID, candidateLabel(rejected.Candidate)+" "+rejectionExplanation(rejected.Reasons))
 	}
-	return strings.TrimSpace(b.String())
+	return sanitize.Text(strings.TrimSpace(b.String()))
 }
 
 func normalizeOptimizationPolicy(policy OptimizationPolicy, profileID string) (OptimizationPolicy, error) {

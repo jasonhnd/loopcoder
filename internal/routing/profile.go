@@ -1179,6 +1179,22 @@ func constraintsFromPolicyInputRecords(records []PolicyInputRecord) ([]Pin, []Ex
 	return pins, exclusions
 }
 
+func policyInputsForTask(records []PolicyInputRecord, taskID string) []PolicyInputRecord {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return append([]PolicyInputRecord(nil), records...)
+	}
+	out := make([]PolicyInputRecord, 0, len(records))
+	for _, record := range records {
+		scope := strings.TrimSpace(record.Scope)
+		if strings.HasPrefix(scope, "task:") && strings.TrimSpace(strings.TrimPrefix(scope, "task:")) != taskID {
+			continue
+		}
+		out = append(out, record)
+	}
+	return out
+}
+
 func pinsForRecord(record PolicyInputRecord) []Pin {
 	if record.InputKind != PolicyInputKindPin {
 		return nil

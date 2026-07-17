@@ -385,10 +385,23 @@ against the deterministic floor whenever they apply. Operator, policy, schema,
 and adapter notes live in
 [`task-requirement-classification.md`](task-requirement-classification.md).
 
-The classifier and routing packages are internal implementation inventory in
-v0.8.0. Ordinary unpinned `dispatch` still defaults directly to Codex, and no
-shipped route-explain/route-decide service makes a persisted routing decision
-authoritative.
+For the frozen v0.8.0 release, the classifier and routing packages were internal
+implementation inventory: ordinary unpinned `dispatch` defaulted directly to
+Codex and no shipped route-explain/route-decide service made a persisted routing
+decision authoritative.
+
+The v0.8.1 candidate adds a narrow product boundary at `loopcoder route`.
+`route explain` builds a provider-neutral decision from the referenced durable
+TaskRequirement, cached inventory and model catalog, quota, availability,
+budget, active policy, runtime, and prior-decision state without writing.
+`route decide` persists the optional validated pin and one immutable first
+decision before provider launch; replay uses that authority and rejects a
+changed pin or task/profile authority identity. Both paths return explicit
+candidate rejection reasons and a typed `no_route` rather than selecting Codex
+by default.
+They do not refresh telemetry or launch providers. Wiring that authority into
+legacy dispatch is a separate release item, so the v0.8.0 dispatch behavior
+above remains historical fact rather than an implied automatic route.
 
 ### Self-Improvement
 

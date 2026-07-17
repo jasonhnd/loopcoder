@@ -1152,6 +1152,62 @@ proposal still matches the expected fingerprint, that an active approval exists
 and is not expired, and only then advances the DeliveryRun to a schedulable
 state. It does not dispatch workers or launch providers.
 
+### Route Explain and Decide (v0.8.1 candidate)
+
+`loopcoder route` exposes the deterministic routing boundary without launching
+a provider or refreshing provider telemetry. Both operations require stable
+`project`, `DeliveryRun`, immutable `TaskRequirement`, and execution-attempt
+decision identities. The referenced TaskRequirement supplies the authoritative
+role, permission, side-effect, capability, network, quality, and task-fit
+requirements. Durable budget summaries, quota reset windows, and the selected
+policy profile supply budget and deadline fit; the CLI does not accept prompt
+text or weaker copies of those fields.
+
+```text
+loopcoder route explain \
+  --project-id <project-id> \
+  --run-id <run-id> \
+  --task-requirement-id <task-requirement-id> \
+  --decision-key worker-attempt-1 \
+  --profile balanced-v1 \
+  --format json
+
+loopcoder route decide \
+  --project-id <project-id> \
+  --run-id <run-id> \
+  --task-requirement-id <task-requirement-id> \
+  --decision-key worker-attempt-1 \
+  --pin-provider grok \
+  --pin-model <model-capability-id> \
+  --pin-reason "operator-selected route" \
+  --format json
+```
+
+`route explain` is read-only and safe to repeat. It loads the cached provider
+inventory and model catalog, quota telemetry, availability and circuit-breaker
+state, budget summaries, active policy inputs, runtime capabilities, and any
+prior first decision. An optional pin narrows only that explanation and is not
+persisted.
+
+`route decide` validates the same evidence, persists an optional provenance-
+bound pin, and records one immutable first routing decision before any caller
+may launch a provider. Reusing the same decision key returns the stored
+decision. A changed task requirement, policy profile, or explicit pin fails
+with `ErrRoutingFingerprintMismatch`; it never silently falls back to Codex.
+Unknown pin references, unsupported permissions, disabled or unusable
+providers, and unknown or stale hard telemetry remain explicit candidate
+rejections.
+
+Text is the default output. `--format json` emits one bounded
+`loopcoder.route_operation.v1` value with deterministic candidate and rejection
+details plus `provider_calls: 0`. A valid selection exits `0`, invalid input
+exits `2`, typed storage/routing failures exit `1`, and a complete typed
+`no_route` result exits `20`. Output is capped at 1 MiB and redacts credentials,
+personal paths, and control characters. It carries record identities and
+bounded diagnostics rather than raw provider responses or prompt bodies.
+Refresh telemetry separately with `loopcoder providers refresh`; neither route
+operation performs discovery, network access, or provider login.
+
 ### Nested Child Plans
 
 `loopcoder nested run` is the v1 nested-plan command. Its production executor
