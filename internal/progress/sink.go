@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -135,8 +134,7 @@ func DeliveryFuncFromSink(sink Sink) DeliveryFunc {
 
 // TerminalHumanSink writes a short redacted human line to W (usually stderr).
 type TerminalHumanSink struct {
-	W  io.Writer
-	mu sync.Mutex
+	W io.Writer
 }
 
 func (s TerminalHumanSink) Kind() SinkKind { return SinkKindTerminalHuman }
@@ -171,8 +169,6 @@ func (s TerminalHumanSink) Deliver(_ context.Context, receipt ProgressReceipt) e
 		sanitizeID(blocker),
 		receipt.CorrelationSequence,
 	)
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	_, err := io.WriteString(s.W, line)
 	return err
 }
@@ -180,8 +176,7 @@ func (s TerminalHumanSink) Deliver(_ context.Context, receipt ProgressReceipt) e
 // JSONLSink writes one framed progress event per receipt to W.
 // W must not be the command's machine JSON stdout for strict JSON commands.
 type JSONLSink struct {
-	W  io.Writer
-	mu sync.Mutex
+	W io.Writer
 }
 
 func (s JSONLSink) Kind() SinkKind { return SinkKindJSONL }
@@ -213,8 +208,6 @@ func (s JSONLSink) Deliver(_ context.Context, receipt ProgressReceipt) error {
 	if err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	_, err = s.W.Write(append(data, '\n'))
 	return err
 }
