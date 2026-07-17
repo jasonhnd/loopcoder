@@ -41,6 +41,16 @@ func newProgressRecorder(ctx context.Context, opts Options, deps Deps, roots run
 	if validateOwnership != nil {
 		progressStore = ownershipValidatedProgressStore{Store: store, validate: validateOwnership}
 	}
+	// Negotiate an active foreground sink. Human-readable progress goes to the
+	// warnings/stderr channel so strict machine JSON stdout stays clean.
+	// Durable outbox remains always-on via the emitter store path.
+	sink, negotiation := progress.NegotiateSink(progress.NegotiateOptions{
+		HumanWriter: warnings,
+		Now:         deps.Now,
+	})
+	if warnings != nil && negotiation.Selected != progress.SinkKindOutboxOnly {
+		fmt.Fprintf(warnings, "[loopcoder] progress sink negotiated: %s (%s)\n", negotiation.Selected, negotiation.Reason)
+	}
 	emitter, err := progress.NewEmitter(progress.EmitterOptions{
 		Store:              progressStore,
 		ProjectID:          roots.ProjectID,
@@ -49,6 +59,7 @@ func newProgressRecorder(ctx context.Context, opts Options, deps Deps, roots run
 		CorrelationID:      jobID,
 		MaxSilenceInterval: deps.ProgressMaxSilence,
 		Clock:              deps.ProgressClock,
+		Deliver:            progress.DeliveryFuncFromSink(sink),
 		DeliveryObligation: progresshost.CurrentObligationFactory(),
 	})
 	if err != nil {
