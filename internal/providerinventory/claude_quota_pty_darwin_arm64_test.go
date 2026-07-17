@@ -64,7 +64,13 @@ func TestRunClaudeUsagePTYCancellationKillsProcess(t *testing.T) {
 
 func TestRunClaudeUsagePTYTimeoutKillsOwnedProcessTree(t *testing.T) {
 	req := claudePTYTestRequest(t, "spawn-and-hang")
-	req.Timeout = 150 * time.Millisecond
+	// spawn-and-hang does not consume interactive input; empty input avoids PTY
+	// local-echo noise that can look like the only captured output under load.
+	req.Input = ""
+	// Allow the helper and its grandchild to start and emit CHILD_PID under CI
+	// contention. The helper hangs forever, so a multi-second cap still proves
+	// timeout-driven tree kill without racing process startup.
+	req.Timeout = 2 * time.Second
 	result, err := runClaudeUsagePTY(context.Background(), req)
 	if err == nil {
 		t.Fatalf("runClaudeUsagePTY err = nil, want timeout; result=%#v output=%q", result, result.Output)
@@ -216,6 +222,7 @@ func runClaudePTYSpawnAndHangHelper() {
 		os.Exit(2)
 	}
 	fmt.Printf("CHILD_PID=%d\n", cmd.Process.Pid)
+	_ = os.Stdout.Sync()
 	sleepForever()
 }
 

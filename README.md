@@ -192,6 +192,15 @@ loopcoder kill --repo . --all                 # terminate all loopcoder-managed 
 loopcoder attest        --role conductor --provider codex-cli --model gpt-5 --permission orchestrate --action "dispatch issue #41" --duration-ms 120000 --total-tokens 12345
 ```
 
+The v0.8.1 candidate additionally exposes routing as an explicit, provider-
+neutral operation. These commands do not launch a provider or change the
+legacy unpinned `dispatch` default:
+
+```bash
+loopcoder route explain --project-id <id> --run-id <id> --task-requirement-id <id> --decision-key <key> --format json
+loopcoder route decide --project-id <id> --run-id <id> --task-requirement-id <id> --decision-key <key> --format json
+```
+
 Machine-local registry and migration commands retained from v0.7.0 include:
 
 ```bash
@@ -359,7 +368,9 @@ During the 0.6.x transition window, readers accept legacy `[attestation]` header
 - Worker: `loopcoder dispatch` can run one explicitly selected registered
   provider for one issue in a fresh git worktree, then open a PR. Unpinned
   dispatch defaults directly to Codex in v0.8.0; automatic product routing is
-  not wired.
+  not wired. The v0.8.1 candidate adds `loopcoder route explain` and
+  `loopcoder route decide` as provider-neutral planning primitives, but this
+  issue does not change the legacy `dispatch` default.
 - Nested orchestration: `loopcoder nested run --plan <file.json>` persists and
   schedules bounded child-plan records. The read-only executor supports Codex,
   Claude, and Grok through explicit provider read-only modes, then compares a
