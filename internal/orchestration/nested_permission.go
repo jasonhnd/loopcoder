@@ -1,7 +1,10 @@
 package orchestration
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -18,7 +21,46 @@ const (
 	NestedCapabilityNotRegistered        = "not_registered"
 	NestedCapabilityUnknownPermission    = "unknown_permission"
 	NestedCapabilityProviderNativeDenied = "provider_native_unsupported"
+
+	NestedDelegationModeLoopCoderManaged NestedDelegationExecutionMode = "loopcoder_managed"
+	NestedDelegationModeProviderNative   NestedDelegationExecutionMode = "provider_native"
+
+	NestedDelegationLoopCoderManaged       NestedDelegationResult = "loopcoder_managed"
+	NestedDelegationBridgeApproved         NestedDelegationResult = "provider_native_bridge_approved"
+	NestedDelegationBridgeRequired         NestedDelegationResult = "provider_native_bridge_required"
+	NestedDelegationOrchestrateUnsupported NestedDelegationResult = "orchestrate_unsupported"
+
+	NestedReasonExecutorNotRegistered        = "nested_executor_not_registered"
+	NestedReasonPermissionUnsupported        = "nested_permission_unsupported"
+	NestedReasonUnknownPermission            = "nested_permission_unknown"
+	NestedReasonProviderNativeBridgeRequired = "provider_native_bridge_required"
+	NestedReasonOrchestrateUnsupported       = "orchestrate_unsupported"
 )
+
+type NestedDelegationExecutionMode string
+
+type NestedDelegationResult string
+
+// ProviderNativeBridge is the code-level extension point for a future audited
+// provider-native bridge. Provider, prompt, environment, and host metadata
+// cannot implement or register a bridge. No production bridge is registered in
+// v0.8.1.
+type ProviderNativeBridge interface {
+	BridgeID() string
+	Provider() string
+	Execute(context.Context, ChildExecutionRequest) (ChildRunResult, error)
+}
+
+// NestedDelegationCapabilityResult is the typed decision made before child
+// persistence, claim acquisition, lifecycle transitions, or provider launch.
+type NestedDelegationCapabilityResult struct {
+	ExecutionMode NestedDelegationExecutionMode `json:"execution_mode"`
+	Result        NestedDelegationResult        `json:"result"`
+	Supported     bool                          `json:"supported"`
+	BridgeID      string                        `json:"bridge_id,omitempty"`
+	ReasonCode    string                        `json:"reason_code"`
+	Remediation   string                        `json:"remediation,omitempty"`
+}
 
 // NestedExecutorCapability is an explicit registration at the nested
 // execution boundary. Provider or model identity never implies a capability.
@@ -27,22 +69,30 @@ type NestedExecutorCapability struct {
 	RegistrationID         string   `json:"registration_id"`
 	Provider               string   `json:"provider,omitempty"`
 	EnforceablePermissions []string `json:"enforceable_permissions"`
-	ProviderNative         bool     `json:"provider_native"`
+	// ProviderNative is retained for compatibility with v0.8.0 diagnostics.
+	// It is never authority and cannot enable native delegation.
+	ProviderNative bool `json:"provider_native"`
+	// NativeBridge is code-only authority. It is intentionally absent from JSON
+	// so external metadata cannot silently opt into provider-native execution.
+	NativeBridge ProviderNativeBridge `json:"-"`
 }
 
 // NestedPermissionRefusal is the stable, bounded refusal emitted before any
 // nested execution state or provider process is created.
 type NestedPermissionRefusal struct {
-	Code                    string `json:"code"`
-	ChildKey                string `json:"child_key"`
-	RequestedPermission     string `json:"requested_permission"`
-	ExecutorID              string `json:"executor_id"`
-	RegistrationID          string `json:"registration_id"`
-	Provider                string `json:"provider,omitempty"`
-	CapabilityResult        string `json:"capability_result"`
-	ProviderNativeRequested bool   `json:"provider_native_requested"`
-	Reason                  string `json:"reason"`
-	NextAction              string `json:"next_action"`
+	Code                    string                           `json:"code"`
+	ChildKey                string                           `json:"child_key"`
+	RequestedPermission     string                           `json:"requested_permission"`
+	ExecutorID              string                           `json:"executor_id"`
+	RegistrationID          string                           `json:"registration_id"`
+	Provider                string                           `json:"provider,omitempty"`
+	CapabilityResult        string                           `json:"capability_result"`
+	ProviderNativeRequested bool                             `json:"provider_native_requested"`
+	ReasonCode              string                           `json:"reason_code"`
+	Remediation             string                           `json:"remediation"`
+	DelegationCapability    NestedDelegationCapabilityResult `json:"delegation_capability"`
+	Reason                  string                           `json:"reason"`
+	NextAction              string                           `json:"next_action"`
 }
 
 // PermissionNotEnforceableError is returned before scheduling whenever an
@@ -108,26 +158,127 @@ func CheckNestedExecutorPermissions(plan *ChildPlan, capability NestedExecutorCa
 	for _, child := range plan.Items {
 		permission := normalizeChildPermission(child.Permission)
 		providerNative := childRequiresNativeRegistration(child)
+		delegation := EvaluateNestedDelegationCapability(child, capability)
 		result := NestedCapabilitySupported
 		switch {
 		case !validChildPermission(permission):
 			result = NestedCapabilityUnknownPermission
+		case !delegation.Supported && delegation.Result == NestedDelegationOrchestrateUnsupported:
+			result = NestedCapabilityUnsupported
+		case !delegation.Supported && delegation.Result == NestedDelegationBridgeRequired:
+			result = NestedCapabilityProviderNativeDenied
 		case strings.TrimSpace(capability.RegistrationID) == "":
 			result = NestedCapabilityNotRegistered
-		case providerNative && !capability.ProviderNative:
-			result = NestedCapabilityProviderNativeDenied
 		case !permissions[permission]:
 			result = NestedCapabilityUnsupported
 		}
 		if result == NestedCapabilitySupported {
 			continue
 		}
-		refusals = append(refusals, newNestedPermissionRefusal(child, capability, permission, providerNative, result))
+		refusals = append(refusals, newNestedPermissionRefusal(child, capability, permission, providerNative, result, delegation))
 	}
 	if len(refusals) == 0 {
 		return nil
 	}
 	return &PermissionNotEnforceableError{Refusals: refusals}
+}
+
+// CheckNestedDelegationCapabilities is the scheduler's entry-point-independent
+// gate. It checks only delegation modes, so ordinary managed read-only and
+// bounded-write scheduler tests remain provider-neutral.
+func CheckNestedDelegationCapabilities(plan *ChildPlan, capability NestedExecutorCapability) error {
+	if plan == nil {
+		return fmt.Errorf("child plan is required")
+	}
+	refusals := make([]NestedPermissionRefusal, 0)
+	for _, child := range plan.Items {
+		delegation := EvaluateNestedDelegationCapability(child, capability)
+		if delegation.Supported {
+			continue
+		}
+		result := NestedCapabilityUnsupported
+		if delegation.Result == NestedDelegationBridgeRequired {
+			result = NestedCapabilityProviderNativeDenied
+		}
+		refusals = append(refusals, newNestedPermissionRefusal(
+			child,
+			capability,
+			normalizeChildPermission(child.Permission),
+			childRequiresNativeRegistration(child),
+			result,
+			delegation,
+		))
+	}
+	if len(refusals) == 0 {
+		return nil
+	}
+	return &PermissionNotEnforceableError{Refusals: refusals}
+}
+
+// EvaluateNestedDelegationCapability separates provider feature advertising
+// from LoopCoder delegation authority. A bridge must be a concrete code-level
+// implementation for the exact provider; legacy booleans and metadata are not
+// sufficient.
+func EvaluateNestedDelegationCapability(child ChildRunPlan, capability NestedExecutorCapability) NestedDelegationCapabilityResult {
+	permission := normalizeChildPermission(child.Permission)
+	providerNative := childRequiresNativeRegistration(child)
+	mode := NestedDelegationModeLoopCoderManaged
+	if providerNative {
+		mode = NestedDelegationModeProviderNative
+	}
+	if permission == string(reporter.PermissionOrchestrate) {
+		return NestedDelegationCapabilityResult{
+			ExecutionMode: mode,
+			Result:        NestedDelegationOrchestrateUnsupported,
+			Supported:     false,
+			ReasonCode:    NestedReasonOrchestrateUnsupported,
+			Remediation:   "use a read-only or bounded-write LoopCoder-managed child; orchestrate execution is not available in v0.8.1",
+		}
+	}
+	if !providerNative {
+		return NestedDelegationCapabilityResult{
+			ExecutionMode: mode,
+			Result:        NestedDelegationLoopCoderManaged,
+			Supported:     true,
+			ReasonCode:    string(NestedDelegationLoopCoderManaged),
+		}
+	}
+	provider := firstNonEmptyChild(nestedProviderFromChild(child), strings.TrimSpace(capability.Provider))
+	bridge := capability.NativeBridge
+	if bridgeID, bridgeProvider, ok := nestedNativeBridgeIdentity(bridge); ok {
+		if bridgeID != "" && provider != "" && bridgeProvider == provider {
+			return NestedDelegationCapabilityResult{
+				ExecutionMode: mode,
+				Result:        NestedDelegationBridgeApproved,
+				Supported:     true,
+				BridgeID:      bridgeID,
+				ReasonCode:    string(NestedDelegationBridgeApproved),
+			}
+		}
+	}
+	return NestedDelegationCapabilityResult{
+		ExecutionMode: mode,
+		Result:        NestedDelegationBridgeRequired,
+		Supported:     false,
+		ReasonCode:    NestedReasonProviderNativeBridgeRequired,
+		Remediation:   "use a LoopCoder-managed child or install a separately implemented, registered, and tested bridge for the exact provider",
+	}
+}
+
+func nestedNativeBridgeIdentity(bridge ProviderNativeBridge) (string, string, bool) {
+	if bridge == nil {
+		return "", "", false
+	}
+	value := reflect.ValueOf(bridge)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		if value.IsNil() {
+			return "", "", false
+		}
+	}
+	id := strings.TrimSpace(bridge.BridgeID())
+	provider := strings.TrimSpace(bridge.Provider())
+	return id, provider, id != "" && provider != ""
 }
 
 // NestedPermissionRefusalReport renders a refusal without persisting a plan,
@@ -185,13 +336,18 @@ func NestedPermissionRefusalReport(repoPath, baseBranch string, plan ChildPlan, 
 	return report
 }
 
-func newNestedPermissionRefusal(child ChildRunPlan, capability NestedExecutorCapability, permission string, providerNative bool, result string) NestedPermissionRefusal {
+func newNestedPermissionRefusal(child ChildRunPlan, capability NestedExecutorCapability, permission string, providerNative bool, result string, delegation NestedDelegationCapabilityResult) NestedPermissionRefusal {
 	next := "register an executor that explicitly enforces the requested permission, then replay the unchanged plan"
+	reasonCode := NestedReasonPermissionUnsupported
 	switch {
 	case result == NestedCapabilityUnknownPermission:
 		next = "use read-only, write, or orchestrate and register an executor that explicitly enforces it"
-	case providerNative:
-		next = "wait for an approved provider-native delegation bridge with claim, budget, progress, and scope enforcement"
+		reasonCode = NestedReasonUnknownPermission
+	case !delegation.Supported:
+		next = delegation.Remediation
+		reasonCode = delegation.ReasonCode
+	case result == NestedCapabilityNotRegistered:
+		reasonCode = NestedReasonExecutorNotRegistered
 	case permission == string(reporter.PermissionReadOnly):
 		next = "wait for a registered mutation-free read-only nested executor"
 	case permission == string(reporter.PermissionWrite):
@@ -207,18 +363,36 @@ func newNestedPermissionRefusal(child ChildRunPlan, capability NestedExecutorCap
 	if providerNative {
 		reason += " with provider-native execution"
 	}
+	provider := firstNonEmptyChild(strings.TrimSpace(capability.Provider), nestedProviderFromChild(child))
 	return NestedPermissionRefusal{
 		Code:                    NestedOutcomePermissionNotEnforceable,
 		ChildKey:                boundedNestedPermissionText(child.ChildKey),
 		RequestedPermission:     boundedNestedPermissionText(permission),
 		ExecutorID:              executorID,
 		RegistrationID:          boundedNestedPermissionText(capability.RegistrationID),
-		Provider:                boundedNestedPermissionText(capability.Provider),
+		Provider:                boundedNestedPermissionText(provider),
 		CapabilityResult:        result,
 		ProviderNativeRequested: providerNative,
+		ReasonCode:              boundedNestedPermissionText(reasonCode),
+		Remediation:             boundedNestedPermissionText(next),
+		DelegationCapability:    delegation,
 		Reason:                  boundedNestedPermissionText(reason),
 		NextAction:              boundedNestedPermissionText(next),
 	}
+}
+
+func nestedProviderFromChild(child ChildRunPlan) string {
+	if len(child.Metadata) == 0 {
+		return ""
+	}
+	var metadata struct {
+		Provider  string `json:"provider"`
+		AdapterID string `json:"adapter_id"`
+	}
+	if err := json.Unmarshal(child.Metadata, &metadata); err != nil {
+		return ""
+	}
+	return firstNonEmptyChild(strings.TrimSpace(metadata.Provider), strings.TrimSpace(metadata.AdapterID))
 }
 
 func boundedNestedPermissionText(value string) string {

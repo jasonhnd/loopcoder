@@ -2328,7 +2328,7 @@ func TestScheduleNestedRunsRefusesNativeChildWithoutRegistration(t *testing.T) {
 	defer store.Close()
 
 	executed := false
-	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+	opts := NestedScheduleOptions{
 		RepoPath:    t.TempDir(),
 		RootRunID:   "run-native-parent",
 		ParentRunID: "run-native-parent",
@@ -2350,7 +2350,8 @@ func TestScheduleNestedRunsRefusesNativeChildWithoutRegistration(t *testing.T) {
 			executed = true
 			return ChildRunResult{Status: NestedStatusSucceeded}, nil
 		},
-	})
+	}
+	report, err := ScheduleNestedRuns(ctx, opts)
 	if err != nil {
 		t.Fatalf("ScheduleNestedRuns: %v", err)
 	}
@@ -2360,8 +2361,90 @@ func TestScheduleNestedRunsRefusesNativeChildWithoutRegistration(t *testing.T) {
 	if len(report.Children) != 1 || report.Children[0].Status != NestedStatusNeedsHuman {
 		t.Fatalf("children = %#v, want needs-human refusal", report.Children)
 	}
-	if !strings.Contains(report.Children[0].Error, "missing expected_outputs") {
-		t.Fatalf("native refusal error = %q, want missing expected_outputs", report.Children[0].Error)
+	if len(report.Refusals) != 1 || report.Refusals[0].ReasonCode != NestedReasonProviderNativeBridgeRequired || report.Refusals[0].Remediation == "" {
+		t.Fatalf("native refusals = %#v, want bridge-required reason and remediation", report.Refusals)
+	}
+	if report.Children[0].StartedAt != "" || report.Children[0].FinishedAt != "" {
+		t.Fatalf("native refusal acquired lifecycle timestamps: %#v", report.Children[0])
+	}
+	var runs, claims, registrations, reservations int
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM runs`).Scan(&runs); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM run_claims`).Scan(&claims); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM agent_registrations`).Scan(&registrations); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM budget_reservations`).Scan(&reservations)
+	}); err != nil {
+		t.Fatalf("query refused native state: %v", err)
+	}
+	if runs != 0 || claims != 0 || registrations != 0 || reservations != 0 {
+		t.Fatalf("refusal persisted state runs=%d claims=%d registrations=%d reservations=%d", runs, claims, registrations, reservations)
+	}
+	replayed, err := ScheduleNestedRuns(ctx, opts)
+	if err != nil {
+		t.Fatalf("ScheduleNestedRuns replay: %v", err)
+	}
+	if !reflect.DeepEqual(report, replayed) {
+		t.Fatalf("native refusal changed on replay:\nfirst=%#v\nsecond=%#v", report, replayed)
+	}
+}
+
+func TestScheduleNestedRunsRefusesOrchestrateBeforeStateOrExecute(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.Open(ctx, storage.Options{Path: filepath.Join(t.TempDir(), "loopcoder.db"), Now: func() time.Time { return nestedTestNow() }})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	defer store.Close()
+
+	executed := false
+	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
+		RepoPath:    t.TempDir(),
+		RootRunID:   "run-orchestrate-parent",
+		ParentRunID: "run-orchestrate-parent",
+		Store:       store,
+		Now:         nestedTestNow(),
+		Clock:       func() time.Time { return nestedTestNow() },
+		Children: []ChildRunPlan{{
+			ChildKey:   "orchestrate-child",
+			Title:      "orchestrate child",
+			Permission: storage.PermissionOrchestrate,
+			Scope:      ChildScope{Paths: []string{"src/orchestrate.go"}},
+			Aggregation: ChildAggregation{
+				Mode:     ChildAggregationCollect,
+				Required: true,
+			},
+		}},
+		Execute: func(context.Context, ChildExecutionRequest) (ChildRunResult, error) {
+			executed = true
+			return ChildRunResult{Status: NestedStatusSucceeded}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleNestedRuns: %v", err)
+	}
+	if executed {
+		t.Fatal("orchestrate child executor was called")
+	}
+	if len(report.Refusals) != 1 || report.Refusals[0].ReasonCode != NestedReasonOrchestrateUnsupported || report.Refusals[0].Remediation == "" {
+		t.Fatalf("orchestrate refusals = %#v, want stable refusal", report.Refusals)
+	}
+	var runs, claims int
+	if err := store.WithTx(ctx, func(tx storage.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM runs`).Scan(&runs); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM run_claims`).Scan(&claims)
+	}); err != nil {
+		t.Fatalf("query refused orchestrate state: %v", err)
+	}
+	if runs != 0 || claims != 0 {
+		t.Fatalf("orchestrate refusal persisted state runs=%d claims=%d", runs, claims)
 	}
 }
 
@@ -2428,6 +2511,10 @@ func TestScheduleNestedRunsNativeChildRequiresExplicitAuthorityMetadata(t *testi
 				t.Fatalf("marshal metadata: %v", err)
 			}
 			executed := false
+			execute := func(context.Context, ChildExecutionRequest) (ChildRunResult, error) {
+				executed = true
+				return ChildRunResult{Status: NestedStatusSucceeded}, nil
+			}
 			report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
 				RepoPath:    t.TempDir(),
 				RootRunID:   parentRunID,
@@ -2447,10 +2534,8 @@ func TestScheduleNestedRunsNativeChildRequiresExplicitAuthorityMetadata(t *testi
 					},
 					Metadata: metadataBytes,
 				}},
-				Execute: func(context.Context, ChildExecutionRequest) (ChildRunResult, error) {
-					executed = true
-					return ChildRunResult{Status: NestedStatusSucceeded}, nil
-				},
+				NativeBridge: testNativeBridge{id: "test:claude-native:v1", provider: "claude", execute: execute},
+				Execute:      execute,
 			})
 			if err != nil {
 				t.Fatalf("ScheduleNestedRuns: %v", err)
@@ -2509,6 +2594,19 @@ func TestScheduleNestedRunsNativeChildRegistersAndTerminalizesAtomically(t *test
 	}
 
 	executed := false
+	execute := func(ctx context.Context, child ChildExecutionRequest) (ChildRunResult, error) {
+		executed = true
+		var state string
+		if err := store.WithTx(ctx, func(tx storage.Tx) error {
+			return tx.QueryRow(ctx, `SELECT registration_state FROM agent_registrations WHERE id = ?`, childAgentID).Scan(&state)
+		}); err != nil {
+			t.Fatalf("query registration during execute: %v", err)
+		}
+		if state != storage.AgentStateRunning {
+			t.Fatalf("registration state during execute = %q, want running", state)
+		}
+		return ChildRunResult{Status: NestedStatusSucceeded, ProviderReceipt: "receipt-native"}, nil
+	}
 	report, err := ScheduleNestedRuns(ctx, NestedScheduleOptions{
 		RepoPath:    t.TempDir(),
 		RootRunID:   parentRunID,
@@ -2528,19 +2626,8 @@ func TestScheduleNestedRunsNativeChildRegistersAndTerminalizesAtomically(t *test
 			},
 			Metadata: metadataBytes,
 		}},
-		Execute: func(ctx context.Context, child ChildExecutionRequest) (ChildRunResult, error) {
-			executed = true
-			var state string
-			if err := store.WithTx(ctx, func(tx storage.Tx) error {
-				return tx.QueryRow(ctx, `SELECT registration_state FROM agent_registrations WHERE id = ?`, childAgentID).Scan(&state)
-			}); err != nil {
-				t.Fatalf("query registration during execute: %v", err)
-			}
-			if state != storage.AgentStateRunning {
-				t.Fatalf("registration state during execute = %q, want running", state)
-			}
-			return ChildRunResult{Status: NestedStatusSucceeded, ProviderReceipt: "receipt-native"}, nil
-		},
+		NativeBridge: testNativeBridge{id: "test:claude-native:v1", provider: "claude", execute: execute},
+		Execute:      execute,
 	})
 	if err != nil {
 		t.Fatalf("ScheduleNestedRuns: %v", err)

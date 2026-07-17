@@ -71,6 +71,29 @@ func TestBuildCodexArgs(t *testing.T) {
 			},
 		},
 		{
+			name: "nested read-only disables delegation and inherited configuration",
+			inv: Invocation{
+				WorktreePath:      "wt",
+				LogPath:           "codex.log",
+				ReadOnly:          true,
+				DisableDelegation: true,
+				Role:              "nested-read-only",
+				Environment:       map[string]string{"CODEX_MULTI_AGENT": "true"},
+			},
+			want: []string{
+				"exec",
+				"--cd", "wt",
+				"-s", "read-only",
+				"--ephemeral",
+				"--ignore-user-config",
+				"--ignore-rules",
+				"--disable", "multi_agent",
+				"--skip-git-repo-check",
+				"-o", "summary.txt",
+				"-",
+			},
+		},
+		{
 			name: "bounded-write argv",
 			inv: Invocation{
 				WorktreePath: "wt",

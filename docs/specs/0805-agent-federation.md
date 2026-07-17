@@ -134,14 +134,23 @@ only within its reservation and applicable ancestor ceilings.
 
 Provider eligibility comes from `0802` provider inventory and
 [`../reference/runtime-capabilities.md`](../reference/runtime-capabilities.md).
-The live matrix for nested sub-agents is:
+The provider inventory matrix for nested sub-agents is shown below. It records
+provider mechanisms only; it is not launch authority. The v0.8.1 production
+binary has no approved provider-native bridge, so every provider-native row
+fails closed with `provider_native_bridge_required` regardless of advertised
+support.
 
 | Provider | Nested sub-agents | Federation launch rule |
 | --- | --- | --- |
-| `claude` | supported | Eligible only when inventory, routing, scope, budget, claim, cancellation, and approval checks pass. |
+| `claude` | advertised | Refused until a separate Claude bridge implementation is code-registered and tested. |
 | `codex` | unsupported | Must fail closed before native-sub-agent launch. It may still run ordinary Worker or Verifier roles where eligible. |
 | `gemini` | unsupported | Must fail closed before native-sub-agent launch. Experimental direct Gemini worker support does not imply federation support. |
 | `antigravity` | unsupported | Must fail closed before native-sub-agent launch. Antigravity is worker-only in the live matrix and lacks read-only, JSON, MCP, token-usage, and nested-agent support. |
+| `grok` | inventory-only | Refused until a separate Grok bridge implementation is code-registered and tested. |
+
+Generic hosts, Paseo, unknown providers, and future providers inherit the same
+fail-closed rule. Prompt text, environment variables, adapter defaults, CLI
+version, and host metadata cannot register a bridge or grant `orchestrate`.
 
 Unknown, stale, unavailable, or conflicting `nested_subagents` capability
 evidence never satisfies a hard federation requirement. A future provider may

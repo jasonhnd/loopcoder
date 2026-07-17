@@ -53,6 +53,24 @@ func TestLookup(t *testing.T) {
 	}
 }
 
+func TestNestedInvocationRequiresHardDelegationDisable(t *testing.T) {
+	for _, role := range []string{"nested-read-only", "nested-bounded-write"} {
+		t.Run(role, func(t *testing.T) {
+			inv := Invocation{Role: role}
+			if err := validateNestedDelegationBoundary(inv); err == nil || !strings.Contains(err.Error(), "must disable provider-native delegation") {
+				t.Fatalf("validation error = %v, want hard no-delegation refusal", err)
+			}
+			inv.DisableDelegation = true
+			if err := validateNestedDelegationBoundary(inv); err != nil {
+				t.Fatalf("disabled delegation rejected: %v", err)
+			}
+		})
+	}
+	if err := validateNestedDelegationBoundary(Invocation{Role: "worker"}); err != nil {
+		t.Fatalf("ordinary worker unexpectedly rejected: %v", err)
+	}
+}
+
 func assertInt64Ptr(t *testing.T, got *int64, want int64) {
 	t.Helper()
 	if got == nil {

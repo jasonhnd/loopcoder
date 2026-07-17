@@ -43,15 +43,19 @@ type Invocation struct {
 	ReadOnly     bool
 	// BoundedWrite selects a provider mode that may modify only the supplied
 	// workspace and must not inherit mutation-capable user configuration.
-	BoundedWrite    bool
-	OutputSchema    string
-	LogPath         string
-	Stderr          io.Writer
-	HardCap         time.Duration
-	StallTimeout    time.Duration
-	LivenessMode    string
-	LivenessCommand string
-	Guardian        supervisedexec.GuardianOptions
+	BoundedWrite bool
+	// DisableDelegation is mandatory for LoopCoder-managed nested roles. It is
+	// set by the scheduler boundary and converted to provider-specific hard
+	// controls; prompt or environment text cannot unset it.
+	DisableDelegation bool
+	OutputSchema      string
+	LogPath           string
+	Stderr            io.Writer
+	HardCap           time.Duration
+	StallTimeout      time.Duration
+	LivenessMode      string
+	LivenessCommand   string
+	Guardian          supervisedexec.GuardianOptions
 	// RunID and Role tag the spawned provider process as loopcoder-managed and
 	// place it in a per-run kill-group (spec 0390, Decision 11).
 	RunID string
@@ -137,6 +141,13 @@ type ProviderProcess struct {
 
 type Runner interface {
 	Run(ctx context.Context, inv Invocation) (Result, error)
+}
+
+func validateNestedDelegationBoundary(inv Invocation) error {
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(inv.Role)), "nested-") && !inv.DisableDelegation {
+		return errors.New("nested provider invocation must disable provider-native delegation")
+	}
+	return nil
 }
 
 var registry = map[string]Runner{

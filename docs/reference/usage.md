@@ -1188,7 +1188,8 @@ active, but it does not promise universal exactly-once external side effects
 after a crash; ambiguous side effects must be resolved with receipts,
 idempotency keys, or `needs-human`.
 
-`orchestrate` children are refused before launch. A read-only child consumes
+`orchestrate` children are refused before persistence, claim acquisition, or
+launch with stable reason code `orchestrate_unsupported`. A read-only child consumes
 the persisted immutable execution contract, requires a registered provider/host
 combination, and invokes the provider with the adapter's explicit read-only
 mode. It does not route through Worker dispatch and does not create a branch,
@@ -1243,9 +1244,21 @@ terminal completion.
 
 Gemini, Antigravity, unknown adapters, unsupported host profiles,
 provider-native delegation, and per-child provider overrides without a matching
-executor registration fail before launch. In particular, Gemini's current safe
-mode disables the repository-inspection tools needed by this executor, while
-Antigravity has no supported read-only adapter.
+executor registration fail before launch. Provider-native requests return
+`provider_native_bridge_required` plus remediation and create no child claim,
+lifecycle transition, budget use, worktree, or provider process. This remains
+true when a provider advertises native sub-agents: adapter availability and
+provider capability inventory are not delegation support. In particular,
+Gemini's current safe mode disables the repository-inspection tools needed by
+this executor, while Antigravity has no supported read-only adapter.
+
+Nested Codex invocations disable `multi_agent` and ignore inherited user and
+repository configuration. Nested Claude invocations expose only the explicit
+read-only tool allowlist, and nested Grok invocations pass `--no-subagents`.
+Every nested provider invocation also carries a mandatory code-level
+no-delegation flag and an immutable prompt rule. Prompt text, environment
+variables, adapter defaults, and host metadata cannot opt back into native
+delegation.
 
 The reserved `test-subprocess` provider exists only for deterministic local and
 release smoke tests. It executes each child item's `scope.commands` as real
