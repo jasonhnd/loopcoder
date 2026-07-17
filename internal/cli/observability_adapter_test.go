@@ -43,7 +43,7 @@ func TestObservabilityJSONLCommandAdaptersEmitMachineRecordsOnly(t *testing.T) {
 	dispatchRepo := t.TempDir()
 	nestedRepo := t.TempDir()
 	planPath := writeNestedPlanFixture(t, nestedRepo, []orchestration.ChildRunPlan{
-		nestedPlanItem("alpha", 864, nil, true, "read-only", nil),
+		nestedPlanItem("alpha", 864, nil, true, "write", nil),
 	}, 1)
 	detached := seedDetachedRecoverObservabilityFixture(t, repoState)
 

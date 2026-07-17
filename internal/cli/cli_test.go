@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/audit"
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
@@ -36,6 +37,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/process"
 	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
+	"github.com/jasonhnd/loopcoder/internal/readonlyexec"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/registry"
 	"github.com/jasonhnd/loopcoder/internal/relaygate"
@@ -9146,13 +9148,14 @@ func TestNestedRunRejectsUnenforceablePermissionMatrixBeforeStateOrDispatch(t *t
 		provider         string
 		metadata         json.RawMessage
 		capabilityResult string
+		registered       bool
 	}{
-		{name: "read-only", permission: "read-only", capabilityResult: orchestration.NestedCapabilityUnsupported},
-		{name: "write", permission: "write", capabilityResult: orchestration.NestedCapabilityUnsupported},
-		{name: "orchestrate", permission: "orchestrate", capabilityResult: orchestration.NestedCapabilityUnsupported},
-		{name: "unknown", permission: "admin", capabilityResult: orchestration.NestedCapabilityUnknownPermission},
-		{name: "provider-native", permission: "read-only", metadata: json.RawMessage(`{"provider_native_subagent":true}`), capabilityResult: orchestration.NestedCapabilityProviderNativeDenied},
-		{name: "test-subprocess", permission: "read-only", provider: nestedTestSubprocessProvider, capabilityResult: orchestration.NestedCapabilityUnsupported},
+		{name: "write", permission: "write", capabilityResult: orchestration.NestedCapabilityUnsupported, registered: true},
+		{name: "orchestrate", permission: "orchestrate", capabilityResult: orchestration.NestedCapabilityUnsupported, registered: true},
+		{name: "unknown", permission: "admin", capabilityResult: orchestration.NestedCapabilityUnknownPermission, registered: true},
+		{name: "provider-native", permission: "read-only", metadata: json.RawMessage(`{"provider_native_subagent":true}`), capabilityResult: orchestration.NestedCapabilityProviderNativeDenied, registered: true},
+		{name: "unsupported-provider", permission: "read-only", provider: "gemini", capabilityResult: orchestration.NestedCapabilityNotRegistered},
+		{name: "test-subprocess-write", permission: "write", provider: nestedTestSubprocessProvider, capabilityResult: orchestration.NestedCapabilityUnsupported, registered: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -9199,7 +9202,7 @@ func TestNestedRunRejectsUnenforceablePermissionMatrixBeforeStateOrDispatch(t *t
 				provider = "codex"
 			}
 
-			dispatchCalls := 0
+			providerCalls := 0
 			var firstOutput string
 			for replay := 0; replay < 2; replay++ {
 				var stdout, stderr bytes.Buffer
@@ -9211,9 +9214,9 @@ func TestNestedRunRejectsUnenforceablePermissionMatrixBeforeStateOrDispatch(t *t
 					"--format", "json",
 				}, &stdout, &stderr, Deps{
 					Now: fixedCLINow,
-					Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
-						dispatchCalls++
-						return worker.Result{}, nil
+					AgentLookup: func(string) (agent.Runner, error) {
+						providerCalls++
+						return nil, errors.New("unexpected provider launch")
 					},
 				})
 				if exitCode != 1 {
@@ -9230,8 +9233,11 @@ func TestNestedRunRejectsUnenforceablePermissionMatrixBeforeStateOrDispatch(t *t
 				if len(report.Refusals) != 1 || report.Refusals[0].Code != orchestration.NestedOutcomePermissionNotEnforceable || report.Refusals[0].CapabilityResult != tt.capabilityResult {
 					t.Fatalf("refusals = %#v, want one %s refusal with result %s", report.Refusals, orchestration.NestedOutcomePermissionNotEnforceable, tt.capabilityResult)
 				}
-				if report.ExecutorCapability == nil || report.ExecutorCapability.RegistrationID == "" || len(report.ExecutorCapability.EnforceablePermissions) != 0 {
-					t.Fatalf("executor capability = %#v, want explicit fail-closed registration", report.ExecutorCapability)
+				if report.ExecutorCapability == nil || (report.ExecutorCapability.RegistrationID != "") != tt.registered {
+					t.Fatalf("executor capability = %#v, registered=%t", report.ExecutorCapability, tt.registered)
+				}
+				if tt.registered && !reflect.DeepEqual(report.ExecutorCapability.EnforceablePermissions, []string{"read-only"}) {
+					t.Fatalf("executor capability = %#v, want read-only-only registration", report.ExecutorCapability)
 				}
 				if len(report.Children) != 1 || report.Children[0].StartedAt != "" || report.Children[0].FinishedAt != "" {
 					t.Fatalf("children = %#v, want one child with no lifecycle timestamps", report.Children)
@@ -9242,8 +9248,8 @@ func TestNestedRunRejectsUnenforceablePermissionMatrixBeforeStateOrDispatch(t *t
 					t.Fatalf("refusal changed on replay:\nfirst=%s\nsecond=%s", firstOutput, stdout.String())
 				}
 			}
-			if dispatchCalls != 0 {
-				t.Fatalf("dispatch calls = %d, want zero", dispatchCalls)
+			if providerCalls != 0 {
+				t.Fatalf("provider calls = %d, want zero", providerCalls)
 			}
 			if _, err := os.Stat(filepath.Join(loopHome, "data", "loopcoder.db")); !os.IsNotExist(err) {
 				t.Fatalf("nested refusal created storage database: %v", err)
@@ -9263,13 +9269,13 @@ func TestNestedRunPermissionRefusalIsVisibleInHumanOutput(t *testing.T) {
 		t.Fatalf("write delivery config: %v", err)
 	}
 	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
-		nestedPlanItem("alpha", 701, nil, true, "read-only", nil),
+		nestedPlanItem("alpha", 701, nil, true, "write", nil),
 	}, 1)
 	exitCode := RunWithDeps([]string{"nested", "run", "--repo", repo, "--plan", planPath, "--provider", "codex"}, &stdout, &stderr, Deps{Now: fixedCLINow})
 	if exitCode != 1 {
 		t.Fatalf("exit code = %d, want 1; stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
 	}
-	for _, want := range []string{"Outcome: permission_not_enforceable", "capability_result=unsupported", "permission=read-only", "wait for a registered mutation-free read-only nested executor"} {
+	for _, want := range []string{"Outcome: permission_not_enforceable", "capability_result=unsupported", "permission=write", "wait for a registered bounded-write nested executor"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("human output missing %q:\n%s", want, stdout.String())
 		}
@@ -9285,13 +9291,9 @@ func TestNestedRunPermissionRefusalPrecedesStrictSelectionValidation(t *testing.
 		t.Fatalf("write delivery config: %v", err)
 	}
 	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
-		nestedPlanItem("alpha", 701, nil, true, "read-only", nil),
+		nestedPlanItem("alpha", 701, nil, true, "write", nil),
 	}, 1)
-	record := validDispatchReport()
-	result := validDispatchResult(record)
-	result.Issue = 701
-	result.RunID = "run-alpha"
-	dispatchCalled := false
+	providerCalled := false
 
 	exitCode := RunWithDeps([]string{
 		"nested", "run",
@@ -9302,9 +9304,9 @@ func TestNestedRunPermissionRefusalPrecedesStrictSelectionValidation(t *testing.
 		"--strict",
 	}, &stdout, &stderr, Deps{
 		Now: fixedCLINow,
-		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
-			dispatchCalled = true
-			return result, nil
+		AgentLookup: func(string) (agent.Runner, error) {
+			providerCalled = true
+			return nil, errors.New("unexpected provider launch")
 		},
 	})
 	if exitCode != 1 {
@@ -9313,8 +9315,8 @@ func TestNestedRunPermissionRefusalPrecedesStrictSelectionValidation(t *testing.
 	if stderr.Len() != 0 {
 		t.Fatalf("stderr = %q, want no JSON-mode warning noise", stderr.String())
 	}
-	if dispatchCalled {
-		t.Fatal("dispatch was called despite fail-closed read-only permission")
+	if providerCalled {
+		t.Fatal("provider was called despite fail-closed write permission")
 	}
 	var got orchestration.NestedScheduleReport
 	assertSingleJSONValue(t, stdout.String(), &got)
@@ -9332,11 +9334,11 @@ func TestNestedRunRefusesEveryChildBeforeConcurrentDispatch(t *testing.T) {
 		t.Fatalf("write delivery config: %v", err)
 	}
 	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
-		nestedPlanItem("alpha", 701, nil, true, "read-only", nil),
-		nestedPlanItem("beta", 702, nil, true, "read-only", nil),
-		nestedPlanItem("gamma", 703, []string{"alpha"}, true, "read-only", nil),
+		nestedPlanItem("alpha", 701, nil, true, "write", nil),
+		nestedPlanItem("beta", 702, nil, true, "write", nil),
+		nestedPlanItem("gamma", 703, []string{"alpha"}, true, "write", nil),
 	}, 2)
-	dispatchCalls := 0
+	providerCalls := 0
 
 	exitCode := RunWithDeps([]string{
 		"nested", "run",
@@ -9346,9 +9348,9 @@ func TestNestedRunRefusesEveryChildBeforeConcurrentDispatch(t *testing.T) {
 		"--format", "json",
 	}, &stdout, &stderr, Deps{
 		Now: fixedCLINow,
-		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
-			dispatchCalls++
-			return worker.Result{}, nil
+		AgentLookup: func(string) (agent.Runner, error) {
+			providerCalls++
+			return nil, errors.New("unexpected provider launch")
 		},
 	})
 	if exitCode != 1 {
@@ -9361,8 +9363,8 @@ func TestNestedRunRefusesEveryChildBeforeConcurrentDispatch(t *testing.T) {
 	if report.Status != orchestration.NestedStatusNeedsHuman || report.Outcome != orchestration.NestedOutcomePermissionNotEnforceable || len(report.Children) != 3 {
 		t.Fatalf("nested report = %#v", report)
 	}
-	if dispatchCalls != 0 {
-		t.Fatalf("dispatch calls = %d, want zero", dispatchCalls)
+	if providerCalls != 0 {
+		t.Fatalf("provider calls = %d, want zero", providerCalls)
 	}
 	for _, child := range report.Children {
 		if child.Status != orchestration.NestedStatusNeedsHuman || child.Outcome != orchestration.NestedOutcomePermissionNotEnforceable || child.StartedAt != "" || child.FinishedAt != "" {
@@ -9379,22 +9381,22 @@ func TestNestedRunReportsConfiguredProviderInPermissionRefusal(t *testing.T) {
 		t.Fatalf("write delivery config: %v", err)
 	}
 	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
-		nestedPlanItem("alpha", 701, nil, true, "read-only", nil),
+		nestedPlanItem("alpha", 701, nil, true, "write", nil),
 	}, 1)
 
-	dispatchCalled := false
+	providerCalled := false
 	exitCode := RunWithDeps([]string{"nested", "run", "--repo", repo, "--plan", planPath, "--format", "json"}, &stdout, &stderr, Deps{
 		Now: fixedCLINow,
-		Dispatch: func(_ context.Context, _ worker.Options) (worker.Result, error) {
-			dispatchCalled = true
-			return worker.Result{}, nil
+		AgentLookup: func(string) (agent.Runner, error) {
+			providerCalled = true
+			return nil, errors.New("unexpected provider launch")
 		},
 	})
 	if exitCode != 1 {
 		t.Fatalf("RunWithDeps returned exit code %d, want 1; stderr=%q", exitCode, stderr.String())
 	}
-	if dispatchCalled {
-		t.Fatal("dispatch was called despite fail-closed read-only permission")
+	if providerCalled {
+		t.Fatal("provider was called despite fail-closed write permission")
 	}
 	var report orchestration.NestedScheduleReport
 	assertSingleJSONValue(t, stdout.String(), &report)
@@ -9646,70 +9648,295 @@ func TestNestedRunRejectsPermissionEscalationBeforeDispatch(t *testing.T) {
 func TestNestedSubprocessExecutorUnitRunsDeterministicCommand(t *testing.T) {
 	t.Setenv("LOOPCODER_HOME", t.TempDir())
 	var stderr bytes.Buffer
-	repo := t.TempDir()
+	repo := initNestedExecutorCLITestRepo(t)
 	child := nestedPlanItem("alpha", 701, nil, true, "read-only", []string{"go env GOOS"})
 	child.ID = child.ChildKey
 	child.RunID = "run-20260102T030405Z-child-0-alpha"
-	executor := nestedSubprocessExecutor(nestedRunOptions{RepoPath: repo, Model: "deterministic-subprocess", Effort: "none"}, Deps{Now: fixedCLINow}, &stderr)
-	result, err := executor(context.Background(), nestedExecutionRequestForCLITest(child))
+	executor := nestedReadOnlyExecutor(nestedRunOptions{RepoPath: repo, Provider: nestedTestSubprocessProvider, Model: "deterministic-subprocess", Effort: "none"}, Deps{Now: fixedCLINow}, &stderr)
+	result, err := executor(context.Background(), nestedExecutionRequestForCLITest(repo, child))
 	if err != nil {
-		t.Fatalf("nestedSubprocessExecutor: %v; stderr=%q", err, stderr.String())
+		t.Fatalf("nestedReadOnlyExecutor: %v; stderr=%q", err, stderr.String())
 	}
-	if result.Status != orchestration.NestedStatusSucceeded {
+	if result.Status != orchestration.NestedStatusSucceeded || result.ReadOnlyEnforcement == nil || result.ReadOnlyEnforcement.Verification != "passed" {
 		t.Fatalf("result = %#v, want succeeded", result)
 	}
 	attempts, err := state.LoadAttempts(repo, child.RunID)
 	if err != nil {
 		t.Fatalf("LoadAttempts: %v", err)
 	}
-	if len(attempts) != 1 || attempts[0].Provider != nestedTestSubprocessProvider || attempts[0].Report == nil {
+	if len(attempts) != 1 || attempts[0].Provider != nestedTestSubprocessProvider || attempts[0].Report == nil || attempts[0].ReadOnlyEnforcement == nil || attempts[0].ReadOnlyEnforcement.Verification != readonlyexec.VerificationPassed {
 		t.Fatalf("attempts = %#v, want test-subprocess report", attempts)
+	}
+	if attempts[0].Branch != "" || strings.TrimSpace(attempts[0].Summary) == "" {
+		t.Fatalf("read-only attempt branch/summary = %q/%q, want no branch and a durable summary", attempts[0].Branch, attempts[0].Summary)
+	}
+	replayRequest := nestedExecutionRequestForCLITest(repo, child)
+	replayRequest.ClaimGeneration++
+	replayed, err := executor(context.Background(), replayRequest)
+	if err != nil || replayed.Status != orchestration.NestedStatusSucceeded || replayed.AttemptPath != result.AttemptPath {
+		t.Fatalf("verified attempt replay result=%#v error=%v", replayed, err)
+	}
+	attemptData, err := os.ReadFile(result.AttemptPath)
+	if err != nil {
+		t.Fatalf("read attempt for tamper fixture: %v", err)
+	}
+	var tamperedRecord map[string]any
+	if err := json.Unmarshal(attemptData, &tamperedRecord); err != nil {
+		t.Fatalf("decode attempt for tamper fixture: %v", err)
+	}
+	tamperedAudit, ok := tamperedRecord["read_only_enforcement"].(map[string]any)
+	if !ok {
+		t.Fatalf("attempt read_only_enforcement = %#v", tamperedRecord["read_only_enforcement"])
+	}
+	tamperedAudit["baseline_fingerprint"] = "sha256:" + strings.Repeat("0", 64)
+	tamperedData, err := json.MarshalIndent(tamperedRecord, "", "  ")
+	if err != nil {
+		t.Fatalf("encode tampered attempt fixture: %v", err)
+	}
+	mustWriteCLITest(t, result.AttemptPath, string(append(tamperedData, '\n')))
+	_, err = executor(context.Background(), replayRequest)
+	var policyViolation interface{ ChildExecutionPolicyViolation() }
+	if !errors.As(err, &policyViolation) {
+		t.Fatalf("tampered attempt replay error=%v, want typed policy violation", err)
 	}
 }
 
-func TestNestedDispatchExecutorUsesProviderNeutralExecutionWork(t *testing.T) {
+func TestValidateNestedPlanReadOnlyProvidersRejectsConflictingMetadata(t *testing.T) {
+	for _, metadata := range []json.RawMessage{
+		json.RawMessage(`{"provider":"grok"}`),
+		json.RawMessage(`{"adapter_id":"grok"}`),
+		json.RawMessage(`{"provider":"codex","adapter_id":"grok"}`),
+	} {
+		plan := orchestration.ChildPlan{Items: []orchestration.ChildRunPlan{{ChildKey: "conflict", Metadata: metadata}}}
+		if err := validateNestedPlanReadOnlyProviders(plan, "codex"); err == nil || !strings.Contains(err.Error(), "does not match executor registration") {
+			t.Fatalf("metadata %s error = %v, want registration mismatch", metadata, err)
+		}
+	}
+}
+
+type nestedAgentRunnerFunc func(context.Context, agent.Invocation) (agent.Result, error)
+
+func (f nestedAgentRunnerFunc) Run(ctx context.Context, invocation agent.Invocation) (agent.Result, error) {
+	return f(ctx, invocation)
+}
+
+func TestNestedReadOnlyExecutorUsesProviderNeutralExecutionWork(t *testing.T) {
 	t.Setenv("LOOPCODER_HOME", t.TempDir())
 	var stderr bytes.Buffer
-	repo := t.TempDir()
+	repo := initNestedExecutorCLITestRepo(t)
 	child := nestedPlanItem("contract", 1005, nil, true, "read-only", nil)
 	child.ID = child.ChildKey
 	child.RunID = "run-20260717T010203Z-child-0-contract"
-	request := nestedExecutionRequestForCLITest(child)
+	request := nestedExecutionRequestForCLITest(repo, child)
 	request.Work = orchestration.ChildExecutionWork{
 		Instructions:   "Use the immutable request.",
-		Branch:         "feature/issue-1005",
-		Provider:       "configured-provider",
+		Provider:       "codex",
 		Model:          "configured-model",
 		Effort:         "high",
 		TimeoutSeconds: 30,
 	}
 	request.ProviderDecision = orchestration.ChildProviderDecisionRef{
-		AdapterID:         "adapter-reference",
+		AdapterID:         "codex",
 		ModelCapabilityID: "model-capability-reference",
 	}
-	var got worker.Options
-	executor := nestedDispatchExecutor(nestedRunOptions{RepoPath: repo, BaseBranch: "pre-prod", Provider: "fallback-provider", Model: "fallback-model", Effort: "medium"}, Deps{
-		Dispatch: func(_ context.Context, opts worker.Options) (worker.Result, error) {
-			got = opts
-			return worker.Result{OK: true, Status: state.StatusSucceeded, RunID: child.RunID, Issue: child.Issue}, nil
+	var got agent.Invocation
+	executor := nestedReadOnlyExecutor(nestedRunOptions{RepoPath: repo, BaseBranch: "pre-prod", Provider: "codex", Model: "fallback-model", Effort: "medium"}, Deps{
+		Now: fixedCLINow,
+		AgentLookup: func(provider string) (agent.Runner, error) {
+			if provider != "codex" {
+				t.Fatalf("provider = %q, want codex", provider)
+			}
+			return nestedAgentRunnerFunc(func(_ context.Context, invocation agent.Invocation) (agent.Result, error) {
+				got = invocation
+				return agent.Result{Summary: "read-only result", Model: invocation.Model, Effort: invocation.Effort}, nil
+			}), nil
 		},
 	}, &stderr)
 	result, err := executor(context.Background(), request)
 	if err != nil {
-		t.Fatalf("nestedDispatchExecutor: %v", err)
+		t.Fatalf("nestedReadOnlyExecutor: %v", err)
 	}
 	if result.Status != orchestration.NestedStatusSucceeded {
 		t.Fatalf("result = %#v", result)
 	}
-	if got.Provider != request.Work.Provider || got.Model != request.Work.Model || got.Effort != request.Work.Effort || got.ProviderKey != request.IdempotencyKey || got.Branch != request.Work.Branch || got.IssueBody == "" {
-		t.Fatalf("worker options did not preserve execution work: %#v", got)
+	if !got.ReadOnly || got.Model != request.Work.Model || got.Effort != request.Work.Effort || got.ProviderKey != request.IdempotencyKey || got.WorktreePath != repo || !strings.Contains(got.Prompt, request.ContractFingerprint) {
+		t.Fatalf("read-only invocation did not preserve execution work: %#v", got)
+	}
+}
+
+func TestNestedReadOnlyExecutorUsesExplicitReadOnlyModeForSupportedProviders(t *testing.T) {
+	for _, provider := range []string{"codex", "claude", "grok"} {
+		t.Run(provider, func(t *testing.T) {
+			t.Setenv("LOOPCODER_HOME", t.TempDir())
+			t.Setenv(hostprofile.EnvName, "generic-local")
+			repo := initNestedExecutorCLITestRepo(t)
+			child := nestedPlanItem(provider, 1006, nil, true, "read-only", nil)
+			child.ID = child.ChildKey
+			child.RunID = "run-20260717T010203Z-child-0-" + provider
+			request := nestedExecutionRequestForCLITest(repo, child)
+			request.Work.Provider = provider
+			request.ProviderDecision.AdapterID = provider
+			var got agent.Invocation
+			executor := nestedReadOnlyExecutor(nestedRunOptions{RepoPath: repo, Provider: provider, Model: "model", Effort: "high"}, Deps{
+				Now: fixedCLINow,
+				AgentLookup: func(gotProvider string) (agent.Runner, error) {
+					if gotProvider != provider {
+						t.Fatalf("provider = %q, want %q", gotProvider, provider)
+					}
+					return nestedAgentRunnerFunc(func(_ context.Context, invocation agent.Invocation) (agent.Result, error) {
+						got = invocation
+						return agent.Result{Summary: "finding", Model: invocation.Model, Effort: invocation.Effort}, nil
+					}), nil
+				},
+			}, io.Discard)
+			result, err := executor(context.Background(), request)
+			if err != nil {
+				t.Fatalf("nestedReadOnlyExecutor: %v", err)
+			}
+			if !got.ReadOnly || got.Role != "nested-read-only" || got.ProviderKey != request.IdempotencyKey {
+				t.Fatalf("invocation = %#v, want explicit read-only contract", got)
+			}
+			if result.Status != orchestration.NestedStatusSucceeded || result.ReadOnlyEnforcement == nil || result.ReadOnlyEnforcement.Verification != readonlyexec.VerificationPassed {
+				t.Fatalf("result = %#v", result)
+			}
+		})
+	}
+}
+
+func TestNestedReadOnlyRoutePreflightRejectsUnsupportedProviderAndHost(t *testing.T) {
+	if err := preflightNestedReadOnlyRoute("gemini", "generic-local"); err == nil || !strings.Contains(err.Error(), "no registered") {
+		t.Fatalf("gemini preflight error = %v", err)
+	}
+	t.Setenv(hostprofile.EnvName, "not-a-host")
+	if err := preflightNestedReadOnlyRoute("codex", ""); err == nil || !strings.Contains(err.Error(), "unknown") {
+		t.Fatalf("unknown host preflight error = %v", err)
+	}
+}
+
+func TestNestedPrivateProjectKeyIsStableAndSeparatesRepositories(t *testing.T) {
+	repoA := t.TempDir()
+	repoB := t.TempDir()
+	keyA, err := nestedPrivateProjectKey(repoA, "")
+	if err != nil {
+		t.Fatalf("nestedPrivateProjectKey repo A: %v", err)
+	}
+	keyAAgain, err := nestedPrivateProjectKey(repoA, "")
+	if err != nil {
+		t.Fatalf("nestedPrivateProjectKey repo A again: %v", err)
+	}
+	keyB, err := nestedPrivateProjectKey(repoB, "")
+	if err != nil {
+		t.Fatalf("nestedPrivateProjectKey repo B: %v", err)
+	}
+	if keyA != keyAAgain || keyA == keyB {
+		t.Fatalf("project keys A=%q again=%q B=%q, want stable isolated identities", keyA, keyAAgain, keyB)
+	}
+	if strings.Contains(keyA, repoA) || strings.Contains(keyB, repoB) {
+		t.Fatalf("project keys leaked repository paths: %q / %q", keyA, keyB)
+	}
+	registeredA, err := nestedPrivateProjectKey(repoA, "project-id")
+	if err != nil {
+		t.Fatalf("nestedPrivateProjectKey registered A: %v", err)
+	}
+	registeredB, err := nestedPrivateProjectKey(repoB, "project-id")
+	if err != nil {
+		t.Fatalf("nestedPrivateProjectKey registered B: %v", err)
+	}
+	if registeredA != registeredB {
+		t.Fatalf("registered project keys = %q / %q, want stable project identity", registeredA, registeredB)
+	}
+}
+
+func TestNestedReadOnlyExecutorPreservesDirtAndOverridesProviderOutcomeOnMutation(t *testing.T) {
+	for _, providerOutcome := range []string{"success", "canceled"} {
+		t.Run(providerOutcome, func(t *testing.T) {
+			t.Setenv("LOOPCODER_HOME", t.TempDir())
+			t.Setenv(hostprofile.EnvName, "generic-local")
+			repo := initNestedExecutorCLITestRepo(t)
+			mustWriteCLITest(t, filepath.Join(repo, "README.md"), "preexisting dirty\n")
+			mustWriteCLITest(t, filepath.Join(repo, "notes.txt"), "user dirt\n")
+			child := nestedPlanItem("mutation-"+providerOutcome, 1006, nil, true, "read-only", nil)
+			child.ID = child.ChildKey
+			child.RunID = "run-20260717T010203Z-child-0-mutation-" + providerOutcome
+			request := nestedExecutionRequestForCLITest(repo, child)
+			request.Work.Provider = "codex"
+			request.ProviderDecision.AdapterID = "codex"
+			mutationPath := filepath.Join(repo, "provider-created.txt")
+			executor := nestedReadOnlyExecutor(nestedRunOptions{RepoPath: repo, Provider: "codex"}, Deps{
+				Now: fixedCLINow,
+				AgentLookup: func(string) (agent.Runner, error) {
+					return nestedAgentRunnerFunc(func(_ context.Context, _ agent.Invocation) (agent.Result, error) {
+						mustWriteCLITest(t, mutationPath, "mutation\n")
+						if providerOutcome == "canceled" {
+							return agent.Result{Summary: "canceled"}, context.Canceled
+						}
+						return agent.Result{Summary: "claimed success"}, nil
+					}), nil
+				},
+			}, io.Discard)
+			result, err := executor(context.Background(), request)
+			var policyViolation interface{ ChildExecutionPolicyViolation() }
+			if !errors.As(err, &policyViolation) {
+				t.Fatalf("error = %v, want typed policy violation", err)
+			}
+			if result.Status != orchestration.NestedStatusNeedsHuman || result.ReadOnlyEnforcement == nil || result.ReadOnlyEnforcement.Verification != readonlyexec.VerificationViolation {
+				t.Fatalf("result = %#v", result)
+			}
+			if result.Report == nil || result.Report.Verified {
+				t.Fatalf("report = %#v, must not be verified", result.Report)
+			}
+			assertCLITestFileText(t, filepath.Join(repo, "README.md"), "preexisting dirty\n")
+			assertCLITestFileText(t, filepath.Join(repo, "notes.txt"), "user dirt\n")
+			assertCLITestFileText(t, mutationPath, "mutation\n")
+		})
+	}
+}
+
+func TestNestedRunExecutesReadOnlyTestProviderWithEnforcementAudit(t *testing.T) {
+	t.Setenv("LOOPCODER_HOME", t.TempDir())
+	repo := initNestedExecutorCLITestRepo(t)
+	item := nestedPlanItem("alpha", 1006, nil, true, "read-only", []string{"git status --short"})
+	item.RunID = state.RunIDForChild(item.ChildKey, 0, fixedCLINow())
+	second := nestedPlanItem("beta", 1006, nil, true, "read-only", []string{"git status --short"})
+	second.RunID = state.RunIDForChild(second.ChildKey, 1, fixedCLINow())
+	plan := orchestration.ChildPlan{
+		SchemaVersion: orchestration.ChildPlanSchemaVersionV1, PlanID: "plan-read-only-e2e",
+		ParentRunID: state.RunIDForWave(fixedCLINow()), RootRunID: state.RunIDForWave(fixedCLINow()),
+		MaxDepth: 2, MaxConcurrency: 2, CreatedAt: state.FormatTimestamp(fixedCLINow()),
+		Items: []orchestration.ChildRunPlan{item, second},
+	}
+	data, err := json.MarshalIndent(plan, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	planPath := filepath.Join(repo, "child-plan.json")
+	if err := os.WriteFile(planPath, data, 0o644); err != nil {
+		t.Fatalf("write plan: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDeps([]string{
+		"nested", "run", "--repo", repo, "--plan", planPath,
+		"--provider", nestedTestSubprocessProvider, "--format", "json",
+	}, &stdout, &stderr, Deps{Now: fixedCLINow})
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d; stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	var report orchestration.NestedScheduleReport
+	assertSingleJSONValue(t, stdout.String(), &report)
+	if report.Status != orchestration.NestedStatusSucceeded || len(report.Children) != 2 {
+		t.Fatalf("report = %#v", report)
+	}
+	for _, child := range report.Children {
+		if child.ReadOnlyEnforcement == nil || child.ReadOnlyEnforcement.Verification != readonlyexec.VerificationPassed {
+			t.Fatalf("child enforcement = %#v", child)
+		}
 	}
 }
 
 func TestNestedSubprocessExecutorUnitRedactsOutputBeforePersistingAttempt(t *testing.T) {
 	t.Setenv("LOOPCODER_HOME", t.TempDir())
 	var stderr bytes.Buffer
-	repo := t.TempDir()
+	repo := initNestedExecutorCLITestRepo(t)
 	canary := "AKIA" + strings.Repeat("A", 16)
 	command := "printf '%s\n' '" + canary + "'; exit 1"
 	if runtime.GOOS == "windows" {
@@ -9718,10 +9945,10 @@ func TestNestedSubprocessExecutorUnitRedactsOutputBeforePersistingAttempt(t *tes
 	child := nestedPlanItem("redact", 701, nil, true, "read-only", []string{command})
 	child.ID = child.ChildKey
 	child.RunID = "run-20260102T030405Z-child-0-redact"
-	executor := nestedSubprocessExecutor(nestedRunOptions{RepoPath: repo, Model: "deterministic-subprocess", Effort: "none"}, Deps{Now: fixedCLINow}, &stderr)
-	_, err := executor(context.Background(), nestedExecutionRequestForCLITest(child))
+	executor := nestedReadOnlyExecutor(nestedRunOptions{RepoPath: repo, Provider: nestedTestSubprocessProvider, Model: "deterministic-subprocess", Effort: "none"}, Deps{Now: fixedCLINow}, &stderr)
+	_, err := executor(context.Background(), nestedExecutionRequestForCLITest(repo, child))
 	if err == nil {
-		t.Fatal("nestedSubprocessExecutor returned nil error, want command failure")
+		t.Fatal("nestedReadOnlyExecutor returned nil error, want command failure")
 	}
 	attempts, err := state.LoadAttempts(repo, child.RunID)
 	if err != nil {
@@ -9742,23 +9969,64 @@ func TestNestedSubprocessExecutorUnitRedactsOutputBeforePersistingAttempt(t *tes
 	}
 }
 
-func nestedExecutionRequestForCLITest(child orchestration.ChildRunPlan) orchestration.ChildExecutionRequest {
+func nestedExecutionRequestForCLITest(repo string, child orchestration.ChildRunPlan) orchestration.ChildExecutionRequest {
 	return orchestration.ChildExecutionRequest{
-		ID:             child.ChildKey,
-		ChildKey:       child.ChildKey,
-		RunID:          child.RunID,
-		Title:          child.Title,
-		Role:           child.Role,
-		Issue:          child.Issue,
-		Permission:     child.Permission,
-		Scope:          child.Scope,
-		DependsOn:      append([]string(nil), child.DependsOn...),
-		Aggregation:    child.Aggregation,
-		Required:       child.Required,
-		Optional:       child.Optional,
-		Ordinal:        child.Ordinal,
-		Depth:          child.Depth,
-		IdempotencyKey: "child-run:" + child.RunID,
+		SchemaVersion:            orchestration.ChildExecutionRequestSchemaVersionV1,
+		ParentRunID:              "run-20260102T030405Z-parent",
+		PlanID:                   "plan-read-only-cli-test",
+		ID:                       child.ChildKey,
+		ChildKey:                 child.ChildKey,
+		RunID:                    child.RunID,
+		Title:                    child.Title,
+		Role:                     child.Role,
+		Issue:                    child.Issue,
+		Permission:               child.Permission,
+		Scope:                    child.Scope,
+		DependsOn:                append([]string(nil), child.DependsOn...),
+		Aggregation:              child.Aggregation,
+		Required:                 child.Required,
+		Optional:                 child.Optional,
+		Ordinal:                  child.Ordinal,
+		Depth:                    child.Depth,
+		IdempotencyKey:           "child-run:" + child.RunID,
+		ClaimGeneration:          1,
+		CheckoutIdentity:         filepath.ToSlash(repo),
+		ScopedRepositoryIdentity: filepath.ToSlash(repo),
+		RepositoryIdentity:       "local:test",
+		ContractFingerprint:      "sha256:cli-test-contract",
+		ProviderDecision:         orchestration.ChildProviderDecisionRef{AdapterID: nestedTestSubprocessProvider},
+	}
+}
+
+func initNestedExecutorCLITestRepo(t *testing.T) string {
+	t.Helper()
+	repo := t.TempDir()
+	runCLITestGit(t, repo, "init", "-b", "main")
+	runCLITestGit(t, repo, "config", "user.email", "loopcoder-test@example.com")
+	runCLITestGit(t, repo, "config", "user.name", "Loopcoder Test")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# Test\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runCLITestGit(t, repo, "add", "README.md")
+	runCLITestGit(t, repo, "commit", "-m", "initial")
+	return repo
+}
+
+func mustWriteCLITest(t *testing.T, path, value string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(value), 0o644); err != nil {
+		t.Fatalf("write %s: %v", filepath.Base(path), err)
+	}
+}
+
+func assertCLITestFileText(t *testing.T, path, want string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", filepath.Base(path), err)
+	}
+	if string(data) != want {
+		t.Fatalf("%s = %q, want %q", filepath.Base(path), data, want)
 	}
 }
 
@@ -9776,7 +10044,7 @@ func TestNestedRunRefusalKeepsOmittedChildRunIDDeterministic(t *testing.T) {
 		MaxConcurrency: 1,
 		CreatedAt:      state.FormatTimestamp(fixedCLINow()),
 		Items: []orchestration.ChildRunPlan{
-			nestedPlanItem("alpha", 701, nil, true, "read-only", []string{"go env GOOS"}),
+			nestedPlanItem("alpha", 701, nil, true, "write", []string{"go env GOOS"}),
 		},
 	}
 	planData, err := json.MarshalIndent(plan, "", "  ")

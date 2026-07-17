@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
@@ -173,7 +174,34 @@ func nestedJSONPayload(report orchestration.NestedScheduleReport) any {
 
 func nestedObservability(report orchestration.NestedScheduleReport) observability.Document {
 	items := make([]observability.RenderItem, 0, len(report.Children))
+	evidence := make([]observability.Evidence, 0)
 	for _, child := range report.Children {
+		if audit := child.ReadOnlyEnforcement; audit != nil {
+			severity := "info"
+			if audit.Verification != "passed" {
+				severity = "error"
+			}
+			evidence = append(evidence, observability.Evidence{
+				Type: "read-only-enforcement", Code: audit.Verification, Severity: severity,
+				Section: "nested", Kind: audit.Mode,
+				Message: fmt.Sprintf("baseline=%s post_run=%s recovered=%t", audit.BaselineFingerprint, audit.PostRunFingerprint, audit.Recovered),
+				SourceRefs: []observability.SourceRef{{
+					Table: "read_only_enforcement", RecordID: child.RunID,
+					DeliveryRunID: child.RunID, Provenance: "durable-read-only-audit",
+				}},
+			})
+			for _, violation := range audit.Violations {
+				evidence = append(evidence, observability.Evidence{
+					Type: "read-only-policy-violation", Code: violation.Code, Severity: "error",
+					Section: "nested", Kind: violation.Surface,
+					Message: fmt.Sprintf("target=%s before=%s after=%s", violation.TargetID, violation.BeforeHash, violation.AfterHash),
+					SourceRefs: []observability.SourceRef{{
+						Table: "read_only_enforcement", RecordID: violation.TargetID,
+						DeliveryRunID: child.RunID, Field: violation.Surface, Provenance: "durable-read-only-audit",
+					}},
+				})
+			}
+		}
 		if report.Outcome == orchestration.NestedOutcomePermissionNotEnforceable {
 			provider := ""
 			if report.ExecutorCapability != nil {
@@ -227,7 +255,7 @@ func nestedObservability(report orchestration.NestedScheduleReport) observabilit
 	return observability.NewDocument("nested", observability.Correlation{
 		DeliveryRunID: report.ParentRunID,
 		Source:        "nested",
-	}, items, nil)
+	}, items, evidence)
 }
 
 func recoveryObservability(opts recovery.Options, result recovery.Result) observability.Document {

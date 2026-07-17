@@ -7,6 +7,7 @@ import (
 	"encoding/base32"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -337,6 +338,64 @@ func TestScheduleNestedRunsAggregatesRequiredFailuresPredictably(t *testing.T) {
 	}
 	if report.Status != NestedStatusNeedsHuman {
 		t.Fatalf("status = %s, want needs-human", report.Status)
+	}
+}
+
+type nestedPolicyViolationTestError struct{}
+
+func (nestedPolicyViolationTestError) Error() string                  { return "guarded state changed" }
+func (nestedPolicyViolationTestError) ChildExecutionPolicyViolation() {}
+
+func TestScheduleNestedRunsNeverReportsReadOnlyPolicyViolationAsSuccess(t *testing.T) {
+	for _, required := range []bool{true, false} {
+		t.Run(fmt.Sprintf("required=%t", required), func(t *testing.T) {
+			repo := t.TempDir()
+			now := nestedTestNow()
+			audit := &state.ReadOnlyEnforcementAudit{
+				Mode:                "provider-read-only+repository-state-v1",
+				Verification:        "policy-violation",
+				BaselineFingerprint: "sha256:before",
+				PostRunFingerprint:  "sha256:after",
+				Violations: []state.ReadOnlyEnforcementViolation{{
+					Code:       "untracked_file_created",
+					Surface:    "checkout",
+					TargetID:   "sha256:target",
+					BeforeHash: "absent",
+					AfterHash:  "sha256:content",
+				}},
+			}
+
+			report, err := ScheduleNestedRuns(context.Background(), NestedScheduleOptions{
+				RepoPath:         repo,
+				ParentRunID:      fmt.Sprintf("run-20260709T000000Z-read-only-policy-%t", required),
+				ConcurrencyLimit: 1,
+				MaxChildren:      1,
+				Now:              now,
+				Clock:            func() time.Time { return now },
+				Children: []ChildRunPlan{{
+					ID: "read-only-child", Issue: 1, Permission: "read-only", Required: required, Optional: !required,
+				}},
+				Execute: func(context.Context, ChildExecutionRequest) (ChildRunResult, error) {
+					return ChildRunResult{
+						Status:              NestedStatusSucceeded,
+						ReadOnlyEnforcement: audit,
+					}, nestedPolicyViolationTestError{}
+				},
+			})
+			if err != nil {
+				t.Fatalf("ScheduleNestedRuns returned error: %v", err)
+			}
+			if report.Status != NestedStatusNeedsHuman || report.Outcome != NestedOutcomeReadOnlyPolicyViolation || len(report.Children) != 1 {
+				t.Fatalf("report = %#v, want one needs-human child", report)
+			}
+			child := report.Children[0]
+			if child.Status != NestedStatusNeedsHuman || child.Outcome != NestedOutcomeReadOnlyPolicyViolation {
+				t.Fatalf("child status/outcome = %q/%q", child.Status, child.Outcome)
+			}
+			if child.ReadOnlyEnforcement == nil || child.ReadOnlyEnforcement.Verification != "policy-violation" {
+				t.Fatalf("child enforcement audit = %#v", child.ReadOnlyEnforcement)
+			}
+		})
 	}
 }
 

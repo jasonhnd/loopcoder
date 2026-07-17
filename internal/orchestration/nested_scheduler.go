@@ -44,6 +44,8 @@ const (
 	NestedEventChildFinished = "nested.child.finished"
 	NestedEventParentDone    = "nested.parent.finished"
 
+	NestedOutcomeReadOnlyPolicyViolation = "read_only_policy_violation"
+
 	ReplayActionNew     = "new"
 	ReplayActionReused  = "reused"
 	ReplayActionResumed = "resumed"
@@ -137,40 +139,41 @@ type NestedScheduleReport struct {
 }
 
 type ChildRunResult struct {
-	ID                  string           `json:"id"`
-	ChildKey            string           `json:"child_key,omitempty"`
-	Title               string           `json:"title,omitempty"`
-	Role                string           `json:"role,omitempty"`
-	RunID               string           `json:"run_id"`
-	Issue               int              `json:"issue,omitempty"`
-	Scope               ChildScope       `json:"scope"`
-	Permission          string           `json:"permission"`
-	DependsOn           []string         `json:"depends_on,omitempty"`
-	Aggregation         ChildAggregation `json:"aggregation"`
-	Required            bool             `json:"required,omitempty"`
-	Optional            bool             `json:"optional,omitempty"`
-	Ordinal             int              `json:"ordinal"`
-	Depth               int              `json:"depth"`
-	Status              string           `json:"status"`
-	Outcome             string           `json:"outcome,omitempty"`
-	ReplayAction        string           `json:"replay_action,omitempty"`
-	ClaimOutcome        string           `json:"claim_outcome,omitempty"`
-	ClaimOwner          string           `json:"claim_owner,omitempty"`
-	ClaimGeneration     int64            `json:"claim_generation,omitempty"`
-	LeaseExpiresAt      string           `json:"lease_expires_at,omitempty"`
-	ClaimPhase          string           `json:"claim_phase,omitempty"`
-	ProviderKey         string           `json:"provider_idempotency_key,omitempty"`
-	ProviderReceipt     string           `json:"provider_receipt,omitempty"`
-	ContractSchema      string           `json:"execution_contract_schema,omitempty"`
-	ContractFingerprint string           `json:"execution_contract_fingerprint,omitempty"`
-	StartedAt           string           `json:"started_at,omitempty"`
-	FinishedAt          string           `json:"finished_at,omitempty"`
-	Error               string           `json:"error,omitempty"`
-	Reason              string           `json:"reason,omitempty"`
-	NextAction          string           `json:"next_action,omitempty"`
-	AttemptPath         string           `json:"attempt_path,omitempty"`
-	RecoveryContextPath string           `json:"recovery_context_path,omitempty"`
-	Report              *reporter.Report `json:"report,omitempty"`
+	ID                  string                          `json:"id"`
+	ChildKey            string                          `json:"child_key,omitempty"`
+	Title               string                          `json:"title,omitempty"`
+	Role                string                          `json:"role,omitempty"`
+	RunID               string                          `json:"run_id"`
+	Issue               int                             `json:"issue,omitempty"`
+	Scope               ChildScope                      `json:"scope"`
+	Permission          string                          `json:"permission"`
+	DependsOn           []string                        `json:"depends_on,omitempty"`
+	Aggregation         ChildAggregation                `json:"aggregation"`
+	Required            bool                            `json:"required,omitempty"`
+	Optional            bool                            `json:"optional,omitempty"`
+	Ordinal             int                             `json:"ordinal"`
+	Depth               int                             `json:"depth"`
+	Status              string                          `json:"status"`
+	Outcome             string                          `json:"outcome,omitempty"`
+	ReplayAction        string                          `json:"replay_action,omitempty"`
+	ClaimOutcome        string                          `json:"claim_outcome,omitempty"`
+	ClaimOwner          string                          `json:"claim_owner,omitempty"`
+	ClaimGeneration     int64                           `json:"claim_generation,omitempty"`
+	LeaseExpiresAt      string                          `json:"lease_expires_at,omitempty"`
+	ClaimPhase          string                          `json:"claim_phase,omitempty"`
+	ProviderKey         string                          `json:"provider_idempotency_key,omitempty"`
+	ProviderReceipt     string                          `json:"provider_receipt,omitempty"`
+	ContractSchema      string                          `json:"execution_contract_schema,omitempty"`
+	ContractFingerprint string                          `json:"execution_contract_fingerprint,omitempty"`
+	StartedAt           string                          `json:"started_at,omitempty"`
+	FinishedAt          string                          `json:"finished_at,omitempty"`
+	Error               string                          `json:"error,omitempty"`
+	Reason              string                          `json:"reason,omitempty"`
+	NextAction          string                          `json:"next_action,omitempty"`
+	AttemptPath         string                          `json:"attempt_path,omitempty"`
+	RecoveryContextPath string                          `json:"recovery_context_path,omitempty"`
+	Report              *reporter.Report                `json:"report,omitempty"`
+	ReadOnlyEnforcement *state.ReadOnlyEnforcementAudit `json:"read_only_enforcement,omitempty"`
 }
 
 type NestedSummary struct {
@@ -668,8 +671,17 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		}
 		result = mergeChildResult(result, executed)
 		if err != nil {
-			result.Status = normalizeNestedStatus(state.FailureStatus(err))
-			result.Error = err.Error()
+			var policyViolation interface{ ChildExecutionPolicyViolation() }
+			if errors.As(err, &policyViolation) {
+				result.Status = NestedStatusNeedsHuman
+				result.Outcome = NestedOutcomeReadOnlyPolicyViolation
+				result.Error = err.Error()
+				result.Reason = "the read-only child changed or could not conclusively verify a guarded state surface"
+				result.NextAction = "inspect the preserved read-only enforcement evidence before any replay"
+			} else {
+				result.Status = normalizeNestedStatus(state.FailureStatus(err))
+				result.Error = err.Error()
+			}
 		}
 		result.Status = normalizeNestedStatus(result.Status)
 		if result.FinishedAt == "" {
@@ -829,6 +841,13 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 	}
 	report.Summary = nestedSummary(results)
 	report.Status = nestedParentStatus(results)
+	for _, child := range results {
+		if child.Outcome == NestedOutcomeReadOnlyPolicyViolation {
+			report.Outcome = NestedOutcomeReadOnlyPolicyViolation
+			report.Status = NestedStatusNeedsHuman
+			break
+		}
+	}
 	if !parentDoneSuppressed() {
 		parentCtx := ctx
 		var cancelParent context.CancelFunc
@@ -1414,6 +1433,9 @@ func mergeChildResult(base, result ChildRunResult) ChildRunResult {
 	if strings.TrimSpace(result.Status) != "" {
 		base.Status = strings.TrimSpace(result.Status)
 	}
+	if strings.TrimSpace(result.Outcome) != "" {
+		base.Outcome = strings.TrimSpace(result.Outcome)
+	}
 	if strings.TrimSpace(result.ReplayAction) != "" {
 		base.ReplayAction = strings.TrimSpace(result.ReplayAction)
 	}
@@ -1444,6 +1466,11 @@ func mergeChildResult(base, result ChildRunResult) ChildRunResult {
 	base.AttemptPath = strings.TrimSpace(result.AttemptPath)
 	base.RecoveryContextPath = strings.TrimSpace(result.RecoveryContextPath)
 	base.Report = result.Report
+	if result.ReadOnlyEnforcement != nil {
+		audit := *result.ReadOnlyEnforcement
+		audit.Violations = append([]state.ReadOnlyEnforcementViolation(nil), result.ReadOnlyEnforcement.Violations...)
+		base.ReadOnlyEnforcement = &audit
+	}
 	if strings.TrimSpace(result.StartedAt) != "" {
 		base.StartedAt = strings.TrimSpace(result.StartedAt)
 	}

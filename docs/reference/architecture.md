@@ -298,11 +298,17 @@ allow controlled takeover by a new generation, but uncertain external side
 effects still route to receipts/idempotency checks or `needs-human`; loopcoder
 does not claim universal exactly-once side effects across crashes.
 
-These ownership mechanics do not make real-provider nested execution a
-supported v0.8.0 path. Production-provider write and orchestrate modes are
-refused. The accepted read-only mode reaches the ordinary Worker adapter
-without an enforceable mutation-free permission, so it is also unsafe for real
-providers. `test-subprocess` is deterministic test infrastructure only.
+The nested read-only execution boundary is separate from Worker dispatch.
+Codex, Claude, and Grok must negotiate their explicit read-only adapter mode;
+unsupported providers and hosts fail before launch. The executor persists a
+private repository/project-state baseline outside the checkout and verifies it
+after every provider outcome. Existing user dirt is part of the baseline, while
+changes to checkout content, the index, refs, config, hooks, linked worktrees,
+or guarded LoopCoder state produce a path-free typed policy violation and
+`needs-human`. Evidence is preserved and no automatic remediation occurs.
+Production-provider write, orchestrate, and provider-native modes remain
+refused. `test-subprocess` is deterministic test infrastructure only, but runs
+through the same mutation enforcement.
 
 ### Delivery Guardrails
 
