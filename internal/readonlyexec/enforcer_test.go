@@ -363,7 +363,7 @@ func initRepository(t *testing.T) string {
 func runGitTest(t *testing.T, repo string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
-	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	cmd.Env = append(cleanGitEnv(os.Environ()), "GIT_OPTIONAL_LOCKS=0")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
 	}
