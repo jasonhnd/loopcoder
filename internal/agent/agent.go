@@ -127,6 +127,10 @@ type Result struct {
 	HungReason         string
 	AdapterVersion     string
 	ExternalSessionRef string
+	// FailureClass is an optional structured outcome class set by adapters
+	// (provideroutcome.Class values). Orchestration classifies using this field
+	// and other structured flags, never by user-facing error-string matching.
+	FailureClass string
 }
 
 type ProviderProcess struct {
