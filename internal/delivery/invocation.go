@@ -7,9 +7,10 @@ import (
 const (
 	InvocationContractSchema = "loopcoder.host_invocation_contract.v1"
 
-	OperationPlan     = "delivery.plan"
-	OperationDecide   = "delivery.decide"
-	OperationContinue = "delivery.continue"
+	OperationPlan          = "delivery.plan"
+	OperationDecide        = "delivery.decide"
+	OperationContinue      = "delivery.continue"
+	OperationClaimDispatch = "delivery.claim-dispatch"
 
 	PermissionReadOnly    = "read-only"
 	PermissionWrite       = "write"
@@ -95,6 +96,18 @@ func ContractForOperation(operation string) (HostOperationContract, error) {
 			IdempotencyRequired: true,
 			Cancellation:        CancellationDurableResumable,
 			ProviderLaunch:      false,
+			MachineJSONOnly:     true,
+		}, nil
+	case OperationClaimDispatch:
+		return HostOperationContract{
+			SchemaVersion:       InvocationContractSchema,
+			Operation:           OperationClaimDispatch,
+			SideEffectClass:     "provider-launch",
+			Permission:          PermissionOrchestrate,
+			ApprovalMutation:    false,
+			IdempotencyRequired: true,
+			Cancellation:        CancellationDurableResumable,
+			ProviderLaunch:      true,
 			MachineJSONOnly:     true,
 		}, nil
 	default:
