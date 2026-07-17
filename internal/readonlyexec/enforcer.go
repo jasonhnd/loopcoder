@@ -717,15 +717,7 @@ func gitAbsolutePath(ctx context.Context, repoPath string, args ...string) (stri
 }
 
 func canonicalIdentity(path string) (string, error) {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return "", err
-	}
-	resolved, err := filepath.EvalSymlinks(abs)
-	if err != nil {
-		return "", err
-	}
-	return filepath.Clean(resolved), nil
+	return pathid.Identity(path)
 }
 
 func digestPath(path string) (string, error) {
