@@ -339,6 +339,15 @@ func TestMCPServersForInvocationRejectsWriteServerForReadOnly(t *testing.T) {
 	}
 }
 
+func TestNestedInvocationRolesMapToRegisteredMCPRoles(t *testing.T) {
+	if got := mcpInvocationRole("nested-read-only"); got != "verifier" {
+		t.Fatalf("nested read-only role = %q, want verifier", got)
+	}
+	if got := mcpInvocationRole("nested-bounded-write"); got != "worker" {
+		t.Fatalf("nested bounded-write role = %q, want worker", got)
+	}
+}
+
 func TestMCPServersForInvocationRejectsUnknownRoles(t *testing.T) {
 	_, err := mcpServersForInvocation(Invocation{
 		Role: "worker",

@@ -17,6 +17,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/hostprofile"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
@@ -29,6 +30,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
+	"github.com/jasonhnd/loopcoder/internal/writeexec"
 )
 
 const (
@@ -82,13 +84,13 @@ func printNestedHelp(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  loopcoder nested run --repo <path> --plan <file.json> [flags]")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Submit a v1 child plan, persist the durable graph, and execute mutation-free read-only children through loopcoder-owned scheduling.")
+	fmt.Fprintln(w, "Submit a v1 child plan, persist the durable graph, and execute read-only or isolated bounded-write children through loopcoder-owned scheduling.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
 	fmt.Fprintln(w, "  --repo string                 repository path (required)")
 	fmt.Fprintln(w, "  --plan string                 child plan JSON file (required)")
 	fmt.Fprintln(w, "  --base-branch string          base branch associated with the nested run (default \"main\")")
-	fmt.Fprintln(w, "  --provider string             read-only child provider: codex, claude, or grok (default from .delivery.yml or \"codex\")")
+	fmt.Fprintln(w, "  --provider string             child provider: codex or grok for bounded write; claude is read-only (default from .delivery.yml or \"codex\")")
 	fmt.Fprintln(w, "  --model string                optional child model override for this run")
 	fmt.Fprintln(w, "  --effort string               optional child reasoning effort override for this run")
 	fmt.Fprintln(w, "  --parent-permission string    parent permission ceiling: read-only, write, or orchestrate (default \"orchestrate\")")
@@ -98,7 +100,7 @@ func printNestedHelp(w io.Writer) {
 	fmt.Fprintln(w, "  --strict                      reject invalid model/depth selections instead of warning")
 	fmt.Fprintln(w, "  --help                        show nested command help")
 	fmt.Fprintln(w)
-	fmt.Fprintf(w, "  provider %q is reserved for deterministic local smoke tests; its scope.commands still pass through the same post-run mutation enforcement.\n", nestedTestSubprocessProvider)
+	fmt.Fprintf(w, "  provider %q is reserved for deterministic local smoke tests; its scope.commands still pass through read-only or bounded-write post-run enforcement.\n", nestedTestSubprocessProvider)
 }
 
 func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
@@ -286,16 +288,16 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		opts.Provider = selection.Provider
 		opts.Model = selection.Model
 		opts.Effort = selection.Effort
-		if err := preflightNestedReadOnlyRoute(opts.Provider, opts.HostProfile); err != nil {
-			fmt.Fprintf(stderr, "nested run: read-only route preflight: %v\n", err)
+		if err := preflightNestedPlanRoute(plan, opts.Provider, opts.HostProfile); err != nil {
+			fmt.Fprintf(stderr, "nested run: child route preflight: %v\n", err)
 			return 1
 		}
 	} else {
 		opts.Model = firstNonEmptyNested(opts.Model, "deterministic-subprocess")
 		opts.Effort = firstNonEmptyNested(opts.Effort, "none")
 	}
-	if err := validateNestedPlanReadOnlyProviders(plan, opts.Provider); err != nil {
-		fmt.Fprintf(stderr, "nested run: read-only provider preflight: %v\n", err)
+	if err := validateNestedPlanProviders(plan, opts.Provider); err != nil {
+		fmt.Fprintf(stderr, "nested run: provider preflight: %v\n", err)
 		return 1
 	}
 
@@ -318,7 +320,7 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	defer cancel()
 
-	executor := nestedReadOnlyExecutor(opts, deps, warnings)
+	executor := nestedExecutor(opts, deps, warnings)
 	progressRecorder, stopProgress := progressSupervisorForRegisteredRepo(context.Background(), resolvedRepo, plan.RootRunID, deps.Now, stderr)
 	defer func() {
 		if err := stopProgress(); err != nil {
@@ -365,15 +367,18 @@ func nestedReportHasContent(report orchestration.NestedScheduleReport) bool {
 }
 
 func nestedExecutorCapability(opts nestedRunOptions) orchestration.NestedExecutorCapability {
-	executorID := "read-only-child"
+	executorID := "nested-child"
 	registrationID := ""
 	if opts.Provider == nestedTestSubprocessProvider {
 		executorID = nestedTestSubprocessProvider
 	}
 	permissions := []string{}
 	if nestedReadOnlyProviderSupported(opts.Provider) {
-		registrationID = "builtin:read-only-child:" + strings.TrimSpace(opts.Provider) + ":v1"
+		registrationID = "builtin:nested-child:" + strings.TrimSpace(opts.Provider) + ":v2"
 		permissions = []string{string(reporter.PermissionReadOnly)}
+		if nestedBoundedWriteProviderSupported(opts.Provider) {
+			permissions = append(permissions, string(reporter.PermissionWrite))
+		}
 	}
 	return orchestration.NestedExecutorCapability{
 		ExecutorID:             executorID,
@@ -381,6 +386,15 @@ func nestedExecutorCapability(opts nestedRunOptions) orchestration.NestedExecuto
 		Provider:               strings.TrimSpace(opts.Provider),
 		EnforceablePermissions: permissions,
 		ProviderNative:         false,
+	}
+}
+
+func nestedBoundedWriteProviderSupported(provider string) bool {
+	switch strings.TrimSpace(provider) {
+	case "codex", "grok", nestedTestSubprocessProvider:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -415,7 +429,53 @@ func preflightNestedReadOnlyRoute(provider, hostProfile string) error {
 	return nil
 }
 
-func validateNestedPlanReadOnlyProviders(plan orchestration.ChildPlan, selectedProvider string) error {
+func preflightNestedWriteRoute(provider, hostProfile string) error {
+	provider = strings.TrimSpace(provider)
+	if !nestedBoundedWriteProviderSupported(provider) || provider == nestedTestSubprocessProvider {
+		if provider == nestedTestSubprocessProvider {
+			return nil
+		}
+		return fmt.Errorf("provider %q has no registered nested bounded-write adapter", provider)
+	}
+	if err := runtimecap.RequireProviderCapability(provider, runtimecap.ProviderBoundedWrite); err != nil {
+		return err
+	}
+	host, err := hostprofile.Resolve(hostprofile.Options{Profile: hostProfile, Getenv: os.Getenv})
+	if err != nil {
+		return err
+	}
+	compatibility := runtimecap.EvaluateCompatibility(provider, host.Name, runtimecap.RoleWorker)
+	if compatibility.Support == runtimecap.SupportUnsupported {
+		return fmt.Errorf("provider %q and host %q cannot enforce the bounded-write child contract (%s)", provider, host.Name, compatibility.Code)
+	}
+	return nil
+}
+
+func preflightNestedPlanRoute(plan orchestration.ChildPlan, provider, hostProfile string) error {
+	seen := map[string]bool{}
+	for _, child := range plan.Items {
+		permission := normalizeNestedPermission(child.Permission)
+		if seen[permission] {
+			continue
+		}
+		seen[permission] = true
+		switch permission {
+		case string(reporter.PermissionReadOnly):
+			if err := preflightNestedReadOnlyRoute(provider, hostProfile); err != nil {
+				return err
+			}
+		case string(reporter.PermissionWrite):
+			if err := preflightNestedWriteRoute(provider, hostProfile); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("child %q permission %q has no nested execution adapter", child.ChildKey, child.Permission)
+		}
+	}
+	return nil
+}
+
+func validateNestedPlanProviders(plan orchestration.ChildPlan, selectedProvider string) error {
 	selectedProvider = strings.TrimSpace(selectedProvider)
 	for _, child := range plan.Items {
 		var metadata nestedChildMetadata
@@ -433,15 +493,38 @@ func validateNestedPlanReadOnlyProviders(plan orchestration.ChildPlan, selectedP
 		} {
 			field := declaration.field
 			requested := strings.TrimSpace(declaration.value)
-			if requested != "" && requested != selectedProvider {
+			if selectedProvider != nestedTestSubprocessProvider && requested != "" && requested != selectedProvider {
 				return fmt.Errorf("child %q %s %q does not match executor registration %q", child.ChildKey, field, requested, selectedProvider)
 			}
 		}
 		if !nestedReadOnlyProviderSupported(selectedProvider) {
-			return fmt.Errorf("child %q provider %q has no registered nested read-only adapter", child.ChildKey, selectedProvider)
+			return fmt.Errorf("child %q provider %q has no registered nested adapter", child.ChildKey, selectedProvider)
+		}
+		if normalizeNestedPermission(child.Permission) == string(reporter.PermissionWrite) && !nestedBoundedWriteProviderSupported(selectedProvider) {
+			return fmt.Errorf("child %q provider %q has no registered nested bounded-write adapter", child.ChildKey, selectedProvider)
 		}
 	}
 	return nil
+}
+
+func validateNestedPlanReadOnlyProviders(plan orchestration.ChildPlan, selectedProvider string) error {
+	return validateNestedPlanProviders(plan, selectedProvider)
+}
+
+func nestedExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) orchestration.ChildRunExecutor {
+	readOnly := nestedReadOnlyExecutor(opts, deps, stderr)
+	boundedWrite := nestedWriteExecutor(opts, deps, stderr)
+	return func(ctx context.Context, request orchestration.ChildExecutionRequest) (orchestration.ChildRunResult, error) {
+		switch normalizeNestedPermission(request.Permission) {
+		case string(reporter.PermissionReadOnly):
+			return readOnly(ctx, request)
+		case string(reporter.PermissionWrite):
+			return boundedWrite(ctx, request)
+		default:
+			base := nestedResultFromRequest(request)
+			return base, &writeexec.PolicyViolationError{Phase: "pre-launch", Reason: "the executor received a permission without a registered nested adapter"}
+		}
+	}
 }
 
 func renderNestedPermissionRefusal(stdout, stderr io.Writer, opts nestedRunOptions, plan orchestration.ChildPlan, capability orchestration.NestedExecutorCapability, permissionErr *orchestration.PermissionNotEnforceableError, deps Deps) int {
@@ -460,7 +543,10 @@ func nestedReadOnlyExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) 
 		if request.Permission != string(reporter.PermissionReadOnly) {
 			return base, &readonlyexec.PolicyViolationError{Phase: "pre-launch", Reason: "the executor received a non-read-only immutable contract"}
 		}
-		provider := firstNonEmptyNested(request.Work.Provider, request.ProviderDecision.AdapterID, opts.Provider)
+		provider := opts.Provider
+		if provider != nestedTestSubprocessProvider {
+			provider = firstNonEmptyNested(request.Work.Provider, request.ProviderDecision.AdapterID, opts.Provider)
+		}
 		if provider != opts.Provider {
 			return base, &readonlyexec.PolicyViolationError{Phase: "pre-launch", Reason: "the persisted provider route does not match the registered read-only adapter"}
 		}
@@ -601,6 +687,274 @@ func nestedReadOnlyExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) 
 	}
 }
 
+func nestedWriteExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) orchestration.ChildRunExecutor {
+	return func(ctx context.Context, request orchestration.ChildExecutionRequest) (orchestration.ChildRunResult, error) {
+		child := request.ChildRunPlan()
+		base := nestedResultFromRequest(request)
+		if request.Permission != string(reporter.PermissionWrite) {
+			return base, &writeexec.PolicyViolationError{Phase: "pre-launch", Reason: "the bounded-write executor received a non-write immutable contract"}
+		}
+		provider := opts.Provider
+		if provider != nestedTestSubprocessProvider {
+			provider = firstNonEmptyNested(request.Work.Provider, request.ProviderDecision.AdapterID, opts.Provider)
+		}
+		if provider != opts.Provider {
+			return base, &writeexec.PolicyViolationError{Phase: "pre-launch", Reason: "the persisted provider route does not match the registered bounded-write adapter"}
+		}
+		if err := preflightNestedWriteRoute(provider, opts.HostProfile); err != nil {
+			return base, &writeexec.PolicyViolationError{Phase: "pre-launch", Reason: "the persisted provider route is not supported for bounded-write execution"}
+		}
+		if err := validateNestedWriteContract(request); err != nil {
+			return base, err
+		}
+
+		enforcementOpts, evidenceDir, err := nestedWriteEnforcementOptions(ctx, opts, request)
+		if err != nil {
+			var policyErr *writeexec.PolicyViolationError
+			if errors.As(err, &policyErr) {
+				return base, err
+			}
+			return base, &writeexec.PolicyViolationError{Phase: "pre-launch", Reason: "the private bounded-write authority could not be prepared"}
+		}
+		base.WorktreePath = enforcementOpts.WorktreePath
+		if existing, ok, err := completedNestedWriteAttempt(opts.RepoPath, child, provider, enforcementOpts); err != nil {
+			return base, err
+		} else if ok {
+			return existing, nil
+		}
+		environment, err := prepareNestedWriteEnvironment(evidenceDir, request.ClaimGeneration)
+		if err != nil {
+			return base, &writeexec.PolicyViolationError{Phase: "pre-launch", Reason: "the private Git deny hooks could not be prepared"}
+		}
+
+		session, baselineAudit, err := writeexec.Begin(ctx, enforcementOpts)
+		base.MutationManifest = nestedMutationManifest(baselineAudit)
+		if err != nil {
+			return base, err
+		}
+		started := deps.Now().UTC()
+		runCtx := ctx
+		cancel := func() {}
+		if request.Work.TimeoutSeconds > 0 {
+			runCtx, cancel = context.WithTimeout(ctx, time.Duration(request.Work.TimeoutSeconds)*time.Second)
+		}
+		defer cancel()
+		providerResult, runErr := runNestedWriteProvider(runCtx, opts, request, provider, deps, evidenceDir, enforcementOpts.WorktreePath, environment, stderr)
+		ended := deps.Now().UTC()
+		status := nestedAgentStatus(providerResult, runErr)
+		summary := strings.TrimSpace(recovery.Scrub(providerResult.Summary))
+		if summary == "" {
+			if runErr == nil && status == orchestration.NestedStatusSucceeded {
+				summary = "bounded-write child completed"
+			} else if runErr == nil {
+				summary = "bounded-write child did not complete successfully"
+			} else {
+				summary = strings.TrimSpace(recovery.Scrub(runErr.Error()))
+			}
+		}
+		summary = boundedNestedText(summary)
+
+		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		audit, enforcementErr := session.Finish(verifyCtx, status)
+		verifyCancel()
+		auditRecord := nestedMutationManifest(audit)
+		base.MutationManifest = auditRecord
+		if enforcementErr != nil {
+			status = orchestration.NestedStatusNeedsHuman
+		}
+		exitCode := providerResult.ExitCode
+		if exitCode == 0 && (runErr != nil || enforcementErr != nil) {
+			exitCode = 1
+		}
+		reportRecord := reporter.Report{
+			WorkID:      child.RunID,
+			Issue:       child.Issue,
+			Role:        reporter.RoleWorker,
+			Provider:    provider,
+			Model:       firstNonEmptyNested(providerResult.Model, request.Work.Model, opts.Model),
+			ModelSource: reporter.ModelSourceForProvider(provider),
+			Effort:      firstNonEmptyNested(providerResult.Effort, request.Work.Effort, opts.Effort),
+			Permission:  reporter.PermissionWrite,
+			Action:      "execute bounded-write nested child " + child.ChildKey,
+			ExitCode:    exitCode,
+			StartedAt:   firstNonEmptyNested(providerResult.StartedAt, state.FormatTimestamp(started)),
+			EndedAt:     firstNonEmptyNested(providerResult.EndedAt, state.FormatTimestamp(ended)),
+			DurationMS:  maxNestedDuration(providerResult.DurationMS, ended.Sub(started).Milliseconds()),
+			Usage:       providerResult.Usage,
+			Verified:    enforcementErr == nil && runErr == nil && status == orchestration.NestedStatusSucceeded,
+		}
+		errText := ""
+		if enforcementErr != nil {
+			errText = enforcementErr.Error()
+		} else if status != orchestration.NestedStatusSucceeded {
+			errText = summary
+		}
+		attemptPath, writeErr := writeNestedWriteAttempt(opts.RepoPath, child, request.ClaimGeneration, provider, reportRecord, status, exitCode, summary, errText, auditRecord, enforcementOpts.WorktreePath, deps.Now)
+		var persistenceErr error
+		if writeErr != nil {
+			fmt.Fprintf(stderr, "[loopcoder] warning: failed to write nested bounded-write attempt: %v\n", writeErr)
+			attemptPath = ""
+			status = orchestration.NestedStatusNeedsHuman
+			reportRecord.Verified = false
+			if reportRecord.ExitCode == 0 {
+				reportRecord.ExitCode = 1
+			}
+			persistenceErr = &writeexec.PolicyViolationError{Phase: "attempt-persistence", Reason: "the verified mutation manifest could not be persisted to the durable child attempt"}
+		}
+		base.Status = status
+		base.StartedAt = reportRecord.StartedAt
+		base.FinishedAt = reportRecord.EndedAt
+		base.AttemptPath = attemptPath
+		base.ProviderReceipt = attemptPath
+		base.Report = &reportRecord
+		base.MutationManifest = auditRecord
+		base.WorktreePath = enforcementOpts.WorktreePath
+		if persistenceErr != nil {
+			base.Error = persistenceErr.Error()
+			base.Reason = "bounded-write completion was withheld because its durable attempt could not be persisted"
+			base.NextAction = "inspect the preserved private manifest and repair local attempt storage before reconciliation"
+			return base, persistenceErr
+		}
+		if enforcementErr != nil {
+			base.Error = enforcementErr.Error()
+			base.Reason = "bounded-write enforcement detected or could not rule out a forbidden state change"
+			base.NextAction = "inspect the preserved mutation manifest and isolated worktree before replaying this child"
+			return base, enforcementErr
+		}
+		if runErr != nil {
+			base.Error = summary
+			base.Reason = summary
+			base.NextAction = "inspect the preserved bounded-write attempt and isolated worktree before recovery"
+			return base, sanitizeNestedWriteProviderError(runErr)
+		}
+		base.Reason = summary
+		if status != orchestration.NestedStatusSucceeded {
+			base.Error = summary
+			base.NextAction = "inspect the bounded-write attempt and isolated worktree before replaying the unchanged plan"
+		}
+		return base, nil
+	}
+}
+
+func validateNestedWriteContract(request orchestration.ChildExecutionRequest) error {
+	if request.ClaimGeneration <= 0 || len(request.MutationScope.Paths) == 0 {
+		return &writeexec.PolicyViolationError{Phase: "pre-launch", Reason: "bounded-write execution requires a fenced claim and a non-empty concrete path scope"}
+	}
+	if len(request.MutationScope.PullRequests) > 0 || len(request.MutationScope.Data) > 0 {
+		return &writeexec.PolicyViolationError{Phase: "pre-launch", Reason: "bounded-write execution supports local path mutations only"}
+	}
+	if len(request.Capabilities.Network) > 0 || len(request.Capabilities.Delegation) > 0 {
+		return &writeexec.PolicyViolationError{Phase: "pre-launch", Reason: "bounded-write execution cannot receive network or delegation capability"}
+	}
+	if strings.TrimSpace(request.Work.Branch) != "" {
+		return &writeexec.PolicyViolationError{Phase: "pre-launch", Reason: "bounded-write execution cannot receive branch authority"}
+	}
+	return nil
+}
+
+func nestedWriteEnforcementOptions(ctx context.Context, opts nestedRunOptions, request orchestration.ChildExecutionRequest) (writeexec.Options, string, error) {
+	roots, err := runtimepath.Resolve(ctx, opts.RepoPath)
+	if err != nil {
+		return writeexec.Options{}, "", err
+	}
+	projectKey, err := nestedPrivateProjectKey(opts.RepoPath, roots.ProjectID)
+	if err != nil {
+		return writeexec.Options{}, "", fmt.Errorf("resolve private nested write project identity: %w", err)
+	}
+	child := request.ChildRunPlan()
+	evidenceDir := filepath.Join(roots.LogsRoot, "nested-write", projectKey, nestedPrivateRunKey(child.RunID))
+	if err := os.MkdirAll(evidenceDir, 0o700); err != nil {
+		return writeexec.Options{}, "", fmt.Errorf("prepare private nested write evidence: %w", err)
+	}
+	requestedBase, _ := gitutil.New().RevParse(ctx, opts.RepoPath, "origin/"+strings.TrimSpace(opts.BaseBranch))
+	baseRevision, err := writeexec.ResolveAuthority(filepath.Join(evidenceDir, "authority.json"), request.ContractFingerprint, requestedBase)
+	if err != nil {
+		return writeexec.Options{}, "", err
+	}
+	claimKey := fmt.Sprintf("claim-%d", request.ClaimGeneration)
+	worktreePath := filepath.Join(roots.TmpRoot, "nested-write", projectKey, nestedPrivateRunKey(child.RunID), claimKey, "worktree")
+	projectStatePaths := []string{filepath.Join(opts.RepoPath, ".loopcoder")}
+	excludedStatePaths := make([]string, 0, len(opts.SchedulerRunIDs))
+	for _, runID := range opts.SchedulerRunIDs {
+		if strings.TrimSpace(runID) == "" || strings.TrimSpace(runID) == child.RunID {
+			continue
+		}
+		excludedStatePaths = append(excludedStatePaths, state.RunPath(opts.RepoPath, runID))
+	}
+	if roots.Registered && strings.TrimSpace(roots.ProjectRoot) != "" {
+		projectStatePaths = append(projectStatePaths, roots.ProjectRoot)
+	}
+	return writeexec.Options{
+		RepoPath:            opts.RepoPath,
+		WorktreePath:        worktreePath,
+		EvidencePath:        filepath.Join(evidenceDir, claimKey+"-enforcement.json"),
+		ContractFingerprint: request.ContractFingerprint,
+		ClaimGeneration:     request.ClaimGeneration,
+		BaseRevision:        baseRevision,
+		AllowedPaths:        append([]string(nil), request.MutationScope.Paths...),
+		ProjectStatePaths:   projectStatePaths,
+		ExcludedPaths:       excludedStatePaths,
+	}, evidenceDir, nil
+}
+
+func prepareNestedWriteEnvironment(evidenceDir string, claimGeneration int64) (map[string]string, error) {
+	hooksDir := filepath.Join(evidenceDir, fmt.Sprintf("claim-%d-hooks", claimGeneration))
+	if err := os.MkdirAll(hooksDir, 0o700); err != nil {
+		return nil, err
+	}
+	denyHook := []byte("#!/bin/sh\nexit 1\n")
+	for _, name := range []string{"pre-commit", "commit-msg", "pre-merge-commit", "pre-rebase", "pre-push"} {
+		path := filepath.Join(hooksDir, name)
+		if err := os.WriteFile(path, denyHook, 0o700); err != nil {
+			return nil, err
+		}
+		if err := os.Chmod(path, 0o700); err != nil {
+			return nil, err
+		}
+	}
+	return map[string]string{
+		"GIT_OPTIONAL_LOCKS":  "0",
+		"GIT_ALLOW_PROTOCOL":  "",
+		"GIT_TERMINAL_PROMPT": "0",
+		"GIT_ASKPASS":         "false",
+		"GCM_INTERACTIVE":     "never",
+		"GIT_CONFIG_NOSYSTEM": "1",
+		"GIT_CONFIG_GLOBAL":   os.DevNull,
+		"GIT_CONFIG_COUNT":    "1",
+		"GIT_CONFIG_KEY_0":    "core.hooksPath",
+		"GIT_CONFIG_VALUE_0":  hooksDir,
+	}, nil
+}
+
+func runNestedWriteProvider(ctx context.Context, opts nestedRunOptions, request orchestration.ChildExecutionRequest, provider string, deps Deps, evidenceDir, worktreePath string, environment map[string]string, stderr io.Writer) (agent.Result, error) {
+	if provider == nestedTestSubprocessProvider {
+		return runNestedTestSubprocess(ctx, opts, request, worktreePath, environment)
+	}
+	runner, err := deps.AgentLookup(provider)
+	if err != nil {
+		return agent.Result{}, err
+	}
+	promptData, err := json.MarshalIndent(request, "", "  ")
+	if err != nil {
+		return agent.Result{}, fmt.Errorf("encode immutable child contract: %w", err)
+	}
+	prompt := "Execute this LoopCoder child only inside the current detached isolated worktree. Modify only the relative equivalents of allowed_mutation_scope.paths. Do not stage, commit, create or move refs, merge, rebase, tag, push, publish, change Git configuration/remotes/hooks/credentials, access the parent checkout, use network or MCP tools, or delegate work. Stop after the scoped file edits and return a concise summary.\n\nImmutable execution contract:\n" + string(promptData)
+	return runner.Run(ctx, agent.Invocation{
+		WorktreePath: worktreePath,
+		Prompt:       prompt,
+		Model:        firstNonEmptyNested(request.Work.Model, opts.Model),
+		Effort:       firstNonEmptyNested(request.Work.Effort, opts.Effort),
+		BoundedWrite: true,
+		Environment:  environment,
+		LogPath:      filepath.Join(evidenceDir, fmt.Sprintf("claim-%d-provider.log", request.ClaimGeneration)),
+		Stderr:       stderr,
+		HardCap:      nestedProviderHardCap(request.Work.TimeoutSeconds),
+		RunID:        request.RunID,
+		Role:         "nested-bounded-write",
+		ProviderKey:  request.IdempotencyKey,
+	})
+}
+
 func runNestedReadOnlyProvider(ctx context.Context, opts nestedRunOptions, request orchestration.ChildExecutionRequest, provider string, deps Deps, evidenceDir string, stderr io.Writer) (agent.Result, error) {
 	if provider == nestedTestSubprocessProvider {
 		return runNestedReadOnlyTestSubprocess(ctx, opts, request)
@@ -630,6 +984,10 @@ func runNestedReadOnlyProvider(ctx context.Context, opts nestedRunOptions, reque
 }
 
 func runNestedReadOnlyTestSubprocess(ctx context.Context, opts nestedRunOptions, request orchestration.ChildExecutionRequest) (agent.Result, error) {
+	return runNestedTestSubprocess(ctx, opts, request, opts.RepoPath, map[string]string{"GIT_OPTIONAL_LOCKS": "0"})
+}
+
+func runNestedTestSubprocess(ctx context.Context, opts nestedRunOptions, request orchestration.ChildExecutionRequest, worktreePath string, environment map[string]string) (agent.Result, error) {
 	child := request.ChildRunPlan()
 	if len(child.Scope.Commands) == 0 {
 		return agent.Result{}, fmt.Errorf("test-subprocess child %q requires at least one scope.commands entry", child.ChildKey)
@@ -645,8 +1003,8 @@ func runNestedReadOnlyTestSubprocess(ctx context.Context, opts nestedRunOptions,
 		}
 		executed = true
 		cmd := shellCommand(context.Background(), command)
-		cmd.Dir = opts.RepoPath
-		cmd.Env = environmentWithOverride(os.Environ(), "GIT_OPTIONAL_LOCKS", "0")
+		cmd.Dir = worktreePath
+		cmd.Env = environmentWithOverridesCLI(os.Environ(), environment)
 		cmd.Stdout = &output
 		cmd.Stderr = &output
 		execResult, err := supervisedexec.Run(ctx, cmd, supervisedexec.Options{
@@ -720,6 +1078,28 @@ func nestedReadOnlyAudit(audit readonlyexec.Audit) *state.ReadOnlyEnforcementAud
 	}
 }
 
+func nestedMutationManifest(audit writeexec.Audit) *state.MutationManifestAudit {
+	changes := make([]state.MutationManifestChange, 0, len(audit.Changes))
+	for _, change := range audit.Changes {
+		changes = append(changes, state.MutationManifestChange{
+			Path: change.Path, Kind: change.Kind, BeforeHash: change.BeforeHash, AfterHash: change.AfterHash,
+		})
+	}
+	violations := make([]state.MutationManifestViolation, 0, len(audit.Violations))
+	for _, violation := range audit.Violations {
+		violations = append(violations, state.MutationManifestViolation{
+			Code: violation.Code, Surface: violation.Surface, TargetID: violation.TargetID,
+			BeforeHash: violation.BeforeHash, AfterHash: violation.AfterHash,
+		})
+	}
+	return &state.MutationManifestAudit{
+		Mode: audit.Mode, Verification: audit.Verification, WorktreeID: audit.WorktreeID,
+		BaseRevision: audit.BaseRevision, BaselineFingerprint: audit.BaselineFingerprint,
+		PostRunFingerprint: audit.PostRunFingerprint, ManifestFingerprint: audit.ManifestFingerprint,
+		Recovered: audit.Recovered, Changes: changes, Violations: violations,
+	}
+}
+
 func nestedAgentStatus(result agent.Result, err error) string {
 	if err != nil {
 		return normalizeExecutorFailureStatus(err)
@@ -788,6 +1168,23 @@ func sanitizeNestedProviderError(err error) error {
 	return errors.New(message)
 }
 
+func sanitizeNestedWriteProviderError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) {
+		return fmt.Errorf("nested bounded-write provider canceled: %w", context.Canceled)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("nested bounded-write provider timed out: %w", context.DeadlineExceeded)
+	}
+	message := boundedNestedText(recovery.Scrub(err.Error()))
+	if strings.TrimSpace(message) == "" {
+		message = "nested bounded-write provider failed"
+	}
+	return errors.New(message)
+}
+
 func environmentWithOverride(environ []string, key, value string) []string {
 	prefix := key + "="
 	out := make([]string, 0, len(environ)+1)
@@ -797,6 +1194,14 @@ func environmentWithOverride(environ []string, key, value string) []string {
 		}
 	}
 	return append(out, prefix+value)
+}
+
+func environmentWithOverridesCLI(environ []string, overrides map[string]string) []string {
+	result := append([]string(nil), environ...)
+	for key, value := range overrides {
+		result = environmentWithOverride(result, key, value)
+	}
+	return result
 }
 
 func completedNestedAttempt(repoPath string, child orchestration.ChildRunPlan, provider string, enforcementOpts readonlyexec.Options) (orchestration.ChildRunResult, bool, error) {
@@ -851,9 +1256,62 @@ func completedNestedAttempt(repoPath string, child orchestration.ChildRunPlan, p
 	return orchestration.ChildRunResult{}, false, nil
 }
 
+func completedNestedWriteAttempt(repoPath string, child orchestration.ChildRunPlan, provider string, enforcementOpts writeexec.Options) (orchestration.ChildRunResult, bool, error) {
+	attempts, err := state.LoadAttempts(repoPath, child.RunID)
+	if err != nil {
+		return orchestration.ChildRunResult{}, false, err
+	}
+	for i := len(attempts) - 1; i >= 0; i-- {
+		attempt := attempts[i]
+		status := state.NormalizeStatus(attempt.Status)
+		if status != state.StatusSucceeded || strings.TrimSpace(attempt.Provider) != strings.TrimSpace(provider) || attempt.MutationManifest == nil || attempt.MutationManifest.Mode != writeexec.EnforcementMode || attempt.MutationManifest.Verification != writeexec.VerificationPassed || strings.TrimSpace(attempt.WorktreePath) != strings.TrimSpace(enforcementOpts.WorktreePath) {
+			continue
+		}
+		verified, err := writeexec.ReconcileVerified(context.Background(), enforcementOpts)
+		if err != nil {
+			return orchestration.ChildRunResult{}, false, err
+		}
+		verifiedAudit := nestedMutationManifest(verified)
+		if !sameNestedMutationManifest(attempt.MutationManifest, verifiedAudit) {
+			return orchestration.ChildRunResult{}, false, &writeexec.PolicyViolationError{Phase: "reconciliation", Reason: "the successful attempt does not match its private bounded-write enforcement evidence"}
+		}
+		result := orchestration.ChildRunResult{
+			ID: child.ID, ChildKey: child.ChildKey, Title: child.Title, Role: child.Role,
+			RunID: child.RunID, Issue: child.Issue, Scope: child.Scope, Permission: child.Permission,
+			DependsOn: append([]string(nil), child.DependsOn...), Aggregation: child.Aggregation,
+			Required: child.Required, Optional: child.Optional, Ordinal: child.Ordinal, Depth: child.Depth,
+			Status: normalizeExecutorStatus(status), ReplayAction: child.ReplayAction,
+			StartedAt: attempt.StartedAt, FinishedAt: attempt.HeartbeatAt,
+			Error: attempt.Error, Reason: firstNonEmptyNested(attempt.Summary, attempt.Error),
+			AttemptPath: attempt.Path, ProviderKey: child.ProviderKey, ProviderReceipt: attempt.Path,
+			RecoveryContextPath: attempt.RecoveryContextPath, Report: attempt.Report,
+			MutationManifest: verifiedAudit, WorktreePath: enforcementOpts.WorktreePath,
+		}
+		return result, true, nil
+	}
+	return orchestration.ChildRunResult{}, false, nil
+}
+
 func sameNestedReadOnlyAudit(left, right *state.ReadOnlyEnforcementAudit) bool {
 	if left == nil || right == nil || left.Mode != right.Mode || left.Verification != right.Verification || left.BaselineFingerprint != right.BaselineFingerprint || left.PostRunFingerprint != right.PostRunFingerprint || left.Recovered != right.Recovered || len(left.Violations) != len(right.Violations) {
 		return false
+	}
+	for index := range left.Violations {
+		if left.Violations[index] != right.Violations[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameNestedMutationManifest(left, right *state.MutationManifestAudit) bool {
+	if left == nil || right == nil || left.Mode != right.Mode || left.Verification != right.Verification || left.WorktreeID != right.WorktreeID || left.BaseRevision != right.BaseRevision || left.BaselineFingerprint != right.BaselineFingerprint || left.PostRunFingerprint != right.PostRunFingerprint || left.ManifestFingerprint != right.ManifestFingerprint || left.Recovered != right.Recovered || len(left.Changes) != len(right.Changes) || len(left.Violations) != len(right.Violations) {
+		return false
+	}
+	for index := range left.Changes {
+		if left.Changes[index] != right.Changes[index] {
+			return false
+		}
 	}
 	for index := range left.Violations {
 		if left.Violations[index] != right.Violations[index] {
@@ -996,6 +1454,18 @@ func renderNestedText(report orchestration.NestedScheduleReport) string {
 			}
 			line += fmt.Sprintf(" read_only_violations=%d", len(child.ReadOnlyEnforcement.Violations))
 		}
+		if child.MutationManifest != nil {
+			line += " write_mode=" + reporter.BoundDecisionText(child.MutationManifest.Mode)
+			line += " write_verification=" + reporter.BoundDecisionText(child.MutationManifest.Verification)
+			line += " base_revision=" + reporter.BoundDecisionText(child.MutationManifest.BaseRevision)
+			if child.MutationManifest.ManifestFingerprint != "" {
+				line += " manifest=" + reporter.BoundDecisionText(child.MutationManifest.ManifestFingerprint)
+			}
+			line += fmt.Sprintf(" changes=%d write_violations=%d", len(child.MutationManifest.Changes), len(child.MutationManifest.Violations))
+		}
+		if child.WorktreePath != "" {
+			line += " worktree=" + reporter.BoundDecisionText(child.WorktreePath)
+		}
 		if child.Error != "" {
 			line += " error=" + reporter.BoundDecisionText(child.Error)
 		}
@@ -1009,6 +1479,19 @@ func renderNestedText(report orchestration.NestedScheduleReport) string {
 		if child.ReadOnlyEnforcement != nil {
 			for _, violation := range child.ReadOnlyEnforcement.Violations {
 				fmt.Fprintf(&b, "  policy_violation code=%s surface=%s target=%s before=%s after=%s\n",
+					reporter.BoundDecisionText(violation.Code), reporter.BoundDecisionText(violation.Surface),
+					reporter.BoundDecisionText(violation.TargetID), reporter.BoundDecisionText(violation.BeforeHash),
+					reporter.BoundDecisionText(violation.AfterHash))
+			}
+		}
+		if child.MutationManifest != nil {
+			for _, change := range child.MutationManifest.Changes {
+				fmt.Fprintf(&b, "  mutation path=%s kind=%s before=%s after=%s\n",
+					reporter.BoundDecisionText(change.Path), reporter.BoundDecisionText(change.Kind),
+					reporter.BoundDecisionText(change.BeforeHash), reporter.BoundDecisionText(change.AfterHash))
+			}
+			for _, violation := range child.MutationManifest.Violations {
+				fmt.Fprintf(&b, "  write_policy_violation code=%s surface=%s target=%s before=%s after=%s\n",
 					reporter.BoundDecisionText(violation.Code), reporter.BoundDecisionText(violation.Surface),
 					reporter.BoundDecisionText(violation.TargetID), reporter.BoundDecisionText(violation.BeforeHash),
 					reporter.BoundDecisionText(violation.AfterHash))
@@ -1066,6 +1549,40 @@ func writeNestedAttempt(repoPath string, child orchestration.ChildRunPlan, provi
 		Usage:               &record.Usage,
 		Report:              &record,
 		ReadOnlyEnforcement: enforcement,
+	})
+}
+
+func writeNestedWriteAttempt(repoPath string, child orchestration.ChildRunPlan, claimGeneration int64, provider string, record reporter.Report, status string, exitCode int, summary, errText string, manifest *state.MutationManifestAudit, worktreePath string, now func() time.Time) (string, error) {
+	if now == nil {
+		now = time.Now
+	}
+	at := state.FormatTimestamp(now())
+	var errPtr *string
+	if strings.TrimSpace(errText) != "" {
+		errCopy := strings.TrimSpace(errText)
+		errPtr = &errCopy
+	}
+	return state.WriteAttempt(repoPath, child.RunID, state.AttemptRecord{
+		Version:          1,
+		JobID:            fmt.Sprintf("job-%s-nested-write-claim-%d", child.ChildKey, claimGeneration),
+		Issue:            child.Issue,
+		Attempt:          1,
+		Provider:         strings.TrimSpace(provider),
+		PID:              os.Getpid(),
+		Phase:            "nested_write_verified",
+		Status:           status,
+		Branch:           "",
+		StartedAt:        record.StartedAt,
+		HeartbeatAt:      at,
+		LastProgressAt:   at,
+		LogBytes:         int64(len(summary)),
+		ExitCode:         &exitCode,
+		Error:            errPtr,
+		Summary:          strings.TrimSpace(summary),
+		Usage:            &record.Usage,
+		Report:           &record,
+		MutationManifest: manifest,
+		WorktreePath:     strings.TrimSpace(worktreePath),
 	})
 }
 

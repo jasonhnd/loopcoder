@@ -306,9 +306,21 @@ after every provider outcome. Existing user dirt is part of the baseline, while
 changes to checkout content, the index, refs, config, hooks, linked worktrees,
 or guarded LoopCoder state produce a path-free typed policy violation and
 `needs-human`. Evidence is preserved and no automatic remediation occurs.
-Production-provider write, orchestrate, and provider-native modes remain
-refused. `test-subprocess` is deterministic test infrastructure only, but runs
-through the same mutation enforcement.
+
+The nested bounded-write boundary is also separate from Worker dispatch. Codex
+and Grok may edit only one detached, machine-local worktree for the fenced claim
+generation; Claude and unsupported providers fail before launch. The immutable
+contract must contain a non-empty canonical path scope and no branch, network,
+remote-side-effect, or delegation authority. A private authority record pins
+the first exact base commit. Pre-run and post-run snapshots compare the full
+child tree plus the parent checkout, sibling worktrees, Git refs/index/config/
+hooks/credentials, and guarded LoopCoder state. Only authorized file changes
+enter the bounded manifest. Policy violations force `needs-human`, successful
+manifests are reconciled before replay, and a stale generation is fenced from
+publishing its manifest or completion. The executor never stages, commits,
+pushes, merges, tags, publishes, or copies changes back. Orchestrate and
+provider-native modes remain refused. `test-subprocess` is deterministic test
+infrastructure only, but runs through the same permission-specific enforcement.
 
 ### Delivery Guardrails
 

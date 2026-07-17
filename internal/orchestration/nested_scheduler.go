@@ -44,7 +44,8 @@ const (
 	NestedEventChildFinished = "nested.child.finished"
 	NestedEventParentDone    = "nested.parent.finished"
 
-	NestedOutcomeReadOnlyPolicyViolation = "read_only_policy_violation"
+	NestedOutcomeReadOnlyPolicyViolation   = "read_only_policy_violation"
+	NestedOutcomeWriteScopePolicyViolation = "write_scope_policy_violation"
 
 	ReplayActionNew     = "new"
 	ReplayActionReused  = "reused"
@@ -174,6 +175,8 @@ type ChildRunResult struct {
 	RecoveryContextPath string                          `json:"recovery_context_path,omitempty"`
 	Report              *reporter.Report                `json:"report,omitempty"`
 	ReadOnlyEnforcement *state.ReadOnlyEnforcementAudit `json:"read_only_enforcement,omitempty"`
+	MutationManifest    *state.MutationManifestAudit    `json:"mutation_manifest,omitempty"`
+	WorktreePath        string                          `json:"worktree_path,omitempty"`
 }
 
 type NestedSummary struct {
@@ -673,11 +676,23 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		if err != nil {
 			var policyViolation interface{ ChildExecutionPolicyViolation() }
 			if errors.As(err, &policyViolation) {
+				outcome := NestedOutcomeReadOnlyPolicyViolation
+				var outcomeError interface{ ChildExecutionPolicyOutcome() string }
+				if errors.As(err, &outcomeError) {
+					if candidate := strings.TrimSpace(outcomeError.ChildExecutionPolicyOutcome()); candidate != "" {
+						outcome = candidate
+					}
+				}
 				result.Status = NestedStatusNeedsHuman
-				result.Outcome = NestedOutcomeReadOnlyPolicyViolation
+				result.Outcome = outcome
 				result.Error = err.Error()
-				result.Reason = "the read-only child changed or could not conclusively verify a guarded state surface"
-				result.NextAction = "inspect the preserved read-only enforcement evidence before any replay"
+				if outcome == NestedOutcomeWriteScopePolicyViolation {
+					result.Reason = "the bounded-write child changed or could not conclusively verify an authorized state surface"
+					result.NextAction = "inspect the preserved bounded-write enforcement evidence before any replay"
+				} else {
+					result.Reason = "the read-only child changed or could not conclusively verify a guarded state surface"
+					result.NextAction = "inspect the preserved read-only enforcement evidence before any replay"
+				}
 			} else {
 				result.Status = normalizeNestedStatus(state.FailureStatus(err))
 				result.Error = err.Error()
@@ -701,6 +716,19 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			markSuppressParentDone()
 		}
 		if storage.IsStaleChildRunClaim(completeClaimErr) {
+			// A stale owner may retain private evidence for diagnosis, but it must
+			// never publish a mutation manifest, provider receipt, or attempt as if
+			// its generation had completed the durable child run.
+			result.MutationManifest = nil
+			result.ReadOnlyEnforcement = nil
+			result.WorktreePath = ""
+			result.ProviderReceipt = ""
+			result.AttemptPath = ""
+			result.RecoveryContextPath = ""
+			result.Report = nil
+			result.Outcome = ""
+			result.Reason = ""
+			result.FinishedAt = ""
 			result.Status = NestedStatusNeedsHuman
 			result.Error = completeClaimErr.Error()
 			result.NextAction = "observe the current durable child owner before publishing terminal state"
@@ -842,8 +870,8 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 	report.Summary = nestedSummary(results)
 	report.Status = nestedParentStatus(results)
 	for _, child := range results {
-		if child.Outcome == NestedOutcomeReadOnlyPolicyViolation {
-			report.Outcome = NestedOutcomeReadOnlyPolicyViolation
+		if isNestedPolicyViolationOutcome(child.Outcome) {
+			report.Outcome = child.Outcome
 			report.Status = NestedStatusNeedsHuman
 			break
 		}
@@ -1471,6 +1499,15 @@ func mergeChildResult(base, result ChildRunResult) ChildRunResult {
 		audit.Violations = append([]state.ReadOnlyEnforcementViolation(nil), result.ReadOnlyEnforcement.Violations...)
 		base.ReadOnlyEnforcement = &audit
 	}
+	if result.MutationManifest != nil {
+		audit := *result.MutationManifest
+		audit.Changes = append([]state.MutationManifestChange(nil), result.MutationManifest.Changes...)
+		audit.Violations = append([]state.MutationManifestViolation(nil), result.MutationManifest.Violations...)
+		base.MutationManifest = &audit
+	}
+	if strings.TrimSpace(result.WorktreePath) != "" {
+		base.WorktreePath = strings.TrimSpace(result.WorktreePath)
+	}
 	if strings.TrimSpace(result.StartedAt) != "" {
 		base.StartedAt = strings.TrimSpace(result.StartedAt)
 	}
@@ -1478,6 +1515,15 @@ func mergeChildResult(base, result ChildRunResult) ChildRunResult {
 		base.FinishedAt = strings.TrimSpace(result.FinishedAt)
 	}
 	return base
+}
+
+func isNestedPolicyViolationOutcome(outcome string) bool {
+	switch strings.TrimSpace(outcome) {
+	case NestedOutcomeReadOnlyPolicyViolation, NestedOutcomeWriteScopePolicyViolation:
+		return true
+	default:
+		return false
+	}
 }
 
 func nestedExecutorID(parentRunID string) string {

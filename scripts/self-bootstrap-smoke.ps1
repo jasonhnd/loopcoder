@@ -166,6 +166,9 @@ $childRunBeta = "run-20260709T000001Z-child-1-self-bootstrap-beta"
 $childRunGamma = "run-20260709T000001Z-child-2-self-bootstrap-gamma"
 $mutationParentRun = "run-20260709T000002Z-wave-read-only-mutation"
 $mutationChildRun = "run-20260709T000003Z-child-0-read-only-mutation"
+$writeParentRun = "run-20260709T000004Z-wave-bounded-write"
+$writeChildRun = "run-20260709T000005Z-child-0-bounded-write"
+$boundedWriteWorktree = ""
 
 try {
     Invoke-Checked "register loopcoder checkout in machine-local project registry" {
@@ -355,6 +358,86 @@ try {
     }
     Remove-Item -LiteralPath $mutationMarkerPath -Force
 
+    $writeTargetRelative = "docs/reference/self-bootstrap.md"
+    $writeTargetPath = Join-Path $repoPath $writeTargetRelative
+    $writeTargetHashBefore = Get-SHA256 $writeTargetPath
+    $worktreeCountBeforeWrite = @(& git -C $repoPath worktree list --porcelain | Where-Object { $_ -match '^worktree ' }).Count
+    if ($LASTEXITCODE -ne 0) {
+        Fail "could not inventory worktrees before bounded-write smoke"
+    }
+    $writePlanPath = Join-Path $artifactDir "bounded-write-plan.json"
+    $writePlan = @{
+        schema_version = "loopcoder.child_plan.v1"
+        plan_id = "plan-$writeParentRun"
+        parent_run_id = $writeParentRun
+        root_run_id = $writeParentRun
+        parent_depth = 0
+        max_depth = 2
+        max_concurrency = 1
+        created_at = "2026-07-09T00:00:04Z"
+        items = @(
+            @{
+                child_key = "bounded-write"
+                title = "bounded-write"
+                role = "worker"
+                run_id = $writeChildRun
+                issue = 1007
+                scope = @{
+                    repo = "."
+                    paths = @($writeTargetRelative)
+                    issues = @(1007)
+                    commands = @("printf 'bounded write smoke\n' >> $writeTargetRelative")
+                }
+                permission = "write"
+                depends_on = @()
+                aggregation = @{
+                    mode = "collect"
+                    required = $true
+                    include_report = $true
+                }
+            }
+        )
+    }
+    ($writePlan | ConvertTo-Json -Depth 10) | Set-Content -LiteralPath $writePlanPath -Encoding utf8
+
+    Invoke-Checked "execute packaged bounded-write child smoke" {
+        $script:writeOutput = @(& $binaryPath nested run --repo $repoPath --plan $writePlanPath --provider test-subprocess --base-branch main --format json)
+        $script:writeOutput | Set-Content -LiteralPath (Join-Path $artifactDir "bounded-write-result.json") -Encoding utf8
+    }
+    $writeResult = ConvertFrom-JsonOutput $writeOutput "bounded-write nested run"
+    $writeChild = @($writeResult.children) | Select-Object -First 1
+    if ($writeResult.status -ne "succeeded" -or -not $writeChild -or $writeChild.status -ne "succeeded") {
+        Fail "bounded-write packaged smoke did not succeed"
+    }
+    if (-not $writeChild.mutation_manifest -or $writeChild.mutation_manifest.verification -ne "passed" -or @($writeChild.mutation_manifest.changes | Where-Object { $_.path -eq $writeTargetRelative }).Count -lt 1) {
+        Fail "bounded-write packaged smoke omitted the allowed mutation manifest"
+    }
+    if (-not $writeChild.worktree_path -or -not $writeChild.attempt_path) {
+        Fail "bounded-write packaged smoke omitted its preserved worktree or attempt path"
+    }
+    Assert-OutsideRepo -Path $writeChild.worktree_path -RepoPath $repoPath -Label "bounded-write child worktree"
+    Assert-OutsideRepo -Path $writeChild.attempt_path -RepoPath $repoPath -Label "bounded-write child attempt"
+    $boundedWriteWorktree = $writeChild.worktree_path
+    $worktreeCountAfterWrite = @(& git -C $repoPath worktree list --porcelain | Where-Object { $_ -match '^worktree ' }).Count
+    if ($LASTEXITCODE -ne 0 -or $worktreeCountAfterWrite -ne ($worktreeCountBeforeWrite + 1)) {
+        Fail "bounded-write packaged smoke did not register exactly one isolated worktree"
+    }
+    if ((Get-SHA256 $writeTargetPath) -ne $writeTargetHashBefore) {
+        Fail "bounded-write packaged smoke modified the parent checkout"
+    }
+    $writeChildTarget = Join-Path $writeChild.worktree_path $writeTargetRelative
+    if (-not (Test-Path -LiteralPath $writeChildTarget) -or (Get-SHA256 $writeChildTarget) -eq $writeTargetHashBefore) {
+        Fail "bounded-write packaged smoke did not preserve the child mutation"
+    }
+    Invoke-Checked "remove packaged bounded-write smoke worktree" {
+        & git -C $repoPath worktree remove --force $writeChild.worktree_path
+    }
+    $boundedWriteWorktree = ""
+    $worktreeCountAfterCleanup = @(& git -C $repoPath worktree list --porcelain | Where-Object { $_ -match '^worktree ' }).Count
+    if ($LASTEXITCODE -ne 0 -or $worktreeCountAfterCleanup -ne $worktreeCountBeforeWrite) {
+        Fail "bounded-write packaged smoke cleanup left a registered worktree"
+    }
+
     Invoke-Checked "render status run tree (human)" {
         $script:statusTextOutput = @(& $binaryPath status --repo $repoPath --run $childRun --format text)
         $script:statusTextOutput | Set-Content -LiteralPath (Join-Path $artifactDir "status.txt") -Encoding utf8
@@ -469,6 +552,9 @@ try {
             status = $nested.status
             mutation_fixture_child = $mutationChildRun
             mutation_fixture_status = $mutationChild.status
+            bounded_write_child = $writeChildRun
+            bounded_write_status = $writeChild.status
+            bounded_write_manifest = $writeChild.mutation_manifest.manifest_fingerprint
         }
         artifacts = [ordered]@{
             status_human = (Join-Path $artifactDir "status.txt")
@@ -476,6 +562,7 @@ try {
             report_human = (Join-Path $artifactDir "report.txt")
             report_json = (Join-Path $artifactDir "report.json")
             doctor_json = (Join-Path $artifactDir "doctor.json")
+            bounded_write_json = (Join-Path $artifactDir "bounded-write-result.json")
         }
     }
     $evidenceJson = $evidence | ConvertTo-Json -Depth 8
@@ -493,6 +580,9 @@ try {
         "project_id: $($registered.project.project_id)",
         "parent_run: $parentRun",
         "child_runs: $childRun, $childRunBeta, $childRunGamma",
+        "bounded_write_child: $writeChildRun",
+        "bounded_write_manifest: $($writeChild.mutation_manifest.manifest_fingerprint)",
+        "bounded_write_parent_unchanged: true",
         "repository_runtime_unchanged: true",
         "artifacts: $artifactDir"
     )
@@ -506,6 +596,9 @@ try {
     }
 }
 finally {
+    if (-not [string]::IsNullOrWhiteSpace($boundedWriteWorktree)) {
+        & git -C $repoPath worktree remove --force $boundedWriteWorktree 2>$null
+    }
     [Environment]::SetEnvironmentVariable("LOOPCODER_HOME", $oldHome, "Process")
     if (-not $KeepArtifacts) {
         Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue

@@ -11,6 +11,7 @@ type ProviderCapability string
 
 const (
 	ProviderReadOnly        ProviderCapability = "read-only"
+	ProviderBoundedWrite    ProviderCapability = "bounded-write"
 	ProviderNestedSubagents ProviderCapability = "nested-subagents"
 	ProviderJSONOutput      ProviderCapability = "json-output"
 	ProviderMCPConfig       ProviderCapability = "mcp-config"
@@ -43,6 +44,7 @@ type ProviderRuntime struct {
 	Executable               string
 	VersionArgv              []string
 	ReadOnly                 bool
+	BoundedWrite             bool
 	NestedSubagents          bool
 	JSONOutput               bool
 	MCPConfig                bool
@@ -359,6 +361,8 @@ func (p ProviderRuntime) Supports(capability ProviderCapability) bool {
 	switch capability {
 	case ProviderReadOnly:
 		return p.ReadOnly
+	case ProviderBoundedWrite:
+		return p.BoundedWrite
 	case ProviderNestedSubagents:
 		return p.NestedSubagents
 	case ProviderJSONOutput:
@@ -531,6 +535,7 @@ var staticContract = Contract{
 			Executable:          "codex",
 			VersionArgv:         []string{"--version"},
 			ReadOnly:            true,
+			BoundedWrite:        true,
 			JSONOutput:          true,
 			MCPConfig:           true,
 			Cancellation:        true,
@@ -644,6 +649,7 @@ var staticContract = Contract{
 			Executable:          "grok",
 			VersionArgv:         []string{"version"},
 			ReadOnly:            true,
+			BoundedWrite:        true,
 			JSONOutput:          true,
 			Cancellation:        true,
 			TokenUsageReporting: true,
