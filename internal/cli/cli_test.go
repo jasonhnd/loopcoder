@@ -9784,6 +9784,40 @@ func TestNestedReadOnlyRoutePreflightRejectsUnsupportedProviderAndHost(t *testin
 	}
 }
 
+func TestNestedPrivateProjectKeyIsStableAndSeparatesRepositories(t *testing.T) {
+	repoA := t.TempDir()
+	repoB := t.TempDir()
+	keyA, err := nestedPrivateProjectKey(repoA, "")
+	if err != nil {
+		t.Fatalf("nestedPrivateProjectKey repo A: %v", err)
+	}
+	keyAAgain, err := nestedPrivateProjectKey(repoA, "")
+	if err != nil {
+		t.Fatalf("nestedPrivateProjectKey repo A again: %v", err)
+	}
+	keyB, err := nestedPrivateProjectKey(repoB, "")
+	if err != nil {
+		t.Fatalf("nestedPrivateProjectKey repo B: %v", err)
+	}
+	if keyA != keyAAgain || keyA == keyB {
+		t.Fatalf("project keys A=%q again=%q B=%q, want stable isolated identities", keyA, keyAAgain, keyB)
+	}
+	if strings.Contains(keyA, repoA) || strings.Contains(keyB, repoB) {
+		t.Fatalf("project keys leaked repository paths: %q / %q", keyA, keyB)
+	}
+	registeredA, err := nestedPrivateProjectKey(repoA, "project-id")
+	if err != nil {
+		t.Fatalf("nestedPrivateProjectKey registered A: %v", err)
+	}
+	registeredB, err := nestedPrivateProjectKey(repoB, "project-id")
+	if err != nil {
+		t.Fatalf("nestedPrivateProjectKey registered B: %v", err)
+	}
+	if registeredA != registeredB {
+		t.Fatalf("registered project keys = %q / %q, want stable project identity", registeredA, registeredB)
+	}
+}
+
 func TestNestedReadOnlyExecutorPreservesDirtAndOverridesProviderOutcomeOnMutation(t *testing.T) {
 	for _, providerOutcome := range []string{"success", "canceled"} {
 		t.Run(providerOutcome, func(t *testing.T) {

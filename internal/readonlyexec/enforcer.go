@@ -159,6 +159,7 @@ func Begin(ctx context.Context, opts Options) (*Session, Audit, error) {
 		if len(violations) > 0 {
 			audit := Audit{Mode: EnforcementMode, Verification: VerificationViolation, BaselineFingerprint: prior.Baseline.Fingerprint, PostRunFingerprint: current.Fingerprint, Recovered: true, Violations: violations}
 			prior.Status = recordStatusViolation
+			prior.ClaimGeneration = opts.ClaimGeneration
 			prior.Recovered = true
 			prior.PostRun = &current
 			prior.Violations = violations
@@ -802,7 +803,7 @@ func loadRecord(path string) (evidenceRecord, bool, error) {
 }
 
 func validEvidenceRecord(opts Options, record evidenceRecord) bool {
-	if record.SchemaVersion != RecordSchemaVersion || record.Mode != EnforcementMode || record.ContractFingerprint != opts.ContractFingerprint || record.ClaimGeneration != opts.ClaimGeneration {
+	if record.SchemaVersion != RecordSchemaVersion || record.Mode != EnforcementMode || record.ContractFingerprint != opts.ContractFingerprint || record.ClaimGeneration <= 0 || record.ClaimGeneration > opts.ClaimGeneration {
 		return false
 	}
 	switch record.Status {

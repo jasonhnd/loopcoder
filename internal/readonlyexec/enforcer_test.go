@@ -207,7 +207,9 @@ func TestSessionRecoversInterruptedBaselineBeforeRelaunch(t *testing.T) {
 		if _, _, err := Begin(context.Background(), opts); err != nil {
 			t.Fatalf("initial Begin: %v", err)
 		}
-		recovered, audit, err := Begin(context.Background(), opts)
+		nextClaim := opts
+		nextClaim.ClaimGeneration++
+		recovered, audit, err := Begin(context.Background(), nextClaim)
 		if err != nil {
 			t.Fatalf("recovery Begin: %v", err)
 		}
@@ -227,7 +229,9 @@ func TestSessionRecoversInterruptedBaselineBeforeRelaunch(t *testing.T) {
 			t.Fatalf("initial Begin: %v", err)
 		}
 		mustWrite(t, filepath.Join(repo, "tracked.txt"), "changed after crash\n")
-		session, audit, err := Begin(context.Background(), opts)
+		nextClaim := opts
+		nextClaim.ClaimGeneration++
+		session, audit, err := Begin(context.Background(), nextClaim)
 		var violation *PolicyViolationError
 		if session != nil || !errors.As(err, &violation) || audit.Verification != VerificationViolation || !audit.Recovered {
 			t.Fatalf("changed recovery session=%#v audit=%#v error=%v", session, audit, err)
@@ -245,7 +249,9 @@ func TestSessionDoesNotRelaunchVerifiedExecutionWhenAttemptDeliveryWasLost(t *te
 	if audit, err := session.Finish(context.Background(), "provider-completed"); err != nil || audit.Verification != VerificationPassed {
 		t.Fatalf("Finish audit=%#v error=%v", audit, err)
 	}
-	relaunched, audit, err := Begin(context.Background(), opts)
+	nextClaim := opts
+	nextClaim.ClaimGeneration++
+	relaunched, audit, err := Begin(context.Background(), nextClaim)
 	var violation *PolicyViolationError
 	if relaunched != nil || !errors.As(err, &violation) || audit.Verification != VerificationInconclusive || !hasViolationCode(audit.Violations, "verified_execution_requires_reconciliation") {
 		t.Fatalf("relaunch session=%#v audit=%#v error=%v", relaunched, audit, err)

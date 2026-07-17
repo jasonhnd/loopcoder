@@ -40,6 +40,7 @@ type nestedRunOptions struct {
 	RepoPath         string
 	PlanPath         string
 	BaseBranch       string
+	HostProfile      string
 	Provider         string
 	Model            string
 	Effort           string
@@ -247,6 +248,7 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "nested run: %v\n", err)
 		return 1
 	}
+	opts.HostProfile = cfg.Host.Profile
 	capabilityOpts := opts
 	if capabilityOpts.Provider != nestedTestSubprocessProvider {
 		capabilityOpts.Provider = firstNonEmptyNested(capabilityOpts.Provider, cfg.Adapters.Worker, defaultProviderForRole("worker"))
@@ -284,7 +286,7 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		opts.Provider = selection.Provider
 		opts.Model = selection.Model
 		opts.Effort = selection.Effort
-		if err := preflightNestedReadOnlyRoute(opts.Provider, cfg.Host.Profile); err != nil {
+		if err := preflightNestedReadOnlyRoute(opts.Provider, opts.HostProfile); err != nil {
 			fmt.Fprintf(stderr, "nested run: read-only route preflight: %v\n", err)
 			return 1
 		}
@@ -467,7 +469,7 @@ func nestedReadOnlyExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) 
 		} else if ok {
 			return existing, nil
 		}
-		if err := preflightNestedReadOnlyRoute(provider, ""); err != nil {
+		if err := preflightNestedReadOnlyRoute(provider, opts.HostProfile); err != nil {
 			return base, &readonlyexec.PolicyViolationError{Phase: "pre-launch", Reason: "the persisted provider route is not supported for read-only execution"}
 		}
 
@@ -475,11 +477,15 @@ func nestedReadOnlyExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) 
 		if err != nil {
 			return base, err
 		}
-		evidenceDir := filepath.Join(roots.LogsRoot, "nested-read-only", nestedPrivateRunKey(child.RunID))
+		projectKey, err := nestedPrivateProjectKey(opts.RepoPath, roots.ProjectID)
+		if err != nil {
+			return base, fmt.Errorf("resolve private nested read-only project identity: %w", err)
+		}
+		evidenceDir := filepath.Join(roots.LogsRoot, "nested-read-only", projectKey, nestedPrivateRunKey(child.RunID))
 		if err := os.MkdirAll(evidenceDir, 0o700); err != nil {
 			return base, fmt.Errorf("prepare private nested read-only evidence: %w", err)
 		}
-		evidencePath := filepath.Join(evidenceDir, fmt.Sprintf("claim-%d-enforcement.json", request.ClaimGeneration))
+		evidencePath := filepath.Join(evidenceDir, "enforcement.json")
 		projectStatePaths := []string{filepath.Join(opts.RepoPath, ".loopcoder")}
 		excludedStatePaths := make([]string, 0, len(opts.SchedulerRunIDs))
 		for _, runID := range opts.SchedulerRunIDs {
@@ -736,6 +742,22 @@ func nestedProviderHardCap(timeoutSeconds int) time.Duration {
 func nestedPrivateRunKey(runID string) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(runID)))
 	return safeBranchSegment(runID) + "-" + fmt.Sprintf("%x", sum[:6])
+}
+
+func nestedPrivateProjectKey(repoPath, projectID string) (string, error) {
+	identity := strings.TrimSpace(projectID)
+	if identity == "" {
+		canonical, err := pathid.Canonicalize(repoPath)
+		if err != nil {
+			return "", err
+		}
+		identity = canonical.Identity
+	}
+	if identity == "" {
+		return "", errors.New("project identity is empty")
+	}
+	sum := sha256.Sum256([]byte(identity))
+	return "project-" + fmt.Sprintf("%x", sum[:12]), nil
 }
 
 func maxNestedDuration(values ...int64) int64 {
