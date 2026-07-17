@@ -1013,7 +1013,7 @@ func gitAbsolutePath(ctx context.Context, repoPath string, args ...string) (stri
 	}
 	path := strings.TrimSpace(string(output))
 	if path == "" {
-		return "", errors.New("Git returned an empty path")
+		return "", errors.New("git returned an empty path")
 	}
 	return filepath.Clean(path), nil
 }
