@@ -217,6 +217,33 @@ This acceptance path is verification-only. It must not force production
 auto-merge, fake success without PR evidence, or depend on paid provider
 services that are not available to the operator.
 
+## v0.8.1 Packaged Nested Permission Matrix
+
+The v0.8.1 release record must include the packaged nested-permission matrix
+result for all seven permission outcomes and their replays, including
+zero-launch refusal evidence, progress receipts, deterministic audit/reason
+codes, parent/worktree isolation, and a matching candidate SHA-256.
+
+The packaged permission matrix is bounded to seven cases, fourteen invocations,
+one concurrent child, depth two, 20 seconds per invocation, and five minutes
+overall. Its blocking provider is always `test-subprocess` with zero paid calls
+and no network. On failure, the release workflow uploads the sanitized
+`loopcoder.nested_permission_matrix_diagnostic.v1` bundle for seven days, with
+a 64 KiB size ceiling; raw outputs, prompts, credentials, and machine paths are
+excluded.
+
+The successful sanitized evidence JSON is retained as a private GitHub Actions
+artifact for 90 days. It is release evidence, not a public release asset, so
+the published release remains limited to the macOS arm64 archive, checksums,
+and Sigstore bundle.
+
+Protected real-provider canaries are opt-in only through
+`scripts/nested-permission-real-provider-smoke.sh` and
+`LOOPCODER_REAL_PROVIDER_SMOKE=1`. The script refuses pull-request events and
+supports only registered contracts: Codex, Claude, and Grok for read-only;
+Codex and Grok for bounded write. These canaries are non-blocking and never
+receive fork PR secrets.
+
 Historical changelog entries, release notes, go/no-go records, and accepted
 specs are release history. Do not terminology-sweep old release evidence merely
 because the current platform or naming changed.
