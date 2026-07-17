@@ -683,6 +683,9 @@ func UpdateChildRunClaimPhase(ctx context.Context, store Store, parentRunID, chi
 			} else if err := appendClaimPhaseEvent(ctx, tx, childRunID, at, phase, "nested-scheduler"); err != nil {
 				return err
 			}
+			if err := updateChildExecutionRequestLifecycleTx(ctx, tx, childRunID, claimGeneration, firstNonEmptyNestedGraph(status, phase), at); err != nil {
+				return err
+			}
 			return nil
 		})
 	})
@@ -727,6 +730,9 @@ func CompleteClaimedChildRun(ctx context.Context, store Store, parentRunID, chil
 				Reason:      reason,
 				Source:      "nested-scheduler",
 			}); err != nil {
+				return err
+			}
+			if err := updateChildExecutionRequestLifecycleTx(ctx, tx, childRunID, claimGeneration, status, updatedAt); err != nil {
 				return err
 			}
 			if err := releaseNestedSchedulerReservationsTx(ctx, tx, childRunID, executorID, claimGeneration, updatedAt); err != nil {
@@ -899,6 +905,9 @@ func transitionRunStatusTx(ctx context.Context, tx Tx, transition RunStatusTrans
 			transition.Status, transition.UpdatedAt, transition.ParentRunID, transition.ChildRunID); err != nil {
 			return fmt.Errorf("transition run edge status: %w", err)
 		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE child_execution_requests SET lifecycle_status = ?, updated_at = ? WHERE child_run_id = ?`, transition.Status, transition.UpdatedAt, transition.RunID); err != nil {
+		return fmt.Errorf("transition child execution request status: %w", err)
 	}
 	payload, err := json.Marshal(map[string]string{
 		"run_id":               transition.RunID,

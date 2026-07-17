@@ -59,7 +59,7 @@ var (
 	nestedClaimRenewEvery    = nestedClaimLeaseDuration / 3
 )
 
-type ChildRunExecutor func(ctx context.Context, child ChildRunPlan) (ChildRunResult, error)
+type ChildRunExecutor func(ctx context.Context, request ChildExecutionRequest) (ChildRunResult, error)
 type RecordNestedEventFunc func(repoPath, runID string, event state.Event) error
 type TaskBoundaryRouteReevaluationFunc func(context.Context, TaskBoundaryRouteReevaluationEvent) error
 
@@ -161,6 +161,8 @@ type ChildRunResult struct {
 	ClaimPhase          string           `json:"claim_phase,omitempty"`
 	ProviderKey         string           `json:"provider_idempotency_key,omitempty"`
 	ProviderReceipt     string           `json:"provider_receipt,omitempty"`
+	ContractSchema      string           `json:"execution_contract_schema,omitempty"`
+	ContractFingerprint string           `json:"execution_contract_fingerprint,omitempty"`
 	StartedAt           string           `json:"started_at,omitempty"`
 	FinishedAt          string           `json:"finished_at,omitempty"`
 	Error               string           `json:"error,omitempty"`
@@ -282,14 +284,36 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		return NestedScheduleReport{}, err
 	}
 	plan.Items = children
-	if err := persistAcceptedChildPlan(ctx, opts, *plan, started); err != nil {
+	executionRequests := make([]ChildExecutionRequest, len(children))
+	for i, child := range children {
+		executionRequests[i], err = BuildChildExecutionRequest(opts.RepoPath, *plan, child)
+		if err != nil {
+			return NestedScheduleReport{}, err
+		}
+	}
+	if err := persistAcceptedChildPlan(ctx, opts, *plan, executionRequests, started); err != nil {
 		return NestedScheduleReport{}, err
+	}
+	executionAuditRequests := make([]ChildExecutionRequest, len(executionRequests))
+	for i := range executionRequests {
+		executionAuditRequests[i] = cloneChildExecutionRequest(executionRequests[i])
+		if opts.Store == nil {
+			continue
+		}
+		persisted, ok, err := storage.LoadChildExecutionRequest(ctx, opts.Store, executionRequests[i].RunID)
+		if err != nil {
+			return NestedScheduleReport{}, err
+		}
+		if ok && persisted.LegacyAmbiguous {
+			executionAuditRequests[i].SchemaVersion = persisted.SchemaVersion
+			executionAuditRequests[i].ContractFingerprint = persisted.ContractFingerprint
+		}
 	}
 	results := make([]ChildRunResult, len(children))
 	dispatchJobs := make([]int, 0, len(children))
 	plannedAttempts := 0
 	for i, child := range children {
-		result := childResultFromPlan(child)
+		result := childResultFromExecutionRequest(child, executionAuditRequests[i])
 		if result.ReplayAction == "" {
 			result.ReplayAction = ReplayActionNew
 			children[i].ReplayAction = ReplayActionNew
@@ -425,7 +449,8 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 	}
 	runChild := func(index int) {
 		child := children[index]
-		result := childResultFromPlan(child)
+		executionRequest := executionRequests[index]
+		result := childResultFromExecutionRequest(child, executionRequest)
 		result.Status = NestedStatusRunning
 		claimAt := runtimeClock().UTC()
 		executorID := nestedExecutorID(opts.ParentRunID)
@@ -528,6 +553,38 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			return
 		}
 		phaseAt := clock().UTC()
+		boundRecord, bindErr := storage.BindChildExecutionRequestClaim(ctx, opts.Store, child.RunID, claim.ExecutorID, claim.ClaimGeneration, executionRequest.ContractFingerprint, storage.ClaimPhaseClaimed, state.FormatTimestamp(phaseAt))
+		if bindErr != nil {
+			result.Status = NestedStatusNeedsHuman
+			result.Error = bindErr.Error()
+			result.NextAction = "inspect the durable child execution contract before replaying"
+			result.FinishedAt = state.FormatTimestamp(clock().UTC())
+			if persistErr := storage.RejectClaimedChildExecutionRequest(ctx, opts.Store, opts.ParentRunID, child.RunID, claim.ExecutorID, claim.ClaimGeneration, result.FinishedAt, "child execution contract gate"); persistErr != nil {
+				setCompleteErr(persistErr)
+				markSuppressParentDone()
+				return
+			}
+			results[index] = withNestedDecision(result)
+			return
+		}
+		if opts.Store != nil {
+			executionRequest, err = childExecutionRequestFromRecord(boundRecord)
+		} else {
+			executionRequest, err = bindChildExecutionRequest(executionRequest, claim.ClaimGeneration, storage.ClaimPhaseClaimed)
+		}
+		if err != nil {
+			result.Status = NestedStatusNeedsHuman
+			result.Error = err.Error()
+			result.NextAction = "repair the durable child execution contract before replaying"
+			result.FinishedAt = state.FormatTimestamp(clock().UTC())
+			if persistErr := storage.RejectClaimedChildExecutionRequest(ctx, opts.Store, opts.ParentRunID, child.RunID, claim.ExecutorID, claim.ClaimGeneration, result.FinishedAt, "child execution contract decode gate"); persistErr != nil {
+				setCompleteErr(persistErr)
+				markSuppressParentDone()
+				return
+			}
+			results[index] = withNestedDecision(result)
+			return
+		}
 		if nativeAgent {
 			nativeRegistration, err = storage.ValidateNativeChildLaunch(ctx, opts.Store, child.RunID, claim.ExecutorID, claim.ClaimGeneration)
 			if err != nil {
@@ -568,6 +625,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			return
 		}
 		result.ClaimPhase = storage.ClaimPhaseExecuting
+		executionRequest.LifecycleStatus = NestedStatusRunning
 		if nativeAgent {
 			if nativeRegistration, err = storage.TransitionAgentRegistration(ctx, opts.Store, nativeRegistration.ChildAgentID, storage.AgentActionHeartbeat, claim.ExecutorID, claim.ClaimGeneration, state.FormatTimestamp(phaseAt)); err != nil {
 				result.Status = NestedStatusNeedsHuman
@@ -594,8 +652,17 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		emitNestedChildProgress(ctx, opts, child, result, NestedEventChildRunning, parseOrClock(result.StartedAt, clock), false)
 
 		stopHeartbeat := startNestedClaimHeartbeat(opts.Store, child.RunID, claim.ExecutorID, claim.ClaimGeneration, runtimeClock)
-		executed, err := opts.Execute(ctx, child)
+		executed, err := opts.Execute(ctx, cloneChildExecutionRequest(executionRequest))
 		heartbeatErr := stopHeartbeat()
+		if contractErr := validateChildExecutionResult(executionRequest, executed); contractErr != nil {
+			executed = ChildRunResult{
+				Status:     NestedStatusNeedsHuman,
+				Error:      contractErr.Error(),
+				Reason:     contractErr.Error(),
+				NextAction: "inspect the executor boundary before replaying this child",
+			}
+			err = nil
+		}
 		if err == nil && strings.TrimSpace(executed.Status) == "" {
 			executed.Status = NestedStatusFailed
 		}
@@ -652,7 +719,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		for index := range pending {
 			if blocked, ok := blockedByNestedDependency(children[index], children, results); ok {
 				delete(pending, index)
-				result := childResultFromPlan(children[index])
+				result := childResultFromExecutionRequest(children[index], executionAuditRequests[index])
 				result.Status = NestedStatusBlocked
 				result.Error = blocked
 				finishedAt := clock().UTC()
@@ -680,7 +747,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			if emittedWaiting[index] || intSliceContains(ready, index) {
 				continue
 			}
-			waiting := childResultFromPlan(children[index])
+			waiting := childResultFromExecutionRequest(children[index], executionAuditRequests[index])
 			waiting.Status = NestedStatusWaiting
 			emitNestedChildProgress(ctx, opts, children[index], waiting, "nested.child.waiting", clock().UTC(), false)
 			emittedWaiting[index] = true
@@ -691,7 +758,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			delete(pending, index)
 			select {
 			case <-ctx.Done():
-				result := childResultFromPlan(children[index])
+				result := childResultFromExecutionRequest(children[index], executionAuditRequests[index])
 				result.Status = normalizeNestedStatus(state.FailureStatus(ctx.Err()))
 				if result.Status == "" {
 					result.Status = NestedStatusCancelled
@@ -1124,9 +1191,12 @@ func firstJSONDiff(left, right any, path string) string {
 	return path
 }
 
-func persistAcceptedChildPlan(ctx context.Context, opts NestedScheduleOptions, plan ChildPlan, started time.Time) error {
+func persistAcceptedChildPlan(ctx context.Context, opts NestedScheduleOptions, plan ChildPlan, requests []ChildExecutionRequest, started time.Time) error {
 	if opts.Store == nil {
 		return nil
+	}
+	if len(requests) != len(plan.Items) {
+		return fmt.Errorf("persist accepted child plan: child/request count mismatch")
 	}
 	planJSON, err := json.Marshal(plan)
 	if err != nil {
@@ -1144,7 +1214,8 @@ func persistAcceptedChildPlan(ctx context.Context, opts NestedScheduleOptions, p
 	}
 	children := make([]storage.RunNode, 0, len(plan.Items))
 	edges := make([]storage.RunEdgeRecord, 0, len(plan.Items))
-	for _, item := range plan.Items {
+	requestRecords := make([]storage.ChildExecutionRequestRecord, 0, len(plan.Items))
+	for i, item := range plan.Items {
 		scopeJSON, err := json.Marshal(item.Scope)
 		if err != nil {
 			return fmt.Errorf("marshal child %q scope: %w", item.ChildKey, err)
@@ -1178,8 +1249,29 @@ func persistAcceptedChildPlan(ctx context.Context, opts NestedScheduleOptions, p
 			CreatedAt:       createdAt,
 			UpdatedAt:       createdAt,
 		})
+		requestJSON, err := json.Marshal(requests[i])
+		if err != nil {
+			return fmt.Errorf("marshal child %q execution request: %w", item.ChildKey, err)
+		}
+		requestRecords = append(requestRecords, storage.ChildExecutionRequestRecord{
+			ChildRunID:          requests[i].RunID,
+			ParentRunID:         requests[i].ParentRunID,
+			PlanID:              requests[i].PlanID,
+			ChildKey:            requests[i].ChildKey,
+			SchemaVersion:       requests[i].SchemaVersion,
+			RequestJSON:         string(requestJSON),
+			ContractFingerprint: requests[i].ContractFingerprint,
+			RepositoryIdentity:  requests[i].RepositoryIdentity,
+			CheckoutIdentity:    requests[i].CheckoutIdentity,
+			Permission:          requests[i].Permission,
+			ScopeJSON:           string(scopeJSON),
+			ClaimGeneration:     requests[i].ClaimGeneration,
+			LifecycleStatus:     requests[i].LifecycleStatus,
+			CreatedAt:           createdAt,
+			UpdatedAt:           createdAt,
+		})
 	}
-	return storage.PersistChildPlanGraph(ctx, opts.Store, parent, children, storage.ChildPlanRecord{
+	return storage.PersistChildPlanGraphWithExecutionRequests(ctx, opts.Store, parent, children, storage.ChildPlanRecord{
 		PlanID:         plan.PlanID,
 		ParentRunID:    plan.ParentRunID,
 		RootRunID:      plan.RootRunID,
@@ -1188,7 +1280,7 @@ func persistAcceptedChildPlan(ctx context.Context, opts NestedScheduleOptions, p
 		MaxConcurrency: plan.MaxConcurrency,
 		PlanJSON:       string(planJSON),
 		CreatedAt:      createdAt,
-	}, edges)
+	}, edges, requestRecords)
 }
 
 func readyNestedChildren(children []ChildRunPlan, results []ChildRunResult, pending map[int]bool) []int {
@@ -1269,6 +1361,13 @@ func childResultFromPlan(child ChildRunPlan) ChildRunResult {
 		Status:       NestedStatusQueued,
 		ReplayAction: child.ReplayAction,
 	}
+}
+
+func childResultFromExecutionRequest(child ChildRunPlan, request ChildExecutionRequest) ChildRunResult {
+	result := childResultFromPlan(child)
+	result.ContractSchema = request.SchemaVersion
+	result.ContractFingerprint = request.ContractFingerprint
+	return result
 }
 
 func mergeChildResult(base, result ChildRunResult) ChildRunResult {

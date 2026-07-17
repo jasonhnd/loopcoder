@@ -372,7 +372,8 @@ func renderNestedPermissionRefusal(stdout, stderr io.Writer, opts nestedRunOptio
 }
 
 func nestedDispatchExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) orchestration.ChildRunExecutor {
-	return func(ctx context.Context, child orchestration.ChildRunPlan) (orchestration.ChildRunResult, error) {
+	return func(ctx context.Context, request orchestration.ChildExecutionRequest) (orchestration.ChildRunResult, error) {
+		child := request.ChildRunPlan()
 		if existing, ok, err := completedNestedAttempt(opts.RepoPath, child); err != nil {
 			return orchestration.ChildRunResult{}, err
 		} else if ok {
@@ -384,18 +385,22 @@ func nestedDispatchExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) 
 		if child.Issue <= 0 {
 			return orchestration.ChildRunResult{}, fmt.Errorf("child %q requires a positive issue or scope issue for worker dispatch", child.ChildKey)
 		}
-		metadata, err := decodeNestedChildMetadata(child.Metadata)
-		if err != nil {
-			return orchestration.ChildRunResult{}, err
-		}
 		dispatchCtx := ctx
 		cancel := func() {}
-		if metadata.TimeoutSeconds > 0 {
-			dispatchCtx, cancel = context.WithTimeout(ctx, time.Duration(metadata.TimeoutSeconds)*time.Second)
+		if request.Work.TimeoutSeconds > 0 {
+			dispatchCtx, cancel = context.WithTimeout(ctx, time.Duration(request.Work.TimeoutSeconds)*time.Second)
 		}
 		defer cancel()
 
-		provider := firstNonEmptyNested(metadata.Provider, opts.Provider)
+		metadata := nestedChildMetadata{
+			IssueBody:      request.Work.Instructions,
+			Branch:         request.Work.Branch,
+			Provider:       request.Work.Provider,
+			Model:          request.Work.Model,
+			Effort:         request.Work.Effort,
+			TimeoutSeconds: request.Work.TimeoutSeconds,
+		}
+		provider := firstNonEmptyNested(request.Work.Provider, request.ProviderDecision.AdapterID, opts.Provider)
 		result, err := deps.Dispatch(dispatchCtx, worker.Options{
 			RepoPath:        opts.RepoPath,
 			IssueNumber:     child.Issue,
@@ -404,7 +409,7 @@ func nestedDispatchExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) 
 			BaseBranch:      opts.BaseBranch,
 			Branch:          firstNonEmptyNested(metadata.Branch, nestedChildBranch(child)),
 			RunID:           child.RunID,
-			ProviderKey:     child.ProviderKey,
+			ProviderKey:     request.IdempotencyKey,
 			Attempt:         1,
 			Provider:        provider,
 			Model:           firstNonEmptyNested(metadata.Model, opts.Model),
@@ -421,7 +426,8 @@ func nestedDispatchExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) 
 }
 
 func nestedSubprocessExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) orchestration.ChildRunExecutor {
-	return func(ctx context.Context, child orchestration.ChildRunPlan) (orchestration.ChildRunResult, error) {
+	return func(ctx context.Context, request orchestration.ChildExecutionRequest) (orchestration.ChildRunResult, error) {
+		child := request.ChildRunPlan()
 		if existing, ok, err := completedNestedAttempt(opts.RepoPath, child); err != nil {
 			return orchestration.ChildRunResult{}, err
 		} else if ok {
@@ -430,10 +436,7 @@ func nestedSubprocessExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer
 		if len(child.Scope.Commands) == 0 {
 			return orchestration.ChildRunResult{}, fmt.Errorf("test-subprocess child %q requires at least one scope.commands entry", child.ChildKey)
 		}
-		metadata, err := decodeNestedChildMetadata(child.Metadata)
-		if err != nil {
-			return orchestration.ChildRunResult{}, err
-		}
+		metadata := nestedChildMetadata{TimeoutSeconds: request.Work.TimeoutSeconds}
 		runCtx := ctx
 		cancel := func() {}
 		if metadata.TimeoutSeconds > 0 {
@@ -712,6 +715,12 @@ func renderNestedText(report orchestration.NestedScheduleReport) string {
 		if child.ProviderKey != "" {
 			line += " provider_key=" + child.ProviderKey
 		}
+		if child.ContractSchema != "" {
+			line += " contract=" + child.ContractSchema
+			if child.ContractFingerprint != "" {
+				line += "@" + child.ContractFingerprint
+			}
+		}
 		if child.Error != "" {
 			line += " error=" + reporter.BoundDecisionText(child.Error)
 		}
@@ -851,19 +860,6 @@ func childScopeSummary(scope orchestration.ChildScope) string {
 		return "{}"
 	}
 	return string(data)
-}
-
-func decodeNestedChildMetadata(raw json.RawMessage) (nestedChildMetadata, error) {
-	if len(strings.TrimSpace(string(raw))) == 0 {
-		return nestedChildMetadata{}, nil
-	}
-	var metadata nestedChildMetadata
-	if err := json.Unmarshal(raw, &metadata); err != nil {
-		return nestedChildMetadata{}, fmt.Errorf("decode child metadata: %w", err)
-	}
-	metadata.IssueBody = boundedNestedText(metadata.IssueBody)
-	metadata.Prompt = boundedNestedText(metadata.Prompt)
-	return metadata, nil
 }
 
 func boundedNestedText(value string) string {
