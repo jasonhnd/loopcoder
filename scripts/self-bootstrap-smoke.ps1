@@ -164,6 +164,8 @@ $parentRun = "run-20260709T000000Z-wave"
 $childRun = "run-20260709T000001Z-child-0-self-bootstrap-alpha"
 $childRunBeta = "run-20260709T000001Z-child-1-self-bootstrap-beta"
 $childRunGamma = "run-20260709T000001Z-child-2-self-bootstrap-gamma"
+$mutationParentRun = "run-20260709T000002Z-wave-read-only-mutation"
+$mutationChildRun = "run-20260709T000003Z-child-0-read-only-mutation"
 
 try {
     Invoke-Checked "register loopcoder checkout in machine-local project registry" {
@@ -293,6 +295,66 @@ try {
     }
     Assert-OutsideRepo -Path $alpha.attempt_path -RepoPath $repoPath -Label "nested child attempt"
 
+    $mutationMarkerName = ".loopcoder-read-only-mutation-fixture"
+    $mutationMarkerPath = Join-Path $repoPath $mutationMarkerName
+    $mutationPlanPath = Join-Path $artifactDir "read-only-mutation-plan.json"
+    $mutationPlan = @{
+        schema_version = "loopcoder.child_plan.v1"
+        plan_id = "plan-$mutationParentRun"
+        parent_run_id = $mutationParentRun
+        root_run_id = $mutationParentRun
+        parent_depth = 0
+        max_depth = 2
+        max_concurrency = 1
+        created_at = "2026-07-09T00:00:02Z"
+        items = @(
+            @{
+                child_key = "read-only-mutation"
+                title = "read-only-mutation"
+                role = "worker"
+                run_id = $mutationChildRun
+                issue = 1006
+                scope = @{
+                    repo = "."
+                    paths = @("scripts/self-bootstrap-smoke.ps1")
+                    issues = @(1006)
+                    commands = @("printf mutation > $mutationMarkerName")
+                }
+                permission = "read-only"
+                depends_on = @()
+                aggregation = @{
+                    mode = "collect"
+                    required = $true
+                    include_report = $true
+                }
+            }
+        )
+    }
+    ($mutationPlan | ConvertTo-Json -Depth 10) | Set-Content -LiteralPath $mutationPlanPath -Encoding utf8
+
+    Write-Host "==> verify read-only mutation fixture fails closed"
+    $mutationOutput = @(& $binaryPath nested run --repo $repoPath --plan $mutationPlanPath --provider test-subprocess --format json)
+    $mutationExitCode = $LASTEXITCODE
+    $mutationOutput | Set-Content -LiteralPath (Join-Path $artifactDir "read-only-mutation-result.json") -Encoding utf8
+    if ($mutationExitCode -eq 0) {
+        Fail "read-only mutation fixture unexpectedly succeeded"
+    }
+    $mutationResult = ConvertFrom-JsonOutput $mutationOutput "read-only mutation fixture"
+    $mutationChild = @($mutationResult.children) | Select-Object -First 1
+    if ($mutationResult.status -ne "needs-human" -or -not $mutationChild -or $mutationChild.status -ne "needs-human" -or $mutationChild.outcome -ne "read_only_policy_violation") {
+        Fail "read-only mutation fixture did not produce the typed needs-human policy outcome"
+    }
+    if (-not $mutationChild.read_only_enforcement -or $mutationChild.read_only_enforcement.verification -ne "policy-violation") {
+        Fail "read-only mutation fixture omitted policy-violation enforcement evidence"
+    }
+    if (@($mutationChild.read_only_enforcement.violations | Where-Object { $_.code -eq "untracked_file_created" }).Count -lt 1) {
+        Fail "read-only mutation fixture omitted the untracked-file violation code"
+    }
+    if (-not (Test-Path -LiteralPath $mutationMarkerPath)) {
+        Fail "read-only executor remediated the mutation instead of preserving evidence"
+    }
+    Remove-Item -LiteralPath $mutationMarkerPath -Force
+
     Invoke-Checked "render status run tree (human)" {
         $script:statusTextOutput = @(& $binaryPath status --repo $repoPath --run $childRun --format text)
         $script:statusTextOutput | Set-Content -LiteralPath (Join-Path $artifactDir "status.txt") -Encoding utf8
@@ -405,6 +467,8 @@ try {
             parent = $parentRun
             children = @($childRun, $childRunBeta, $childRunGamma)
             status = $nested.status
+            mutation_fixture_child = $mutationChildRun
+            mutation_fixture_status = $mutationChild.status
         }
         artifacts = [ordered]@{
             status_human = (Join-Path $artifactDir "status.txt")

@@ -258,26 +258,33 @@ func TestWriteAttemptWritesCompactSidecar(t *testing.T) {
 	totalTokens := int64(154)
 	costUSD := 0.42
 	reportRecord := validAttemptReport(101, totalTokens)
+	enforcement := &ReadOnlyEnforcementAudit{
+		Mode: "provider-read-only+repository-state-v1", Verification: "passed",
+		BaselineFingerprint: "sha256:before", PostRunFingerprint: "sha256:before",
+		Violations: []ReadOnlyEnforcementViolation{},
+	}
 
 	path, err := WriteAttempt(repo, "run-test", AttemptRecord{
-		Version:        1,
-		JobID:          "job-101-1234",
-		Issue:          101,
-		Attempt:        2,
-		Provider:       "codex",
-		PID:            1234,
-		Phase:          "codex_exited",
-		Status:         "failed",
-		Branch:         "loop/issue-101-retry-2",
-		StartedAt:      "2026-06-26T12:00:00Z",
-		HeartbeatAt:    "2026-06-26T12:01:00Z",
-		LastProgressAt: "2026-06-26T12:01:00Z",
-		LogBytes:       123,
-		ExitCode:       &exitCode,
-		Error:          &errText,
-		Usage:          &reporter.Usage{TotalTokens: &totalTokens},
-		Report:         &reportRecord,
-		CostUSD:        &costUSD,
+		Version:             1,
+		JobID:               "job-101-1234",
+		Issue:               101,
+		Attempt:             2,
+		Provider:            "codex",
+		PID:                 1234,
+		Phase:               "codex_exited",
+		Status:              "failed",
+		Branch:              "loop/issue-101-retry-2",
+		StartedAt:           "2026-06-26T12:00:00Z",
+		HeartbeatAt:         "2026-06-26T12:01:00Z",
+		LastProgressAt:      "2026-06-26T12:01:00Z",
+		LogBytes:            123,
+		ExitCode:            &exitCode,
+		Error:               &errText,
+		Summary:             "fixture summary",
+		Usage:               &reporter.Usage{TotalTokens: &totalTokens},
+		Report:              &reportRecord,
+		CostUSD:             &costUSD,
+		ReadOnlyEnforcement: enforcement,
 	})
 	if err != nil {
 		t.Fatalf("WriteAttempt returned error: %v", err)
@@ -297,13 +304,17 @@ func TestWriteAttemptWritesCompactSidecar(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatalf("attempt JSON invalid: %v", err)
 	}
-	for _, key := range []string{"version", "job_id", "issue", "attempt", "provider", "pid", "phase", "status", "branch", "started_at", "heartbeat_at", "last_progress_at", "log_bytes", "exit_code", "error", "usage", "report", "cost_usd"} {
+	for _, key := range []string{"version", "job_id", "issue", "attempt", "provider", "pid", "phase", "status", "branch", "started_at", "heartbeat_at", "last_progress_at", "log_bytes", "exit_code", "error", "usage", "report", "cost_usd", "read_only_enforcement"} {
 		if _, ok := got[key]; !ok {
 			t.Fatalf("attempt JSON missing key %q: %s", key, string(data))
 		}
 	}
 	if got["branch"] != "loop/issue-101-retry-2" {
 		t.Fatalf("branch = %#v", got["branch"])
+	}
+	attempts, err := LoadAttempts(repo, "run-test")
+	if err != nil || len(attempts) != 1 || attempts[0].Summary != "fixture summary" || attempts[0].ReadOnlyEnforcement == nil || attempts[0].ReadOnlyEnforcement.Verification != "passed" {
+		t.Fatalf("LoadAttempts enforcement round trip = %#v, error=%v", attempts, err)
 	}
 	reportField, ok := got["report"].(map[string]any)
 	if !ok {

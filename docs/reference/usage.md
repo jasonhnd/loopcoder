@@ -1154,8 +1154,9 @@ state. It does not dispatch workers or launch providers.
 
 ### Nested Child Plans
 
-`loopcoder nested run` is the v1 nested-plan command, but no real-provider
-nested execution mode is supported in v0.8.0:
+`loopcoder nested run` is the v1 nested-plan command. Its production executor
+accepts mutation-free `read-only` children through the registered Codex,
+Claude, and Grok read-only adapters:
 
 ```text
 loopcoder nested run --repo . --plan child-plan.json --provider codex
@@ -1187,19 +1188,36 @@ active, but it does not promise universal exactly-once external side effects
 after a crash; ambiguous side effects must be resolved with receipts,
 idempotency keys, or `needs-human`.
 
-In v0.8.0, production-provider `write` and `orchestrate` children are refused
-before dispatch. The command accepts a `read-only` child but sends it through
-the ordinary Worker adapter without an enforceable mutation-free permission,
-so that accepted path is also unsafe for real providers. Do not use Codex,
-Claude, Grok, Antigravity, Gemini, or any other real provider with `nested run`
-in v0.8.0. The command's plan, scheduler, persistence, claim, recovery, and
-permission records are implementation inventory and deterministic-test
-infrastructure, not proof of a safe product bridge.
+Production-provider `write` and `orchestrate` children are refused before
+launch. A read-only child consumes the persisted immutable execution contract,
+requires a registered provider/host combination, and invokes the provider with
+the adapter's explicit read-only mode. It does not route through Worker
+dispatch and does not create a branch, worktree, commit, or pull request.
+
+Immediately before launch, LoopCoder persists a private baseline outside the
+checkout. The baseline distinguishes existing user dirt and fingerprints the
+checkout, tracked and untracked content (including ignored files), index,
+refs/HEAD, local Git config, hooks, linked worktree inventory and contents, and
+guarded LoopCoder project state. Post-run verification always runs, including
+after provider failure, cancellation, or timeout. A changed or inconclusive
+surface produces `needs-human` with outcome `read_only_policy_violation`, a
+path-free `read_only_enforcement` audit, and preserved private evidence. The
+executor never calls the result successful and never attempts remediation.
+Interrupted baselines are verified before any relaunch; prior violations remain
+blocked for human review.
+
+Gemini, Antigravity, unknown adapters, unsupported host profiles,
+provider-native delegation, and per-child provider overrides without a matching
+executor registration fail before launch. In particular, Gemini's current safe
+mode disables the repository-inspection tools needed by this executor, while
+Antigravity has no supported read-only adapter.
 
 The reserved `test-subprocess` provider exists only for deterministic local and
 release smoke tests. It executes each child item's `scope.commands` as real local
-subprocesses and writes ordinary local attempt/report records without calling a
-remote provider.
+subprocesses without calling a remote provider, but it uses the same baseline,
+post-run verification, typed policy failure, and durable audit path. Release
+smoke includes a real mutation attempt and requires the packaged binary to
+reject it without deleting the mutation fixture.
 
 ## Exit Codes
 

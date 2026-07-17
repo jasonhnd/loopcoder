@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -14,16 +15,20 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/agent"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/home"
+	"github.com/jasonhnd/loopcoder/internal/hostprofile"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
 	"github.com/jasonhnd/loopcoder/internal/pathid"
+	"github.com/jasonhnd/loopcoder/internal/readonlyexec"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/runtimecap"
+	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
-	"github.com/jasonhnd/loopcoder/internal/worker"
 )
 
 const (
@@ -43,6 +48,7 @@ type nestedRunOptions struct {
 	Timeout          time.Duration
 	ConfigFromBase   bool
 	Strict           bool
+	SchedulerRunIDs  []string
 }
 
 type nestedChildMetadata struct {
@@ -53,6 +59,7 @@ type nestedChildMetadata struct {
 	Model          string `json:"model,omitempty"`
 	Effort         string `json:"effort,omitempty"`
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+	AdapterID      string `json:"adapter_id,omitempty"`
 }
 
 func runNested(args []string, stdout, stderr io.Writer, deps Deps) int {
@@ -74,15 +81,15 @@ func printNestedHelp(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  loopcoder nested run --repo <path> --plan <file.json> [flags]")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Submit a v1 child plan, persist the durable graph, and execute children through loopcoder-owned scheduling.")
+	fmt.Fprintln(w, "Submit a v1 child plan, persist the durable graph, and execute mutation-free read-only children through loopcoder-owned scheduling.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
 	fmt.Fprintln(w, "  --repo string                 repository path (required)")
 	fmt.Fprintln(w, "  --plan string                 child plan JSON file (required)")
-	fmt.Fprintln(w, "  --base-branch string          base branch for worker children (default \"main\")")
-	fmt.Fprintln(w, "  --provider string             worker provider (default from .delivery.yml or \"codex\")")
-	fmt.Fprintln(w, "  --model string                optional worker model override for this run")
-	fmt.Fprintln(w, "  --effort string               optional worker reasoning effort override for this run")
+	fmt.Fprintln(w, "  --base-branch string          base branch associated with the nested run (default \"main\")")
+	fmt.Fprintln(w, "  --provider string             read-only child provider: codex, claude, or grok (default from .delivery.yml or \"codex\")")
+	fmt.Fprintln(w, "  --model string                optional child model override for this run")
+	fmt.Fprintln(w, "  --effort string               optional child reasoning effort override for this run")
 	fmt.Fprintln(w, "  --parent-permission string    parent permission ceiling: read-only, write, or orchestrate (default \"orchestrate\")")
 	fmt.Fprintln(w, "  --format string               output format: text, json, or jsonl (default \"text\")")
 	fmt.Fprintln(w, "  --timeout duration            optional timeout for the nested run, for example 30s or 5m")
@@ -90,13 +97,13 @@ func printNestedHelp(w io.Writer) {
 	fmt.Fprintln(w, "  --strict                      reject invalid model/depth selections instead of warning")
 	fmt.Fprintln(w, "  --help                        show nested command help")
 	fmt.Fprintln(w)
-	fmt.Fprintf(w, "  provider %q is reserved for deterministic local smoke tests and executes scope.commands as subprocesses.\n", nestedTestSubprocessProvider)
+	fmt.Fprintf(w, "  provider %q is reserved for deterministic local smoke tests; its scope.commands still pass through the same post-run mutation enforcement.\n", nestedTestSubprocessProvider)
 }
 
 func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 	defaults := DefaultDeps()
-	if deps.Dispatch == nil {
-		deps.Dispatch = defaults.Dispatch
+	if deps.AgentLookup == nil {
+		deps.AgentLookup = defaults.AgentLookup
 	}
 	if deps.Now == nil {
 		deps.Now = defaults.Now
@@ -254,6 +261,10 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	opts.Provider = capabilityOpts.Provider
+	opts.SchedulerRunIDs = append(opts.SchedulerRunIDs, plan.ParentRunID)
+	for _, child := range plan.Items {
+		opts.SchedulerRunIDs = append(opts.SchedulerRunIDs, child.RunID)
+	}
 
 	if opts.Provider != nestedTestSubprocessProvider {
 		selection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
@@ -273,9 +284,17 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		opts.Provider = selection.Provider
 		opts.Model = selection.Model
 		opts.Effort = selection.Effort
+		if err := preflightNestedReadOnlyRoute(opts.Provider, cfg.Host.Profile); err != nil {
+			fmt.Fprintf(stderr, "nested run: read-only route preflight: %v\n", err)
+			return 1
+		}
 	} else {
 		opts.Model = firstNonEmptyNested(opts.Model, "deterministic-subprocess")
 		opts.Effort = firstNonEmptyNested(opts.Effort, "none")
+	}
+	if err := validateNestedPlanReadOnlyProviders(plan, opts.Provider); err != nil {
+		fmt.Fprintf(stderr, "nested run: read-only provider preflight: %v\n", err)
+		return 1
 	}
 
 	layout, err := home.Resolve(home.DefaultDeps())
@@ -297,10 +316,7 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	defer cancel()
 
-	executor := nestedDispatchExecutor(opts, deps, warnings)
-	if opts.Provider == nestedTestSubprocessProvider {
-		executor = nestedSubprocessExecutor(opts, deps, warnings)
-	}
+	executor := nestedReadOnlyExecutor(opts, deps, warnings)
 	progressRecorder, stopProgress := progressSupervisorForRegisteredRepo(context.Background(), resolvedRepo, plan.RootRunID, deps.Now, stderr)
 	defer func() {
 		if err := stopProgress(); err != nil {
@@ -347,19 +363,83 @@ func nestedReportHasContent(report orchestration.NestedScheduleReport) bool {
 }
 
 func nestedExecutorCapability(opts nestedRunOptions) orchestration.NestedExecutorCapability {
-	executorID := "worker-dispatch"
-	registrationID := "builtin:worker-dispatch:v1"
+	executorID := "read-only-child"
+	registrationID := ""
 	if opts.Provider == nestedTestSubprocessProvider {
 		executorID = nestedTestSubprocessProvider
-		registrationID = "builtin:test-subprocess:v1"
+	}
+	permissions := []string{}
+	if nestedReadOnlyProviderSupported(opts.Provider) {
+		registrationID = "builtin:read-only-child:" + strings.TrimSpace(opts.Provider) + ":v1"
+		permissions = []string{string(reporter.PermissionReadOnly)}
 	}
 	return orchestration.NestedExecutorCapability{
 		ExecutorID:             executorID,
 		RegistrationID:         registrationID,
 		Provider:               strings.TrimSpace(opts.Provider),
-		EnforceablePermissions: []string{},
+		EnforceablePermissions: permissions,
 		ProviderNative:         false,
 	}
+}
+
+func nestedReadOnlyProviderSupported(provider string) bool {
+	switch strings.TrimSpace(provider) {
+	case "codex", "claude", "grok", nestedTestSubprocessProvider:
+		return true
+	default:
+		return false
+	}
+}
+
+func preflightNestedReadOnlyRoute(provider, hostProfile string) error {
+	provider = strings.TrimSpace(provider)
+	if !nestedReadOnlyProviderSupported(provider) || provider == nestedTestSubprocessProvider {
+		if provider == nestedTestSubprocessProvider {
+			return nil
+		}
+		return fmt.Errorf("provider %q has no registered nested read-only adapter", provider)
+	}
+	if err := runtimecap.RequireProviderCapability(provider, runtimecap.ProviderReadOnly); err != nil {
+		return err
+	}
+	host, err := hostprofile.Resolve(hostprofile.Options{Profile: hostProfile, Getenv: os.Getenv})
+	if err != nil {
+		return err
+	}
+	compatibility := runtimecap.EvaluateCompatibility(provider, host.Name, runtimecap.RoleVerifier)
+	if compatibility.Support == runtimecap.SupportUnsupported {
+		return fmt.Errorf("provider %q and host %q cannot enforce the read-only child contract (%s)", provider, host.Name, compatibility.Code)
+	}
+	return nil
+}
+
+func validateNestedPlanReadOnlyProviders(plan orchestration.ChildPlan, selectedProvider string) error {
+	selectedProvider = strings.TrimSpace(selectedProvider)
+	for _, child := range plan.Items {
+		var metadata nestedChildMetadata
+		if len(child.Metadata) > 0 {
+			if err := json.Unmarshal(child.Metadata, &metadata); err != nil {
+				return fmt.Errorf("child %q provider metadata is invalid: %w", child.ChildKey, err)
+			}
+		}
+		for _, declaration := range []struct {
+			field string
+			value string
+		}{
+			{field: "provider", value: metadata.Provider},
+			{field: "adapter_id", value: metadata.AdapterID},
+		} {
+			field := declaration.field
+			requested := strings.TrimSpace(declaration.value)
+			if requested != "" && requested != selectedProvider {
+				return fmt.Errorf("child %q %s %q does not match executor registration %q", child.ChildKey, field, requested, selectedProvider)
+			}
+		}
+		if !nestedReadOnlyProviderSupported(selectedProvider) {
+			return fmt.Errorf("child %q provider %q has no registered nested read-only adapter", child.ChildKey, selectedProvider)
+		}
+	}
+	return nil
 }
 
 func renderNestedPermissionRefusal(stdout, stderr io.Writer, opts nestedRunOptions, plan orchestration.ChildPlan, capability orchestration.NestedExecutorCapability, permissionErr *orchestration.PermissionNotEnforceableError, deps Deps) int {
@@ -371,190 +451,332 @@ func renderNestedPermissionRefusal(stdout, stderr io.Writer, opts nestedRunOptio
 	return 1
 }
 
-func nestedDispatchExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) orchestration.ChildRunExecutor {
+func nestedReadOnlyExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) orchestration.ChildRunExecutor {
 	return func(ctx context.Context, request orchestration.ChildExecutionRequest) (orchestration.ChildRunResult, error) {
 		child := request.ChildRunPlan()
-		if existing, ok, err := completedNestedAttempt(opts.RepoPath, child); err != nil {
-			return orchestration.ChildRunResult{}, err
-		} else if ok {
-			return existing, nil
-		}
-		if child.Permission == string(reporter.PermissionWrite) || child.Permission == string(reporter.PermissionOrchestrate) {
-			return orchestration.ChildRunResult{}, fmt.Errorf("provider dispatch executor cannot enforce scoped writes for child %q with permission %q", child.ChildKey, child.Permission)
-		}
-		if child.Issue <= 0 {
-			return orchestration.ChildRunResult{}, fmt.Errorf("child %q requires a positive issue or scope issue for worker dispatch", child.ChildKey)
-		}
-		dispatchCtx := ctx
-		cancel := func() {}
-		if request.Work.TimeoutSeconds > 0 {
-			dispatchCtx, cancel = context.WithTimeout(ctx, time.Duration(request.Work.TimeoutSeconds)*time.Second)
-		}
-		defer cancel()
-
-		metadata := nestedChildMetadata{
-			IssueBody:      request.Work.Instructions,
-			Branch:         request.Work.Branch,
-			Provider:       request.Work.Provider,
-			Model:          request.Work.Model,
-			Effort:         request.Work.Effort,
-			TimeoutSeconds: request.Work.TimeoutSeconds,
+		base := nestedResultFromRequest(request)
+		if request.Permission != string(reporter.PermissionReadOnly) {
+			return base, &readonlyexec.PolicyViolationError{Phase: "pre-launch", Reason: "the executor received a non-read-only immutable contract"}
 		}
 		provider := firstNonEmptyNested(request.Work.Provider, request.ProviderDecision.AdapterID, opts.Provider)
-		result, err := deps.Dispatch(dispatchCtx, worker.Options{
-			RepoPath:        opts.RepoPath,
-			IssueNumber:     child.Issue,
-			IssueTitle:      child.Title,
-			IssueBody:       nestedChildIssueBody(opts, child, metadata),
-			BaseBranch:      opts.BaseBranch,
-			Branch:          firstNonEmptyNested(metadata.Branch, nestedChildBranch(child)),
-			RunID:           child.RunID,
-			ProviderKey:     request.IdempotencyKey,
-			Attempt:         1,
-			Provider:        provider,
-			Model:           firstNonEmptyNested(metadata.Model, opts.Model),
-			Effort:          firstNonEmptyNested(metadata.Effort, opts.Effort),
-			ConfigFromBase:  opts.ConfigFromBase,
-			RecoveryContext: "",
-			Stderr:          stderr,
-		})
-		if err != nil {
-			return orchestration.ChildRunResult{}, err
+		if provider != opts.Provider {
+			return base, &readonlyexec.PolicyViolationError{Phase: "pre-launch", Reason: "the persisted provider route does not match the registered read-only adapter"}
 		}
-		return childResultFromWorker(child, result), nil
-	}
-}
-
-func nestedSubprocessExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) orchestration.ChildRunExecutor {
-	return func(ctx context.Context, request orchestration.ChildExecutionRequest) (orchestration.ChildRunResult, error) {
-		child := request.ChildRunPlan()
-		if existing, ok, err := completedNestedAttempt(opts.RepoPath, child); err != nil {
-			return orchestration.ChildRunResult{}, err
+		if existing, ok, err := completedNestedAttempt(opts.RepoPath, child, provider); err != nil {
+			return base, err
 		} else if ok {
 			return existing, nil
 		}
-		if len(child.Scope.Commands) == 0 {
-			return orchestration.ChildRunResult{}, fmt.Errorf("test-subprocess child %q requires at least one scope.commands entry", child.ChildKey)
+		if err := preflightNestedReadOnlyRoute(provider, ""); err != nil {
+			return base, &readonlyexec.PolicyViolationError{Phase: "pre-launch", Reason: "the persisted provider route is not supported for read-only execution"}
 		}
-		metadata := nestedChildMetadata{TimeoutSeconds: request.Work.TimeoutSeconds}
-		runCtx := ctx
-		cancel := func() {}
-		if metadata.TimeoutSeconds > 0 {
-			runCtx, cancel = context.WithTimeout(ctx, time.Duration(metadata.TimeoutSeconds)*time.Second)
-		}
-		defer cancel()
 
-		started := deps.Now().UTC()
-		status := orchestration.NestedStatusSucceeded
-		exitCode := 0
-		var output strings.Builder
-		for _, command := range child.Scope.Commands {
-			command = strings.TrimSpace(command)
-			if command == "" {
+		roots, err := runtimepath.Resolve(ctx, opts.RepoPath)
+		if err != nil {
+			return base, err
+		}
+		evidenceDir := filepath.Join(roots.LogsRoot, "nested-read-only", nestedPrivateRunKey(child.RunID))
+		if err := os.MkdirAll(evidenceDir, 0o700); err != nil {
+			return base, fmt.Errorf("prepare private nested read-only evidence: %w", err)
+		}
+		evidencePath := filepath.Join(evidenceDir, fmt.Sprintf("claim-%d-enforcement.json", request.ClaimGeneration))
+		projectStatePaths := []string{filepath.Join(opts.RepoPath, ".loopcoder")}
+		excludedStatePaths := make([]string, 0, len(opts.SchedulerRunIDs))
+		for _, runID := range opts.SchedulerRunIDs {
+			if strings.TrimSpace(runID) == "" || strings.TrimSpace(runID) == child.RunID {
 				continue
 			}
-			cmd := shellCommand(context.Background(), command)
-			cmd.Dir = opts.RepoPath
-			cmd.Stdout = &output
-			cmd.Stderr = &output
-			result, err := supervisedexec.Run(runCtx, cmd, supervisedexec.Options{
-				HardCap: nestedSubprocessHardCap(metadata),
-				RunID:   child.RunID,
-				Role:    "nested-test-subprocess",
-			})
-			if err != nil {
-				status = normalizeExecutorFailureStatus(err)
-				exitCode = commandExitCode(err)
-				if exitCode == 0 {
-					exitCode = 1
-				}
-				break
-			}
-			if result.Killed {
-				status = orchestration.NestedStatusTimedOut
-				exitCode = 1
-				if runCtx.Err() != nil {
-					status = normalizeExecutorFailureStatus(runCtx.Err())
-				}
-				break
-			}
-			if result.ExitCode != 0 {
-				status = orchestration.NestedStatusFailed
-				exitCode = result.ExitCode
-				break
-			}
+			excludedStatePaths = append(excludedStatePaths, state.RunPath(opts.RepoPath, runID))
 		}
+		if roots.Registered && strings.TrimSpace(roots.ProjectRoot) != "" {
+			projectStatePaths = append(projectStatePaths, roots.ProjectRoot)
+		}
+		session, baselineAudit, err := readonlyexec.Begin(ctx, readonlyexec.Options{
+			RepoPath:            opts.RepoPath,
+			EvidencePath:        evidencePath,
+			ContractFingerprint: request.ContractFingerprint,
+			ClaimGeneration:     request.ClaimGeneration,
+			ProjectStatePaths:   projectStatePaths,
+			ExcludedPaths:       excludedStatePaths,
+		})
+		base.ReadOnlyEnforcement = nestedReadOnlyAudit(baselineAudit)
+		if err != nil {
+			return base, err
+		}
+
+		started := deps.Now().UTC()
+		runCtx := ctx
+		cancel := func() {}
+		if request.Work.TimeoutSeconds > 0 {
+			runCtx, cancel = context.WithTimeout(ctx, time.Duration(request.Work.TimeoutSeconds)*time.Second)
+		}
+		defer cancel()
+		providerResult, runErr := runNestedReadOnlyProvider(runCtx, opts, request, provider, deps, evidenceDir, stderr)
 		ended := deps.Now().UTC()
-		summary := strings.TrimSpace(recovery.Scrub(output.String()))
+		status := nestedAgentStatus(providerResult, runErr)
+		summary := strings.TrimSpace(recovery.Scrub(providerResult.Summary))
 		if summary == "" {
-			summary = "test subprocess completed"
+			if runErr == nil && status == orchestration.NestedStatusSucceeded {
+				summary = "read-only child completed"
+			} else if runErr == nil {
+				summary = "read-only child did not complete successfully"
+			} else {
+				summary = strings.TrimSpace(recovery.Scrub(runErr.Error()))
+			}
 		}
-		if len(summary) > nestedPromptBudgetBytes {
-			summary = summary[:nestedPromptBudgetBytes] + "\n[loopcoder] subprocess output truncated"
+		summary = boundedNestedText(summary)
+
+		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		audit, enforcementErr := session.Finish(verifyCtx, status)
+		verifyCancel()
+		auditRecord := nestedReadOnlyAudit(audit)
+		base.ReadOnlyEnforcement = auditRecord
+		if enforcementErr != nil {
+			status = orchestration.NestedStatusNeedsHuman
+		}
+		exitCode := providerResult.ExitCode
+		if exitCode == 0 && (runErr != nil || enforcementErr != nil) {
+			exitCode = 1
 		}
 		reportRecord := reporter.Report{
 			WorkID:      child.RunID,
 			Issue:       child.Issue,
 			Role:        reporter.RoleWorker,
-			Provider:    nestedTestSubprocessProvider,
-			Model:       firstNonEmptyNested(opts.Model, "deterministic-subprocess"),
-			ModelSource: reporter.ModelSourceSelfReported,
-			Effort:      firstNonEmptyNested(opts.Effort, "none"),
-			Permission:  reporter.Permission(child.Permission),
-			Action:      "execute nested child " + child.ChildKey,
+			Provider:    provider,
+			Model:       firstNonEmptyNested(providerResult.Model, request.Work.Model, opts.Model),
+			ModelSource: reporter.ModelSourceForProvider(provider),
+			Effort:      firstNonEmptyNested(providerResult.Effort, request.Work.Effort, opts.Effort),
+			Permission:  reporter.PermissionReadOnly,
+			Action:      "execute read-only nested child " + child.ChildKey,
 			ExitCode:    exitCode,
-			StartedAt:   state.FormatTimestamp(started),
-			EndedAt:     state.FormatTimestamp(ended),
-			DurationMS:  ended.Sub(started).Milliseconds(),
-			Usage: reporter.Usage{
-				TotalTokens: int64Ptr(0),
-			},
-			Verified: true,
+			StartedAt:   firstNonEmptyNested(providerResult.StartedAt, state.FormatTimestamp(started)),
+			EndedAt:     firstNonEmptyNested(providerResult.EndedAt, state.FormatTimestamp(ended)),
+			DurationMS:  maxNestedDuration(providerResult.DurationMS, ended.Sub(started).Milliseconds()),
+			Usage:       providerResult.Usage,
+			Verified:    enforcementErr == nil && runErr == nil && status == orchestration.NestedStatusSucceeded,
 		}
-		attemptStatus := status
 		errText := ""
-		if status != orchestration.NestedStatusSucceeded {
+		if enforcementErr != nil {
+			errText = enforcementErr.Error()
+		} else if status != orchestration.NestedStatusSucceeded {
 			errText = summary
 		}
-		attemptPath, writeErr := writeNestedAttempt(opts.RepoPath, child, reportRecord, attemptStatus, exitCode, summary, errText, deps.Now)
+		attemptPath, writeErr := writeNestedAttempt(opts.RepoPath, child, provider, reportRecord, status, exitCode, summary, errText, auditRecord, deps.Now)
 		if writeErr != nil {
-			fmt.Fprintf(stderr, "[loopcoder] warning: failed to write nested subprocess attempt: %v\n", writeErr)
+			fmt.Fprintf(stderr, "[loopcoder] warning: failed to write nested read-only attempt: %v\n", writeErr)
+			attemptPath = ""
 		}
-		result := orchestration.ChildRunResult{
-			ID:              child.ID,
-			ChildKey:        child.ChildKey,
-			Title:           child.Title,
-			Role:            child.Role,
-			RunID:           child.RunID,
-			Issue:           child.Issue,
-			Scope:           child.Scope,
-			Permission:      child.Permission,
-			DependsOn:       append([]string(nil), child.DependsOn...),
-			Aggregation:     child.Aggregation,
-			Required:        child.Required,
-			Optional:        child.Optional,
-			Ordinal:         child.Ordinal,
-			Depth:           child.Depth,
-			Status:          status,
-			ReplayAction:    child.ReplayAction,
-			StartedAt:       reportRecord.StartedAt,
-			FinishedAt:      reportRecord.EndedAt,
-			AttemptPath:     attemptPath,
-			ProviderKey:     child.ProviderKey,
-			ProviderReceipt: attemptPath,
-			Report:          &reportRecord,
+		base.Status = status
+		base.StartedAt = reportRecord.StartedAt
+		base.FinishedAt = reportRecord.EndedAt
+		base.AttemptPath = attemptPath
+		base.ProviderReceipt = attemptPath
+		base.Report = &reportRecord
+		base.ReadOnlyEnforcement = auditRecord
+		if enforcementErr != nil {
+			base.Error = enforcementErr.Error()
+			base.Reason = "read-only enforcement detected or could not rule out a guarded state change"
+			base.NextAction = "inspect the preserved enforcement audit before replaying this child"
+			return base, enforcementErr
 		}
+		if runErr != nil {
+			base.Error = summary
+			base.Reason = summary
+			base.NextAction = "inspect the failed read-only provider attempt and rerun the unchanged plan after recovery"
+			return base, sanitizeNestedProviderError(runErr)
+		}
+		base.Reason = summary
 		if status != orchestration.NestedStatusSucceeded {
-			result.Error = summary
-			result.Reason = summary
-			result.NextAction = "inspect the failed nested child and rerun the same plan after recovery"
-			return result, errors.New(summary)
+			base.Error = summary
+			base.NextAction = "inspect the read-only provider attempt before replaying the unchanged plan"
 		}
-		return result, nil
+		return base, nil
 	}
 }
 
-func completedNestedAttempt(repoPath string, child orchestration.ChildRunPlan) (orchestration.ChildRunResult, bool, error) {
+func runNestedReadOnlyProvider(ctx context.Context, opts nestedRunOptions, request orchestration.ChildExecutionRequest, provider string, deps Deps, evidenceDir string, stderr io.Writer) (agent.Result, error) {
+	if provider == nestedTestSubprocessProvider {
+		return runNestedReadOnlyTestSubprocess(ctx, opts, request)
+	}
+	runner, err := deps.AgentLookup(provider)
+	if err != nil {
+		return agent.Result{}, err
+	}
+	promptData, err := json.MarshalIndent(request, "", "  ")
+	if err != nil {
+		return agent.Result{}, fmt.Errorf("encode immutable child contract: %w", err)
+	}
+	prompt := "Execute this LoopCoder nested child in strictly read-only mode. Do not modify files, Git state, hooks, configuration, worktree metadata, or LoopCoder project state. Return concise findings only.\n\nImmutable execution contract:\n" + string(promptData)
+	return runner.Run(ctx, agent.Invocation{
+		WorktreePath: filepath.FromSlash(request.ScopedRepositoryIdentity),
+		Prompt:       prompt,
+		Model:        firstNonEmptyNested(request.Work.Model, opts.Model),
+		Effort:       firstNonEmptyNested(request.Work.Effort, opts.Effort),
+		ReadOnly:     true,
+		LogPath:      filepath.Join(evidenceDir, fmt.Sprintf("claim-%d-provider.log", request.ClaimGeneration)),
+		Stderr:       stderr,
+		HardCap:      nestedProviderHardCap(request.Work.TimeoutSeconds),
+		RunID:        request.RunID,
+		Role:         "nested-read-only",
+		ProviderKey:  request.IdempotencyKey,
+	})
+}
+
+func runNestedReadOnlyTestSubprocess(ctx context.Context, opts nestedRunOptions, request orchestration.ChildExecutionRequest) (agent.Result, error) {
+	child := request.ChildRunPlan()
+	if len(child.Scope.Commands) == 0 {
+		return agent.Result{}, fmt.Errorf("test-subprocess child %q requires at least one scope.commands entry", child.ChildKey)
+	}
+	started := time.Now().UTC()
+	result := agent.Result{Model: firstNonEmptyNested(opts.Model, "deterministic-subprocess"), Effort: firstNonEmptyNested(opts.Effort, "none")}
+	var output strings.Builder
+	executed := false
+	for _, command := range child.Scope.Commands {
+		command = strings.TrimSpace(command)
+		if command == "" {
+			continue
+		}
+		executed = true
+		cmd := shellCommand(context.Background(), command)
+		cmd.Dir = opts.RepoPath
+		cmd.Env = environmentWithOverride(os.Environ(), "GIT_OPTIONAL_LOCKS", "0")
+		cmd.Stdout = &output
+		cmd.Stderr = &output
+		execResult, err := supervisedexec.Run(ctx, cmd, supervisedexec.Options{
+			HardCap: nestedSubprocessHardCap(nestedChildMetadata{TimeoutSeconds: request.Work.TimeoutSeconds}),
+			RunID:   child.RunID,
+			Role:    "nested-test-subprocess",
+		})
+		result.ExitCode = execResult.ExitCode
+		if err != nil {
+			result.ExitCode = commandExitCode(err)
+			if result.ExitCode == 0 {
+				result.ExitCode = 1
+			}
+			result.Summary = output.String()
+			result.StartedAt = state.FormatTimestamp(started)
+			result.EndedAt = state.FormatTimestamp(time.Now().UTC())
+			return result, err
+		}
+		if execResult.Killed {
+			result.ExitCode = 1
+			result.Hung = true
+			result.HungReason = "test subprocess exceeded its execution boundary"
+			break
+		}
+		if execResult.ExitCode != 0 {
+			break
+		}
+	}
+	if !executed {
+		return result, fmt.Errorf("test-subprocess child %q has no non-empty scope.commands entry", child.ChildKey)
+	}
+	ended := time.Now().UTC()
+	result.Summary = output.String()
+	result.StartedAt = state.FormatTimestamp(started)
+	result.EndedAt = state.FormatTimestamp(ended)
+	result.DurationMS = ended.Sub(started).Milliseconds()
+	result.Usage.TotalTokens = int64Ptr(0)
+	if result.Hung {
+		return result, context.DeadlineExceeded
+	}
+	if result.ExitCode != 0 {
+		return result, fmt.Errorf("test subprocess exited with code %d", result.ExitCode)
+	}
+	return result, nil
+}
+
+func nestedResultFromRequest(request orchestration.ChildExecutionRequest) orchestration.ChildRunResult {
+	child := request.ChildRunPlan()
+	return orchestration.ChildRunResult{
+		ID: child.ID, ChildKey: child.ChildKey, Title: child.Title, Role: child.Role,
+		RunID: child.RunID, Issue: child.Issue, Scope: child.Scope, Permission: child.Permission,
+		DependsOn: append([]string(nil), child.DependsOn...), Aggregation: child.Aggregation,
+		Required: child.Required, Optional: child.Optional, Ordinal: child.Ordinal, Depth: child.Depth,
+		ReplayAction: child.ReplayAction, ProviderKey: request.IdempotencyKey,
+		ContractSchema: request.SchemaVersion, ContractFingerprint: request.ContractFingerprint,
+	}
+}
+
+func nestedReadOnlyAudit(audit readonlyexec.Audit) *state.ReadOnlyEnforcementAudit {
+	violations := make([]state.ReadOnlyEnforcementViolation, 0, len(audit.Violations))
+	for _, violation := range audit.Violations {
+		violations = append(violations, state.ReadOnlyEnforcementViolation{
+			Code: violation.Code, Surface: violation.Surface, TargetID: violation.TargetID,
+			BeforeHash: violation.BeforeHash, AfterHash: violation.AfterHash,
+		})
+	}
+	return &state.ReadOnlyEnforcementAudit{
+		Mode: audit.Mode, Verification: audit.Verification,
+		BaselineFingerprint: audit.BaselineFingerprint, PostRunFingerprint: audit.PostRunFingerprint,
+		Recovered: audit.Recovered, Violations: violations,
+	}
+}
+
+func nestedAgentStatus(result agent.Result, err error) string {
+	if err != nil {
+		return normalizeExecutorFailureStatus(err)
+	}
+	if result.Hung {
+		return orchestration.NestedStatusNeedsHuman
+	}
+	if result.ExitCode != 0 {
+		return orchestration.NestedStatusFailed
+	}
+	return orchestration.NestedStatusSucceeded
+}
+
+func nestedProviderHardCap(timeoutSeconds int) time.Duration {
+	if timeoutSeconds <= 0 {
+		return supervisedexec.DefaultHardCap
+	}
+	return time.Duration(timeoutSeconds) * time.Second
+}
+
+func nestedPrivateRunKey(runID string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(runID)))
+	return safeBranchSegment(runID) + "-" + fmt.Sprintf("%x", sum[:6])
+}
+
+func maxNestedDuration(values ...int64) int64 {
+	var maximum int64
+	for _, value := range values {
+		if value > maximum {
+			maximum = value
+		}
+	}
+	return maximum
+}
+
+func sanitizeNestedProviderError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) {
+		return fmt.Errorf("nested read-only provider canceled: %w", context.Canceled)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("nested read-only provider timed out: %w", context.DeadlineExceeded)
+	}
+	message := boundedNestedText(recovery.Scrub(err.Error()))
+	if strings.TrimSpace(message) == "" {
+		message = "nested read-only provider failed"
+	}
+	return errors.New(message)
+}
+
+func environmentWithOverride(environ []string, key, value string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(environ)+1)
+	for _, entry := range environ {
+		if !strings.HasPrefix(entry, prefix) {
+			out = append(out, entry)
+		}
+	}
+	return append(out, prefix+value)
+}
+
+func completedNestedAttempt(repoPath string, child orchestration.ChildRunPlan, provider string) (orchestration.ChildRunResult, bool, error) {
 	attempts, err := state.LoadAttempts(repoPath, child.RunID)
 	if err != nil {
 		return orchestration.ChildRunResult{}, false, err
@@ -562,7 +784,7 @@ func completedNestedAttempt(repoPath string, child orchestration.ChildRunPlan) (
 	for i := len(attempts) - 1; i >= 0; i-- {
 		attempt := attempts[i]
 		status := state.NormalizeStatus(attempt.Status)
-		if status != state.StatusSucceeded {
+		if status != state.StatusSucceeded || strings.TrimSpace(attempt.Provider) != strings.TrimSpace(provider) || attempt.ReadOnlyEnforcement == nil || attempt.ReadOnlyEnforcement.Mode != readonlyexec.EnforcementMode || attempt.ReadOnlyEnforcement.Verification != readonlyexec.VerificationPassed {
 			continue
 		}
 		result := orchestration.ChildRunResult{
@@ -585,12 +807,13 @@ func completedNestedAttempt(repoPath string, child orchestration.ChildRunPlan) (
 			StartedAt:           attempt.StartedAt,
 			FinishedAt:          attempt.HeartbeatAt,
 			Error:               attempt.Error,
-			Reason:              attempt.Error,
+			Reason:              firstNonEmptyNested(attempt.Summary, attempt.Error),
 			AttemptPath:         attempt.Path,
 			ProviderKey:         child.ProviderKey,
 			ProviderReceipt:     attempt.Path,
 			RecoveryContextPath: attempt.RecoveryContextPath,
 			Report:              attempt.Report,
+			ReadOnlyEnforcement: attempt.ReadOnlyEnforcement,
 		}
 		return result, true, nil
 	}
@@ -721,6 +944,15 @@ func renderNestedText(report orchestration.NestedScheduleReport) string {
 				line += "@" + child.ContractFingerprint
 			}
 		}
+		if child.ReadOnlyEnforcement != nil {
+			line += " read_only_mode=" + reporter.BoundDecisionText(child.ReadOnlyEnforcement.Mode)
+			line += " read_only_verification=" + reporter.BoundDecisionText(child.ReadOnlyEnforcement.Verification)
+			line += " baseline=" + reporter.BoundDecisionText(child.ReadOnlyEnforcement.BaselineFingerprint)
+			if child.ReadOnlyEnforcement.PostRunFingerprint != "" {
+				line += " post_run=" + reporter.BoundDecisionText(child.ReadOnlyEnforcement.PostRunFingerprint)
+			}
+			line += fmt.Sprintf(" read_only_violations=%d", len(child.ReadOnlyEnforcement.Violations))
+		}
 		if child.Error != "" {
 			line += " error=" + reporter.BoundDecisionText(child.Error)
 		}
@@ -731,6 +963,14 @@ func renderNestedText(report orchestration.NestedScheduleReport) string {
 			line += " next_action=" + reporter.BoundDecisionText(child.NextAction)
 		}
 		fmt.Fprintln(&b, line)
+		if child.ReadOnlyEnforcement != nil {
+			for _, violation := range child.ReadOnlyEnforcement.Violations {
+				fmt.Fprintf(&b, "  policy_violation code=%s surface=%s target=%s before=%s after=%s\n",
+					reporter.BoundDecisionText(violation.Code), reporter.BoundDecisionText(violation.Surface),
+					reporter.BoundDecisionText(violation.TargetID), reporter.BoundDecisionText(violation.BeforeHash),
+					reporter.BoundDecisionText(violation.AfterHash))
+			}
+		}
 	}
 	for _, refusal := range report.Refusals {
 		fmt.Fprintf(&b, "Refusal: child=%s code=%s permission=%s capability_result=%s provider_native=%t next_action=%s\n",
@@ -753,55 +993,7 @@ func renderNestedText(report orchestration.NestedScheduleReport) string {
 	return b.String()
 }
 
-func childResultFromWorker(child orchestration.ChildRunPlan, result worker.Result) orchestration.ChildRunResult {
-	status := normalizeExecutorStatus(result.Status)
-	if status == "" {
-		if result.OK {
-			status = orchestration.NestedStatusSucceeded
-		} else {
-			status = orchestration.NestedStatusFailed
-		}
-	}
-	runID := firstNonEmptyNested(result.RunID, child.RunID)
-	childResult := orchestration.ChildRunResult{
-		ID:              child.ID,
-		ChildKey:        child.ChildKey,
-		Title:           child.Title,
-		Role:            child.Role,
-		RunID:           runID,
-		Issue:           result.Issue,
-		Scope:           child.Scope,
-		Permission:      child.Permission,
-		DependsOn:       append([]string(nil), child.DependsOn...),
-		Aggregation:     child.Aggregation,
-		Required:        child.Required,
-		Optional:        child.Optional,
-		Ordinal:         child.Ordinal,
-		Depth:           child.Depth,
-		Status:          status,
-		ReplayAction:    child.ReplayAction,
-		Error:           "",
-		Reason:          result.Reason,
-		NextAction:      result.NextAction,
-		AttemptPath:     result.AttemptPath,
-		ProviderKey:     child.ProviderKey,
-		ProviderReceipt: firstNonEmptyNested(result.PR, result.AttemptPath),
-		Report:          result.Report,
-	}
-	if status != orchestration.NestedStatusSucceeded {
-		receipt := reporter.NormalizeDecision(reporter.DecisionInput{
-			Status:             status,
-			ExplicitReason:     childResult.Reason,
-			ConcreteError:      result.Summary,
-			ExplicitNextAction: childResult.NextAction,
-		})
-		childResult.Reason = receipt.Reason
-		childResult.NextAction = receipt.NextAction
-	}
-	return childResult
-}
-
-func writeNestedAttempt(repoPath string, child orchestration.ChildRunPlan, record reporter.Report, status string, exitCode int, summary, errText string, now func() time.Time) (string, error) {
+func writeNestedAttempt(repoPath string, child orchestration.ChildRunPlan, provider string, record reporter.Report, status string, exitCode int, summary, errText string, enforcement *state.ReadOnlyEnforcementAudit, now func() time.Time) (string, error) {
 	if now == nil {
 		now = time.Now
 	}
@@ -812,54 +1004,26 @@ func writeNestedAttempt(repoPath string, child orchestration.ChildRunPlan, recor
 		errPtr = &errCopy
 	}
 	return state.WriteAttempt(repoPath, child.RunID, state.AttemptRecord{
-		Version:        1,
-		JobID:          "job-" + child.ChildKey + "-test-subprocess",
-		Issue:          child.Issue,
-		Attempt:        1,
-		Provider:       nestedTestSubprocessProvider,
-		PID:            os.Getpid(),
-		Phase:          "nested_subprocess_exited",
-		Status:         status,
-		Branch:         nestedChildBranch(child),
-		StartedAt:      record.StartedAt,
-		HeartbeatAt:    at,
-		LastProgressAt: at,
-		LogBytes:       int64(len(summary)),
-		ExitCode:       &exitCode,
-		Error:          errPtr,
-		Usage:          &record.Usage,
-		Report:         &record,
+		Version:             1,
+		JobID:               "job-" + child.ChildKey + "-nested-read-only",
+		Issue:               child.Issue,
+		Attempt:             1,
+		Provider:            strings.TrimSpace(provider),
+		PID:                 os.Getpid(),
+		Phase:               "nested_read_only_verified",
+		Status:              status,
+		Branch:              "",
+		StartedAt:           record.StartedAt,
+		HeartbeatAt:         at,
+		LastProgressAt:      at,
+		LogBytes:            int64(len(summary)),
+		ExitCode:            &exitCode,
+		Error:               errPtr,
+		Summary:             strings.TrimSpace(summary),
+		Usage:               &record.Usage,
+		Report:              &record,
+		ReadOnlyEnforcement: enforcement,
 	})
-}
-
-func nestedChildIssueBody(opts nestedRunOptions, child orchestration.ChildRunPlan, metadata nestedChildMetadata) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "Nested child generated by loopcoder.\n\nBase branch: %s\nChild key: %s\nPermission: %s\nScope: %s\n\n",
-		opts.BaseBranch,
-		child.ChildKey,
-		child.Permission,
-		childScopeSummary(child.Scope),
-	)
-	if strings.TrimSpace(metadata.IssueBody) != "" {
-		b.WriteString(boundedNestedText(metadata.IssueBody))
-	} else if strings.TrimSpace(metadata.Prompt) != "" {
-		b.WriteString(boundedNestedText(metadata.Prompt))
-	} else {
-		fmt.Fprintf(&b, "Implement the nested child task: %s\n", child.Title)
-	}
-	if child.Permission == string(reporter.PermissionOrchestrate) {
-		fmt.Fprintf(&b, "\n\nNested policy: loopcoder owns child identity, spawning, permission, persistence, budget, and recovery. Do not use provider-native sub-agents outside a loopcoder child plan; max_depth=%d.\n", lcdefaults.NestedSchedulerMaxDepth)
-	}
-	_ = opts
-	return b.String()
-}
-
-func childScopeSummary(scope orchestration.ChildScope) string {
-	data, err := json.Marshal(scope)
-	if err != nil {
-		return "{}"
-	}
-	return string(data)
 }
 
 func boundedNestedText(value string) string {
@@ -868,14 +1032,6 @@ func boundedNestedText(value string) string {
 		return value
 	}
 	return value[:nestedPromptBudgetBytes] + "\n[loopcoder] nested child context truncated"
-}
-
-func nestedChildBranch(child orchestration.ChildRunPlan) string {
-	issue := child.Issue
-	if issue <= 0 {
-		issue = 1
-	}
-	return fmt.Sprintf("loop/issue-%d-%s", issue, safeBranchSegment(child.ChildKey))
 }
 
 func safeBranchSegment(value string) string {

@@ -361,11 +361,15 @@ During the 0.6.x transition window, readers accept legacy `[attestation]` header
   dispatch defaults directly to Codex in v0.8.0; automatic product routing is
   not wired.
 - Nested orchestration: `loopcoder nested run --plan <file.json>` persists and
-  schedules bounded child-plan records. Production-provider write and
-  orchestrate modes are refused, while the accepted read-only path does not
-  enforce mutation-free behavior in the Worker adapter. Therefore no
-  real-provider nested mode is supported in v0.8.0. The reserved
-  `test-subprocess` provider is deterministic test infrastructure only.
+  schedules bounded child-plan records. The read-only executor supports Codex,
+  Claude, and Grok through explicit provider read-only modes, then compares a
+  durable pre-run repository/project-state baseline with the post-run state.
+  Existing user dirt is preserved as baseline; any tracked, untracked, index,
+  ref, config, hook, linked-worktree, or guarded LoopCoder-state change becomes
+  a typed `needs-human` policy violation and is never remediated automatically.
+  Write, orchestrate, provider-native, and unregistered provider/host routes are
+  refused before provider launch. The reserved `test-subprocess` provider is
+  deterministic test infrastructure and passes through the same enforcement.
 - Verifier: `loopcoder loopreview` returns a structured `pass`, `fail`, or
   `needs-human` verdict. Codex and Claude have historical mechanism smoke
   evidence, not protected exact-v0.8.0 canaries; provider independence is

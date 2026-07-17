@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/audit"
 	"github.com/jasonhnd/loopcoder/internal/budget"
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
@@ -87,6 +88,7 @@ type Deps struct {
 	Discover                    func(ctx context.Context, opts perception.Options) (perception.Report, error)
 	Compile                     func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
 	Dispatch                    func(ctx context.Context, opts worker.Options) (worker.Result, error)
+	AgentLookup                 func(provider string) (agent.Runner, error)
 	Loopreview                  func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
 	Promote                     func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
 	Recover                     func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
@@ -222,6 +224,7 @@ func DefaultDeps() Deps {
 		Dispatch: func(ctx context.Context, opts worker.Options) (worker.Result, error) {
 			return worker.Dispatch(ctx, opts, worker.DefaultDeps())
 		},
+		AgentLookup: agent.Lookup,
 		Loopreview: func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error) {
 			return loopreview.Run(ctx, opts, loopreview.DefaultDeps())
 		},
