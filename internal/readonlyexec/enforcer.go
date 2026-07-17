@@ -122,6 +122,30 @@ type Session struct {
 	recovered bool
 }
 
+// ReconcileVerified authenticates a previously completed provider execution
+// before an attempt record may be reused after terminal delivery was lost.
+func ReconcileVerified(opts Options) (Audit, error) {
+	opts = normalizeOptions(opts)
+	if err := validateOptions(opts); err != nil {
+		audit := inconclusiveAudit()
+		return audit, &PolicyViolationError{Phase: "reconciliation", Violations: audit.Violations, Reason: "verified read-only evidence could not be prepared for reconciliation"}
+	}
+	record, ok, err := loadRecord(opts.EvidencePath)
+	if err != nil || !ok {
+		audit := Audit{Mode: EnforcementMode, Verification: VerificationInconclusive, Violations: []Violation{contractEvidenceViolation()}}
+		return audit, &PolicyViolationError{Phase: "reconciliation", Violations: audit.Violations, Reason: "verified read-only evidence is missing or unreadable"}
+	}
+	if !validEvidenceRecord(opts, record) {
+		audit := Audit{Mode: EnforcementMode, Verification: VerificationInconclusive, Violations: []Violation{contractEvidenceViolation()}}
+		return audit, &PolicyViolationError{Phase: "reconciliation", Violations: audit.Violations, Reason: "verified read-only evidence failed integrity validation"}
+	}
+	audit := auditFromRecord(record)
+	if record.Status != recordStatusVerified || audit.Verification != VerificationPassed {
+		return audit, &PolicyViolationError{Phase: "reconciliation", Violations: audit.Violations, Reason: "read-only evidence is not a verified successful execution"}
+	}
+	return audit, nil
+}
+
 // Begin captures and persists the pre-run baseline. An interrupted prior
 // baseline is verified before a new provider may launch.
 func Begin(ctx context.Context, opts Options) (*Session, Audit, error) {

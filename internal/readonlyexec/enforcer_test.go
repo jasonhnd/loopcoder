@@ -256,6 +256,10 @@ func TestSessionDoesNotRelaunchVerifiedExecutionWhenAttemptDeliveryWasLost(t *te
 	if relaunched != nil || !errors.As(err, &violation) || audit.Verification != VerificationInconclusive || !hasViolationCode(audit.Violations, "verified_execution_requires_reconciliation") {
 		t.Fatalf("relaunch session=%#v audit=%#v error=%v", relaunched, audit, err)
 	}
+	reconciled, err := ReconcileVerified(nextClaim)
+	if err != nil || reconciled.Verification != VerificationPassed || reconciled.BaselineFingerprint == "" || reconciled.PostRunFingerprint == "" {
+		t.Fatalf("ReconcileVerified audit=%#v error=%v", reconciled, err)
+	}
 }
 
 func TestSessionFailsClosedWhenEvidenceIsModified(t *testing.T) {

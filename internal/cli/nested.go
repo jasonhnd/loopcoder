@@ -464,11 +464,6 @@ func nestedReadOnlyExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) 
 		if provider != opts.Provider {
 			return base, &readonlyexec.PolicyViolationError{Phase: "pre-launch", Reason: "the persisted provider route does not match the registered read-only adapter"}
 		}
-		if existing, ok, err := completedNestedAttempt(opts.RepoPath, child, provider); err != nil {
-			return base, err
-		} else if ok {
-			return existing, nil
-		}
 		if err := preflightNestedReadOnlyRoute(provider, opts.HostProfile); err != nil {
 			return base, &readonlyexec.PolicyViolationError{Phase: "pre-launch", Reason: "the persisted provider route is not supported for read-only execution"}
 		}
@@ -497,14 +492,20 @@ func nestedReadOnlyExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) 
 		if roots.Registered && strings.TrimSpace(roots.ProjectRoot) != "" {
 			projectStatePaths = append(projectStatePaths, roots.ProjectRoot)
 		}
-		session, baselineAudit, err := readonlyexec.Begin(ctx, readonlyexec.Options{
+		enforcementOpts := readonlyexec.Options{
 			RepoPath:            opts.RepoPath,
 			EvidencePath:        evidencePath,
 			ContractFingerprint: request.ContractFingerprint,
 			ClaimGeneration:     request.ClaimGeneration,
 			ProjectStatePaths:   projectStatePaths,
 			ExcludedPaths:       excludedStatePaths,
-		})
+		}
+		if existing, ok, err := completedNestedAttempt(opts.RepoPath, child, provider, enforcementOpts); err != nil {
+			return base, err
+		} else if ok {
+			return existing, nil
+		}
+		session, baselineAudit, err := readonlyexec.Begin(ctx, enforcementOpts)
 		base.ReadOnlyEnforcement = nestedReadOnlyAudit(baselineAudit)
 		if err != nil {
 			return base, err
@@ -798,7 +799,7 @@ func environmentWithOverride(environ []string, key, value string) []string {
 	return append(out, prefix+value)
 }
 
-func completedNestedAttempt(repoPath string, child orchestration.ChildRunPlan, provider string) (orchestration.ChildRunResult, bool, error) {
+func completedNestedAttempt(repoPath string, child orchestration.ChildRunPlan, provider string, enforcementOpts readonlyexec.Options) (orchestration.ChildRunResult, bool, error) {
 	attempts, err := state.LoadAttempts(repoPath, child.RunID)
 	if err != nil {
 		return orchestration.ChildRunResult{}, false, err
@@ -808,6 +809,14 @@ func completedNestedAttempt(repoPath string, child orchestration.ChildRunPlan, p
 		status := state.NormalizeStatus(attempt.Status)
 		if status != state.StatusSucceeded || strings.TrimSpace(attempt.Provider) != strings.TrimSpace(provider) || attempt.ReadOnlyEnforcement == nil || attempt.ReadOnlyEnforcement.Mode != readonlyexec.EnforcementMode || attempt.ReadOnlyEnforcement.Verification != readonlyexec.VerificationPassed {
 			continue
+		}
+		verified, err := readonlyexec.ReconcileVerified(enforcementOpts)
+		if err != nil {
+			return orchestration.ChildRunResult{}, false, err
+		}
+		verifiedAudit := nestedReadOnlyAudit(verified)
+		if !sameNestedReadOnlyAudit(attempt.ReadOnlyEnforcement, verifiedAudit) {
+			return orchestration.ChildRunResult{}, false, &readonlyexec.PolicyViolationError{Phase: "reconciliation", Reason: "the successful attempt does not match its private read-only enforcement evidence"}
 		}
 		result := orchestration.ChildRunResult{
 			ID:                  child.ID,
@@ -835,11 +844,23 @@ func completedNestedAttempt(repoPath string, child orchestration.ChildRunPlan, p
 			ProviderReceipt:     attempt.Path,
 			RecoveryContextPath: attempt.RecoveryContextPath,
 			Report:              attempt.Report,
-			ReadOnlyEnforcement: attempt.ReadOnlyEnforcement,
+			ReadOnlyEnforcement: verifiedAudit,
 		}
 		return result, true, nil
 	}
 	return orchestration.ChildRunResult{}, false, nil
+}
+
+func sameNestedReadOnlyAudit(left, right *state.ReadOnlyEnforcementAudit) bool {
+	if left == nil || right == nil || left.Mode != right.Mode || left.Verification != right.Verification || left.BaselineFingerprint != right.BaselineFingerprint || left.PostRunFingerprint != right.PostRunFingerprint || left.Recovered != right.Recovered || len(left.Violations) != len(right.Violations) {
+		return false
+	}
+	for index := range left.Violations {
+		if left.Violations[index] != right.Violations[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func enforceNestedPlanScope(repoPath, parentPermission string, plan *orchestration.ChildPlan) error {

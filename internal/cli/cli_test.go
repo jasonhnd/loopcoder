@@ -9670,6 +9670,35 @@ func TestNestedSubprocessExecutorUnitRunsDeterministicCommand(t *testing.T) {
 	if attempts[0].Branch != "" || strings.TrimSpace(attempts[0].Summary) == "" {
 		t.Fatalf("read-only attempt branch/summary = %q/%q, want no branch and a durable summary", attempts[0].Branch, attempts[0].Summary)
 	}
+	replayRequest := nestedExecutionRequestForCLITest(repo, child)
+	replayRequest.ClaimGeneration++
+	replayed, err := executor(context.Background(), replayRequest)
+	if err != nil || replayed.Status != orchestration.NestedStatusSucceeded || replayed.AttemptPath != result.AttemptPath {
+		t.Fatalf("verified attempt replay result=%#v error=%v", replayed, err)
+	}
+	attemptData, err := os.ReadFile(result.AttemptPath)
+	if err != nil {
+		t.Fatalf("read attempt for tamper fixture: %v", err)
+	}
+	var tamperedRecord map[string]any
+	if err := json.Unmarshal(attemptData, &tamperedRecord); err != nil {
+		t.Fatalf("decode attempt for tamper fixture: %v", err)
+	}
+	tamperedAudit, ok := tamperedRecord["read_only_enforcement"].(map[string]any)
+	if !ok {
+		t.Fatalf("attempt read_only_enforcement = %#v", tamperedRecord["read_only_enforcement"])
+	}
+	tamperedAudit["baseline_fingerprint"] = "sha256:" + strings.Repeat("0", 64)
+	tamperedData, err := json.MarshalIndent(tamperedRecord, "", "  ")
+	if err != nil {
+		t.Fatalf("encode tampered attempt fixture: %v", err)
+	}
+	mustWriteCLITest(t, result.AttemptPath, string(append(tamperedData, '\n')))
+	_, err = executor(context.Background(), replayRequest)
+	var policyViolation interface{ ChildExecutionPolicyViolation() }
+	if !errors.As(err, &policyViolation) {
+		t.Fatalf("tampered attempt replay error=%v, want typed policy violation", err)
+	}
 }
 
 func TestValidateNestedPlanReadOnlyProvidersRejectsConflictingMetadata(t *testing.T) {
