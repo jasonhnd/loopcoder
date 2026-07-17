@@ -81,6 +81,47 @@ The smoke proves all of the following:
   `.loopcoder/runs`, `.loopcoder/logs`, `.loopcoder/recovery`, or
   `.loopcoder/relay` paths.
 
+## v0.8.1 Nested Permission Matrix
+
+The v0.8.1 release smoke extends this acceptance path with
+`scripts/nested-permission-matrix-smoke.sh`. The macOS release job downloads the
+single signed candidate artifact produced by the build job, verifies
+`SHA256SUMS`, extracts it once, and passes that exact binary directly to the
+matrix. The matrix does not rebuild or substitute the candidate.
+
+The blocking matrix uses a fresh temporary repository and `LOOPCODER_HOME`, the
+deterministic `test-subprocess` provider, and no network or provider
+credentials. It runs seven cases and one replay per case: successful read-only,
+read-only mutation, in-scope bounded write, out-of-scope write, orchestrate
+refusal, unbridged provider-native refusal, and unknown-permission refusal. It
+asserts provider launch counts, child lifecycle and claim evidence, parent
+aggregation, progress receipts, audit reason codes, parent/worktree isolation,
+replay behavior, and the absence of repository-local runtime payload.
+
+The resource ceiling is fixed at 14 invocations, one concurrent child, depth
+two, a 20-second timeout per invocation, and five minutes for the complete
+matrix. A failure writes only
+`loopcoder.nested_permission_matrix_diagnostic.v1`: the failed case, a stable
+failure code, and completed sanitized summaries. The release workflow retains
+that failure bundle for seven days and caps it at 64 KiB. Successful sanitized
+matrix evidence is retained as a private GitHub Actions artifact for 90 days;
+it is not added to the three public release assets. Neither artifact contains
+raw provider output, prompts, credentials, or machine paths.
+
+Real-provider canaries are separate, non-blocking, and operator-initiated. They
+are never run on pull-request events and require the explicit protected gate:
+
+```text
+LOOPCODER_REAL_PROVIDER_SMOKE=1 bash scripts/nested-permission-real-provider-smoke.sh \
+  --binary <packaged-binary> --provider codex --permission read-only
+```
+
+Read-only canaries are exposed only for the registered Codex, Claude, and Grok
+executors. Bounded-write canaries are exposed only for Codex and Grok. They use
+the operator's existing provider installation and authentication; no forked PR
+receives secrets, and neither Grok nor any other real provider is a blocking
+release canary in this matrix.
+
 ## v0.7.0 Upgrade And Rollback Smoke
 
 The staged release workflow must run the exact candidate artifact through:

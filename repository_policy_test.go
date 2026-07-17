@@ -196,6 +196,162 @@ func TestV080SelfBootstrapSmokeContract(t *testing.T) {
 	}
 }
 
+func TestV081NestedPermissionMatrixSmokeContract(t *testing.T) {
+	root := repositoryPolicyRoot(t)
+	matrixPath := filepath.Join(root, "scripts", "nested-permission-matrix-smoke.sh")
+	data, err := os.ReadFile(matrixPath)
+	if err != nil {
+		t.Fatalf("read nested permission matrix smoke script: %v", err)
+	}
+	info, err := os.Stat(matrixPath)
+	if err != nil {
+		t.Fatalf("stat nested permission matrix smoke script: %v", err)
+	}
+	if info.Mode()&0o111 == 0 {
+		t.Fatal("nested permission matrix smoke script must be executable")
+	}
+	matrix := string(data)
+	for _, want := range []string{
+		`#!/usr/bin/env bash`,
+		`set -euo pipefail`,
+		`trap on_error ERR`,
+		`--binary`,
+		`--candidate-source`,
+		`loopcoder.nested_permission_matrix_evidence.v1`,
+		`loopcoder.nested_permission_matrix_diagnostic.v1`,
+		`--provider test-subprocess`,
+		`"clean_temporary_home": True`,
+		`"clean_temporary_repository": True`,
+		`"cases": 7`,
+		`"invocations": 14`,
+		`"max_concurrency": 1`,
+		`"per_invocation_timeout_seconds": int(os.environ["CASE_TIMEOUT"])`,
+		`"max_matrix_duration_seconds": int(os.environ["MAX_DURATION"])`,
+		`"paid_provider_calls": 0`,
+		`provider_launches_replay`,
+		`claim_generation`,
+		`nested.child.queued`,
+		`nested.child.running`,
+		`nested.child.finished`,
+		`read_only_policy_violation`,
+		`untracked_file_created`,
+		`write_scope_policy_violation`,
+		`out_of_scope_mutation`,
+		`orchestrate_unsupported`,
+		`provider_native_bridge_required`,
+		`nested_permission_unknown`,
+		`replay_action`,
+		`repo_local_payload_created`,
+		`"paths_included": False`,
+		`"prompts_included": False`,
+		`"credentials_included": False`,
+		`"raw_output_included": False`,
+		`"max_bytes": int(os.environ["MAX_DIAGNOSTIC"])`,
+		`matrix_unhandled_error`,
+	} {
+		if !strings.Contains(matrix, want) {
+			t.Fatalf("nested permission matrix does not contain required seam %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"go build",
+		"gh ",
+		"GITHUB_TOKEN",
+		"GH_TOKEN",
+		"pwsh",
+		"powershell",
+		".ps1",
+	} {
+		if strings.Contains(matrix, forbidden) {
+			t.Fatalf("blocking nested permission matrix contains forbidden external seam %q", forbidden)
+		}
+	}
+
+	selfBootstrapData, err := os.ReadFile(filepath.Join(root, "scripts", "self-bootstrap-smoke.ps1"))
+	if err != nil {
+		t.Fatalf("read self-bootstrap smoke script: %v", err)
+	}
+	if strings.Contains(string(selfBootstrapData), "nested-permission-matrix-smoke") {
+		t.Fatal("the macOS nested permission matrix must not be routed through the legacy PowerShell self-bootstrap script")
+	}
+
+	realCanaryPath := filepath.Join(root, "scripts", "nested-permission-real-provider-smoke.sh")
+	realCanaryData, err := os.ReadFile(realCanaryPath)
+	if err != nil {
+		t.Fatalf("read opt-in real-provider canary script: %v", err)
+	}
+	realCanaryInfo, err := os.Stat(realCanaryPath)
+	if err != nil {
+		t.Fatalf("stat opt-in real-provider canary script: %v", err)
+	}
+	if realCanaryInfo.Mode()&0o111 == 0 {
+		t.Fatal("real-provider nested canary script must be executable")
+	}
+	realCanary := string(realCanaryData)
+	for _, want := range []string{
+		`#!/usr/bin/env bash`,
+		`${LOOPCODER_REAL_PROVIDER_SMOKE-}`,
+		`pull_request|pull_request_target`,
+		`codex|claude|grok`,
+		`codex|grok`,
+		`"protected_opt_in": True`,
+		`"pull_request_events_allowed": False`,
+		`"candidate_sha256": os.environ["CANDIDATE_HASH"]`,
+	} {
+		if !strings.Contains(realCanary, want) {
+			t.Fatalf("real-provider nested canary does not contain required opt-in seam %q", want)
+		}
+	}
+	for _, forbidden := range []string{"pwsh", "powershell", ".ps1"} {
+		if strings.Contains(strings.ToLower(realCanary), forbidden) {
+			t.Fatalf("real-provider nested canary contains forbidden PowerShell seam %q", forbidden)
+		}
+	}
+
+	releaseData, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatalf("read release workflow: %v", err)
+	}
+	release := string(releaseData)
+	for _, want := range []string{
+		`name: release-candidate-${{ github.ref_name }}`,
+		`path: ${{ runner.temp }}/nested-permission-candidate`,
+		`name: Run packaged nested permission matrix`,
+		`shasum -a 256 -c SHA256SUMS`,
+		`tar -xzf "${archive}"`,
+		`bash scripts/nested-permission-matrix-smoke.sh`,
+		`--candidate-source packaged`,
+		`name: Retain packaged nested permission matrix evidence`,
+		`name: nested-permission-matrix-evidence-${{ github.run_id }}`,
+		`path: ${{ runner.temp }}/nested-permission-evidence/permission-matrix-evidence.json`,
+		`retention-days: 90`,
+		`name: Retain sanitized permission-matrix diagnostics`,
+		`if: failure()`,
+		`path: ${{ runner.temp }}/loopcoder-permission-matrix-diagnostics`,
+		`retention-days: 7`,
+	} {
+		if !strings.Contains(release, want) {
+			t.Fatalf("release workflow does not retain the bounded diagnostic seam %q", want)
+		}
+	}
+	downloadIndex := strings.Index(release, `path: ${{ runner.temp }}/nested-permission-candidate`)
+	matrixIndex := strings.Index(release, `name: Run packaged nested permission matrix`)
+	evidenceIndex := strings.Index(release, `name: Retain packaged nested permission matrix evidence`)
+	legacySmokeIndex := strings.Index(release, `name: Smoke staged draft artifacts`)
+	if downloadIndex < 0 || matrixIndex < 0 || evidenceIndex < 0 || legacySmokeIndex < 0 || downloadIndex > matrixIndex || matrixIndex > evidenceIndex || evidenceIndex > legacySmokeIndex {
+		t.Fatal("release workflow must download, run, and retain the native packaged matrix before the legacy artifact smoke")
+	}
+	for _, workflow := range []string{"ci.yml", "release.yml"} {
+		workflowData, err := os.ReadFile(filepath.Join(root, ".github", "workflows", workflow))
+		if err != nil {
+			t.Fatalf("read workflow %s: %v", workflow, err)
+		}
+		if strings.Contains(string(workflowData), "nested-permission-real-provider-smoke.sh") {
+			t.Fatalf("%s must not run the protected real-provider canary automatically", workflow)
+		}
+	}
+}
+
 func TestV080LivingDocumentationPolicy(t *testing.T) {
 	root := repositoryPolicyRoot(t)
 	files := []string{
