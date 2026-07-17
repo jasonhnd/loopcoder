@@ -151,6 +151,9 @@ func (r GrokRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	if inv.ReadOnly && inv.BoundedWrite {
 		return Result{ExitCode: -1}, errors.New("grok invocation cannot be both read-only and bounded-write")
 	}
+	if err := validateNestedDelegationBoundary(inv); err != nil {
+		return Result{ExitCode: -1}, err
+	}
 	if _, err := mcpServersForInvocation(inv); err != nil {
 		return Result{ExitCode: -1}, fmt.Errorf("grok MCP configuration: %w", err)
 	}

@@ -367,9 +367,12 @@ During the 0.6.x transition window, readers accept legacy `[attestation]` header
   Existing user dirt is preserved as baseline; any tracked, untracked, index,
   ref, config, hook, linked-worktree, or guarded LoopCoder-state change becomes
   a typed `needs-human` policy violation and is never remediated automatically.
-  Write, orchestrate, provider-native, and unregistered provider/host routes are
-  refused before provider launch. The reserved `test-subprocess` provider is
-  deterministic test infrastructure and passes through the same enforcement.
+  Bounded write is registered only for Codex and Grok and is verified in an
+  isolated detached worktree. Orchestrate, provider-native, and unregistered
+  provider/host routes are refused before persistence, claim, or provider
+  launch. Provider feature advertising is inventory evidence, not delegation
+  authority. The reserved `test-subprocess` provider is deterministic test
+  infrastructure and passes through the same enforcement.
 - Verifier: `loopcoder loopreview` returns a structured `pass`, `fail`, or
   `needs-human` verdict. Codex and Claude have historical mechanism smoke
   evidence, not protected exact-v0.8.0 canaries; provider independence is

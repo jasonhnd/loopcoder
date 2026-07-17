@@ -148,7 +148,8 @@ func normalizeAndValidateChildItems(plan *ChildPlan) error {
 		}
 		item.Permission = normalizeChildPermission(item.Permission)
 		if !validChildPermission(item.Permission) {
-			refusal := newNestedPermissionRefusal(*item, NestedExecutorCapability{}, item.Permission, childRequiresNativeRegistration(*item), NestedCapabilityUnknownPermission)
+			capability := NestedExecutorCapability{}
+			refusal := newNestedPermissionRefusal(*item, capability, item.Permission, childRequiresNativeRegistration(*item), NestedCapabilityUnknownPermission, EvaluateNestedDelegationCapability(*item, capability))
 			refusal.Reason = boundedNestedPermissionText(fmt.Sprintf("child %q permission must be one of read-only, write, orchestrate; requested %q is not enforceable", item.ChildKey, item.Permission))
 			return &PermissionNotEnforceableError{Refusals: []NestedPermissionRefusal{refusal}}
 		}

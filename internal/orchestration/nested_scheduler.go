@@ -96,6 +96,9 @@ type NestedScheduleOptions struct {
 	// AllowUnbudgetedLocalTest is reserved for the CLI's deterministic
 	// test-subprocess provider. Real provider routes must leave it false.
 	AllowUnbudgetedLocalTest bool
+	// NativeBridge is the only authority that can enable provider-native child
+	// execution. No production bridge is registered in v0.8.1.
+	NativeBridge ProviderNativeBridge
 
 	Execute                       ChildRunExecutor
 	RecordEvent                   RecordNestedEventFunc
@@ -290,6 +293,22 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		return NestedScheduleReport{}, err
 	}
 	plan.Items = children
+	delegationCapability := NestedExecutorCapability{
+		ExecutorID:             "nested-scheduler",
+		RegistrationID:         "builtin:nested-scheduler:v1",
+		EnforceablePermissions: []string{string(reporter.PermissionReadOnly), string(reporter.PermissionWrite)},
+		NativeBridge:           opts.NativeBridge,
+	}
+	if _, provider, ok := nestedNativeBridgeIdentity(opts.NativeBridge); ok {
+		delegationCapability.Provider = provider
+	}
+	if err := CheckNestedDelegationCapabilities(plan, delegationCapability); err != nil {
+		var permissionErr *PermissionNotEnforceableError
+		if errors.As(err, &permissionErr) {
+			return NestedPermissionRefusalReport(opts.RepoPath, opts.BaseBranch, *plan, delegationCapability, permissionErr, started), nil
+		}
+		return NestedScheduleReport{}, err
+	}
 	executionRequests := make([]ChildExecutionRequest, len(children))
 	for i, child := range children {
 		executionRequests[i], err = BuildChildExecutionRequest(opts.RepoPath, *plan, child)
@@ -658,7 +677,11 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		emitNestedChildProgress(ctx, opts, child, result, NestedEventChildRunning, parseOrClock(result.StartedAt, clock), false)
 
 		stopHeartbeat := startNestedClaimHeartbeat(opts.Store, child.RunID, claim.ExecutorID, claim.ClaimGeneration, runtimeClock)
-		executed, err := opts.Execute(ctx, cloneChildExecutionRequest(executionRequest))
+		executor := opts.Execute
+		if nativeAgent {
+			executor = opts.NativeBridge.Execute
+		}
+		executed, err := executor(ctx, cloneChildExecutionRequest(executionRequest))
 		heartbeatErr := stopHeartbeat()
 		if contractErr := validateChildExecutionResult(executionRequest, executed); contractErr != nil {
 			executed = ChildRunResult{

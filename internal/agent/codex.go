@@ -58,6 +58,14 @@ func BuildCodexArgs(inv Invocation) []string {
 	}
 	if inv.ReadOnly {
 		args = append(args, "-s", "read-only")
+		if inv.DisableDelegation {
+			args = append(args,
+				"--ephemeral",
+				"--ignore-user-config",
+				"--ignore-rules",
+				"--disable", "multi_agent",
+			)
+		}
 	} else if inv.BoundedWrite {
 		args = append(args,
 			"-s", "workspace-write",
@@ -131,6 +139,9 @@ func (ExecCodexRunner) Run(ctx context.Context, inv Invocation) (Result, error) 
 	}
 	if inv.ReadOnly && inv.BoundedWrite {
 		return Result{ExitCode: -1}, errors.New("codex invocation cannot be both read-only and bounded-write")
+	}
+	if err := validateNestedDelegationBoundary(inv); err != nil {
+		return Result{ExitCode: -1}, err
 	}
 	if _, err := mcpServersForInvocation(inv); err != nil {
 		return Result{ExitCode: -1}, fmt.Errorf("codex MCP configuration: %w", err)
