@@ -15,6 +15,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/delivery"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/lockfile"
@@ -25,6 +26,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/providerreconcile"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
+	"github.com/jasonhnd/loopcoder/internal/routing"
 	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 	"github.com/jasonhnd/loopcoder/internal/skills"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -58,10 +60,13 @@ type Options struct {
 	// worker launch. Empty only when a test or legacy caller injects an
 	// already-selected provider without going through route decide.
 	RoutingDecisionID string
-	Timeout           time.Duration
-	ConfigFromBase    bool
-	KeepWorktree      bool
-	Stderr            io.Writer
+	// RoutePinned is true when the launch provider came from an explicit
+	// --provider pin. Pinned launches never auto-fallback.
+	RoutePinned    bool
+	Timeout        time.Duration
+	ConfigFromBase bool
+	KeepWorktree   bool
+	Stderr         io.Writer
 	// BeforeProviderCall runs after provider-free adoption/reconciliation and
 	// immediately before the provider runner. Callers use it to durably reserve
 	// a budget slot; returning an error prevents the provider launch.
@@ -85,8 +90,15 @@ type Result struct {
 	// FallbackTrigger is the routing fallback trigger derived from FailureClass.
 	FallbackTrigger string `json:"fallback_trigger,omitempty"`
 	// AutoFallbackAllowed is false for needs-human classes (ambiguous, auth, etc).
-	AutoFallbackAllowed bool                       `json:"auto_fallback_allowed,omitempty"`
-	DeliveryOutcome     string                     `json:"delivery_outcome,omitempty"`
+	AutoFallbackAllowed bool `json:"auto_fallback_allowed,omitempty"`
+	// FallbackApplied is true when a bounded successor route was decided.
+	FallbackApplied bool `json:"fallback_applied,omitempty"`
+	// FallbackNeedsHuman is true when typed fallback refused auto succession.
+	FallbackNeedsHuman bool   `json:"fallback_needs_human,omitempty"`
+	FallbackDecisionID string `json:"fallback_decision_id,omitempty"`
+	// FallbackCandidateID is the successor routing candidate when selected.
+	FallbackCandidateID string `json:"fallback_candidate_id,omitempty"`
+	DeliveryOutcome     string `json:"delivery_outcome,omitempty"`
 	Evidence            []string                   `json:"evidence,omitempty"`
 	ExitCode            int                        `json:"exit_code"`
 	LogBytes            int64                      `json:"log_bytes"`
@@ -1026,37 +1038,152 @@ func providerFailureResult(dispatch *dispatchContext, agentResult agent.Result, 
 }
 
 // attachTypedFailure classifies the provider attempt into a stable class and
-// fallback trigger without error-string matching in orchestration policy.
+// connects auto-eligible failures to routing.ApplyTypedProviderFailure so a
+// bounded successor can be decided before any further provider launch.
 func attachTypedFailure(dispatch *dispatchContext, result Result, agentResult agent.Result, runErr error) Result {
 	class := provideroutcome.Classify(agentResult, runErr)
 	result.FailureClass = string(class)
 	result.FallbackTrigger = string(provideroutcome.FallbackTrigger(class))
 	result.AutoFallbackAllowed = provideroutcome.AllowsAutomaticFallback(class)
 	decisionID := ""
+	pinned := false
 	if dispatch != nil {
 		decisionID = strings.TrimSpace(dispatch.opts.RoutingDecisionID)
+		pinned = dispatch.opts.RoutePinned
 	}
 	evidence := []string{
 		"failure_class=" + string(class),
 		"fallback_trigger=" + result.FallbackTrigger,
 		fmt.Sprintf("auto_fallback_allowed=%t", result.AutoFallbackAllowed),
+		fmt.Sprintf("route_pinned=%t", pinned),
 	}
 	if decisionID != "" {
 		evidence = append(evidence, "routing_decision_id="+decisionID)
 	}
 	if provideroutcome.NeedsHuman(class) {
 		result.Outcome = string(OutcomeNeedsHuman)
+		result.FallbackNeedsHuman = true
 		result.NextAction = "needs-human: typed provider outcome forbids automatic fallback; inspect evidence and decide"
 		result.Evidence = compactEvidence(append(result.Evidence, evidence...))
 		return result
 	}
-	result.Evidence = compactEvidence(append(result.Evidence, evidence...))
+	if !result.AutoFallbackAllowed {
+		result.Evidence = compactEvidence(append(result.Evidence, evidence...))
+		result.NextAction = "typed failure recorded; automatic fallback is not allowed for this class"
+		return result
+	}
 	if decisionID == "" {
+		result.Evidence = compactEvidence(append(result.Evidence, evidence...))
 		result.NextAction = "typed failure recorded; no routing decision present so automatic fallback is unavailable"
 		return result
 	}
-	result.NextAction = "apply bounded fallback for trigger " + result.FallbackTrigger + " against routing decision " + decisionID
+	fallback, appliedEvidence := applyTypedFallbackForDispatch(dispatch, class, decisionID, pinned)
+	evidence = append(evidence, appliedEvidence...)
+	result.Evidence = compactEvidence(append(result.Evidence, evidence...))
+	result.FallbackNeedsHuman = fallback.NeedsHuman
+	result.FallbackApplied = fallback.Applied
+	if fallback.Applied {
+		result.FallbackDecisionID = strings.TrimSpace(fallback.Decision.FallbackDecisionID)
+		result.FallbackCandidateID = firstNonEmptyWorker(
+			fallback.Decision.FallbackCandidateID,
+			fallback.Decision.SelectedCandidateID,
+		)
+	}
+	if fallback.NeedsHuman {
+		result.Outcome = string(OutcomeNeedsHuman)
+	}
+	if strings.TrimSpace(fallback.NextAction) != "" {
+		result.NextAction = fallback.NextAction
+	} else {
+		result.NextAction = "apply bounded fallback for trigger " + result.FallbackTrigger + " against routing decision " + decisionID
+	}
+	if dispatch != nil && dispatch.warnings != nil && (fallback.Applied || fallback.NeedsHuman) {
+		fmt.Fprintf(dispatch.warnings, "[loopcoder] typed fallback: class=%s applied=%t needs_human=%t next=%s\n",
+			class, fallback.Applied, fallback.NeedsHuman, result.NextAction)
+	}
 	return result
+}
+
+func applyTypedFallbackForDispatch(dispatch *dispatchContext, class provideroutcome.Class, decisionID string, pinned bool) (routing.TypedFallbackResult, []string) {
+	empty := routing.TypedFallbackResult{
+		Class:               class,
+		AutoFallbackAllowed: true,
+		NextAction:          "typed failure recorded; fallback store unavailable",
+	}
+	if dispatch == nil || !dispatch.runtimeRoots.Registered || strings.TrimSpace(dispatch.runtimeRoots.DatabasePath) == "" {
+		return empty, []string{"fallback_store=unavailable"}
+	}
+	openStore := dispatch.deps.OpenStore
+	if openStore == nil {
+		openStore = dispatch.deps.OpenProgressStore
+	}
+	if openStore == nil {
+		openStore = storage.Open
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	store, err := openStore(ctx, storage.Options{Path: dispatch.runtimeRoots.DatabasePath, Now: dispatch.deps.Now})
+	if err != nil {
+		empty.NextAction = "typed failure recorded; open store for fallback failed: " + err.Error()
+		return empty, []string{"fallback_store_open_error"}
+	}
+	defer store.Close()
+
+	original, err := routing.LoadRoutingDecision(ctx, store, decisionID)
+	if err != nil {
+		empty.NextAction = "typed failure recorded; load routing decision failed: " + err.Error()
+		return empty, []string{"fallback_load_decision_error"}
+	}
+	prior := strings.TrimSpace(original.ChosenCandidateID)
+	if prior == "" {
+		empty.NextAction = "typed failure recorded; routing decision has no chosen candidate for fallback"
+		return empty, []string{"fallback_prior_candidate_missing"}
+	}
+	req := routing.TypedFallbackRequest{
+		RoutingDecisionID: decisionID,
+		PriorCandidateID:  prior,
+		Class:             class,
+		IdempotencyKey:    fmt.Sprintf("worker-typed-fallback:%s:%s:%d", decisionID, class, dispatch.opts.Attempt),
+		Pinned:            pinned,
+		DecidedBy: delivery.Actor{
+			ActorKind:         "system",
+			ActorID:           "loopcoder-worker",
+			Display:           "loopcoder worker",
+			DecisionAuthority: "worker-typed-fallback",
+			Source:            "worker.attachTypedFailure",
+		},
+		Host: delivery.Host{
+			HostKind:         "cli",
+			HostID:           "loopcoder-worker",
+			SessionID:        dispatch.opts.RunID,
+			LoopcoderVersion: "loopcoder",
+		},
+	}
+	out, applyErr := routing.ApplyTypedProviderFailure(ctx, store, req)
+	evidence := []string{
+		"fallback_prior_candidate=" + prior,
+		fmt.Sprintf("fallback_applied=%t", out.Applied),
+		fmt.Sprintf("fallback_needs_human=%t", out.NeedsHuman),
+	}
+	if out.Decision.FallbackDecisionID != "" {
+		evidence = append(evidence, "fallback_decision_id="+out.Decision.FallbackDecisionID)
+	}
+	if out.Decision.FallbackCandidateID != "" {
+		evidence = append(evidence, "fallback_candidate_id="+out.Decision.FallbackCandidateID)
+	}
+	if applyErr != nil && !out.Applied {
+		evidence = append(evidence, "fallback_error="+applyErr.Error())
+	}
+	return out, evidence
+}
+
+func firstNonEmptyWorker(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func reconcileBeforeProviderLaunch(ctx context.Context, dispatch *dispatchContext) providerreconcile.Receipt {

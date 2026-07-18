@@ -4771,6 +4771,8 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		opts.Model = routeResult.Model
 		opts.Effort = routeResult.Effort
 		opts.RoutingDecisionID = routeResult.RoutingDecisionID
+		// Explicit --provider is a durable pin: typed auto-fallback is refused.
+		opts.RoutePinned = explicitProvider != ""
 		if strings.TrimSpace(opts.RunID) == "" && strings.TrimSpace(routeResult.DeliveryRunID) != "" {
 			opts.RunID = routeResult.DeliveryRunID
 		}
