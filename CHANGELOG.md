@@ -4,6 +4,11 @@
 
 ### Changed
 
+- **Host progress visibility contracts** - negotiated foreground sinks for
+  Codex, Claude, Paseo, and generic CLI; Worker progress delivery annotates
+  the selected host; unknown hosts degrade to generic. See
+  `docs/reference/progress-hosts.md`. Active delivery still never uses a model.
+
 - **Production wait wiring** - `loopcoder wait` now ships provider-free
   `approval`, `outbox`, and `detached-worker` watchers against durable local
   state, with restartable file checkpoints and zero provider launches.

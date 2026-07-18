@@ -29,10 +29,11 @@ delivery pending. A generated receipt is not evidence of worker progress, host
 delivery, user visibility, delivery acknowledgment, or renewal of any lease,
 claim, reservation, budget, quota window, or stall watchdog deadline.
 
-In v0.8.0, durable inspection through `status` and `attach` is available, but
-the active delivery path lacks exact-artifact proof of an attached progress
-sink and host visibility. The five-minute policy and persistence mechanics are
-therefore not a promise of unsolicited user-visible receipts for every run.
+Durable inspection through `status` and `attach` remains available. v0.8.1 also
+negotiates an active foreground sink per host profile (see
+[`progress-hosts.md`](progress-hosts.md)): Worker dispatch writes human-readable
+progress to stderr by default without model calls, while durable outbox delivery
+supports reconnect/replay. Detached runs still require attach/status.
 
 Rollback behavior is fail-closed. Schema v25 is committed atomically with its
 migration row, and older binaries that only support v24 reject the database as a

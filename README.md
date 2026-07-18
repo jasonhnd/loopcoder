@@ -31,7 +31,8 @@ paths, so use v0.8.0 for controlled canary and development work, not unattended
 end-to-end production orchestration. The binding status of routing, verifier
 independence, nested execution, progress, waiters, providers, signing, and the
 installer is in the
-[`v0.8.0 capability and support matrix`](docs/reference/v0.8.0-capability-matrix.md).
+[`v0.8.0 capability and support matrix`](docs/reference/v0.8.0-capability-matrix.md)
+and the [host progress visibility contracts](docs/reference/progress-hosts.md).
 
 ## The loop
 
