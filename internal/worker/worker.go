@@ -15,7 +15,6 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/config"
-	"github.com/jasonhnd/loopcoder/internal/delivery"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/lockfile"
@@ -26,7 +25,6 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/providerreconcile"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
-	"github.com/jasonhnd/loopcoder/internal/routing"
 	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 	"github.com/jasonhnd/loopcoder/internal/skills"
 	"github.com/jasonhnd/loopcoder/internal/state"
@@ -1038,8 +1036,9 @@ func providerFailureResult(dispatch *dispatchContext, agentResult agent.Result, 
 }
 
 // attachTypedFailure classifies the provider attempt into a stable class and
-// connects auto-eligible failures to routing.ApplyTypedProviderFailure so a
-// bounded successor can be decided before any further provider launch.
+// fallback trigger without error-string matching. Production wiring of
+// routing.ApplyTypedProviderFailure lives in the CLI layer to avoid an import
+// cycle (worker → routing → orchestration → worker).
 func attachTypedFailure(dispatch *dispatchContext, result Result, agentResult agent.Result, runErr error) Result {
 	class := provideroutcome.Classify(agentResult, runErr)
 	result.FailureClass = string(class)
@@ -1067,123 +1066,24 @@ func attachTypedFailure(dispatch *dispatchContext, result Result, agentResult ag
 		result.Evidence = compactEvidence(append(result.Evidence, evidence...))
 		return result
 	}
+	result.Evidence = compactEvidence(append(result.Evidence, evidence...))
 	if !result.AutoFallbackAllowed {
-		result.Evidence = compactEvidence(append(result.Evidence, evidence...))
 		result.NextAction = "typed failure recorded; automatic fallback is not allowed for this class"
 		return result
 	}
 	if decisionID == "" {
-		result.Evidence = compactEvidence(append(result.Evidence, evidence...))
 		result.NextAction = "typed failure recorded; no routing decision present so automatic fallback is unavailable"
 		return result
 	}
-	fallback, appliedEvidence := applyTypedFallbackForDispatch(dispatch, class, decisionID, pinned)
-	evidence = append(evidence, appliedEvidence...)
-	result.Evidence = compactEvidence(append(result.Evidence, evidence...))
-	result.FallbackNeedsHuman = fallback.NeedsHuman
-	result.FallbackApplied = fallback.Applied
-	if fallback.Applied {
-		result.FallbackDecisionID = strings.TrimSpace(fallback.Decision.FallbackDecisionID)
-		result.FallbackCandidateID = firstNonEmptyWorker(
-			fallback.Decision.FallbackCandidateID,
-			fallback.Decision.SelectedCandidateID,
-		)
-	}
-	if fallback.NeedsHuman {
+	if pinned {
+		result.FallbackNeedsHuman = true
 		result.Outcome = string(OutcomeNeedsHuman)
+		result.NextAction = "needs-human: explicit pin forbids automatic fallback without owner authorization"
+		return result
 	}
-	if strings.TrimSpace(fallback.NextAction) != "" {
-		result.NextAction = fallback.NextAction
-	} else {
-		result.NextAction = "apply bounded fallback for trigger " + result.FallbackTrigger + " against routing decision " + decisionID
-	}
-	if dispatch != nil && dispatch.warnings != nil && (fallback.Applied || fallback.NeedsHuman) {
-		fmt.Fprintf(dispatch.warnings, "[loopcoder] typed fallback: class=%s applied=%t needs_human=%t next=%s\n",
-			class, fallback.Applied, fallback.NeedsHuman, result.NextAction)
-	}
+	// CLI applies routing.ApplyTypedProviderFailure after Dispatch returns.
+	result.NextAction = "apply bounded fallback for trigger " + result.FallbackTrigger + " against routing decision " + decisionID
 	return result
-}
-
-func applyTypedFallbackForDispatch(dispatch *dispatchContext, class provideroutcome.Class, decisionID string, pinned bool) (routing.TypedFallbackResult, []string) {
-	empty := routing.TypedFallbackResult{
-		Class:               class,
-		AutoFallbackAllowed: true,
-		NextAction:          "typed failure recorded; fallback store unavailable",
-	}
-	if dispatch == nil || !dispatch.runtimeRoots.Registered || strings.TrimSpace(dispatch.runtimeRoots.DatabasePath) == "" {
-		return empty, []string{"fallback_store=unavailable"}
-	}
-	openStore := dispatch.deps.OpenStore
-	if openStore == nil {
-		openStore = dispatch.deps.OpenProgressStore
-	}
-	if openStore == nil {
-		openStore = storage.Open
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	store, err := openStore(ctx, storage.Options{Path: dispatch.runtimeRoots.DatabasePath, Now: dispatch.deps.Now})
-	if err != nil {
-		empty.NextAction = "typed failure recorded; open store for fallback failed: " + err.Error()
-		return empty, []string{"fallback_store_open_error"}
-	}
-	defer store.Close()
-
-	original, err := routing.LoadRoutingDecision(ctx, store, decisionID)
-	if err != nil {
-		empty.NextAction = "typed failure recorded; load routing decision failed: " + err.Error()
-		return empty, []string{"fallback_load_decision_error"}
-	}
-	prior := strings.TrimSpace(original.ChosenCandidateID)
-	if prior == "" {
-		empty.NextAction = "typed failure recorded; routing decision has no chosen candidate for fallback"
-		return empty, []string{"fallback_prior_candidate_missing"}
-	}
-	req := routing.TypedFallbackRequest{
-		RoutingDecisionID: decisionID,
-		PriorCandidateID:  prior,
-		Class:             class,
-		IdempotencyKey:    fmt.Sprintf("worker-typed-fallback:%s:%s:%d", decisionID, class, dispatch.opts.Attempt),
-		Pinned:            pinned,
-		DecidedBy: delivery.Actor{
-			ActorKind:         "system",
-			ActorID:           "loopcoder-worker",
-			Display:           "loopcoder worker",
-			DecisionAuthority: "worker-typed-fallback",
-			Source:            "worker.attachTypedFailure",
-		},
-		Host: delivery.Host{
-			HostKind:         "cli",
-			HostID:           "loopcoder-worker",
-			SessionID:        dispatch.opts.RunID,
-			LoopcoderVersion: "loopcoder",
-		},
-	}
-	out, applyErr := routing.ApplyTypedProviderFailure(ctx, store, req)
-	evidence := []string{
-		"fallback_prior_candidate=" + prior,
-		fmt.Sprintf("fallback_applied=%t", out.Applied),
-		fmt.Sprintf("fallback_needs_human=%t", out.NeedsHuman),
-	}
-	if out.Decision.FallbackDecisionID != "" {
-		evidence = append(evidence, "fallback_decision_id="+out.Decision.FallbackDecisionID)
-	}
-	if out.Decision.FallbackCandidateID != "" {
-		evidence = append(evidence, "fallback_candidate_id="+out.Decision.FallbackCandidateID)
-	}
-	if applyErr != nil && !out.Applied {
-		evidence = append(evidence, "fallback_error="+applyErr.Error())
-	}
-	return out, evidence
-}
-
-func firstNonEmptyWorker(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
 }
 
 func reconcileBeforeProviderLaunch(ctx context.Context, dispatch *dispatchContext) providerreconcile.Receipt {

@@ -35,18 +35,19 @@ func TestAttachTypedFailurePinBlocksAutomaticFallback(t *testing.T) {
 		opts: Options{
 			RoutingDecisionID: "route-pinned",
 			RoutePinned:       true,
-			// Registered roots omitted: fallback store path is not exercised when
-			// pin short-circuits inside ApplyTypedProviderFailure after open.
 		},
 	}
-	// Without registered store, auto-eligible class still reaches store open.
-	// Use needs-human-free class but pin forces needs-human from ApplyTyped when store exists.
-	// When store unavailable, NextAction records unavailability — pin is still recorded in evidence.
 	result := attachTypedFailure(dispatch, Result{OK: false}, agent.Result{
 		FailureClass: string(provideroutcome.ClassQuotaExhausted),
 	}, errors.New("quota"))
 	if !result.AutoFallbackAllowed {
 		t.Fatal("quota class should allow auto fallback at classification layer")
+	}
+	if !result.FallbackNeedsHuman {
+		t.Fatal("pinned route should mark fallback needs-human at worker boundary")
+	}
+	if !strings.Contains(result.NextAction, "explicit pin") {
+		t.Fatalf("NextAction = %q", result.NextAction)
 	}
 	joined := strings.Join(result.Evidence, " ")
 	if !strings.Contains(joined, "route_pinned=true") {
