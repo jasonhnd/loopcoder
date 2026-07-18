@@ -287,8 +287,16 @@ automatic takeover. Design rationale:
 [`../specs/0041-resilience.md`](../specs/0041-resilience.md).
 
 Nested child infrastructure adds a SQLite-backed ownership layer around child
-claims. The scheduler persists the accepted child plan and run graph, then a
-claim transaction atomically records `run_claims.executor_id`,
+claims. Before the accepted child plan is persisted, each unpinned child may
+resolve a permission-safe route from its immutable execution contract. The
+selected adapter/model/effort is written into `provider_decision` and `work`
+and becomes the only launch authority for that child. Different children in one
+plan may select different eligible providers when policy and nested permission
+enforcement allow it. Explicit child pins and a global `--provider` pin pass
+the same nested matrix. Orchestrate permission and unbridged provider-native
+delegation remain refused before claim. Parent cancellation blocks new child
+routing. The scheduler then persists the accepted child plan and run graph, and
+a claim transaction atomically records `run_claims.executor_id`,
 `claim_generation`, `claimed_at`, `lease_expires_at`, and `heartbeat_at` while
 moving the child run and parent edge to `running`. A scheduler that loses to an
 active claim reports the owner and lease as an observation and does not call the

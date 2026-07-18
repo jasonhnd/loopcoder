@@ -251,9 +251,15 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 1
 	}
 	opts.HostProfile = cfg.Host.Profile
+	explicitProvider := strings.TrimSpace(opts.Provider) != ""
 	capabilityOpts := opts
-	if capabilityOpts.Provider != nestedTestSubprocessProvider {
-		capabilityOpts.Provider = firstNonEmptyNested(capabilityOpts.Provider, cfg.Adapters.Worker, defaultProviderForRole("worker"))
+	if capabilityOpts.Provider != nestedTestSubprocessProvider && explicitProvider {
+		// Global --provider remains a hard pin for unpinned children.
+		capabilityOpts.Provider = strings.TrimSpace(capabilityOpts.Provider)
+	} else if capabilityOpts.Provider != nestedTestSubprocessProvider && !explicitProvider {
+		// Unpinned nested children route per child; capability registration is
+		// the multi-provider permission matrix, not a single worker default.
+		capabilityOpts.Provider = ""
 	}
 	capability := nestedExecutorCapability(capabilityOpts)
 	if err := orchestration.CheckNestedExecutorPermissions(&plan, capability); err != nil {
@@ -264,13 +270,15 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "nested run: permission preflight: %v\n", err)
 		return 1
 	}
-	opts.Provider = capabilityOpts.Provider
 	opts.SchedulerRunIDs = append(opts.SchedulerRunIDs, plan.ParentRunID)
 	for _, child := range plan.Items {
 		opts.SchedulerRunIDs = append(opts.SchedulerRunIDs, child.RunID)
 	}
 
-	if opts.Provider != nestedTestSubprocessProvider {
+	if opts.Provider == nestedTestSubprocessProvider {
+		opts.Model = firstNonEmptyNested(opts.Model, "deterministic-subprocess")
+		opts.Effort = firstNonEmptyNested(opts.Effort, "none")
+	} else if explicitProvider {
 		selection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
 			Role:           "worker",
 			Provider:       opts.Provider,
@@ -293,8 +301,12 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 			return 1
 		}
 	} else {
-		opts.Model = firstNonEmptyNested(opts.Model, "deterministic-subprocess")
-		opts.Effort = firstNonEmptyNested(opts.Effort, "none")
+		// Unpinned multi-child plans preflight each permission against at least
+		// one registered nested adapter; per-child adapters are chosen later.
+		if err := preflightNestedPlanPermissions(plan, opts.HostProfile); err != nil {
+			fmt.Fprintf(stderr, "nested run: child route preflight: %v\n", err)
+			return 1
+		}
 	}
 	if err := validateNestedPlanProviders(plan, opts.Provider); err != nil {
 		fmt.Fprintf(stderr, "nested run: provider preflight: %v\n", err)
@@ -339,6 +351,7 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		MaxDepth:                 plan.MaxDepth,
 		Progress:                 progressRecorder,
 		AllowUnbudgetedLocalTest: opts.Provider == nestedTestSubprocessProvider,
+		ResolveChildRoute:        nestedChildRouteResolver(opts, explicitProvider, deps.Now),
 		Execute:                  executor,
 	})
 	if err != nil {
@@ -369,21 +382,27 @@ func nestedReportHasContent(report orchestration.NestedScheduleReport) bool {
 func nestedExecutorCapability(opts nestedRunOptions) orchestration.NestedExecutorCapability {
 	executorID := "nested-child"
 	registrationID := ""
-	if opts.Provider == nestedTestSubprocessProvider {
+	provider := strings.TrimSpace(opts.Provider)
+	if provider == nestedTestSubprocessProvider {
 		executorID = nestedTestSubprocessProvider
 	}
 	permissions := []string{}
-	if nestedReadOnlyProviderSupported(opts.Provider) {
-		registrationID = "builtin:nested-child:" + strings.TrimSpace(opts.Provider) + ":v2"
+	if provider == "" {
+		// Multi-provider registration: any permission the nested matrix can
+		// enforce through at least one supported adapter.
+		registrationID = "builtin:nested-child:permission-matrix:v1"
+		permissions = []string{string(reporter.PermissionReadOnly), string(reporter.PermissionWrite)}
+	} else if nestedReadOnlyProviderSupported(provider) {
+		registrationID = "builtin:nested-child:" + provider + ":v2"
 		permissions = []string{string(reporter.PermissionReadOnly)}
-		if nestedBoundedWriteProviderSupported(opts.Provider) {
+		if nestedBoundedWriteProviderSupported(provider) {
 			permissions = append(permissions, string(reporter.PermissionWrite))
 		}
 	}
 	return orchestration.NestedExecutorCapability{
 		ExecutorID:             executorID,
 		RegistrationID:         registrationID,
-		Provider:               strings.TrimSpace(opts.Provider),
+		Provider:               provider,
 		EnforceablePermissions: permissions,
 		ProviderNative:         false,
 	}
@@ -475,6 +494,70 @@ func preflightNestedPlanRoute(plan orchestration.ChildPlan, provider, hostProfil
 	return nil
 }
 
+// preflightNestedPlanPermissions verifies each distinct child permission has at
+// least one nested-safe adapter. Per-child selection happens later via routing.
+func preflightNestedPlanPermissions(plan orchestration.ChildPlan, hostProfile string) error {
+	seen := map[string]bool{}
+	for _, child := range plan.Items {
+		permission := normalizeNestedPermission(child.Permission)
+		if seen[permission] {
+			continue
+		}
+		seen[permission] = true
+		switch permission {
+		case string(reporter.PermissionReadOnly):
+			var first error
+			ok := false
+			for _, provider := range nestedReadOnlyProviders() {
+				if err := preflightNestedReadOnlyRoute(provider, hostProfile); err != nil {
+					if first == nil {
+						first = err
+					}
+					continue
+				}
+				ok = true
+				break
+			}
+			if !ok {
+				if first != nil {
+					return first
+				}
+				return fmt.Errorf("no nested read-only adapter is registered")
+			}
+		case string(reporter.PermissionWrite):
+			var first error
+			ok := false
+			for _, provider := range nestedBoundedWriteProviders() {
+				if err := preflightNestedWriteRoute(provider, hostProfile); err != nil {
+					if first == nil {
+						first = err
+					}
+					continue
+				}
+				ok = true
+				break
+			}
+			if !ok {
+				if first != nil {
+					return first
+				}
+				return fmt.Errorf("no nested bounded-write adapter is registered")
+			}
+		default:
+			return fmt.Errorf("child %q permission %q has no nested execution adapter", child.ChildKey, child.Permission)
+		}
+	}
+	return nil
+}
+
+func nestedReadOnlyProviders() []string {
+	return []string{"codex", "claude", "grok", nestedTestSubprocessProvider}
+}
+
+func nestedBoundedWriteProviders() []string {
+	return []string{"codex", "grok", nestedTestSubprocessProvider}
+}
+
 func validateNestedPlanProviders(plan orchestration.ChildPlan, selectedProvider string) error {
 	selectedProvider = strings.TrimSpace(selectedProvider)
 	for _, child := range plan.Items {
@@ -484,6 +567,8 @@ func validateNestedPlanProviders(plan orchestration.ChildPlan, selectedProvider 
 				return fmt.Errorf("child %q provider metadata is invalid: %w", child.ChildKey, err)
 			}
 		}
+		// Explicit child pins must pass the same permission matrix as unpinned
+		// routes. A global CLI pin still forbids conflicting child pins.
 		for _, declaration := range []struct {
 			field string
 			value string
@@ -493,9 +578,23 @@ func validateNestedPlanProviders(plan orchestration.ChildPlan, selectedProvider 
 		} {
 			field := declaration.field
 			requested := strings.TrimSpace(declaration.value)
-			if selectedProvider != nestedTestSubprocessProvider && requested != "" && requested != selectedProvider {
+			if requested == "" {
+				continue
+			}
+			if selectedProvider != "" && selectedProvider != nestedTestSubprocessProvider && requested != selectedProvider {
 				return fmt.Errorf("child %q %s %q does not match executor registration %q", child.ChildKey, field, requested, selectedProvider)
 			}
+			if permission := normalizeNestedPermission(child.Permission); permission != "" {
+				if err := nestedPermissionSafeAdapter(permission, requested); err != nil {
+					return fmt.Errorf("child %q %s: %w", child.ChildKey, field, err)
+				}
+			} else if !nestedReadOnlyProviderSupported(requested) {
+				return fmt.Errorf("child %q %s %q has no registered nested adapter", child.ChildKey, field, requested)
+			}
+		}
+		if selectedProvider == "" {
+			// Unpinned multi-provider plans are validated per child after route.
+			continue
 		}
 		if !nestedReadOnlyProviderSupported(selectedProvider) {
 			return fmt.Errorf("child %q provider %q has no registered nested adapter", child.ChildKey, selectedProvider)
@@ -547,7 +646,9 @@ func nestedReadOnlyExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) 
 		if provider != nestedTestSubprocessProvider {
 			provider = firstNonEmptyNested(request.Work.Provider, request.ProviderDecision.AdapterID, opts.Provider)
 		}
-		if provider != opts.Provider {
+		// Launch authority is the immutable route. A global CLI pin still binds
+		// when present; otherwise any permission-safe nested adapter may run.
+		if opts.Provider != "" && opts.Provider != nestedTestSubprocessProvider && provider != opts.Provider {
 			return base, &readonlyexec.PolicyViolationError{Phase: "pre-launch", Reason: "the persisted provider route does not match the registered read-only adapter"}
 		}
 		if err := preflightNestedReadOnlyRoute(provider, opts.HostProfile); err != nil {
@@ -698,7 +799,7 @@ func nestedWriteExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer) orc
 		if provider != nestedTestSubprocessProvider {
 			provider = firstNonEmptyNested(request.Work.Provider, request.ProviderDecision.AdapterID, opts.Provider)
 		}
-		if provider != opts.Provider {
+		if opts.Provider != "" && opts.Provider != nestedTestSubprocessProvider && provider != opts.Provider {
 			return base, &writeexec.PolicyViolationError{Phase: "pre-launch", Reason: "the persisted provider route does not match the registered bounded-write adapter"}
 		}
 		if err := preflightNestedWriteRoute(provider, opts.HostProfile); err != nil {
