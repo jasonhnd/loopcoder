@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/gitutil"
 	"github.com/jasonhnd/loopcoder/internal/providerauthority"
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/storage"
@@ -271,6 +272,9 @@ func materialWorktreeChanged(worktreePath string) (bool, []string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", "-C", clean, "status", "--porcelain", "--untracked-files=normal")
+	// Isolate from parent GIT_* / index env so concurrent hooks cannot make an
+	// unrelated clean worktree look like a mass deletion of the host checkout.
+	cmd.Env = gitutil.CleanEnv(os.Environ())
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
