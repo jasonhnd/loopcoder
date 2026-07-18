@@ -1119,6 +1119,9 @@ loopcoder delivery continue --project-id <project-id> --run-id <run-id> --expect
 
 loopcoder wait quota-reset --until <RFC3339>
 loopcoder wait quota-reset --until <RFC3339> --format json
+loopcoder wait approval --repo <path> --run <delivery-run-id> [--format text|json]
+loopcoder wait outbox --repo <path> --run <delivery-run-id> [--obligation <id>] [--format text|json]
+loopcoder wait detached-worker --repo <path> --run <run-id> [--format text|json]
 ```
 
 `hook` is for host hook integration rather than normal customer workflow.
@@ -1157,14 +1160,25 @@ state. It does not dispatch workers or launch providers.
 
 ### Provider-Free Local Wait (v0.8.1 candidate)
 
-`loopcoder wait` is a provider-free local wait surface. The first production
-subcommand is `wait quota-reset`, which waits only on a known reset time using
-the wall clock. It emits optional five-minute wait receipts, never launches a
+`loopcoder wait` is a provider-free local wait surface. Production subcommands:
+
+- `wait quota-reset` — wall-clock wait for a known quota reset time
+- `wait approval` — durable `delivery_runs.approval_status` (approve/reject/expire)
+- `wait outbox` — durable progress delivery obligations
+- `wait detached-worker` — durable detached run terminal/lost/ambiguous states
+
+Each stored wait uses the shared waitstate machine, five-minute receipts, and a
+project-local restart checkpoint. None launch a provider. `wait quota-reset`
+waits only on a known reset time using the wall clock. It emits optional
+five-minute wait receipts, never launches a
 provider, and never polls provider quota APIs. Unknown or past reset times are
 rejected rather than treated as zero or unlimited capacity.
 
 ```text
 loopcoder wait quota-reset --until 2026-07-17T18:00:00Z --format json
+loopcoder wait approval --repo . --run <delivery-run-id> --format json
+loopcoder wait outbox --repo . --run <delivery-run-id> --format json
+loopcoder wait detached-worker --repo . --run <run-id> --format json
 ```
 
 ### Route Explain and Decide (v0.8.1 candidate)

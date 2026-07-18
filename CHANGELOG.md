@@ -4,6 +4,12 @@
 
 ### Changed
 
+- **Production wait wiring** - `loopcoder wait` now ships provider-free
+  `approval`, `outbox`, and `detached-worker` watchers against durable local
+  state, with restartable file checkpoints and zero provider launches.
+  `quota-reset` remains available. GitHub CI waiting stays on the existing
+  orchestration path.
+
 - **Nested child route authority** - unpinned nested children resolve a
   permission-safe route from the immutable child execution contract before
   plan persistence and claim/launch. Mixed read-only/write plans may select
