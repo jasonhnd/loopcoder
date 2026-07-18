@@ -71,8 +71,3 @@ func applyChildRouteToResult(result ChildRunResult, request ChildExecutionReques
 	}
 	return result
 }
-
-func childRouteAlreadyDecided(request ChildExecutionRequest) bool {
-	return strings.TrimSpace(request.ProviderDecision.RoutingDecisionID) != "" &&
-		strings.TrimSpace(request.ProviderDecision.AdapterID) != ""
-}
