@@ -9425,7 +9425,9 @@ func TestNestedRunReportsConfiguredProviderInPermissionRefusal(t *testing.T) {
 	}, 1)
 
 	providerCalled := false
-	exitCode := RunWithDeps([]string{"nested", "run", "--repo", repo, "--plan", planPath, "--format", "json"}, &stdout, &stderr, Deps{
+	// Explicit --provider pin is required for a single-adapter capability
+	// diagnostic. Unpinned nested runs use the multi-provider permission matrix.
+	exitCode := RunWithDeps([]string{"nested", "run", "--repo", repo, "--plan", planPath, "--provider", "claude", "--format", "json"}, &stdout, &stderr, Deps{
 		Now: fixedCLINow,
 		AgentLookup: func(string) (agent.Runner, error) {
 			providerCalled = true

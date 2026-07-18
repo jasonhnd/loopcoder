@@ -61,17 +61,21 @@ func nestedChildRouteProduction(ctx context.Context, request orchestration.Child
 
 	roots, err := runtimepath.Resolve(ctx, input.RepoPath)
 	if err != nil {
-		return orchestration.ChildRouteDecision{}, fmt.Errorf("resolve project runtime: %w", err)
+		return orchestration.ChildRouteDecision{Outcome: routing.RouteOutcomeNoRoute, ZeroProviderLaunches: true},
+			fmt.Errorf("resolve project runtime: %w", err)
 	}
 	if !roots.Registered || strings.TrimSpace(roots.ProjectID) == "" {
-		return orchestration.ChildRouteDecision{}, fmt.Errorf("nested child routing requires a registered project; run loopcoder projects register --repo %s", input.RepoPath)
+		return orchestration.ChildRouteDecision{Outcome: routing.RouteOutcomeNoRoute, ZeroProviderLaunches: true},
+			fmt.Errorf("nested child routing requires a registered project; run loopcoder projects register --repo %s", input.RepoPath)
 	}
 	if strings.TrimSpace(roots.DatabasePath) == "" {
-		return orchestration.ChildRouteDecision{}, fmt.Errorf("nested child routing requires a project database path")
+		return orchestration.ChildRouteDecision{Outcome: routing.RouteOutcomeNoRoute, ZeroProviderLaunches: true},
+			fmt.Errorf("nested child routing requires a project database path")
 	}
 	store, err := storage.Open(ctx, storage.Options{Path: roots.DatabasePath, Now: func() time.Time { return now }})
 	if err != nil {
-		return orchestration.ChildRouteDecision{}, fmt.Errorf("open project store: %w", err)
+		return orchestration.ChildRouteDecision{Outcome: routing.RouteOutcomeNoRoute, ZeroProviderLaunches: true},
+			fmt.Errorf("open project store: %w", err)
 	}
 	defer store.Close()
 

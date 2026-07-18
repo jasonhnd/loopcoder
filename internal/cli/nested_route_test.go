@@ -67,9 +67,9 @@ func TestNestedChildRouteProductionUsesDecideAndPermissionGate(t *testing.T) {
 		},
 		Work: orchestration.ChildExecutionWork{Instructions: "edit"},
 	}
-	// Without registered project the function fails before decide — that is the
-	// production fail-closed path.
-	_, err := nestedChildRouteProduction(context.Background(), request, NestedChildRouteInput{
+	// Without registered project the function fails closed as no_route with zero
+	// launches so the scheduler can still emit a parent report.
+	decision, err := nestedChildRouteProduction(context.Background(), request, NestedChildRouteInput{
 		RepoPath:       t.TempDir(),
 		ParentRunID:    "parent",
 		Now:            time.Date(2026, 7, 18, 0, 0, 0, 0, time.UTC),
@@ -80,6 +80,9 @@ func TestNestedChildRouteProductionUsesDecideAndPermissionGate(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "registered project") {
 		t.Fatalf("error = %q, want registered project", err.Error())
+	}
+	if !decision.ZeroProviderLaunches || decision.Outcome != routing.RouteOutcomeNoRoute {
+		t.Fatalf("decision = %+v, want no_route zero launches", decision)
 	}
 	if captured.DecisionKey != "" {
 		t.Fatalf("decide should not run before registration: %#v", captured)
