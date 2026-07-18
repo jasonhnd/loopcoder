@@ -57,6 +57,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/upgrade"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 	"github.com/jasonhnd/loopcoder/internal/verify"
+	"github.com/jasonhnd/loopcoder/internal/waitstate"
 	"github.com/jasonhnd/loopcoder/internal/worker"
 )
 
@@ -78,6 +79,8 @@ type Deps struct {
 	NewPromoteWriter         func(repoPath string) orchestration.PromotionWriter
 	ProcessAlive             func(pid int) bool
 	Now                      func() time.Time
+	// WaitClock optionally overrides the provider-free wait clock for tests.
+	WaitClock                waitstate.Clock
 	RuntimeGOOS              string
 	RuntimeGOARCH            string
 	IsTerminal               func(w io.Writer) bool

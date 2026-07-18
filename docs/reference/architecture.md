@@ -278,8 +278,10 @@ Progress generation, persistence, and delivery-outbox components can create
 durable five-minute receipts, but v0.8.0 has no exact-artifact proof that active
 work delivers them unsolicited to the initiating host. Restartable local
 state-machine implementations exist for CI, approval, quota-reset, outbox, and
-worker-terminal waiting; only the local GitHub CI waiter is connected as a
-supported product path. Recovery reconciles live provider authority before
+worker-terminal waiting. The local GitHub CI waiter is connected through
+orchestration, while approval, delivery-outbox, and detached-worker waits are
+reachable as shipped `loopcoder wait` product paths against durable local
+state (zero provider calls, restartable checkpoints). Recovery reconciles live provider authority before
 redispatch, adopts existing PRs and already-applied delivery effects
 idempotently, and fences concurrent recovery so useful provider work is not
 executed twice. Ambiguous external effects become `needs-human` rather than an
