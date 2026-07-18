@@ -4288,8 +4288,14 @@ func TestDispatchReplaysCancelledDetachedRunForClaudeHostAndLeavesCancellationUn
 	record := validDispatchReport()
 	result := validDispatchResult(record)
 	result.RunID = "run-after-claude-cancelled-detached"
+	// Claude-host non-interactive dispatch defaults to detached. This test only
+	// wants host progress replay + injected Worker launch; without --foreground
+	// it spawns a real detached supervisor against LOOPCODER_HOME and flakes on
+	// TempDir cleanup (and never calls the injected Dispatch).
+	dispatchCalled := false
 	exitCode := RunWithDeps([]string{
 		"dispatch",
+		"--foreground",
 		"--repo", repo,
 		"--issue-number", "901",
 		"--issue-title", "After Claude cancelled detached",
@@ -4298,6 +4304,7 @@ func TestDispatchReplaysCancelledDetachedRunForClaudeHostAndLeavesCancellationUn
 	}, &stdout, &stderr, Deps{
 		Now: func() time.Time { return now.Add(2 * time.Minute) },
 		Dispatch: func(_ context.Context, _ worker.Options) (worker.Result, error) {
+			dispatchCalled = true
 			if !strings.Contains(stderr.String(), "replaying 1 pending progress receipt for Claude Code origin") ||
 				!strings.Contains(stderr.String(), "status=cancelled") {
 				return worker.Result{}, fmt.Errorf("cancelled Claude receipt was not replayed before dispatch: %q", stderr.String())
@@ -4307,6 +4314,9 @@ func TestDispatchReplaysCancelledDetachedRunForClaudeHostAndLeavesCancellationUn
 	})
 	if exitCode != 0 {
 		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	if !dispatchCalled {
+		t.Fatal("injected Dispatch was not called; dispatch likely defaulted to detached without --foreground")
 	}
 	var parsed worker.Result
 	assertSingleJSONValue(t, stdout.String(), &parsed)
@@ -4395,8 +4405,12 @@ func TestDispatchReplaysCancelledDetachedRunForPaseoHostAndLeavesCancellationUnk
 	record := validDispatchReport()
 	result := validDispatchResult(record)
 	result.RunID = "run-after-paseo-cancelled-detached"
+	// Same as the Claude cancelled-replay case: host-profiled non-interactive
+	// dispatch defaults to detached and must be forced into the foreground path.
+	dispatchCalled := false
 	exitCode := RunWithDeps([]string{
 		"dispatch",
+		"--foreground",
 		"--repo", repo,
 		"--issue-number", "903",
 		"--issue-title", "After Paseo cancelled detached",
@@ -4405,6 +4419,7 @@ func TestDispatchReplaysCancelledDetachedRunForPaseoHostAndLeavesCancellationUnk
 	}, &stdout, &stderr, Deps{
 		Now: func() time.Time { return now.Add(2 * time.Minute) },
 		Dispatch: func(_ context.Context, _ worker.Options) (worker.Result, error) {
+			dispatchCalled = true
 			if !strings.Contains(stderr.String(), "replaying 1 pending progress receipt for Paseo origin") ||
 				!strings.Contains(stderr.String(), "status=cancelled") {
 				return worker.Result{}, fmt.Errorf("cancelled Paseo receipt was not replayed before dispatch: %q", stderr.String())
@@ -4414,6 +4429,9 @@ func TestDispatchReplaysCancelledDetachedRunForPaseoHostAndLeavesCancellationUnk
 	})
 	if exitCode != 0 {
 		t.Fatalf("dispatch exit = %d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	if !dispatchCalled {
+		t.Fatal("injected Dispatch was not called; dispatch likely defaulted to detached without --foreground")
 	}
 	var parsed worker.Result
 	assertSingleJSONValue(t, stdout.String(), &parsed)
@@ -9425,7 +9443,9 @@ func TestNestedRunReportsConfiguredProviderInPermissionRefusal(t *testing.T) {
 	}, 1)
 
 	providerCalled := false
-	exitCode := RunWithDeps([]string{"nested", "run", "--repo", repo, "--plan", planPath, "--format", "json"}, &stdout, &stderr, Deps{
+	// Explicit --provider pin is required for a single-adapter capability
+	// diagnostic. Unpinned nested runs use the multi-provider permission matrix.
+	exitCode := RunWithDeps([]string{"nested", "run", "--repo", repo, "--plan", planPath, "--provider", "claude", "--format", "json"}, &stdout, &stderr, Deps{
 		Now: fixedCLINow,
 		AgentLookup: func(string) (agent.Runner, error) {
 			providerCalled = true

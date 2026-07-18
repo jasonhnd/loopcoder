@@ -4,22 +4,26 @@
 
 ### Changed
 
+- **Nested child route authority** - unpinned nested children resolve a
+  permission-safe route from the immutable child execution contract before
+  plan persistence and claim/launch. Mixed read-only/write plans may select
+  different eligible adapters; explicit child or `--provider` pins pass the
+  same nested permission matrix. Orchestrate and unbridged native delegation
+  remain refused. Route receipts appear on child results.
+
 - **Worker dispatch route authority** - ordinary unpinned `loopcoder dispatch`
   persists a route decision before provider launch and uses the selected
   adapter/model/effort exactly. Explicit `--provider` is a durable pin.
   Empty-provider Codex defaults are removed from the worker prepare path.
   `no_route` returns exit code 20 with zero provider launches.
 
-All notable changes to this project will be documented in this file.
-
-## [Unreleased]
-
-### Changed
-
 - **Independent verifier route authority** - unpinned `loopreview` persists a
   verifier route decision before launch, enforces independence from the
   configured worker, and returns needs-human when no independent read-only
   verifier is available.
+
+All notable changes to this project will be documented in this file.
+
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).

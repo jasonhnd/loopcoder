@@ -100,6 +100,11 @@ type NestedScheduleOptions struct {
 	// execution. No production bridge is registered in v0.8.1.
 	NativeBridge ProviderNativeBridge
 
+	// ResolveChildRoute, when set, selects a provider/model for each unpinned
+	// child from the immutable execution contract before plan persistence and
+	// claim/launch. Replay reuses the durable decision via the resolver.
+	ResolveChildRoute ChildRouteResolver
+
 	Execute                       ChildRunExecutor
 	RecordEvent                   RecordNestedEventFunc
 	TaskBoundaryRouteReevaluation TaskBoundaryRouteReevaluationFunc
@@ -180,6 +185,12 @@ type ChildRunResult struct {
 	ReadOnlyEnforcement *state.ReadOnlyEnforcementAudit `json:"read_only_enforcement,omitempty"`
 	MutationManifest    *state.MutationManifestAudit    `json:"mutation_manifest,omitempty"`
 	WorktreePath        string                          `json:"worktree_path,omitempty"`
+	RoutingDecisionID   string                          `json:"routing_decision_id,omitempty"`
+	RouteAdapterID      string                          `json:"route_adapter_id,omitempty"`
+	RouteModel          string                          `json:"route_model,omitempty"`
+	RouteOutcome        string                          `json:"route_outcome,omitempty"`
+	RouteReason         string                          `json:"route_reason,omitempty"`
+	RouteReplayed       bool                            `json:"route_replayed,omitempty"`
 }
 
 type NestedSummary struct {
@@ -310,11 +321,53 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		return NestedScheduleReport{}, err
 	}
 	executionRequests := make([]ChildExecutionRequest, len(children))
+	routeDecisions := make([]ChildRouteDecision, len(children))
+	routeBlocked := make([]string, len(children))
 	for i, child := range children {
 		executionRequests[i], err = BuildChildExecutionRequest(opts.RepoPath, *plan, child)
 		if err != nil {
 			return NestedScheduleReport{}, err
 		}
+		if opts.ResolveChildRoute == nil {
+			continue
+		}
+		// Parent cancellation must not start new child routing.
+		if err := ctx.Err(); err != nil {
+			routeBlocked[i] = fmt.Sprintf("parent cancelled before child route: %v", err)
+			continue
+		}
+		// Explicit pins and prior authority on the contract still go through the
+		// resolver so permission and capability checks stay uniform.
+		decision, routeErr := opts.ResolveChildRoute(ctx, executionRequests[i])
+		if routeErr != nil {
+			if decision.RoutingDecisionID != "" || decision.ZeroProviderLaunches {
+				routeDecisions[i] = decision
+				routeBlocked[i] = routeErr.Error()
+				if decision.AdapterID != "" {
+					// Keep the refused decision on the contract for audit when a
+					// durable decision id exists but launch is blocked.
+					if applied, applyErr := ApplyChildRouteDecision(executionRequests[i], decision); applyErr == nil {
+						executionRequests[i] = applied
+					}
+				}
+				continue
+			}
+			return NestedScheduleReport{}, fmt.Errorf("child %q route: %w", child.ChildKey, routeErr)
+		}
+		if decision.ZeroProviderLaunches || strings.TrimSpace(decision.AdapterID) == "" {
+			routeDecisions[i] = decision
+			if strings.TrimSpace(decision.Outcome) == "" {
+				decision.Outcome = "no_route"
+			}
+			routeBlocked[i] = firstNonEmptyChild(decision.ChosenReason, "no eligible nested child route")
+			continue
+		}
+		applied, applyErr := ApplyChildRouteDecision(executionRequests[i], decision)
+		if applyErr != nil {
+			return NestedScheduleReport{}, fmt.Errorf("child %q apply route: %w", child.ChildKey, applyErr)
+		}
+		executionRequests[i] = applied
+		routeDecisions[i] = decision
 	}
 	if err := persistAcceptedChildPlan(ctx, opts, *plan, executionRequests, started); err != nil {
 		return NestedScheduleReport{}, err
@@ -339,9 +392,26 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 	plannedAttempts := 0
 	for i, child := range children {
 		result := childResultFromExecutionRequest(child, executionAuditRequests[i])
+		result = applyChildRouteToResult(result, executionAuditRequests[i], routeDecisions[i])
 		if result.ReplayAction == "" {
 			result.ReplayAction = ReplayActionNew
 			children[i].ReplayAction = ReplayActionNew
+		}
+		if blocked := strings.TrimSpace(routeBlocked[i]); blocked != "" {
+			result.Status = NestedStatusNeedsHuman
+			result.Error = blocked
+			result.Reason = blocked
+			result.NextAction = "inspect the nested child route decision before replaying"
+			result.FinishedAt = state.FormatTimestamp(started)
+			if err := storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt, "nested child route gate"); err != nil {
+				return NestedScheduleReport{}, err
+			}
+			if err := recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildFinished, started); err != nil {
+				return NestedScheduleReport{}, err
+			}
+			emitNestedChildProgress(ctx, opts, child, result, NestedEventChildFinished, started, true)
+			results[i] = withNestedDecision(result)
+			continue
 		}
 		if replayed, ok := replay[child.ChildKey]; ok {
 			durableStatus := strings.TrimSpace(replayed.Status)
@@ -1437,6 +1507,9 @@ func childResultFromExecutionRequest(child ChildRunPlan, request ChildExecutionR
 	result := childResultFromPlan(child)
 	result.ContractSchema = request.SchemaVersion
 	result.ContractFingerprint = request.ContractFingerprint
+	result.RoutingDecisionID = strings.TrimSpace(request.ProviderDecision.RoutingDecisionID)
+	result.RouteAdapterID = firstNonEmptyChild(request.ProviderDecision.AdapterID, request.Work.Provider)
+	result.RouteModel = firstNonEmptyChild(request.Work.Model, request.ProviderDecision.ModelCapabilityID)
 	return result
 }
 
