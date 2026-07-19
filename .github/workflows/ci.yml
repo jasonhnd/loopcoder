@@ -60,6 +60,9 @@ jobs:
       - name: Installer unit test
         run: bash scripts/install_test.sh
 
+      - name: Release provider canary harness unit test
+        run: bash scripts/release-provider-canary_test.sh
+
   test:
     runs-on: macos-15
     steps:
