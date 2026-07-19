@@ -66,6 +66,9 @@ jobs:
       - name: macOS codesign harness unit test
         run: bash scripts/macos-codesign-notarize_test.sh
 
+      - name: v0.8.1 product-path go/no-go gate unit test
+        run: bash scripts/v081-product-path-gate_test.sh
+
   test:
     runs-on: macos-15
     steps:
