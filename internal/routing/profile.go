@@ -1000,6 +1000,22 @@ func validateConstraint(kind, id string, c CandidateConstraint, inventory provid
 	if c.ModelCapabilityID != "" {
 		model, ok := models[c.ModelCapabilityID]
 		if !ok {
+			// Accept registry display names / aliases that map to exactly one model.
+			var resolved []providerinventory.ModelCapability
+			for _, candidate := range inventory.ModelCapabilities {
+				if c.AdapterID != "" && candidate.AdapterID != c.AdapterID {
+					continue
+				}
+				if modelNameMatches(candidate, c.ModelCapabilityID) {
+					resolved = append(resolved, candidate)
+				}
+			}
+			if len(resolved) == 1 {
+				model = resolved[0]
+				ok = true
+			}
+		}
+		if !ok {
 			diagnostics = append(diagnostics, policyDiag(taskrequirements.ErrMissingReferenceCode, "invalid", "model_capability_id", c.ModelCapabilityID, "model capability is not present in current inventory", nil, "run providers refresh or remove the stale model pin"))
 		} else {
 			diagnostics = append(diagnostics, staleInventoryDiagnostics("model_capability_id", model.ModelCapabilityID, model.FreshnessState, model.Confidence, now)...)

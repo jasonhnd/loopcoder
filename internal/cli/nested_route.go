@@ -9,8 +9,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/budget"
 	"github.com/jasonhnd/loopcoder/internal/delivery"
 	"github.com/jasonhnd/loopcoder/internal/orchestration"
+	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/routing"
 	"github.com/jasonhnd/loopcoder/internal/runtimepath"
@@ -82,13 +84,15 @@ func nestedChildRouteProduction(ctx context.Context, request orchestration.Child
 	parentRunID := firstNonEmpty(strings.TrimSpace(input.ParentRunID), strings.TrimSpace(request.ParentRunID), strings.TrimSpace(request.RunID))
 	hostName := strings.TrimSpace(input.HostName)
 	if hostName == "" {
-		hostName = "loopcoder-cli"
+		// Must match a runtimecap host profile (codex-cli, claude-code, generic-local, ...).
+		hostName = "generic-local"
 	}
 	actor := delivery.Actor{
 		ActorKind:         "system",
 		ActorID:           "loopcoder-nested",
 		Display:           "loopcoder nested",
-		DecisionAuthority: "nested-child-route",
+		// Routing decisions require authority router|user (not a free-form tag).
+		DecisionAuthority: "router",
 		Source:            "cli.nested",
 	}
 	host := delivery.Host{
@@ -189,6 +193,10 @@ func nestedChildRouteProduction(ctx context.Context, request orchestration.Child
 		req.PermissionRequired = taskrequirements.PermissionReadOnly
 		req.SideEffectClass = taskrequirements.SideEffectLocalRead
 		req.RequiredOutput = taskrequirements.OutputVerificationVerdict
+		// Classifier raises risk for AllowsProviderLaunch. Nested read-only
+		// children are local-read verifiers; keep risk low so uncollected
+		// quota/budget telemetry does not hard-block an auth-ready launch.
+		req.RiskTier = taskrequirements.RiskLow
 	} else {
 		req.PermissionRequired = taskrequirements.PermissionWrite
 		req.SideEffectClass = taskrequirements.SideEffectProviderLaunch
@@ -197,6 +205,9 @@ func nestedChildRouteProduction(ctx context.Context, request orchestration.Child
 	// Nested children are LoopCoder-managed; do not require provider-native
 	// nested-subagent catalog capability.
 	req.NestedAllowed = false
+	// Permission/side-effect overrides above change the canonical payload;
+	// clear so Persist recomputes TaskRequirementFingerprint.
+	req.TaskRequirementFingerprint = ""
 	req, err = taskrequirements.PersistTaskRequirement(ctx, store, req, taskrequirements.PersistOptions{Now: now})
 	if err != nil {
 		return orchestration.ChildRouteDecision{}, fmt.Errorf("persist nested child task requirement: %w", err)
@@ -211,7 +222,6 @@ func nestedChildRouteProduction(ctx context.Context, request orchestration.Child
 		HostName:          hostName,
 		DecidedBy:         actor,
 		Host:              host,
-		PinActor:          actor,
 	}
 	pinProvider := firstNonEmpty(
 		strings.TrimSpace(request.Work.Provider),
@@ -229,10 +239,25 @@ func nestedChildRouteProduction(ctx context.Context, request orchestration.Child
 		strings.TrimSpace(input.GlobalEffort),
 	)
 	if pinProvider != "" {
+		// Pins are user authority and require ActorKind=user provenance.
+		routeRequest.PinActor = delivery.Actor{
+			ActorKind:         "user",
+			ActorID:           "local-user",
+			Display:           "local user",
+			DecisionAuthority: "user",
+			Source:            "cli.nested",
+		}
+		// Inventory candidates currently expose only the "default" invocation
+		// profile. Map launch effort separately after selection; do not hard-pin
+		// deep/fast profile keys that inventory has not yet materialized.
+		invProfile := mapEffortToInvocationProfile(pinEffort)
+		if invProfile != "default" {
+			invProfile = ""
+		}
 		routeRequest.Pin = &routing.CandidateConstraint{
 			AdapterID:            pinProvider,
 			ModelCapabilityID:    pinModel,
-			InvocationProfileKey: mapEffortToInvocationProfile(pinEffort),
+			InvocationProfileKey: invProfile,
 		}
 		routeRequest.PinReason = "explicit nested child or --provider pin"
 	}
@@ -278,6 +303,33 @@ func nestedChildRouteProduction(ctx context.Context, request orchestration.Child
 	out.ReasoningProfileID = mapEffortToInvocationProfile(out.Effort)
 	out.Outcome = routing.RouteOutcomeSelected
 	out.ZeroProviderLaunches = false
+	out.ProjectID = roots.ProjectID
+	out.DeliveryRunID = run.DeliveryRunID
+	out.TaskID = task.TaskID
+	out.ProviderInstallationID = strings.TrimSpace(candidate.ProviderInstallationID)
+	out.AccountProfileID = strings.TrimSpace(candidate.AccountProfileID)
+	out.RoutingFingerprint = strings.TrimSpace(result.Decision.RoutingFingerprint)
+	out.PlanFingerprint = strings.TrimSpace(result.Decision.PlanFingerprint)
+	out.PolicyFingerprint = strings.TrimSpace(result.Decision.PolicyFingerprint)
+	out.AuthorizationFingerprint = strings.TrimSpace(result.Decision.AuthorizationFingerprint)
+	// Nested claim/launch requires a positive budget reservation against a
+	// durable policy. Seed a soft project ceiling when none exists yet.
+	out.BudgetRequestedValue = 1
+	if _, err := budget.UpsertPolicy(ctx, store, budget.PolicyInput{
+		Scope:         budget.Scope{ScopeKind: budget.ScopeProject, ProjectID: roots.ProjectID},
+		QuantityKind:  providerinventory.QuantityLocalPolicy,
+		WindowKind:    providerinventory.WindowUnbounded,
+		PolicyMode:    budget.PolicySoft,
+		CeilingValue:  1_000_000,
+		PolicyVersion: "nested-child-default-v1",
+		Ordinal:       "0",
+		Actor:         budget.Actor{ActorID: "loopcoder-nested", Role: "system"},
+		Host:          budget.Host{HostID: hostName},
+		Source:        "nested-child-route-default",
+		Evidence:      "default soft project ceiling for nested child launches",
+	}); err != nil {
+		return out, fmt.Errorf("ensure nested child budget policy: %w", err)
+	}
 	return out, nil
 }
 

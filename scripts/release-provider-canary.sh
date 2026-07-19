@@ -389,6 +389,7 @@ run_live() {
   mkdir -p "$repo" "$loopcoder_home"
   export LOOPCODER_HOME="$loopcoder_home"
   git -C "$root" init -b main "$repo" >/dev/null 2>&1
+  git -C "$repo" config core.hooksPath /dev/null
   git -C "$repo" config user.email release-provider-canary@example.invalid
   git -C "$repo" config user.name "Release Provider Canary"
   printf '# Release provider canary\n' >"$repo/README.md"
@@ -412,25 +413,33 @@ run_live() {
   if [[ "$blocking" == "false" ]]; then
     ISSUE_NUM=1021
   fi
+  # Run IDs must match state.IsRunID:
+  #   run-<YYYYMMDDTHHMMSSZ>-wave
+  #   run-<YYYYMMDDTHHMMSSZ>-child-<index>-<slug>
   PROVIDER="$provider" PLAN="$plan" ISSUE_NUM="$ISSUE_NUM" python3 <<'PY'
-import json, os
+import json, os, re
+from datetime import datetime, timezone
+
 provider = os.environ["PROVIDER"]
 issue = int(os.environ["ISSUE_NUM"])
-parent = "run-release-canary-" + provider
+stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+slug = re.sub(r"[^a-z0-9]+", "-", provider.lower()).strip("-") or "provider"
+parent = f"run-{stamp}-wave"
+child = f"run-{stamp}-child-0-{slug}"
 payload = {
     "schema_version": "loopcoder.child_plan.v1",
-    "plan_id": "plan-" + parent,
+    "plan_id": f"plan-{parent}",
     "parent_run_id": parent,
     "root_run_id": parent,
     "parent_depth": 0,
     "max_depth": 1,
     "max_concurrency": 1,
-    "created_at": "2026-07-19T00:00:00Z",
+    "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "items": [{
-        "child_key": "release-canary-" + provider,
+        "child_key": f"release-canary-{slug}",
         "title": "Inspect README.md and report the heading without changing any file",
         "role": "worker",
-        "run_id": "run-release-canary-child-" + provider,
+        "run_id": child,
         "issue": issue,
         "scope": {
             "repo": ".",
