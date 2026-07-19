@@ -58,10 +58,13 @@ type Options struct {
 	// worker launch. Empty only when a test or legacy caller injects an
 	// already-selected provider without going through route decide.
 	RoutingDecisionID string
-	Timeout           time.Duration
-	ConfigFromBase    bool
-	KeepWorktree      bool
-	Stderr            io.Writer
+	// RoutePinned is true when the launch provider came from an explicit
+	// --provider pin. Pinned launches never auto-fallback.
+	RoutePinned    bool
+	Timeout        time.Duration
+	ConfigFromBase bool
+	KeepWorktree   bool
+	Stderr         io.Writer
 	// BeforeProviderCall runs after provider-free adoption/reconciliation and
 	// immediately before the provider runner. Callers use it to durably reserve
 	// a budget slot; returning an error prevents the provider launch.
@@ -85,8 +88,15 @@ type Result struct {
 	// FallbackTrigger is the routing fallback trigger derived from FailureClass.
 	FallbackTrigger string `json:"fallback_trigger,omitempty"`
 	// AutoFallbackAllowed is false for needs-human classes (ambiguous, auth, etc).
-	AutoFallbackAllowed bool                       `json:"auto_fallback_allowed,omitempty"`
-	DeliveryOutcome     string                     `json:"delivery_outcome,omitempty"`
+	AutoFallbackAllowed bool `json:"auto_fallback_allowed,omitempty"`
+	// FallbackApplied is true when a bounded successor route was decided.
+	FallbackApplied bool `json:"fallback_applied,omitempty"`
+	// FallbackNeedsHuman is true when typed fallback refused auto succession.
+	FallbackNeedsHuman bool   `json:"fallback_needs_human,omitempty"`
+	FallbackDecisionID string `json:"fallback_decision_id,omitempty"`
+	// FallbackCandidateID is the successor routing candidate when selected.
+	FallbackCandidateID string `json:"fallback_candidate_id,omitempty"`
+	DeliveryOutcome     string `json:"delivery_outcome,omitempty"`
 	Evidence            []string                   `json:"evidence,omitempty"`
 	ExitCode            int                        `json:"exit_code"`
 	LogBytes            int64                      `json:"log_bytes"`
@@ -1026,35 +1036,52 @@ func providerFailureResult(dispatch *dispatchContext, agentResult agent.Result, 
 }
 
 // attachTypedFailure classifies the provider attempt into a stable class and
-// fallback trigger without error-string matching in orchestration policy.
+// fallback trigger without error-string matching. Production wiring of
+// routing.ApplyTypedProviderFailure lives in the CLI layer to avoid an import
+// cycle (worker → routing → orchestration → worker).
 func attachTypedFailure(dispatch *dispatchContext, result Result, agentResult agent.Result, runErr error) Result {
 	class := provideroutcome.Classify(agentResult, runErr)
 	result.FailureClass = string(class)
 	result.FallbackTrigger = string(provideroutcome.FallbackTrigger(class))
 	result.AutoFallbackAllowed = provideroutcome.AllowsAutomaticFallback(class)
 	decisionID := ""
+	pinned := false
 	if dispatch != nil {
 		decisionID = strings.TrimSpace(dispatch.opts.RoutingDecisionID)
+		pinned = dispatch.opts.RoutePinned
 	}
 	evidence := []string{
 		"failure_class=" + string(class),
 		"fallback_trigger=" + result.FallbackTrigger,
 		fmt.Sprintf("auto_fallback_allowed=%t", result.AutoFallbackAllowed),
+		fmt.Sprintf("route_pinned=%t", pinned),
 	}
 	if decisionID != "" {
 		evidence = append(evidence, "routing_decision_id="+decisionID)
 	}
 	if provideroutcome.NeedsHuman(class) {
 		result.Outcome = string(OutcomeNeedsHuman)
+		result.FallbackNeedsHuman = true
 		result.NextAction = "needs-human: typed provider outcome forbids automatic fallback; inspect evidence and decide"
 		result.Evidence = compactEvidence(append(result.Evidence, evidence...))
 		return result
 	}
 	result.Evidence = compactEvidence(append(result.Evidence, evidence...))
+	if !result.AutoFallbackAllowed {
+		result.NextAction = "typed failure recorded; automatic fallback is not allowed for this class"
+		return result
+	}
 	if decisionID == "" {
 		result.NextAction = "typed failure recorded; no routing decision present so automatic fallback is unavailable"
 		return result
 	}
+	if pinned {
+		result.FallbackNeedsHuman = true
+		result.Outcome = string(OutcomeNeedsHuman)
+		result.NextAction = "needs-human: explicit pin forbids automatic fallback without owner authorization"
+		return result
+	}
+	// CLI applies routing.ApplyTypedProviderFailure after Dispatch returns.
 	result.NextAction = "apply bounded fallback for trigger " + result.FallbackTrigger + " against routing decision " + decisionID
 	return result
 }

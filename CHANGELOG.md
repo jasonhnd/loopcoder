@@ -4,6 +4,12 @@
 
 ### Changed
 
+- **Typed fallback production wiring** - after Worker classifies a provider
+  failure, `dispatch` / `delivery claim-dispatch` call
+  `routing.ApplyTypedProviderFailure` when a route decision exists. Pins and
+  needs-human classes stay fail-closed; auto-eligible classes may persist a
+  bounded successor without relaunching a provider in-process.
+
 - **Host progress visibility contracts** - negotiated foreground sinks for
   Codex, Claude, Paseo, and generic CLI; Worker progress delivery annotates
   the selected host; unknown hosts degrade to generic. See

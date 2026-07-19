@@ -400,12 +400,17 @@ func runDeliveryClaimDispatch(args []string, stdout, stderr io.Writer, deps Deps
 	}
 
 	result, dispatchErr := deps.Dispatch(context.Background(), workerOpts)
+	result = applyTypedFallbackAfterDispatch(context.Background(), workerOpts.RepoPath, workerOpts, result, deps.Now, stderr)
 	receipt.WorkerDispatched = true
 	receipt.WorkerRunID = result.RunID
 	receipt.ProviderInvoked = result.ProviderInvoked
 	if dispatchErr != nil {
 		fmt.Fprintf(stderr, "delivery claim-dispatch: worker dispatch: %v\n", dispatchErr)
-		receipt.NextAction = "inspect claimed attempt and recover ambiguous launch; do not claim another task automatically"
+		if strings.TrimSpace(result.NextAction) != "" {
+			receipt.NextAction = result.NextAction
+		} else {
+			receipt.NextAction = "inspect claimed attempt and recover ambiguous launch; do not claim another task automatically"
+		}
 		if common.Format == "json" {
 			_ = json.NewEncoder(stdout).Encode(receipt)
 		}

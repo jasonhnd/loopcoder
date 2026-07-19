@@ -4771,6 +4771,8 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		opts.Model = routeResult.Model
 		opts.Effort = routeResult.Effort
 		opts.RoutingDecisionID = routeResult.RoutingDecisionID
+		// Explicit --provider is a durable pin: typed auto-fallback is refused.
+		opts.RoutePinned = explicitProvider != ""
 		if strings.TrimSpace(opts.RunID) == "" && strings.TrimSpace(routeResult.DeliveryRunID) != "" {
 			opts.RunID = routeResult.DeliveryRunID
 		}
@@ -4864,6 +4866,9 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		}
 		fmt.Fprintf(stderr, "dispatch: %v\n", err)
 	}
+	// Connect typed provider failures to bounded fallback after launch returns.
+	// Never relaunches a provider here (avoids import cycles and retry loops).
+	result = applyTypedFallbackAfterDispatch(context.Background(), opts.RepoPath, opts, result, deps.Now, stderr)
 	if result.Report == nil {
 		if result.Reconciliation == nil {
 			fmt.Fprintln(stderr, "dispatch: dispatch report is missing")
