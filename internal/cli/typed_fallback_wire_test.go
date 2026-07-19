@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -10,7 +11,7 @@ import (
 
 func TestApplyTypedFallbackAfterDispatchSkipsSuccess(t *testing.T) {
 	in := worker.Result{OK: true, FailureClass: string(provideroutcome.ClassQuotaExhausted)}
-	out := applyTypedFallbackAfterDispatch(nil, t.TempDir(), worker.Options{RoutingDecisionID: "r1"}, in, nil, nil)
+	out := applyTypedFallbackAfterDispatch(context.TODO(), t.TempDir(), worker.Options{RoutingDecisionID: "r1"}, in, nil, nil)
 	if out.FallbackApplied {
 		t.Fatal("applied fallback on success")
 	}
@@ -22,7 +23,7 @@ func TestApplyTypedFallbackAfterDispatchRespectsPin(t *testing.T) {
 		FailureClass:        string(provideroutcome.ClassQuotaExhausted),
 		AutoFallbackAllowed: true,
 	}
-	out := applyTypedFallbackAfterDispatch(nil, t.TempDir(), worker.Options{
+	out := applyTypedFallbackAfterDispatch(context.TODO(), t.TempDir(), worker.Options{
 		RoutingDecisionID: "r1",
 		RoutePinned:       true,
 	}, in, nil, nil)
@@ -40,7 +41,7 @@ func TestApplyTypedFallbackAfterDispatchMissingDecision(t *testing.T) {
 		FailureClass:        string(provideroutcome.ClassTransientTransport),
 		AutoFallbackAllowed: true,
 	}
-	out := applyTypedFallbackAfterDispatch(nil, t.TempDir(), worker.Options{}, in, nil, nil)
+	out := applyTypedFallbackAfterDispatch(context.TODO(), t.TempDir(), worker.Options{}, in, nil, nil)
 	if out.FallbackApplied {
 		t.Fatal("applied without decision id")
 	}
