@@ -7,59 +7,112 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- **Product-path Full GO no longer requires live Apple Developer ID** - Full GO
-  is packaged gates + live Codex/Claude canaries + zero open release-blockers.
-  Live Apple sign/notarize remains recommended for Gatekeeper-friendly public
-  downloads and is opt-in via `--include-apple-live 1`. See
-  `docs/reference/v0.8.1-go-no-go.md` and `docs/reference/macos-codesign.md`.
-
 ## [0.8.1] - 2026-07-19
 
-v0.8.1 closes the production-path gaps found after v0.8.0 publication on native
-Darwin arm64: automatic Worker/Verifier route authority, DeliveryRun
-claim-dispatch, nested permission-safe child routing, typed fallback wiring,
-local waiters, progress host contracts, installer custom-directory PATH, and
-release evidence harnesses (canaries, Apple sign/notarize, product-path
-go/no-go gate). Fixture and packaged gates pass without live providers; live
-Codex/Claude canaries remain owner-gated for product-path Full GO. Live Apple
-trust is optional (recommended for public download UX).
-Operator checklist: [`docs/reference/v0.8.1-release-runbook.md`](docs/reference/v0.8.1-release-runbook.md).
+v0.8.1 is the **production-path closure** release for native Darwin arm64. It
+connects the contracts that v0.8.0 published into the commands operators
+actually run: Worker/Verifier route authority, DeliveryRun claim-dispatch,
+nested permission-safe child routing, typed provider fallback, local waiters,
+progress host contracts, installer custom-directory PATH, and release evidence
+harnesses (canaries, optional Apple sign/notarize, product-path go/no-go gate).
+
+**Product-path Full GO** = packaged binary gates + live Codex/Claude canaries +
+zero open release-blockers. Live Apple Developer ID + notarize is **optional**
+(recommended for Gatekeeper-friendly public downloads). Fixture success never
+substitutes live canaries.
+
+- Operator checklist: [`docs/reference/v0.8.1-release-runbook.md`](docs/reference/v0.8.1-release-runbook.md)
+- Gate contract: [`docs/reference/v0.8.1-go-no-go.md`](docs/reference/v0.8.1-go-no-go.md)
+- GitHub release notes draft: [`.github/release-notes/v0.8.1.md`](.github/release-notes/v0.8.1.md)
+- Tracking: [#1002](https://github.com/jasonhnd/loopcoder/issues/1002)
 
 ### Added
+
+- **Worker dispatch route authority** - ordinary unpinned `loopcoder dispatch`
+  persists a durable routing decision before any provider process starts, then
+  launches the selected adapter/model/effort exactly. Explicit `--provider` is
+  a durable user pin. Empty-provider implicit Codex defaults are removed from
+  the worker prepare path. `no_route` returns exit code **20** with zero
+  provider launches.
+
+- **Independent verifier route authority** - unpinned `loopreview` persists a
+  verifier route decision before launch, enforces independence from the
+  configured worker, and returns needs-human when no independent read-only
+  verifier is available.
+
+- **DeliveryRun claim-dispatch** - claim one ready DeliveryRun task under
+  durable ownership and dispatch it through the product path
+  (`delivery claim-dispatch`).
+
+- **Nested child route authority** - unpinned nested children resolve a
+  permission-safe route from the immutable child execution contract before plan
+  persistence and claim/launch. Mixed read-only/write plans may select different
+  eligible adapters; child or global `--provider` pins pass the same nested
+  permission matrix. Orchestrate and unbridged native provider-native nested
+  delegation remain refuse-closed. Route receipts appear on child results.
+
+- **Typed provider failure → bounded fallback wiring** - after Worker classifies
+  a provider failure, `dispatch` / `delivery claim-dispatch` call
+  `routing.ApplyTypedProviderFailure` when a route decision exists. Pins and
+  needs-human classes stay fail-closed; auto-eligible classes may persist a
+  bounded successor without relaunching a provider in-process.
+
+- **Production wait wiring** - `loopcoder wait` ships provider-free `approval`,
+  `outbox`, and `detached-worker` watchers against durable local state, with
+  restartable file checkpoints and zero provider launches. `quota-reset` remains
+  available. GitHub CI waiting stays on the existing orchestration path.
+
+- **Host progress visibility contracts** - negotiated foreground sinks for
+  Codex, Claude, Paseo, and generic CLI; Worker progress delivery annotates the
+  selected host; unknown hosts degrade to generic. Active delivery still never
+  uses a model. See `docs/reference/progress-hosts.md`.
+
+- **Protected Codex/Claude release canaries** -
+  `scripts/release-provider-canary.sh` with fixture and live modes, sanitized
+  evidence schema `loopcoder.release_provider_canary.v1`, fork/PR guards, and
+  workflow `.github/workflows/release-provider-canary.yml` (environment
+  `release-canary` for live runs). Live mode never falls back across providers
+  and requires `LOOPCODER_REAL_PROVIDER_CANARY=1`.
+
+- **Non-blocking Grok/Antigravity canaries** - same harness accepts `grok` and
+  `antigravity` with `blocking:false`. Missing CLI/auth/model surfaces report
+  `not_available` (exit 0) instead of product failure or fabricated zero quota;
+  workflow live jobs are informational and cannot fail the blocking Codex/Claude
+  summary. See `docs/reference/release-provider-canaries.md`.
+
+- **v0.8.1 product-path go/no-go gate** - `scripts/v081-product-path-gate.sh`
+  produces machine-readable `loopcoder.v081_go_no_go.v1` evidence and a human
+  report. Fixture mode is CI-safe; packaged mode exercises the candidate binary;
+  live Codex/Claude canaries are explicit opt-in for product-path Full GO and
+  are never substituted by fixtures. Live Apple trust is optional/recommended
+  via `--include-apple-live 1`. See `docs/reference/v0.8.1-go-no-go.md`.
+
+- **macOS Developer ID sign/notarize harness** -
+  `scripts/macos-codesign-notarize.sh` with dry-run and live modes, sanitized
+  `loopcoder.macos_codesign.v1` evidence, PR/fork refusal, and release `sign`
+  job integration. Live mode requires `APPLE_SIGN=1` plus Developer ID identity,
+  Team ID, and notary keychain profile secrets; dry-run remains the default
+  without credentials. Product-path Full GO does **not** require live Apple.
 
 - **v0.8.1 release runbook** - operator freeze → Full GO → publish checklist in
   `docs/reference/v0.8.1-release-runbook.md`, linked from the go/no-go gate and
   releasing reference.
 
-- **Non-blocking Grok/Antigravity canaries** - `release-provider-canary.sh`
-  accepts `grok` and `antigravity` with `blocking:false`. Missing CLI/auth/model
-  surfaces report `not_available` (exit 0) instead of product failure or zero
-  quota; workflow live jobs are informational and cannot fail the blocking
-  Codex/Claude summary. See `docs/reference/release-provider-canaries.md`.
-
-- **v0.8.1 product-path go/no-go gate** - `scripts/v081-product-path-gate.sh`
-  produces machine-readable `loopcoder.v081_go_no_go.v1` evidence and a human
-  report. Fixture mode is CI-safe; packaged mode exercises the candidate binary;
-  live Codex/Claude canaries remain explicit opt-in for product-path Full GO and
-  are never substituted by fixtures. Live Apple trust is optional/recommended.
-  See `docs/reference/v0.8.1-go-no-go.md`.
-
-- **Protected Codex/Claude release canaries** - `scripts/release-provider-canary.sh`
-  with fixture and live modes, sanitized evidence schema
-  `loopcoder.release_provider_canary.v1`, fork/PR guards, and workflow
-  `.github/workflows/release-provider-canary.yml` (environment `release-canary`
-  for live runs). Live mode never falls back across providers and requires
-  `LOOPCODER_REAL_PROVIDER_CANARY=1`.
-
-- **macOS Developer ID sign/notarize harness** - `scripts/macos-codesign-notarize.sh`
-  with dry-run and live modes, sanitized `loopcoder.macos_codesign.v1` evidence,
-  PR/fork refusal, and release `sign` job integration. Live mode requires
-  `APPLE_SIGN=1` plus Developer ID identity, Team ID, and notary keychain
-  profile secrets; dry-run remains the default without credentials.
+- **Nested permission matrix / real-provider smokes** -
+  `scripts/nested-permission-matrix-smoke.sh` and
+  `scripts/nested-permission-real-provider-smoke.sh` for packaged binary
+  permission policy proof.
 
 ### Fixed
+
+- **Live nested Codex/Claude canary route and launch** - nested routing used
+  invalid canary run IDs, display-name model pins (`gpt-5.5` vs opaque
+  `mcap_*`), incomplete inventory promotion (`usable_for_invocation`, model
+  availability), missing nested budget authority, unsupported deep/fast
+  invocation-profile pins, and Claude auth probes without `USER`/`LOGNAME`.
+  Product path now routes and launches auth-ready local CLIs; release canary
+  plans emit `state.IsRunID`-shaped run IDs and isolate fixture repos from
+  ambient git hooks.
 
 - **Nested permission matrix on macOS Bash 3.2** - clear the ERR trap around
   expected non-zero `nested run` exits so policy-violation cases are not
@@ -71,42 +124,29 @@ Operator checklist: [`docs/reference/v0.8.1-release-runbook.md`](docs/reference/
   spaces). Re-runs stay idempotent; `LOOPCODER_NO_MODIFY_PATH=1` prints
   guidance without editing profiles. Relative install dirs are rejected.
 
+- **Inventory / routing evidence for live machines** - promote installation
+  `usable_for_invocation=yes` when auth readiness is ready; treat
+  adapter-declared catalog models as available for routing; derive in-memory
+  availability scores when none are persisted; allow low-risk nested read-only
+  work without uncollected quota/budget telemetry; resolve human model names to
+  inventory model capability IDs on transient pins.
+
 ### Changed
 
-- **Typed fallback production wiring** - after Worker classifies a provider
-  failure, `dispatch` / `delivery claim-dispatch` call
-  `routing.ApplyTypedProviderFailure` when a route decision exists. Pins and
-  needs-human classes stay fail-closed; auto-eligible classes may persist a
-  bounded successor without relaunching a provider in-process.
+- **Product-path Full GO no longer requires live Apple Developer ID** - Full GO
+  is packaged gates + live Codex/Claude canaries + zero open release-blockers.
+  Live Apple sign/notarize remains recommended for Gatekeeper-friendly public
+  downloads and is opt-in via `--include-apple-live 1`. See
+  `docs/reference/v0.8.1-go-no-go.md` and `docs/reference/macos-codesign.md`.
 
-- **Host progress visibility contracts** - negotiated foreground sinks for
-  Codex, Claude, Paseo, and generic CLI; Worker progress delivery annotates
-  the selected host; unknown hosts degrade to generic. See
-  `docs/reference/progress-hosts.md`. Active delivery still never uses a model.
+- **Nested claim/launch budget authority** - successful nested child routes seed
+  a soft project budget ceiling when none exists and carry route fingerprints /
+  budget request fields into child plan metadata so claim/launch can reserve
+  against durable policy without unbudgeted test escapes.
 
-- **Production wait wiring** - `loopcoder wait` now ships provider-free
-  `approval`, `outbox`, and `detached-worker` watchers against durable local
-  state, with restartable file checkpoints and zero provider launches.
-  `quota-reset` remains available. GitHub CI waiting stays on the existing
-  orchestration path.
-
-- **Nested child route authority** - unpinned nested children resolve a
-  permission-safe route from the immutable child execution contract before
-  plan persistence and claim/launch. Mixed read-only/write plans may select
-  different eligible adapters; explicit child or `--provider` pins pass the
-  same nested permission matrix. Orchestrate and unbridged native delegation
-  remain refused. Route receipts appear on child results.
-
-- **Worker dispatch route authority** - ordinary unpinned `loopcoder dispatch`
-  persists a route decision before provider launch and uses the selected
-  adapter/model/effort exactly. Explicit `--provider` is a durable pin.
-  Empty-provider Codex defaults are removed from the worker prepare path.
-  `no_route` returns exit code 20 with zero provider launches.
-
-- **Independent verifier route authority** - unpinned `loopreview` persists a
-  verifier route decision before launch, enforces independence from the
-  configured worker, and returns needs-human when no independent read-only
-  verifier is available.
+- **Release evidence semantics** - fixture/packaged gates never substitute live
+  canaries; missing Apple credentials are not product-path NO-GO unless live
+  Apple was explicitly requested.
 
 ## [0.8.0] - 2026-07-16
 
