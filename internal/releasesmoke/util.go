@@ -109,29 +109,6 @@ func withEnv(extra map[string]string, fn func() error) error {
 	return fn()
 }
 
-func processEnvWith(overrides map[string]string) []string {
-	base := os.Environ()
-	if len(overrides) == 0 {
-		return base
-	}
-	index := make(map[string]int, len(base))
-	for i, kv := range base {
-		if eq := strings.IndexByte(kv, '='); eq > 0 {
-			index[kv[:eq]] = i
-		}
-	}
-	out := append([]string(nil), base...)
-	for key, value := range overrides {
-		entry := key + "=" + value
-		if i, ok := index[key]; ok {
-			out[i] = entry
-			continue
-		}
-		out = append(out, entry)
-	}
-	return out
-}
-
 func treeInventory(root string) ([]string, error) {
 	if _, err := os.Stat(root); err != nil {
 		if os.IsNotExist(err) {
