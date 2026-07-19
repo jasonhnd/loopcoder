@@ -1,8 +1,13 @@
 # macOS Developer ID signing and notarization
 
-v0.8.1 public distribution requires Apple trust in addition to Sigstore archive
-checksum provenance. This document describes the local harness and release
-integration for issue [#1022](https://github.com/jasonhnd/loopcoder/issues/1022).
+v0.8.1 **product-path Full GO does not require** Apple Developer ID signing.
+CLI distribution may ship as source, `go build`, installer script, or archive
+with Sigstore/checksum provenance only.
+
+Live Developer ID + notarize remains **recommended** for Gatekeeper-friendly
+browser downloads and DMG-style UX (comparable to notarized desktop apps). This
+document describes the local harness and release integration for issue
+[#1022](https://github.com/jasonhnd/loopcoder/issues/1022).
 
 ## Harness
 
@@ -71,8 +76,11 @@ The release workflow should:
 5. Smoke/canary against those exact digests
 6. Publish only if digests still match
 
-Dry-run remains available when Apple credentials are not configured; live mode
-must fail closed rather than publish an ad-hoc-signed Mach-O.
+Dry-run remains available when Apple credentials are not configured. Live mode
+must fail closed when explicitly requested (`APPLE_SIGN=1` / `--include-apple-live 1`)
+rather than publish an ad-hoc-signed Mach-O. Skipping live Apple trust entirely
+is a valid product-path choice; do not claim notarized/Developer ID trust in
+release notes when the path was not run.
 
 Release repository configuration:
 
