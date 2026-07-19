@@ -1,6 +1,22 @@
 # Changelog
 
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
 ## [Unreleased]
+
+## [0.8.1] - 2026-07-19
+
+v0.8.1 closes the production-path gaps found after v0.8.0 publication on native
+Darwin arm64: automatic Worker/Verifier route authority, DeliveryRun
+claim-dispatch, nested permission-safe child routing, typed fallback wiring,
+local waiters, progress host contracts, installer custom-directory PATH, and
+release evidence harnesses (canaries, Apple sign/notarize, product-path
+go/no-go gate). Fixture and packaged gates pass without live providers; live
+Codex/Claude canaries and live Apple trust remain owner-gated for Full GO.
+Operator checklist: [`docs/reference/v0.8.1-release-runbook.md`](docs/reference/v0.8.1-release-runbook.md).
 
 ### Added
 
@@ -82,15 +98,9 @@
   configured worker, and returns needs-human when no independent read-only
   verifier is available.
 
-All notable changes to this project will be documented in this file.
-
-
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
 ## [0.8.0] - 2026-07-16
 
-v0.8.0 is the current public release for native Darwin arm64. It publishes
+v0.8.0 was the prior public release for native Darwin arm64. It publishes
 resource, routing, nested-run, progress, and waiter contracts alongside durable
 process ownership and an auditable migration. A post-publication product-path
 audit found that several of those contracts are not connected end to end or

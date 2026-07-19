@@ -23,11 +23,11 @@ Per-project prerequisites: `git`, authenticated `gh`, at least one
 authenticated provider CLI (`codex` and/or `claude`), and a GitHub remote with
 push access.
 
-1. Install the v0.8.0 binary once per supported macOS Apple Silicon machine,
+1. Install the v0.8.1 binary once per supported macOS Apple Silicon machine,
    shared across all local projects.
 
    ```text
-   curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.0
+   curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.1
    ```
 
    Windows, Linux, WSL, containers, and Intel macOS are not supported by the
@@ -156,15 +156,15 @@ default.
 
 ## Install
 
-The supported v0.8.0 consumer distribution is GitHub Releases on native macOS
-Apple Silicon only. Tagged v0.8.0 releases publish
+The supported v0.8.x consumer distribution is GitHub Releases on native macOS
+Apple Silicon only. Tagged releases publish
 `loopcoder_<version>_darwin_arm64.tar.gz`, plus `SHA256SUMS` and signature
 material. The installer rejects unsupported hosts before release lookup,
 download, temporary directory creation, install directory creation, binary
 replacement, or PATH/profile mutation. On the supported host, it verifies the
 `SHA256SUMS` signature with cosign before trusting checksums, installs under
-`~/.loopcoder/bin`, and updates or prints PATH instructions. The installer does
-not require Go.
+`~/.loopcoder/bin` (or absolute `LOOPCODER_INSTALL_DIR`), and updates or prints
+PATH instructions for that same directory. The installer does not require Go.
 
 The default install directory is `~/.loopcoder/bin`. Set absolute
 `LOOPCODER_INSTALL_DIR` to place the binary elsewhere; PATH detection, shell
@@ -173,11 +173,11 @@ Set `LOOPCODER_NO_MODIFY_PATH=1` to print PATH instructions without editing
 profiles. Profile edits are idempotent and quote paths that contain spaces.
 
 ```text
-curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.0
-LOOPCODER_INSTALL_DIR="$HOME/tools/loopcoder" curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.0
+curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.1
+LOOPCODER_INSTALL_DIR="$HOME/tools/loopcoder" curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.1
 ```
 
-To choose a different supported v0.8.x release, replace `0.8.0` with the
+To choose a different supported v0.8.x release, replace `0.8.1` with the
 desired version. v0.7.0 remains the final legacy multi-platform release for
 Windows, Linux, WSL, containers, and Intel macOS.
 
@@ -190,7 +190,7 @@ loopcoder version
 `go install` remains available for users who already have Go:
 
 ```text
-go install github.com/jasonhnd/loopcoder/cmd/loopcoder@v0.8.0
+go install github.com/jasonhnd/loopcoder/cmd/loopcoder@v0.8.1
 ```
 
 From a source checkout, you can also build a development binary locally:
@@ -1083,7 +1083,7 @@ loopcoder state pull --repo .
 loopcoder lease acquire --repo . --run-id <run-id>
 loopcoder lease release --repo . --run-id <run-id>
 
-loopcoder upgrade --version 0.8.0
+loopcoder upgrade --version 0.8.1
 
 loopcoder hook conductor-reporter
 loopcoder hook conductor-relay-guard
