@@ -32,19 +32,24 @@ unsupported.
 Run from a LoopCoder source checkout on Darwin arm64:
 
 ```text
-pwsh scripts/self-bootstrap-smoke.ps1 -Version 0.8.0
+bash scripts/self-bootstrap-smoke.sh --version 0.8.1
 ```
 
 For release evidence, pass the binary extracted from the staged candidate:
 
 ```text
-pwsh scripts/self-bootstrap-smoke.ps1 \
-  -Version 0.8.0 \
-  -Binary <staged-candidate>/loopcoder \
-  -KeepArtifacts
+bash scripts/self-bootstrap-smoke.sh \
+  --version 0.8.1 \
+  --binary <staged-candidate>/loopcoder \
+  --keep-artifacts
 ```
 
-The script may build a local development binary only when `-Binary` is absent.
+Implementation lives in `internal/releasesmoke` (Go). The shell driver only sets
+environment and runs `go test`. Schema assertions bind to
+`storage.CurrentSchemaVersion` — never a hard-coded current generation.
+PowerShell drivers are removed (spec 1058).
+
+The script may build a local development binary only when `--binary` is absent.
 It records the selected binary path, SHA-256, and `loopcoder version` output so
 a release run can prove that self-bootstrap consumed the same candidate later
 eligible for publication.
@@ -62,7 +67,8 @@ The smoke proves all of the following:
 - registered run payloads are written below
   `$LOOPCODER_HOME/projects/<project_id>/`, not the repository;
 - `migrate storage` planning is read-only and reports the current source and
-  target schema without creating a backup for a fresh schema-30 database;
+  target schema (`source == target == CurrentSchemaVersion`, status `current`)
+  without creating a backup for a fresh already-current database;
 - a deterministic three-child graph executes with dependency-aware fan-out and
   fan-in, durable parent/child identity, and no remote provider call;
 - a forbidden read-only mutation returns the typed policy outcome and remains
@@ -73,7 +79,7 @@ The smoke proves all of the following:
 - `status` and `report` both produce representative human output and valid JSON
   for the same run tree;
 - progress, report, and doctor artifacts are retained only under the temporary
-  evidence directory when `-KeepArtifacts` is used;
+  evidence directory when `--keep-artifacts` is used;
 - doctor reports database, registry, nested-run, provider compatibility, and
   host-profile evidence honestly, while optional missing provider login or
   GitHub readiness remains visible rather than fabricated as success;

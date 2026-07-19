@@ -336,12 +336,12 @@ jobs:
           retention-days: 90
 
       - name: Smoke staged draft artifacts
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          ./scripts/release-smoke.ps1 -Version '${{ github.ref_name }}' -PreviousVersion '0.7.0'
+          set -euo pipefail
+          bash scripts/release-smoke.sh --version '${{ github.ref_name }}' --previous '0.7.0'
 
       - name: Retain sanitized permission-matrix diagnostics
         if: failure()

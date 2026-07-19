@@ -30,6 +30,23 @@ higher-authority source and report the conflict.
 - Confidence: low | medium | high
 - Supersedes: <optional earlier entry id>
 
+### 2026-07-20 - run depowershell-1058 - Release smoke must not keep a second schema truth in PowerShell
+
+- Scope: #1058 / docs/specs/1058-depowershell-release-smoke.md
+- Role: conductor
+- Observed: Release publish was blocked because `scripts/*-smoke.ps1` asserted
+  hard-coded schema 30 while `storage.CurrentSchemaVersion` was already 31.
+  Product support is darwin/arm64 only; PowerShell was historical release glue.
+- Evidence: release smoke failure on schema 30 vs plan target 31; spec 1058.
+- Learning: Keep release/self-bootstrap acceptance in Go next to
+  `CurrentSchemaVersion`. Thin bash drivers only; never hard-code the current
+  schema generation in scripts. Legacy v0.7 source schema 9 may stay literal.
+  Zero `scripts/*.ps1` on the current surface; CI must fail if they return.
+- Applies to: scripts, release workflow, storage migrations, releasing docs
+- Candidate improvement: none (implemented under #1058)
+- Confidence: high
+- Supersedes:
+
 ### 2026-06-26 - run 2026-06-26-v0.1.2 - Conductor must run its own newly-merged playbook steps in-session
 
 - Scope: SKILL.md self-improvement close-out (issues #47 / #48)
