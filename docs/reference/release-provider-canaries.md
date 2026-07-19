@@ -64,4 +64,4 @@ LOOPCODER_REAL_PROVIDER_CANARY=1 bash scripts/release-provider-canary.sh \
 
 `loopcoder.release_provider_canary.v1` JSON per provider, including status,
 result class, detail code, resolved model (when known), adapter mode, receipt
-delivery flag, digests, timestamps, hard limits, and redaction attestation.
+delivery flag, digests, timestamps, hard limits, and redaction flags.

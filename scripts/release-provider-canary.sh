@@ -245,12 +245,14 @@ command_for_provider() {
 }
 
 run_live() {
-  reject_untrusted_context
-
+  # Opt-in before trust gates so missing approval is not masked by ambient CI
+  # event names (e.g. pull_request on the verify job).
   if [[ "${LOOPCODER_REAL_PROVIDER_CANARY-}" != "1" ]]; then
     echo "live canary disabled; set LOOPCODER_REAL_PROVIDER_CANARY=1 after protected approval" >&2
     exit 2
   fi
+  reject_untrusted_context
+
   if [[ -z "$binary" || ! -x "$binary" ]]; then
     echo "live canary requires --binary executable" >&2
     exit 2

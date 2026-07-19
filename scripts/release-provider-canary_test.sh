@@ -98,9 +98,14 @@ if [[ -e "${codex_only}/release-provider-canary-claude.json" ]]; then
   exit 1
 fi
 
-# Live mode refused without opt-in.
+# Live mode refused without opt-in (clear ambient CI event vars).
 set +e
-bash "$canary" --mode live --provider codex --binary /bin/sh >"${tmp_root}/live_no_opt.out" 2>"${tmp_root}/live_no_opt.err"
+(
+  unset LOOPCODER_REAL_PROVIDER_CANARY || true
+  unset GITHUB_EVENT_NAME || true
+  unset GITHUB_EVENT_PATH || true
+  bash "$canary" --mode live --provider codex --binary /bin/sh
+) >"${tmp_root}/live_no_opt.out" 2>"${tmp_root}/live_no_opt.err"
 live_status=$?
 set -e
 assert_eq "$live_status" 2 "live without opt-in"
@@ -111,6 +116,7 @@ set +e
 (
   export LOOPCODER_REAL_PROVIDER_CANARY=1
   export GITHUB_EVENT_NAME=pull_request
+  unset GITHUB_EVENT_PATH || true
   bash "$canary" --mode live --provider claude --binary /bin/sh
 ) >"${tmp_root}/live_pr.out" 2>"${tmp_root}/live_pr.err"
 pr_status=$?
