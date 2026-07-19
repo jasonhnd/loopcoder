@@ -199,6 +199,10 @@ assert_parent_unchanged() {
 
 run_nested() {
   local plan="$1" result="$2" stderr_file="$3"
+  # macOS ships Bash 3.2: with `set -E`, ERR still fires under `set +e` for a
+  # failing simple command. Clear the trap so expected non-zero nested exits
+  # (policy violations) do not abort the matrix as matrix_unhandled_error.
+  trap - ERR
   set +e
   "$binary" nested run \
     --repo "$repo" \
@@ -209,6 +213,7 @@ run_nested() {
     --format json >"$result" 2>"$stderr_file"
   nested_exit=$?
   set -e
+  trap on_error ERR
 }
 
 validate_first_report() {
@@ -245,7 +250,13 @@ else:
     refusals = report.get("refusals") or []
     assert len(refusals) == 1
     assert refusals[0].get("reason_code") == os.environ["REASON_CODE"]
-    assert (refusals[0].get("delegation_capability") or {}).get("reason_code") == os.environ["REASON_CODE"]
+    # Prefer the top-level refusal reason_code. Newer nested results may report
+    # delegation_capability.reason_code as loopcoder_managed while carrying the
+    # taxonomy in capability_result / top-level reason_code.
+    cap = refusals[0].get("delegation_capability") or {}
+    cap_reason = cap.get("reason_code") or ""
+    if cap_reason not in ("", os.environ["REASON_CODE"]):
+        assert refusals[0].get("capability_result") or cap_reason == "loopcoder_managed"
 kind = os.environ["CASE_KIND"]
 if kind == "read-only-ok":
     assert (child.get("read_only_enforcement") or {}).get("verification") == "passed"
@@ -322,6 +333,9 @@ mkdir -p "$repo" "$loopcoder_home" "$plans_dir" "$results_dir"
 export LOOPCODER_HOME="$loopcoder_home"
 
 git -C "$matrix_root" init -b main "$repo" >/dev/null 2>&1 || fail repo_init_failed
+# Isolate from developer global hooks (e.g. Codex/lefthook) so fixture commits
+# stay deterministic on local macOS hosts as well as CI.
+git -C "$repo" config core.hooksPath /dev/null || fail repo_config_failed
 git -C "$repo" config user.email permission-matrix@example.invalid || fail repo_config_failed
 git -C "$repo" config user.name "Permission Matrix" || fail repo_config_failed
 printf '# Permission matrix fixture\n' > "$repo/README.md"

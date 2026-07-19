@@ -35,6 +35,11 @@
 
 ### Fixed
 
+- **Nested permission matrix on macOS Bash 3.2** - clear the ERR trap around
+  expected non-zero `nested run` exits so policy-violation cases are not
+  misreported as `matrix_unhandled_error`. Isolate fixture repos from global
+  git hooks and accept modern refusal `capability_result` shapes.
+
 - **Installer custom directory PATH** - `LOOPCODER_INSTALL_DIR` is now reused
   for PATH detection, profile lines, and printed instructions (quoted for
   spaces). Re-runs stay idempotent; `LOOPCODER_NO_MODIFY_PATH=1` prints
