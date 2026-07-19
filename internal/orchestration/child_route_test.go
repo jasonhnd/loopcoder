@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -48,6 +49,7 @@ func TestScheduleNestedRunsRoutesChildrenToDifferentProviders(t *testing.T) {
 		t.Fatalf("PrepareNestedPlanForExecution: %v", err)
 	}
 
+	var seenMu sync.Mutex
 	seen := map[string]string{}
 	report, err := ScheduleNestedRuns(context.Background(), NestedScheduleOptions{
 		RepoPath:                 repo,
@@ -81,7 +83,10 @@ func TestScheduleNestedRunsRoutesChildrenToDifferentProviders(t *testing.T) {
 			}
 		},
 		Execute: func(_ context.Context, request ChildExecutionRequest) (ChildRunResult, error) {
+			// Children launch concurrently under MaxConcurrency; protect shared map.
+			seenMu.Lock()
 			seen[request.ChildKey] = request.Work.Provider
+			seenMu.Unlock()
 			if request.ProviderDecision.RoutingDecisionID == "" {
 				t.Fatalf("child %s missing routing decision on launch", request.ChildKey)
 			}
@@ -103,8 +108,11 @@ func TestScheduleNestedRunsRoutesChildrenToDifferentProviders(t *testing.T) {
 	if report.Status != NestedStatusSucceeded {
 		t.Fatalf("status = %q, want succeeded; children=%+v", report.Status, report.Children)
 	}
-	if seen["read-child"] != "claude" || seen["write-child"] != "codex" {
-		t.Fatalf("seen providers = %#v, want read=claude write=codex", seen)
+	seenMu.Lock()
+	gotRead, gotWrite := seen["read-child"], seen["write-child"]
+	seenMu.Unlock()
+	if gotRead != "claude" || gotWrite != "codex" {
+		t.Fatalf("seen providers = read=%q write=%q, want read=claude write=codex", gotRead, gotWrite)
 	}
 	for _, child := range report.Children {
 		if child.RoutingDecisionID == "" || child.RouteAdapterID == "" {
