@@ -70,16 +70,31 @@ loop  > done. 2 PRs promoted, 0 blocked.
 
 ## Install
 
-Install the public v0.8.1 release on native macOS Apple Silicon
+Install the public **v0.8.1** release on native macOS Apple Silicon
 (`darwin/arm64`) with the no-Go shell installer:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.1
 ```
 
-Windows, Linux, WSL, containers, and Intel macOS are not supported by the
-current v0.8.0 installer. Users who need those hosts should remain on the
-historical v0.7.0 release.
+Custom install directory (PATH, profile lines, and printed instructions all use
+the same directory; re-runs are idempotent):
+
+```bash
+LOOPCODER_INSTALL_DIR="$HOME/tools/loopcoder" \
+  curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.1
+```
+
+Guidance only (do not edit shell profiles):
+
+```bash
+LOOPCODER_NO_MODIFY_PATH=1 \
+  curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.1
+```
+
+Windows, Linux, WSL, containers, and Intel macOS are **not** supported by the
+v0.8 installer. Users who need those hosts should remain on the historical
+**v0.7.0** release.
 
 Or install with Go on the supported host:
 
@@ -90,22 +105,29 @@ go install github.com/jasonhnd/loopcoder/cmd/loopcoder@v0.8.1
 Then confirm the binary:
 
 ```bash
-loopcoder version
+loopcoder version   # expect platform=darwin/arm64
+loopcoder doctor
 ```
 
-For a first consumer repository, follow the [`Quickstart (new project)`](docs/reference/usage.md#quickstart-new-project): install once, run `loopcoder version`, run `loopcoder init --repo .`, install the playbook and project conductor hooks with `loopcoder skill install --repo .`, run `loopcoder doctor --repo .`, run `loopcoder report --repo .`, then drive dispatch, `tick`, and `loopreview` through `/loopcoder <your need>`.
+For a first consumer repository, follow the [`Quickstart (new project)`](docs/reference/usage.md#quickstart-new-project): install once, run `loopcoder version`, run `loopcoder init --repo .`, install the playbook and project conductor hooks with `loopcoder skill install --repo .`, run `loopcoder projects register --repo .`, run `loopcoder doctor --repo .`, run `loopcoder report --repo .`, then drive dispatch, `tick`, and `loopreview` through `/loopcoder <your need>`.
 
 Prerequisites on `PATH`: `git`, authenticated `gh`, and at least one registered
-provider CLI. The release installer verifies the Sigstore-signed
-`SHA256SUMS` before trusting checksums, using cosign on the script path. This
-proves archive integrity; the v0.8.0 binary is not Apple Developer ID signed or
-notarized. `codex` is the default worker, `antigravity` uses executable `agy`,
-and the direct `gemini` adapter is experimental/unverified. Provider
-registration is not proof of authentication, usable capacity, safe role
-support, or exact-release real-provider evidence; consult the capability
-matrix before dispatch.
+provider CLI. The release installer verifies the Sigstore-signed `SHA256SUMS`
+before trusting checksums (cosign on the script path). That proves **archive
+integrity and release provenance**. Apple Developer ID + notarize is
+**optional** for product-path GO; when the published Mach-O is not notarized,
+prefer the installer + Sigstore path or `go install` rather than expecting
+Gatekeeper to treat a browser download like a notarized desktop app.
+`codex` is the default worker, `claude` is the usual independent verifier,
+`antigravity` uses executable `agy`, and the direct `gemini` adapter is
+experimental/unverified. Provider registration is not proof of authentication,
+usable capacity, safe role support, or exact-release real-provider evidence;
+consult the capability matrix before unattended dispatch.
 
-Current v0.8.0 support is native macOS Apple Silicon only (`darwin/arm64`). See [`docs/reference/usage.md`](docs/reference/usage.md) for setup and end-to-end usage. loopcoder is also usable as a Claude Code skill; point the `loopcoder` skill at this repo.
+**v0.8.1 support is native macOS Apple Silicon only (`darwin/arm64`).** See
+[`docs/reference/usage.md`](docs/reference/usage.md) for setup and end-to-end
+usage. loopcoder is also usable as a Claude Code skill; point the `loopcoder`
+skill at this repo.
 
 ## Upgrade From 0.7.0 / 0.8.0 To 0.8.1
 
@@ -439,18 +461,38 @@ During the 0.6.x transition window, readers accept legacy `[attestation]` header
 - [`docs/learnings.md`](docs/learnings.md) -- append-only operational learnings.
 - [`CHANGELOG.md`](CHANGELOG.md) -- release history.
 
+## What's new in v0.8.1
+
+Compared with v0.8.0 (contracts without full product wiring):
+
+| Path | v0.8.1 |
+| --- | --- |
+| Unpinned Worker `dispatch` | Persists route decision, then launches selected provider |
+| Independent `loopreview` | Verifier route + independence policy |
+| DeliveryRun | `claim-dispatch` for one ready task |
+| Nested children | Permission-safe route before claim/launch; live Codex/Claude canaries pass |
+| Provider failure | Typed classification → bounded fallback wiring |
+| Wait | Provider-free `approval` / `outbox` / `detached-worker` / `quota-reset` |
+| Progress hosts | Codex / Claude / Paseo / generic contracts |
+| Installer | `LOOPCODER_INSTALL_DIR` honored for PATH/profile/instructions |
+| Release | Canaries + product-path go/no-go gate; Apple live optional |
+
+Full narrative: [`.github/release-notes/v0.8.1.md`](.github/release-notes/v0.8.1.md) and
+[`CHANGELOG.md`](CHANGELOG.md).
+
 ## Status
 
 v0.8.1 is the current release line for native macOS Apple Silicon only. Product
 paths for routing, nested permissions, waiters, progress hosts, installer PATH,
 and release evidence harnesses are connected. Fixture and packaged go/no-go
-gates pass; product-path Full GO requires owner-run live Codex/Claude canaries.
-Live Apple Developer ID + notarize is optional (recommended for public download
-UX). See the
+gates pass; **product-path Full GO** requires owner-run live Codex/Claude
+canaries against the freeze digest. Live Apple Developer ID + notarize is
+optional (recommended for Gatekeeper-friendly public downloads). See the
 [`v0.8.1 release runbook`](docs/reference/v0.8.1-release-runbook.md),
+[`v0.8.1 go/no-go gate`](docs/reference/v0.8.1-go-no-go.md),
 [`capability matrix`](docs/reference/v0.8.0-capability-matrix.md), and
-[`v0.8.1 go/no-go gate`](docs/reference/v0.8.1-go-no-go.md). The repository
-keeps `gate: human-merge` for LoopCoder-core safety.
+[host progress visibility contracts](docs/reference/progress-hosts.md). The
+repository keeps `gate: human-merge` for LoopCoder-core safety.
 
 v0.7.0 remains available as the final legacy multi-platform release. v0.8.0
 remains the prior Darwin arm64 public tag. Historical
