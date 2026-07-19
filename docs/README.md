@@ -17,13 +17,18 @@ Every document is exactly one of these types:
 - [`BACKLOG.md`](BACKLOG.md): backlog and deferred work.
 - [`domains.md`](domains.md): domain profile guidance and docs-domain example.
 - [`learnings.md`](learnings.md): append-only operational learnings.
+- [`product-evolution.md`](product-evolution.md): historical product decisions from v0.6 through v0.8 and links to their authoritative specs.
+- [`self-hosting-playbook.md`](self-hosting-playbook.md): mandatory scope, resource, progress, retry, verification, and cleanup controls for LoopCoder developing itself.
+- [`v0.8.0-retrospective.md`](v0.8.0-retrospective.md): sanitized engineering retrospective and corrective-action record for the v0.8.0 cycle.
 - [`reference/audit.md`](reference/audit.md): read-only security audit command.
 - [`reference/architecture.md`](reference/architecture.md): current system map.
+- [`reference/development-release-checklist.md`](reference/development-release-checklist.md): reusable intake-to-publication evidence checklist and GO/NO-GO matrix.
 - [`reference/releasing.md`](reference/releasing.md): release documentation rules.
 - [`reference/self-bootstrap.md`](reference/self-bootstrap.md): v0.8.0 self-bootstrap acceptance checklist.
 - [`reference/stability-policy.md`](reference/stability-policy.md): 0.x stability policy.
 - [`reference/storage-migration.md`](reference/storage-migration.md): v0.7-to-v0.8 storage planning, backup, and rollback contract.
 - [`reference/task-requirement-classification.md`](reference/task-requirement-classification.md): v0.8 planner task requirement classification.
+- [`reference/v0.8.0-capability-matrix.md`](reference/v0.8.0-capability-matrix.md): binding v0.8.0 capability, reachability, evidence, and production-support status.
 - [`reference/v0.8.0-go-no-go.md`](reference/v0.8.0-go-no-go.md): current v0.8.0 release evidence and go/no-go record.
 - [`reference/v0.7.0-go-no-go.md`](reference/v0.7.0-go-no-go.md): completed historical v0.7.0 release record.
 - [`reference/worker.md`](reference/worker.md): current worker adapter behavior.

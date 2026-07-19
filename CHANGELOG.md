@@ -7,11 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.8.0] - 2026-07-16
 
-v0.8.0 is the current release candidate. It turns the v0.7 machine-local
-runtime into a resource-aware, provider-neutral orchestration layer with
-durable process ownership, bounded agent federation, explainable routing, and
-auditable migration. Publication remains gated by the completed v0.8.0
-go/no-go record and protected release environment.
+v0.8.0 is the current public release for native Darwin arm64. It publishes
+resource, routing, nested-run, progress, and waiter contracts alongside durable
+process ownership and an auditable migration. A post-publication product-path
+audit found that several of those contracts are not connected end to end or
+proven with real providers, so v0.8.0 is supported for controlled canary and
+development work rather than unattended production orchestration. The binding
+status is the
+[`v0.8.0 capability and support matrix`](docs/reference/v0.8.0-capability-matrix.md).
 
 ### Added
 
@@ -33,14 +36,15 @@ go/no-go record and protected release environment.
 - **Hierarchical budgets and availability** - machine, provider, account,
   model, project, run, and task scopes support atomic reserve, commit, release,
   retry, and conservative overage handling.
-- **Explainable routing and fallback** - deterministic task requirements,
-  capability-first hard eligibility, quota/reset-aware scoring, policy-bound
-  fallback, independent verifier selection, and reason-coded decisions replace
-  implicit provider choice.
-- **Controlled agent federation** - provider-native sub-agent capability is
-  admitted only through durable registrations, parent authority, depth,
+- **Routing and fallback contracts** - deterministic task requirements,
+  capability-first eligibility, quota/reset-aware scoring, policy-bound
+  fallback, independent-verifier policy, and reason-coded decision types are
+  implemented for integration in v0.8.1. Ordinary unpinned v0.8.0 dispatch
+  still defaults directly to Codex.
+- **Nested-run contracts** - durable registrations, parent authority, depth,
   fan-out, concurrency, permission, budget, cancellation, and one-writer
-  fences. Provider-native children cannot bypass LoopCoder's run graph.
+  records provide bounded deterministic test infrastructure. No
+  production-provider nested mode is supported in v0.8.0.
 - **Grok provider** - the `grok` worker adapter, bounded install/auth/catalog
   discovery, ACP billing telemetry when advertised and explicitly allowed,
   dynamic model attribution, and native-agent capability probing are available
@@ -49,10 +53,11 @@ go/no-go record and protected release environment.
   detached supervisor, persists provider PID/process-group/birth identity, and
   returns a run ID for `status`, `attach`, and `cancel`. A Darwin guardian reaps
   verified provider groups after abrupt supervisor death.
-- **Provider-free waiting and progress delivery** - CI, approval, quota reset,
-  outbox, and worker-terminal waits use a restartable local state machine with
-  no model invocation. Active work emits durable progress at least every five
-  minutes and routes receipts through the delivery outbox.
+- **Provider-free waiter and progress infrastructure** - restartable CI,
+  approval, quota-reset, outbox, and worker-terminal state-machine components
+  plus durable five-minute receipts and a delivery outbox are present. The
+  local CI waiter is connected; the other active waiter and unsolicited host
+  delivery paths remain incomplete in v0.8.0.
 - **Orchestration cost accounting** - model calls, tokens when known, wall
   time, waiting, retries, recovery, delivery, and verifier work are recorded
   per run; unresolved reservations remain fail-closed while terminal providers
@@ -79,7 +84,7 @@ go/no-go record and protected release environment.
   redispatch. Existing PR, already-applied push, no-change, and delivery retry
   outcomes are typed and idempotent so administrative completion cannot rerun
   useful provider work.
-- **Release verification** - staged smoke uses the exact signed candidate for
+- **Release verification** - staged smoke used the exact final archive for
   fresh install, self-bootstrap, v0.7 schema migration, copied-backup rollback,
   already-latest upgrade, and public artifact checks before publication.
 
@@ -118,6 +123,22 @@ offline v0.7.0 restore procedure.
 
 ### Known Limitations
 
+- Automatic Worker routing, routed Verifier independence, typed fallback, and
+  quota-reset waiting are not connected product paths. Explicitly pinned
+  Worker and Verifier use is canary-only.
+- No real-provider nested mode is supported. The accepted read-only nested path
+  does not enforce mutation-free behavior in the Worker adapter, and write or
+  orchestrate production-provider modes are refused.
+- Progress receipts and delivery-outbox records are durable, but active work
+  does not have release-proven unsolicited host delivery. Approval, outbox,
+  and detached-terminal waiters are not fully integrated.
+- The public Mach-O is not Apple Developer ID signed or notarized. Sigstore
+  verifies checksum provenance and archive integrity, not Gatekeeper trust.
+- Custom install-directory binary placement exists, but PATH/profile guidance
+  still assumes the default directory.
+- Protected exact-v0.8.0 real-provider canaries are absent. Historical adapter
+  smokes and deterministic fixtures do not replace release evidence.
+
 - Provider quota is used for routing only when a supported, sufficiently fresh
   source supplies the required evidence. LoopCoder does not scrape private
   credentials, invent exact five-hour or weekly limits, or treat CLI presence
@@ -132,10 +153,11 @@ offline v0.7.0 restore procedure.
 
 ## [0.7.0] - 2026-07-11
 
-v0.7.0 is the current customer install target. It moves loopcoder's local
-runtime from repo-only files toward a machine-local project registry and
-SQLite-backed runtime store, adds explicit local-state migration and nested
-run-tree observability, and ships through the staged signed release flow.
+v0.7.0 was the customer install target for its release cycle and remains the
+final legacy multi-platform release. It moved loopcoder's local runtime from
+repo-only files toward a machine-local project registry and SQLite-backed
+runtime store, added explicit local-state migration and nested run-tree
+observability, and shipped through the staged signed release flow.
 
 ### Added
 

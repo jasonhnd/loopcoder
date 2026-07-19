@@ -108,8 +108,14 @@ v0.8.0, pull-request CI emits exactly four stable contexts: `verify`, `test`,
 `darwin/arm64` Go tuple assertion. The pull-request `race` context runs the
 race detector for Go packages changed by that PR, or a small concurrent sentinel
 set when no Go package changed. The release `build` job reruns the complete
-`go test -race -count=1 -timeout=20m ./...` suite before it packages the tagged
-artifact. This keeps ordinary PR feedback bounded without weakening the final
+race suite with `bash scripts/ci-full-race.sh` before it packages the tagged
+artifact. The helper derives the exact package inventory from `go list ./...`
+and fails closed if that inventory cannot be built, contains duplicates, or
+does not contain the required isolated packages. It runs every package exactly
+once with `-race -count=1 -timeout=20m`: ordinary packages run in one bounded
+group, then `internal/storage`, `internal/routing`, and
+`internal/supervisedexec` run in isolated invocations without ordinary-package
+contention. This keeps ordinary PR feedback bounded without weakening the final
 release race gate.
 
 This repository currently has one collaborator. GitHub does not allow a pull

@@ -4,6 +4,11 @@ This document is the living map of loopcoder as it works now. It describes the
 current repository and runtime behavior, not the larger north-star system in
 [`DESIGN.md`](../../DESIGN.md).
 
+Architecture inventory is not the production-support boundary. The binding
+v0.8.0 classification of implemented code, reachable entry points,
+deterministic coverage, real-provider evidence, and supported use is the
+[`v0.8.0 capability and support matrix`](v0.8.0-capability-matrix.md).
+
 ## Overview
 
 loopcoder is a host-agent playbook plus a native Go binary. It is not a daemon
@@ -22,7 +27,7 @@ multi-platform release; other platforms can return only through a separately
 approved future roadmap. Provider-neutral architecture does not imply
 host-platform support.
 
-The built loop is:
+The intended conductor-led loop is:
 
 ```text
 need
@@ -36,6 +41,10 @@ need
   -> promote follows the configured production gate
   -> chat progress and final report
 ```
+
+v0.8.0 exposes many of these steps individually, but the complete chain is not
+release-proven as an unattended product path. Use explicit providers and the
+human merge gate for controlled canaries.
 
 GitHub issues, labels, PRs, branches, and checks remain the delivery source of
 truth. Local `.loopcoder/runs/<RunId>/` state and the optional state branch help
@@ -64,9 +73,11 @@ up unless `--keep-worktree` is set. The provider edits files only; loopcoder
 owns commit, push, PR creation, and cleanup.
 
 The worker provider is selected through the shared provider registry. The
-current worker provider registry supports `codex`, `claude`, `antigravity`,
-`grok`, and experimental direct `gemini`, with `codex` as the default in the
-dispatch path. The static model registry used by `loopcoder models` covers
+current worker provider registry contains `codex`, `claude`, `antigravity`,
+`grok`, and experimental direct `gemini`, with `codex` as the direct default in
+the dispatch path. Registry presence does not prove authentication, capacity,
+safe role support, automatic routing, or exact-release canary evidence. The
+static model registry used by `loopcoder models` covers
 `codex`, `claude`, and `antigravity`; `grok` is represented as a
 dynamic-inventory provider without fabricated static model defaults, and the
 direct `gemini` adapter remains outside that registry. See
@@ -104,6 +115,11 @@ effort, and 2,447 input / 4,947 output tokens. `gemini` remains unverified for
 available or verified, so selecting it for `loopreview` fails closed instead of
 running a mutating review.
 
+That historical proof is not a protected exact-v0.8.0 artifact canary.
+Verifier selection is explicit and same-provider independence is advisory in
+v0.8.0; there is no production route service that persists and enforces an
+independent selection.
+
 ## Ports And Adapters
 
 loopcoder is organized around stable responsibilities with native adapters:
@@ -117,7 +133,7 @@ loopcoder is organized around stable responsibilities with native adapters:
 | Verifier | Review PRs against issue, diff, checks, and spec | `loopcoder loopreview` read-only provider invocation |
 | LocalGate | Run configured local tests/typecheck/build commands | `loopcoder verify-local` |
 | Gate | Decide whether pre-prod may promote to production | New scaffolds write `human-merge`; legacy empty or missing gates normalize to `auto` |
-| Reporter | Persist and surface progress, verdicts, failures, and final status | Durable progress/outbox records plus host-specific chat delivery |
+| Reporter | Persist and surface progress, verdicts, failures, and final status | Durable progress/outbox records; active host delivery is not release-proven |
 
 `.delivery.yml` selects per-repo defaults such as base branch, worker provider,
 verifier provider, promotion gate, required hosted checks, local command gates,
@@ -258,18 +274,20 @@ PID, process group, process birth identity, executable identity, owner, and
 generation; `ps`, `status`, `kill`, and recovery fail closed when that identity
 is stale, ambiguous, missing, or reused.
 
-Progress receipts are persisted at least every five minutes during active
-work and enter the durable delivery outbox. Waiting for CI, approval, quota
-reset, outbox delivery, or worker terminalization uses a local restartable
-state machine with no provider invocation. Recovery reconciles live provider
-authority before redispatch, adopts existing PRs and already-applied delivery
-effects idempotently, and fences concurrent recovery so useful provider work is
-not executed twice. Ambiguous external effects become `needs-human` rather
-than an automatic takeover. Design rationale:
+Progress generation, persistence, and delivery-outbox components can create
+durable five-minute receipts, but v0.8.0 has no exact-artifact proof that active
+work delivers them unsolicited to the initiating host. Restartable local
+state-machine implementations exist for CI, approval, quota-reset, outbox, and
+worker-terminal waiting; only the local GitHub CI waiter is connected as a
+supported product path. Recovery reconciles live provider authority before
+redispatch, adopts existing PRs and already-applied delivery effects
+idempotently, and fences concurrent recovery so useful provider work is not
+executed twice. Ambiguous external effects become `needs-human` rather than an
+automatic takeover. Design rationale:
 [`../specs/0041-resilience.md`](../specs/0041-resilience.md).
 
-Nested child execution adds a SQLite-backed ownership layer for child provider
-launch. The scheduler persists the accepted child plan and run graph, then a
+Nested child infrastructure adds a SQLite-backed ownership layer around child
+claims. The scheduler persists the accepted child plan and run graph, then a
 claim transaction atomically records `run_claims.executor_id`,
 `claim_generation`, `claimed_at`, `lease_expires_at`, and `heartbeat_at` while
 moving the child run and parent edge to `running`. A scheduler that loses to an
@@ -279,6 +297,12 @@ worker cannot overwrite the result from a later recovery owner. Expired leases
 allow controlled takeover by a new generation, but uncertain external side
 effects still route to receipts/idempotency checks or `needs-human`; loopcoder
 does not claim universal exactly-once side effects across crashes.
+
+These ownership mechanics do not make real-provider nested execution a
+supported v0.8.0 path. Production-provider write and orchestrate modes are
+refused. The accepted read-only mode reaches the ordinary Worker adapter
+without an enforceable mutation-free permission, so it is also unsafe for real
+providers. `test-subprocess` is deterministic test infrastructure only.
 
 ### Delivery Guardrails
 
@@ -307,13 +331,16 @@ persistence functions. Invalid transitions, dependency cycles, stale approvals,
 duplicate replay, missing references, and cross-project references return the
 stable typed errors from the spec and roll back the whole write transaction.
 
-The v0.8 candidate approval surface is `loopcoder delivery`. `delivery plan`
+The v0.8 approval-record surface is `loopcoder delivery`. `delivery plan`
 performs only read transactions over existing DeliveryRun, task, and dependency
 rows and returns the current input, policy, plan, and authorization
 fingerprints. `delivery decide` records approval decisions for the exact current
 fingerprint, and `delivery continue` refuses stale, expired, rejected, or
 policy-denied work before it can become schedulable. These commands do not
 dispatch workers or launch providers.
+
+`delivery continue` therefore advances persisted state only; it is not a
+complete claim-and-dispatch product bridge in v0.8.0.
 
 When a schema-v9 database is opened, migration 10 captures a local backup image
 before opening the migration write transaction, then records that backup
@@ -339,6 +366,11 @@ visible in later decisions through `source.record_ids` and are revalidated
 against the deterministic floor whenever they apply. Operator, policy, schema,
 and adapter notes live in
 [`task-requirement-classification.md`](task-requirement-classification.md).
+
+The classifier and routing packages are internal implementation inventory in
+v0.8.0. Ordinary unpinned `dispatch` still defaults directly to Codex, and no
+shipped route-explain/route-decide service makes a persisted routing decision
+authoritative.
 
 ### Self-Improvement
 

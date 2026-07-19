@@ -1,13 +1,19 @@
 # Self-Bootstrap Acceptance
 
-This checklist defines the v0.8.0 self-bootstrap acceptance scenario. It proves
-that the release candidate can operate on the LoopCoder repository, persist
+This checklist defines the historical v0.8.0 self-bootstrap acceptance
+scenario. It proved that the staged release artifact could operate on the
+LoopCoder repository, persist
 durable machine-local state, execute a bounded child graph, render human and
 JSON evidence, and recover or roll back without paid provider quota.
 
 The scenario is release evidence, not publication authority. It cannot promote
 `main`, create a tag, publish a release, waive a failed check, or replace the
 required human approval in the `release-publication` environment.
+
+The child graph uses the reserved `test-subprocess` fixture. This smoke is not
+real-provider nested evidence and does not prove end-to-end production support.
+See the binding
+[`v0.8.0 capability and support matrix`](v0.8.0-capability-matrix.md).
 
 ## Platform Boundary
 
@@ -21,7 +27,7 @@ The smoke must fail before creating temporary state, opening storage, invoking
 a provider, contacting GitHub, or mutating a repository when the host tuple is
 unsupported.
 
-## Deterministic Candidate Smoke
+## Deterministic Release Smoke
 
 Run from a LoopCoder source checkout on Darwin arm64:
 
@@ -99,6 +105,11 @@ backup discards v0.8-only state created after migration. See
 the executable offline procedure.
 
 ## Required Release Evidence
+
+This section records the pre-publication evidence map. The later product-path
+audit narrowed what that evidence supports; it must be read together with the
+capability matrix rather than as a claim that every listed internal component
+was connected to a shipped production path.
 
 The final v0.8.0 evidence record must connect these boundaries:
 
