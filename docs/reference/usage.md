@@ -166,13 +166,15 @@ replacement, or PATH/profile mutation. On the supported host, it verifies the
 `~/.loopcoder/bin`, and updates or prints PATH instructions. The installer does
 not require Go.
 
-The default install directory is the supported documented path. v0.8.0 can
-place the binary in an absolute `LOOPCODER_INSTALL_DIR`, but its PATH/profile
-guidance still targets `~/.loopcoder/bin`; custom-directory setup is therefore
-not supported as a complete installer flow.
+The default install directory is `~/.loopcoder/bin`. Set absolute
+`LOOPCODER_INSTALL_DIR` to place the binary elsewhere; PATH detection, shell
+profile updates, and printed instructions all use that same resolved directory.
+Set `LOOPCODER_NO_MODIFY_PATH=1` to print PATH instructions without editing
+profiles. Profile edits are idempotent and quote paths that contain spaces.
 
 ```text
 curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.0
+LOOPCODER_INSTALL_DIR="$HOME/tools/loopcoder" curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.0
 ```
 
 To choose a different supported v0.8.x release, replace `0.8.0` with the

@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Installer custom directory PATH** - `LOOPCODER_INSTALL_DIR` is now reused
+  for PATH detection, profile lines, and printed instructions (quoted for
+  spaces). Re-runs stay idempotent; `LOOPCODER_NO_MODIFY_PATH=1` prints
+  guidance without editing profiles. Relative install dirs are rejected.
+
 ### Changed
 
 - **Typed fallback production wiring** - after Worker classifies a provider
@@ -174,8 +181,6 @@ offline v0.7.0 restore procedure.
   and detached-terminal waiters are not fully integrated.
 - The public Mach-O is not Apple Developer ID signed or notarized. Sigstore
   verifies checksum provenance and archive integrity, not Gatekeeper trust.
-- Custom install-directory binary placement exists, but PATH/profile guidance
-  still assumes the default directory.
 - Protected exact-v0.8.0 real-provider canaries are absent. Historical adapter
   smokes and deterministic fixtures do not replace release evidence.
 
