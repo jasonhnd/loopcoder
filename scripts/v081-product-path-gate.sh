@@ -4,6 +4,10 @@
 # One command produces machine-readable + human-readable evidence for the
 # exact darwin/arm64 candidate. Real-provider and Apple live steps are
 # opt-in and never substituted by fixture success.
+#
+# Product-path Full GO = packaged + live Codex/Claude canaries (+ zero open
+# release-blockers). Live Apple Developer ID is recommended for Gatekeeper UX
+# but optional; enable with --include-apple-live 1.
 set -euo pipefail
 
 mode="fixture"
@@ -412,8 +416,9 @@ PY
   elif [[ "$count" == "-1" || -z "$count" ]]; then
     record "release_blockers_closed" "not_run" "could not parse open-blocker inventory" "$log"
   else
-    # Full GO path fails closed when blockers remain; partial runs only warn.
-    if [[ "$mode" == "packaged" && "$include_live_canaries" -eq 1 && "$include_apple_live" -eq 1 ]]; then
+    # Product-path Full GO fails closed when blockers remain; partial runs only warn.
+    # Full GO = packaged + live canaries (Apple live is optional / recommended).
+    if [[ "$mode" == "packaged" && "$include_live_canaries" -eq 1 ]]; then
       record "release_blockers_closed" "fail" "open release-blockers remain: $count" "$log"
       return 1
     fi
@@ -520,7 +525,8 @@ PY
     echo
     echo "- Fixture/canary-harness success does **not** substitute live Codex/Claude canaries."
     echo "- Apple dry-run does **not** substitute Developer ID + notarization live evidence."
-    echo "- Full GO requires packaged binary gates + live canaries + live Apple trust + zero open release-blockers."
+    echo "- Product-path Full GO requires packaged binary gates + live Codex/Claude canaries + zero open release-blockers."
+    echo "- Live Apple Developer ID + notarize is **recommended** for Gatekeeper-friendly public downloads; it is optional for product-path Full GO (request with \`--include-apple-live 1\`)."
     echo "- Evidence index: \`$(basename "$evidence_index")\`"
   } >"$human_report"
 

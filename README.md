@@ -25,8 +25,9 @@ It removes the copy-paste churn of AI coding: ask the model, paste issues into G
 
 v0.8.1 is the current release line for native macOS Apple Silicon
 (`darwin/arm64`) only. Fixture and packaged product-path gates pass on the
-candidate; live Codex/Claude canaries and live Apple Developer ID trust remain
-owner-gated for Full GO. See the
+candidate; live Codex/Claude canaries remain owner-gated for product-path Full
+GO. Live Apple Developer ID + notarize is recommended for Gatekeeper-friendly
+public downloads and is optional for product-path GO. See the
 [`v0.8.1 release runbook`](docs/reference/v0.8.1-release-runbook.md),
 [`capability matrix`](docs/reference/v0.8.0-capability-matrix.md), and
 [host progress visibility contracts](docs/reference/progress-hosts.md).
@@ -443,8 +444,9 @@ During the 0.6.x transition window, readers accept legacy `[attestation]` header
 v0.8.1 is the current release line for native macOS Apple Silicon only. Product
 paths for routing, nested permissions, waiters, progress hosts, installer PATH,
 and release evidence harnesses are connected. Fixture and packaged go/no-go
-gates pass; Full GO still requires owner-run live Codex/Claude canaries and
-live Apple Developer ID trust when publishing. See the
+gates pass; product-path Full GO requires owner-run live Codex/Claude canaries.
+Live Apple Developer ID + notarize is optional (recommended for public download
+UX). See the
 [`v0.8.1 release runbook`](docs/reference/v0.8.1-release-runbook.md),
 [`capability matrix`](docs/reference/v0.8.0-capability-matrix.md), and
 [`v0.8.1 go/no-go gate`](docs/reference/v0.8.1-go-no-go.md). The repository

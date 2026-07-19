@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Product-path Full GO no longer requires live Apple Developer ID** - Full GO
+  is packaged gates + live Codex/Claude canaries + zero open release-blockers.
+  Live Apple sign/notarize remains recommended for Gatekeeper-friendly public
+  downloads and is opt-in via `--include-apple-live 1`. See
+  `docs/reference/v0.8.1-go-no-go.md` and `docs/reference/macos-codesign.md`.
+
 ## [0.8.1] - 2026-07-19
 
 v0.8.1 closes the production-path gaps found after v0.8.0 publication on native
@@ -15,7 +23,8 @@ claim-dispatch, nested permission-safe child routing, typed fallback wiring,
 local waiters, progress host contracts, installer custom-directory PATH, and
 release evidence harnesses (canaries, Apple sign/notarize, product-path
 go/no-go gate). Fixture and packaged gates pass without live providers; live
-Codex/Claude canaries and live Apple trust remain owner-gated for Full GO.
+Codex/Claude canaries remain owner-gated for product-path Full GO. Live Apple
+trust is optional (recommended for public download UX).
 Operator checklist: [`docs/reference/v0.8.1-release-runbook.md`](docs/reference/v0.8.1-release-runbook.md).
 
 ### Added
@@ -33,8 +42,9 @@ Operator checklist: [`docs/reference/v0.8.1-release-runbook.md`](docs/reference/
 - **v0.8.1 product-path go/no-go gate** - `scripts/v081-product-path-gate.sh`
   produces machine-readable `loopcoder.v081_go_no_go.v1` evidence and a human
   report. Fixture mode is CI-safe; packaged mode exercises the candidate binary;
-  live Codex/Claude canaries and live Apple trust remain explicit opt-in and are
-  never substituted by fixtures. See `docs/reference/v0.8.1-go-no-go.md`.
+  live Codex/Claude canaries remain explicit opt-in for product-path Full GO and
+  are never substituted by fixtures. Live Apple trust is optional/recommended.
+  See `docs/reference/v0.8.1-go-no-go.md`.
 
 - **Protected Codex/Claude release canaries** - `scripts/release-provider-canary.sh`
   with fixture and live modes, sanitized evidence schema
