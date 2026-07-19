@@ -67,8 +67,10 @@ run_fixture codex success 0
 run_fixture claude success 0
 assert_file_contains "${tmp_root}/codex_success/release-provider-canary-codex.json" '"status": "passed"'
 assert_file_contains "${tmp_root}/claude_success/release-provider-canary-claude.json" '"status": "passed"'
+assert_file_contains "${tmp_root}/codex_success/release-provider-canary-codex.json" '"blocking": true'
+assert_file_contains "${tmp_root}/claude_success/release-provider-canary-claude.json" '"blocking": true'
 
-# Failure scenarios (typed infrastructure vs product).
+# Failure scenarios (typed infrastructure vs product) — blocking hard-fail.
 run_fixture codex auth_failure 1
 assert_file_contains "${tmp_root}/codex_auth_failure/release-provider-canary-codex.json" '"result_class": "infrastructure"'
 assert_file_contains "${tmp_root}/codex_auth_failure/release-provider-canary-codex.json" '"detail_code": "auth_unavailable"'
@@ -88,13 +90,51 @@ assert_file_contains "${tmp_root}/codex_cancel/release-provider-canary-codex.jso
 run_fixture claude missing_cli 1
 assert_file_contains "${tmp_root}/claude_missing_cli/release-provider-canary-claude.json" '"detail_code": "cli_not_found"'
 
-# No silent cross-provider fallback: running codex must not write claude evidence.
+# Non-blocking Grok / Antigravity: success + not_available paths (exit 0).
+run_fixture grok success 0
+assert_file_contains "${tmp_root}/grok_success/release-provider-canary-grok.json" '"blocking": false'
+assert_file_contains "${tmp_root}/grok_success/release-provider-canary-grok.json" '"status": "passed"'
+assert_file_contains "${tmp_root}/grok_success/release-provider-canary-grok.json" '"provider": "grok"'
+
+run_fixture antigravity success 0
+assert_file_contains "${tmp_root}/antigravity_success/release-provider-canary-antigravity.json" '"blocking": false'
+assert_file_contains "${tmp_root}/antigravity_success/release-provider-canary-antigravity.json" '"provider": "antigravity"'
+
+run_fixture grok missing_cli 0
+assert_file_contains "${tmp_root}/grok_missing_cli/release-provider-canary-grok.json" '"status": "not_available"'
+assert_file_contains "${tmp_root}/grok_missing_cli/release-provider-canary-grok.json" '"detail_code": "cli_not_found"'
+
+run_fixture antigravity not_available 0
+assert_file_contains "${tmp_root}/antigravity_not_available/release-provider-canary-antigravity.json" '"status": "not_available"'
+
+run_fixture grok model_unavailable 0
+assert_file_contains "${tmp_root}/grok_model_unavailable/release-provider-canary-grok.json" '"detail_code": "model_unavailable"'
+
+run_fixture antigravity auth_failure 0
+assert_file_contains "${tmp_root}/antigravity_auth_failure/release-provider-canary-antigravity.json" '"status": "not_available"'
+assert_file_contains "${tmp_root}/antigravity_auth_failure/release-provider-canary-antigravity.json" '"detail_code": "auth_unavailable"'
+
+# Non-blocking quota gaps are unknown, never fabricated zero quota.
+run_fixture grok quota_failure 0
+assert_file_contains "${tmp_root}/grok_quota_failure/release-provider-canary-grok.json" '"detail_code": "quota_unknown"'
+assert_file_not_contains "${tmp_root}/grok_quota_failure/release-provider-canary-grok.json" 'quota_exhausted'
+
+# No silent cross-provider fallback: running codex must not write claude/grok evidence.
 codex_only="${tmp_root}/codex_only"
 mkdir -p "$codex_only"
 bash "$canary" --mode fixture --provider codex --scenario success --artifact-dir "$codex_only" >/dev/null
 test -f "${codex_only}/release-provider-canary-codex.json"
-if [[ -e "${codex_only}/release-provider-canary-claude.json" ]]; then
-  echo "FAIL codex canary wrote claude evidence" >&2
+if [[ -e "${codex_only}/release-provider-canary-claude.json" || -e "${codex_only}/release-provider-canary-grok.json" ]]; then
+  echo "FAIL codex canary wrote another provider evidence" >&2
+  exit 1
+fi
+# Grok must not write antigravity evidence either.
+grok_only="${tmp_root}/grok_only"
+mkdir -p "$grok_only"
+bash "$canary" --mode fixture --provider grok --scenario success --artifact-dir "$grok_only" >/dev/null
+test -f "${grok_only}/release-provider-canary-grok.json"
+if [[ -e "${grok_only}/release-provider-canary-antigravity.json" || -e "${grok_only}/release-provider-canary-codex.json" ]]; then
+  echo "FAIL grok canary wrote another provider evidence" >&2
   exit 1
 fi
 
@@ -131,12 +171,12 @@ mc_status=$?
 set -e
 assert_eq "$mc_status" 2 "max-calls>1 rejected"
 
-# Unsupported provider rejected.
+# Unknown provider rejected.
 set +e
-bash "$canary" --mode fixture --provider grok --scenario success >"${tmp_root}/grok.out" 2>"${tmp_root}/grok.err"
-g_status=$?
+bash "$canary" --mode fixture --provider nope --scenario success >"${tmp_root}/nope.out" 2>"${tmp_root}/nope.err"
+nope_status=$?
 set -e
-assert_eq "$g_status" 2 "grok rejected for blocking canary script"
+assert_eq "$nope_status" 2 "unknown provider rejected"
 
 # Fork context refuse (synthetic event payload).
 fork_event="${tmp_root}/fork_event.json"

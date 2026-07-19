@@ -4,6 +4,12 @@
 
 ### Added
 
+- **Non-blocking Grok/Antigravity canaries** - `release-provider-canary.sh`
+  accepts `grok` and `antigravity` with `blocking:false`. Missing CLI/auth/model
+  surfaces report `not_available` (exit 0) instead of product failure or zero
+  quota; workflow live jobs are informational and cannot fail the blocking
+  Codex/Claude summary. See `docs/reference/release-provider-canaries.md`.
+
 - **v0.8.1 product-path go/no-go gate** - `scripts/v081-product-path-gate.sh`
   produces machine-readable `loopcoder.v081_go_no_go.v1` evidence and a human
   report. Fixture mode is CI-safe; packaged mode exercises the candidate binary;

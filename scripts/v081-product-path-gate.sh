@@ -347,9 +347,30 @@ gate_live_canaries() {
       failed=1
     fi
   done
-  # Non-blocking providers: record not_run unless a dedicated script exists later.
-  record "live_canary_grok" "not_run" "non-blocking for v0.8.1 (#1021)" ""
-  record "live_canary_antigravity" "not_run" "non-blocking for v0.8.1 (#1021)" ""
+  # Non-blocking providers (#1021): run when live canaries are enabled, but
+  # never flip the gate decision on soft not_available / soft-fail outcomes.
+  for provider in grok antigravity; do
+    local log="${artifact_dir}/logs/live_canary_${provider}.log"
+    set +e
+    LOOPCODER_REAL_PROVIDER_CANARY=1 bash "$repo_root/scripts/release-provider-canary.sh" \
+      --mode live \
+      --provider "$provider" \
+      --binary "$binary" \
+      --timeout-seconds 180 \
+      --max-calls 1 \
+      --artifact-dir "$artifact_dir/evidence" \
+      --candidate-sha "${candidate_sha:-}" \
+      ${expected_digest:+--expected-digest "$expected_digest"} \
+      >"$log" 2>&1
+    local st=$?
+    set -e
+    scrub_file "$log"
+    if [[ "$st" -eq 0 ]]; then
+      record "live_canary_${provider}" "pass" "non-blocking canary completed (passed or not_available)" "$log"
+    else
+      record "live_canary_${provider}" "warn" "non-blocking canary unexpected exit=$st (does not fail GO)" "$log"
+    fi
+  done
   return "$failed"
 }
 
