@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Protected Codex/Claude release canaries** - `scripts/release-provider-canary.sh`
+  with fixture and live modes, sanitized evidence schema
+  `loopcoder.release_provider_canary.v1`, fork/PR guards, and workflow
+  `.github/workflows/release-provider-canary.yml` (environment `release-canary`
+  for live runs). Live mode never falls back across providers and requires
+  `LOOPCODER_REAL_PROVIDER_CANARY=1`.
+
 ### Fixed
 
 - **Installer custom directory PATH** - `LOOPCODER_INSTALL_DIR` is now reused
