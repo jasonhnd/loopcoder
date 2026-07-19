@@ -63,6 +63,9 @@ jobs:
       - name: Release provider canary harness unit test
         run: bash scripts/release-provider-canary_test.sh
 
+      - name: macOS codesign harness unit test
+        run: bash scripts/macos-codesign-notarize_test.sh
+
   test:
     runs-on: macos-15
     steps:
