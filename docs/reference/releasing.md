@@ -2,6 +2,10 @@
 
 This reference records release-documentation rules that apply to every loopcoder version bump.
 
+For the current production-closure candidate, follow the concrete operator
+checklist in [`v0.8.1-release-runbook.md`](v0.8.1-release-runbook.md) (gate,
+canaries, Apple trust, tag, publish).
+
 ## Required Release Documentation
 
 Every version bump must rewrite all three release-facing surfaces:

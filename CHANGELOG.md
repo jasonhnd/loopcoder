@@ -4,6 +4,10 @@
 
 ### Added
 
+- **v0.8.1 release runbook** - operator freeze → Full GO → publish checklist in
+  `docs/reference/v0.8.1-release-runbook.md`, linked from the go/no-go gate and
+  releasing reference.
+
 - **Non-blocking Grok/Antigravity canaries** - `release-provider-canary.sh`
   accepts `grok` and `antigravity` with `blocking:false`. Missing CLI/auth/model
   surfaces report `not_available` (exit 0) instead of product failure or zero
