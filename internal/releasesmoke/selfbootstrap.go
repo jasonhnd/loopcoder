@@ -59,6 +59,11 @@ func RunSelfBootstrap(opts SelfBootstrapOptions) error {
 	if out, err := clone.CombinedOutput(); err != nil {
 		return fmt.Errorf("clone smoke repository: %w\n%s", err, out)
 	}
+	// Tag/CI checkouts are often detached. Bounded-write authority needs an exact
+	// base revision named by --base-branch main; pin main to the clone tip.
+	if out, err := exec.Command("git", "-C", repoPath, "checkout", "-B", "main").CombinedOutput(); err != nil {
+		return fmt.Errorf("pin smoke clone main branch: %w\n%s", err, out)
+	}
 
 	repoRuntimeBefore, err := repoRuntimeInventory(repoPath)
 	if err != nil {
