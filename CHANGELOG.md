@@ -4,6 +4,12 @@
 
 ### Added
 
+- **v0.8.1 product-path go/no-go gate** - `scripts/v081-product-path-gate.sh`
+  produces machine-readable `loopcoder.v081_go_no_go.v1` evidence and a human
+  report. Fixture mode is CI-safe; packaged mode exercises the candidate binary;
+  live Codex/Claude canaries and live Apple trust remain explicit opt-in and are
+  never substituted by fixtures. See `docs/reference/v0.8.1-go-no-go.md`.
+
 - **Protected Codex/Claude release canaries** - `scripts/release-provider-canary.sh`
   with fixture and live modes, sanitized evidence schema
   `loopcoder.release_provider_canary.v1`, fork/PR guards, and workflow
