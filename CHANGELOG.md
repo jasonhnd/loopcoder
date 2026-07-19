@@ -11,6 +11,12 @@
   for live runs). Live mode never falls back across providers and requires
   `LOOPCODER_REAL_PROVIDER_CANARY=1`.
 
+- **macOS Developer ID sign/notarize harness** - `scripts/macos-codesign-notarize.sh`
+  with dry-run and live modes, sanitized `loopcoder.macos_codesign.v1` evidence,
+  PR/fork refusal, and release `sign` job integration. Live mode requires
+  `APPLE_SIGN=1` plus Developer ID identity, Team ID, and notary keychain
+  profile secrets; dry-run remains the default without credentials.
+
 ### Fixed
 
 - **Installer custom directory PATH** - `LOOPCODER_INSTALL_DIR` is now reused

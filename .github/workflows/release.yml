@@ -130,6 +130,56 @@ jobs:
           name: release-darwin-arm64
           path: dist
 
+      - name: Apple Developer ID sign and notarize
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          APPLE_SIGN: ${{ vars.APPLE_SIGN || '0' }}
+          APPLE_CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_NOTARY_KEYCHAIN_PROFILE: ${{ secrets.APPLE_NOTARY_KEYCHAIN_PROFILE }}
+          APPLE_BUNDLE_ID: ${{ vars.APPLE_BUNDLE_ID || 'com.jasonhnd.loopcoder' }}
+          APPLE_STAPLE: ${{ vars.APPLE_STAPLE || 'auto' }}
+          # GitHub-hosted runners often cannot complete full Gatekeeper assess.
+          APPLE_SKIP_SPCTL: ${{ vars.APPLE_SKIP_SPCTL || '1' }}
+        run: |
+          set -euo pipefail
+
+          version="${TAG_NAME#v}"
+          archive="dist/loopcoder_${version}_darwin_arm64.tar.gz"
+          extract="${RUNNER_TEMP}/apple-sign-extract"
+          evidence="${RUNNER_TEMP}/apple-sign-evidence"
+          rm -rf "${extract}" "${evidence}"
+          mkdir -p "${extract}" "${evidence}"
+          tar -xzf "${archive}" -C "${extract}"
+          test -x "${extract}/loopcoder"
+
+          if [[ "${APPLE_SIGN}" == "1" ]]; then
+            bash scripts/macos-codesign-notarize.sh \
+              --mode live \
+              --binary "${extract}/loopcoder" \
+              --archive "${archive}" \
+              --artifact-dir "${evidence}"
+          else
+            bash scripts/macos-codesign-notarize.sh \
+              --mode dry-run \
+              --binary "${extract}/loopcoder" \
+              --archive "${archive}" \
+              --artifact-dir "${evidence}"
+            echo "Apple live signing disabled (set repository variable APPLE_SIGN=1 and secrets to enable)."
+          fi
+
+          # Final archive bytes are what checksums/Sigstore must cover.
+          bash scripts/stage-draft-release.sh validate-archives
+
+      - name: Retain Apple trust evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: macos-codesign-evidence-${{ github.ref_name }}
+          path: ${{ runner.temp }}/apple-sign-evidence/macos-codesign-evidence.json
+          if-no-files-found: ignore
+          retention-days: 90
+
       - name: Generate checksums
         env:
           TAG_NAME: ${{ github.ref_name }}
