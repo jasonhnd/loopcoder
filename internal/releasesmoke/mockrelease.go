@@ -11,6 +11,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ReleaseAssets is a downloaded/staged GitHub release asset set for one tag.
@@ -62,7 +63,10 @@ func StartMockReleaseAPI(repo string, release ReleaseAssets) (*MockReleaseAPI, e
 		go func() { _ = api.server.Close() }()
 	})
 	mux.HandleFunc("/", api.serve)
-	api.server = &http.Server{Handler: mux}
+	api.server = &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 	api.wg.Add(1)
 	go func() {
 		defer api.wg.Done()
