@@ -25,15 +25,16 @@ func RunSelfBootstrap(opts SelfBootstrapOptions) error {
 		return err
 	}
 
-	repoPath, err := filepath.Abs(opts.Repo)
+	sourceRepo, err := filepath.Abs(opts.Repo)
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(filepath.Join(repoPath, ".git")); err != nil {
-		return fmt.Errorf("self-bootstrap smoke must run against a git checkout; .git not found under %s", repoPath)
+	if _, err := os.Stat(filepath.Join(sourceRepo, ".git")); err != nil {
+		return fmt.Errorf("self-bootstrap smoke must run against a git checkout; .git not found under %s", sourceRepo)
 	}
 
-	repoRuntimeBefore, err := repoRuntimeInventory(repoPath)
+	// Inventory the operator checkout so nested smoke must not spill into it.
+	sourceRuntimeBefore, err := repoRuntimeInventory(sourceRepo)
 	if err != nil {
 		return err
 	}
@@ -49,6 +50,21 @@ func RunSelfBootstrap(opts SelfBootstrapOptions) error {
 		}
 	}()
 
+	// Nested read-only baselines need a normal working tree. Linked worktrees of
+	// bare repos (common local conductor layout) can make baseline capture
+	// inconclusive; use a temporary local clone of HEAD instead.
+	// Directory basename feeds project display_name when identity is local-path.
+	repoPath := filepath.Join(tmp, "loopcoder")
+	clone := exec.Command("git", "clone", "--local", sourceRepo, repoPath)
+	if out, err := clone.CombinedOutput(); err != nil {
+		return fmt.Errorf("clone smoke repository: %w\n%s", err, out)
+	}
+
+	repoRuntimeBefore, err := repoRuntimeInventory(repoPath)
+	if err != nil {
+		return err
+	}
+
 	loopcoderHome := filepath.Join(tmp, "home")
 	artifactDir := opts.ArtifactDir
 	if artifactDir == "" {
@@ -62,17 +78,25 @@ func RunSelfBootstrap(opts SelfBootstrapOptions) error {
 	}
 
 	return withEnv(map[string]string{"LOOPCODER_HOME": loopcoderHome}, func() error {
-		return runSelfBootstrapBody(opts, repoPath, loopcoderHome, artifactDir, repoRuntimeBefore, &keep, tmp)
+		if err := runSelfBootstrapBody(opts, sourceRepo, repoPath, loopcoderHome, artifactDir, repoRuntimeBefore, sourceRuntimeBefore, &keep, tmp); err != nil {
+			return err
+		}
+		return nil
 	})
 }
 
-func runSelfBootstrapBody(opts SelfBootstrapOptions, repoPath, loopcoderHome, artifactDir string, repoRuntimeBefore []string, keep *bool, tmp string) error {
+func runSelfBootstrapBody(opts SelfBootstrapOptions, sourceRepo, repoPath, loopcoderHome, artifactDir string, repoRuntimeBefore, sourceRuntimeBefore []string, keep *bool, tmp string) error {
 	usingStaged := strings.TrimSpace(opts.Binary) != ""
 	binaryPath := strings.TrimSpace(opts.Binary)
 	if binaryPath == "" {
-		binaryPath = filepath.Join(tmp, "loopcoder")
+		binDir := filepath.Join(tmp, "bin")
+		if err := os.MkdirAll(binDir, 0o755); err != nil {
+			return err
+		}
+		binaryPath = filepath.Join(binDir, "loopcoder")
+		// Build from the operator source checkout (has full module + tools).
 		cmd := exec.Command("go", "build", "-o", binaryPath, "./cmd/loopcoder")
-		cmd.Dir = repoPath
+		cmd.Dir = sourceRepo
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("build local loopcoder binary: %w\n%s", err, out)
@@ -110,14 +134,15 @@ func runSelfBootstrapBody(opts SelfBootstrapOptions, repoPath, loopcoderHome, ar
 		}
 	}
 
+	// Run IDs must match state.IsRunID (wave or child shapes only).
 	const (
 		parentRun         = "run-20260709T000000Z-wave"
 		childRun          = "run-20260709T000001Z-child-0-self-bootstrap-alpha"
 		childRunBeta      = "run-20260709T000001Z-child-1-self-bootstrap-beta"
 		childRunGamma     = "run-20260709T000001Z-child-2-self-bootstrap-gamma"
-		mutationParentRun = "run-20260709T000002Z-wave-read-only-mutation"
+		mutationParentRun = "run-20260709T000002Z-wave"
 		mutationChildRun  = "run-20260709T000003Z-child-0-read-only-mutation"
-		writeParentRun    = "run-20260709T000004Z-wave-bounded-write"
+		writeParentRun    = "run-20260709T000004Z-wave"
 		writeChildRun     = "run-20260709T000005Z-child-0-bounded-write"
 	)
 	boundedWriteWorktree := ""
@@ -514,9 +539,11 @@ func runSelfBootstrapBody(opts SelfBootstrapOptions, repoPath, loopcoderHome, ar
 				TmpRoot      string `json:"tmp_root"`
 			} `json:"project_registry"`
 			NestedRuns struct {
-				ParentEdges int    `json:"parent_edges"`
-				ChildEdges  int    `json:"child_edges"`
-				Status      string `json:"status"`
+				ParentEdges  int    `json:"parent_edges"`
+				ChildEdges   int    `json:"child_edges"`
+				Status       string `json:"status"`
+				ProblemCount int    `json:"problem_count"`
+				Message      string `json:"message"`
 			} `json:"nested_runs"`
 		} `json:"runtime"`
 		ProviderCompatibility []struct {
@@ -553,8 +580,16 @@ func runSelfBootstrapBody(opts SelfBootstrapOptions, repoPath, loopcoderHome, ar
 			return err
 		}
 	}
+	// Nested edges are durable under LOOPCODER_HOME; status "ok" with zero edges
+	// would mean doctor could not see the nested graph we just executed.
 	if doctor.Runtime.NestedRuns.ParentEdges < 1 || doctor.Runtime.NestedRuns.ChildEdges < 1 || doctor.Runtime.NestedRuns.Status != "ok" {
-		return fmt.Errorf("doctor JSON did not report healthy nested run edges")
+		return fmt.Errorf("doctor JSON did not report healthy nested run edges: status=%s parent_edges=%d child_edges=%d problems=%d message=%q",
+			doctor.Runtime.NestedRuns.Status,
+			doctor.Runtime.NestedRuns.ParentEdges,
+			doctor.Runtime.NestedRuns.ChildEdges,
+			doctor.Runtime.NestedRuns.ProblemCount,
+			doctor.Runtime.NestedRuns.Message,
+		)
 	}
 	codexWorker := false
 	for _, pc := range doctor.ProviderCompatibility {
@@ -574,7 +609,14 @@ func runSelfBootstrapBody(opts SelfBootstrapOptions, repoPath, loopcoderHome, ar
 	if err != nil {
 		return err
 	}
-	if err := assertInventoryUnchanged(repoRuntimeBefore, repoRuntimeAfter, "repository-local runtime payload inventory"); err != nil {
+	if err := assertInventoryUnchanged(repoRuntimeBefore, repoRuntimeAfter, "smoke-repo runtime payload inventory"); err != nil {
+		return err
+	}
+	sourceRuntimeAfter, err := repoRuntimeInventory(sourceRepo)
+	if err != nil {
+		return err
+	}
+	if err := assertInventoryUnchanged(sourceRuntimeBefore, sourceRuntimeAfter, "repository-local runtime payload inventory"); err != nil {
 		return err
 	}
 
