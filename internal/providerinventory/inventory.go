@@ -855,6 +855,10 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 		}
 	}
 	quotaSnapshots = LinkQuotaConflicts(quotaSnapshots)
+	// Installation discovery alone must leave usable_for_invocation=unknown.
+	// Promote to "yes" only when a ready auth-readiness record binds the same
+	// installation — auth evidence is separate from path/version probes.
+	promoteUsableInstallations(installations, authReadiness)
 	sort.SliceStable(installations, func(i, j int) bool {
 		if installations[i].AdapterID != installations[j].AdapterID {
 			return installations[i].AdapterID < installations[j].AdapterID
@@ -1274,6 +1278,34 @@ func discoverCandidates(adapter AdapterDeclaration, deps Deps) []candidate {
 		}
 	}
 	return out
+}
+
+// promoteUsableInstallations sets usable_for_invocation=yes when installation
+// is installed and at least one bound auth-readiness record is ready.
+// Spec: usable MUST NOT be true from install evidence alone.
+func promoteUsableInstallations(installations []ProviderInstallation, readiness []AuthReadiness) {
+	readyInstallations := map[string]bool{}
+	for _, auth := range readiness {
+		if auth.ReadinessState != ReadinessReady {
+			continue
+		}
+		if auth.ProviderInstallationID == nil {
+			continue
+		}
+		id := strings.TrimSpace(*auth.ProviderInstallationID)
+		if id != "" {
+			readyInstallations[id] = true
+		}
+	}
+	for i := range installations {
+		if installations[i].InstallationState != InstallationInstalled {
+			continue
+		}
+		if !readyInstallations[installations[i].ProviderInstallationID] {
+			continue
+		}
+		installations[i].UsableForInvocation = "yes"
+	}
 }
 
 func inspectCandidate(ctx context.Context, adapter AdapterDeclaration, candidate candidate, now time.Time, deps Deps) (ProviderInstallation, ProbeResult) {
@@ -3315,6 +3347,8 @@ func allowedProbeEnvKeys() []string {
 		"TEMP",
 		"TMP",
 		"HOME",
+		"USER",
+		"LOGNAME",
 		"USERPROFILE",
 		"OS",
 		"PROCESSOR_ARCHITECTURE",

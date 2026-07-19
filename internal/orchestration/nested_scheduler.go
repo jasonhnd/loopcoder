@@ -368,6 +368,9 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		}
 		executionRequests[i] = applied
 		routeDecisions[i] = decision
+		// Carry route budget authority onto the child plan metadata used by
+		// claim/launch reservation (separate from the immutable execution contract).
+		children[i].Metadata = mergeNestedRouteBudgetAuthority(children[i].Metadata, decision, applied)
 	}
 	if err := persistAcceptedChildPlan(ctx, opts, *plan, executionRequests, started); err != nil {
 		return NestedScheduleReport{}, err
@@ -1701,6 +1704,54 @@ func schedulerAuthorityFromChild(child ChildRunPlan) schedulerAuthorityMetadata 
 		authority.SubAgentID = strings.TrimSpace(child.RunID)
 	}
 	return authority
+}
+
+// mergeNestedRouteBudgetAuthority copies production route budget fields into
+// child plan metadata so claim/launch can reserve against a durable policy.
+func mergeNestedRouteBudgetAuthority(existing []byte, decision ChildRouteDecision, request ChildExecutionRequest) []byte {
+	authority := schedulerAuthorityMetadata{}
+	if len(existing) > 0 {
+		_ = json.Unmarshal(existing, &authority)
+	}
+	set := func(dst *string, value string) {
+		if v := strings.TrimSpace(value); v != "" {
+			*dst = v
+		}
+	}
+	set(&authority.ProjectID, decision.ProjectID)
+	set(&authority.DeliveryRunID, decision.DeliveryRunID)
+	set(&authority.TaskID, decision.TaskID)
+	set(&authority.AdapterID, decision.AdapterID)
+	set(&authority.ProviderInstallationID, decision.ProviderInstallationID)
+	set(&authority.AccountProfileID, decision.AccountProfileID)
+	set(&authority.ModelCapabilityID, decision.ModelCapabilityID)
+	set(&authority.RoutingDecisionID, decision.RoutingDecisionID)
+	set(&authority.RoutingFingerprint, decision.RoutingFingerprint)
+	set(&authority.PlanFingerprint, decision.PlanFingerprint)
+	set(&authority.PolicyFingerprint, decision.PolicyFingerprint)
+	set(&authority.AuthorizationFingerprint, decision.AuthorizationFingerprint)
+	if request.RunID != "" {
+		authority.SubAgentID = strings.TrimSpace(request.RunID)
+	}
+	if decision.BudgetRequestedValue > 0 {
+		authority.BudgetRequestedValue = decision.BudgetRequestedValue
+	} else if authority.BudgetRequestedValue <= 0 && strings.TrimSpace(decision.RoutingDecisionID) != "" {
+		authority.BudgetRequestedValue = 1
+	}
+	if strings.TrimSpace(authority.BudgetQuantityKind) == "" {
+		authority.BudgetQuantityKind = "local-policy"
+	}
+	if strings.TrimSpace(authority.BudgetUnit) == "" {
+		authority.BudgetUnit = "local-policy-unit"
+	}
+	if strings.TrimSpace(authority.BudgetWindowKind) == "" {
+		authority.BudgetWindowKind = "unbounded"
+	}
+	payload, err := json.Marshal(authority)
+	if err != nil {
+		return existing
+	}
+	return payload
 }
 
 func nestedSchedulerProviderRoute(child ChildRunPlan, authority schedulerAuthorityMetadata) string {

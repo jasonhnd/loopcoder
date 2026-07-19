@@ -11,6 +11,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/availability"
 	"github.com/jasonhnd/loopcoder/internal/budget"
 	"github.com/jasonhnd/loopcoder/internal/delivery"
+	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/runtimecap"
 	"github.com/jasonhnd/loopcoder/internal/sanitize"
 	"github.com/jasonhnd/loopcoder/internal/storage"
@@ -342,6 +343,25 @@ func assembleStoredRouteInput(ctx context.Context, store storage.Store, request 
 	if err != nil {
 		return DecisionInput{}, err
 	}
+	// Load may return empty scores before any availability persist. Derive a
+	// fresh in-memory view from the cached inventory so hard eligibility has
+	// installation/auth/model evidence without inventing durable scores.
+	if len(availabilityResult.Scores) == 0 {
+		invReport, invErr := providerinventory.Load(ctx, store)
+		if invErr != nil {
+			return DecisionInput{}, invErr
+		}
+		derived := availability.Derive(availability.Inputs{
+			Inventory:       invReport,
+			BudgetSummaries: budgets,
+			CircuitBreakers: availabilityResult.CircuitBreakers,
+			Now:             now,
+		})
+		availabilityResult.Scores = derived.Scores
+		if len(availabilityResult.CircuitBreakers) == 0 {
+			availabilityResult.CircuitBreakers = derived.CircuitBreakers
+		}
+	}
 	inputs, err := InputsWithCachedInventory(ctx, store, Inputs{
 		Requirement:        requirement,
 		BudgetClass:        budgetClass,
@@ -373,12 +393,15 @@ func assembleStoredRouteInput(ctx context.Context, store storage.Store, request 
 	records = policyInputsForTask(records, requirement.TaskID, request.DecisionKey)
 	pins, exclusions := constraintsFromPolicyInputRecords(records)
 	if request.Pin != nil {
+		// CLI/config pins often use registry display names (e.g. gpt-5.5).
+		// Inventory keys are opaque model_capability_id values; resolve first.
+		resolvedModel := resolvePinnedModelCapabilityID(inputs.Inventory, request.Pin.AdapterID, request.Pin.ModelCapabilityID)
 		transient := Pin{
 			PinID:                  "route-cli-transient-pin",
 			AdapterID:              request.Pin.AdapterID,
 			ProviderInstallationID: request.Pin.ProviderInstallationID,
 			AccountProfileID:       request.Pin.AccountProfileID,
-			ModelCapabilityID:      request.Pin.ModelCapabilityID,
+			ModelCapabilityID:      resolvedModel,
 			InvocationProfileKey:   request.Pin.InvocationProfileKey,
 		}
 		if diagnostics := ValidatePolicyInputs(inputs.Inventory, []Pin{transient}, nil, profile.PolicyFingerprint, now); len(diagnostics) > 0 {
@@ -455,4 +478,30 @@ func decisionContainsPin(decision RoutingDecision, constraint CandidateConstrain
 		}
 	}
 	return false
+}
+
+// resolvePinnedModelCapabilityID maps a CLI/config model pin (opaque id,
+// canonical id, display name, or alias) onto the inventory model_capability_id.
+// Empty pins stay empty so adapter-only pins remain valid.
+func resolvePinnedModelCapabilityID(inventory providerinventory.Report, adapterID, modelPin string) string {
+	modelPin = strings.TrimSpace(modelPin)
+	if modelPin == "" {
+		return ""
+	}
+	adapterID = strings.TrimSpace(adapterID)
+	var matches []string
+	for _, model := range inventory.ModelCapabilities {
+		if adapterID != "" && model.AdapterID != adapterID {
+			continue
+		}
+		if modelNameMatches(model, modelPin) {
+			matches = append(matches, model.ModelCapabilityID)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0]
+	}
+	// Unresolved or ambiguous: keep the original pin so ValidatePolicyInputs
+	// can emit a precise missing-reference diagnostic.
+	return modelPin
 }

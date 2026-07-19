@@ -20,6 +20,17 @@ type ChildRouteDecision struct {
 	ChosenReason         string
 	Replayed             bool
 	ZeroProviderLaunches bool
+	// Claim/launch budget authority must match the accepted routing decision.
+	ProjectID                string
+	DeliveryRunID            string
+	TaskID                   string
+	ProviderInstallationID   string
+	AccountProfileID         string
+	RoutingFingerprint       string
+	PlanFingerprint          string
+	PolicyFingerprint        string
+	AuthorizationFingerprint string
+	BudgetRequestedValue     int64
 }
 
 // ChildRouteResolver decides a provider/model route from the immutable child
