@@ -282,6 +282,77 @@ run_supported_case() {
   fi
 }
 
+# Install with install_dir intentionally off PATH so ensure_path mutates profiles.
+# Args: name shell_path install_dir_rel [extra env assignments...]
+run_path_case() {
+  local name="$1"
+  local shell_path="$2"
+  local install_rel="$3"
+  shift 3
+  local case_dir="${tmp_root}/${name}"
+  local bin_dir="${case_dir}/bin"
+  local home_dir="${case_dir}/home"
+  local install_dir="${case_dir}/${install_rel}"
+  mkdir -p "${case_dir}/tmp" "${home_dir}"
+  make_archive_fixture "${case_dir}"
+  write_supported_stubs "${bin_dir}"
+  : >"${case_dir}/curl.log"
+  : >"${case_dir}/cosign.log"
+
+  # Pre-seed profile once (do not clobber on re-runs — keeps idempotency tests honest).
+  local seed_marker="${case_dir}/profile.seed"
+  if [[ -f "${seed_marker}" ]]; then
+    local shell_name profile_path
+    shell_name="$(basename "${shell_path}")"
+    case "${shell_name}" in
+      zsh) profile_path="${home_dir}/.zshrc" ;;
+      bash) profile_path="${home_dir}/.bashrc" ;;
+      *) profile_path="${home_dir}/.profile" ;;
+    esac
+    if [[ ! -f "${profile_path}" ]]; then
+      cp "${seed_marker}" "${profile_path}"
+    fi
+  fi
+
+  set +e
+  (
+    export LOOPCODER_INSTALL_OS="darwin"
+    export LOOPCODER_INSTALL_ARCH="arm64"
+    export LOOPCODER_VERSION="0.8.0"
+    export LOOPCODER_INSTALL_DIR="${install_dir}"
+    export HOME="${home_dir}"
+    export TMPDIR="${case_dir}/tmp"
+    # Keep stubs and host tools, but do NOT put install_dir on PATH.
+    export PATH="${bin_dir}:/usr/bin:/bin"
+    export SHELL="${shell_path}"
+    export INSTALL_ARCHIVE_FIXTURE="${case_dir}/loopcoder_0.8.0_darwin_arm64.tar.gz"
+    export INSTALL_ARCHIVE_SHA="${case_dir}/archive.sha256"
+    export INSTALL_CURL_LOG="${case_dir}/curl.log"
+    export INSTALL_COSIGN_LOG="${case_dir}/cosign.log"
+    # Optional extra env (e.g. LOOPCODER_NO_MODIFY_PATH=1)
+    while [[ "$#" -gt 0 ]]; do
+      export "$1"
+      shift
+    done
+    /bin/sh "${installer}"
+  ) >"${case_dir}/stdout.txt" 2>"${case_dir}/stderr.txt"
+  local status="$?"
+  set -e
+
+  if [[ "${status}" -ne 0 ]]; then
+    echo "${name}: expected exit 0, got ${status}" >&2
+    cat "${case_dir}/stdout.txt" >&2
+    cat "${case_dir}/stderr.txt" >&2
+    exit 1
+  fi
+  test -x "${install_dir}/loopcoder" || {
+    echo "${name}: binary missing at ${install_dir}/loopcoder" >&2
+    exit 1
+  }
+  # Expose resolved paths for callers.
+  printf '%s\n' "${install_dir}" >"${case_dir}/resolved_install_dir"
+}
+
 if [[ "${LOOPCODER_INSTALL_TEST_ONLY:-all}" != "interruption" ]]; then
 run_unsupported_case "darwin_amd64" "darwin" "amd64"
 run_unsupported_case "linux_amd64" "linux" "amd64"
@@ -365,6 +436,165 @@ if [[ -e "${missing_dir}/install" ]] || find "${missing_dir}/tmp" -mindepth 1 -p
   echo "missing tools case performed install/temp filesystem side effects" >&2
   exit 1
 fi
+
+# --- PATH / profile coverage for custom and default install directories ---
+
+# Custom absolute dir with zsh: writes that exact dir into ~/.zshrc.
+run_path_case "path_custom_zsh" "/bin/zsh" "opt/loopcoder/bin"
+custom_install="$(cat "${tmp_root}/path_custom_zsh/resolved_install_dir")"
+assert_contains "${tmp_root}/path_custom_zsh/home/.zshrc" "export PATH='${custom_install}':\$PATH"
+assert_contains "${tmp_root}/path_custom_zsh/stdout.txt" "Added ${custom_install} to PATH"
+assert_not_contains "${tmp_root}/path_custom_zsh/home/.zshrc" '$HOME/.loopcoder/bin'
+assert_not_contains "${tmp_root}/path_custom_zsh/stdout.txt" 'export PATH="$HOME/.loopcoder/bin'
+
+# Default install dir form: unset LOOPCODER_INSTALL_DIR via empty install using HOME default.
+# Reuse path harness with install under home/.loopcoder/bin by not setting INSTALL_DIR —
+# run a dedicated case.
+default_case="${tmp_root}/path_default_zsh"
+mkdir -p "${default_case}/tmp" "${default_case}/home" "${default_case}/bin"
+make_archive_fixture "${default_case}"
+write_supported_stubs "${default_case}/bin"
+: >"${default_case}/curl.log"
+: >"${default_case}/cosign.log"
+set +e
+(
+  export LOOPCODER_INSTALL_OS="darwin"
+  export LOOPCODER_INSTALL_ARCH="arm64"
+  export LOOPCODER_VERSION="0.8.0"
+  unset LOOPCODER_INSTALL_DIR || true
+  export HOME="${default_case}/home"
+  export TMPDIR="${default_case}/tmp"
+  export PATH="${default_case}/bin:/usr/bin:/bin"
+  export SHELL="/bin/zsh"
+  export INSTALL_ARCHIVE_FIXTURE="${default_case}/loopcoder_0.8.0_darwin_arm64.tar.gz"
+  export INSTALL_ARCHIVE_SHA="${default_case}/archive.sha256"
+  export INSTALL_CURL_LOG="${default_case}/curl.log"
+  export INSTALL_COSIGN_LOG="${default_case}/cosign.log"
+  /bin/sh "${installer}"
+) >"${default_case}/stdout.txt" 2>"${default_case}/stderr.txt"
+default_status="$?"
+set -e
+if [[ "${default_status}" -ne 0 ]]; then
+  echo "path_default_zsh: expected exit 0, got ${default_status}" >&2
+  cat "${default_case}/stdout.txt" >&2
+  cat "${default_case}/stderr.txt" >&2
+  exit 1
+fi
+default_bin="${default_case}/home/.loopcoder/bin"
+test -x "${default_bin}/loopcoder"
+assert_contains "${default_case}/home/.zshrc" "export PATH='${default_bin}':\$PATH"
+
+# Paths containing spaces.
+run_path_case "path_spaces_bash" "/bin/bash" "My Tools/loopcoder bin"
+spaces_install="$(cat "${tmp_root}/path_spaces_bash/resolved_install_dir")"
+assert_contains "${tmp_root}/path_spaces_bash/home/.bashrc" "export PATH='${spaces_install}':\$PATH"
+test -x "${spaces_install}/loopcoder"
+
+# Idempotent re-run does not duplicate profile lines; preserves unrelated text.
+seed_profile="${tmp_root}/path_idempotent_zsh"
+mkdir -p "${seed_profile}"
+printf '%s\n' '# user marker keep-me' 'export FOO=bar' >"${seed_profile}/profile.seed"
+run_path_case "path_idempotent_zsh" "/bin/zsh" "custom/bin"
+run_path_case "path_idempotent_zsh" "/bin/zsh" "custom/bin"
+idem_install="$(cat "${tmp_root}/path_idempotent_zsh/resolved_install_dir")"
+idem_profile="${tmp_root}/path_idempotent_zsh/home/.zshrc"
+assert_contains "${idem_profile}" "# user marker keep-me"
+assert_contains "${idem_profile}" "export FOO=bar"
+export_count="$(grep -cF "export PATH='${idem_install}':\$PATH" "${idem_profile}" || true)"
+if [[ "${export_count}" -ne 1 ]]; then
+  echo "path_idempotent_zsh: expected exactly one PATH export, got ${export_count}" >&2
+  cat "${idem_profile}" >&2
+  exit 1
+fi
+assert_contains "${tmp_root}/path_idempotent_zsh/stdout.txt" "A loopcoder PATH entry already exists"
+
+# Already on PATH: no profile mutation.
+already_case="${tmp_root}/path_already_on_path"
+mkdir -p "${already_case}/tmp" "${already_case}/home" "${already_case}/bin" "${already_case}/install"
+printf '%s\n' 'preexisting' >"${already_case}/home/.profile"
+make_archive_fixture "${already_case}"
+write_supported_stubs "${already_case}/bin"
+: >"${already_case}/curl.log"
+: >"${already_case}/cosign.log"
+set +e
+(
+  export LOOPCODER_INSTALL_OS="darwin"
+  export LOOPCODER_INSTALL_ARCH="arm64"
+  export LOOPCODER_VERSION="0.8.0"
+  export LOOPCODER_INSTALL_DIR="${already_case}/install"
+  export HOME="${already_case}/home"
+  export TMPDIR="${already_case}/tmp"
+  export PATH="${already_case}/bin:${already_case}/install:/usr/bin:/bin"
+  export SHELL="/bin/sh"
+  export INSTALL_ARCHIVE_FIXTURE="${already_case}/loopcoder_0.8.0_darwin_arm64.tar.gz"
+  export INSTALL_ARCHIVE_SHA="${already_case}/archive.sha256"
+  export INSTALL_CURL_LOG="${already_case}/curl.log"
+  export INSTALL_COSIGN_LOG="${already_case}/cosign.log"
+  /bin/sh "${installer}"
+) >"${already_case}/stdout.txt" 2>"${already_case}/stderr.txt"
+already_status="$?"
+set -e
+if [[ "${already_status}" -ne 0 ]]; then
+  echo "path_already_on_path: expected exit 0, got ${already_status}" >&2
+  exit 1
+fi
+assert_contains "${already_case}/stdout.txt" "is already on PATH"
+if ! grep -qx 'preexisting' "${already_case}/home/.profile"; then
+  echo "path_already_on_path: profile was mutated" >&2
+  cat "${already_case}/home/.profile" >&2
+  exit 1
+fi
+
+# LOOPCODER_NO_MODIFY_PATH=1 prints instructions and leaves profiles untouched.
+run_path_case "path_no_modify" "/bin/zsh" "nomod/bin" "LOOPCODER_NO_MODIFY_PATH=1"
+nomod_install="$(cat "${tmp_root}/path_no_modify/resolved_install_dir")"
+assert_contains "${tmp_root}/path_no_modify/stdout.txt" "${nomod_install} is not on PATH"
+assert_contains "${tmp_root}/path_no_modify/stdout.txt" "export PATH='${nomod_install}':\$PATH"
+if [[ -e "${tmp_root}/path_no_modify/home/.zshrc" ]]; then
+  echo "path_no_modify: unexpected profile write" >&2
+  cat "${tmp_root}/path_no_modify/home/.zshrc" >&2
+  exit 1
+fi
+
+# Unsupported shell: print manual instructions for the resolved BIN_DIR.
+run_path_case "path_unsupported_shell" "/usr/local/bin/fish" "fish/bin"
+fish_install="$(cat "${tmp_root}/path_unsupported_shell/resolved_install_dir")"
+assert_contains "${tmp_root}/path_unsupported_shell/stdout.txt" "export PATH='${fish_install}':\$PATH"
+assert_not_contains "${tmp_root}/path_unsupported_shell/stdout.txt" '$HOME/.loopcoder/bin'
+if [[ -e "${tmp_root}/path_unsupported_shell/home/.zshrc" || -e "${tmp_root}/path_unsupported_shell/home/.profile" ]]; then
+  echo "path_unsupported_shell: unexpected profile write" >&2
+  exit 1
+fi
+
+# Relative LOOPCODER_INSTALL_DIR is rejected.
+rel_case="${tmp_root}/path_relative_rejected"
+mkdir -p "${rel_case}/tmp" "${rel_case}/home" "${rel_case}/bin"
+make_archive_fixture "${rel_case}"
+write_supported_stubs "${rel_case}/bin"
+set +e
+(
+  export LOOPCODER_INSTALL_OS="darwin"
+  export LOOPCODER_INSTALL_ARCH="arm64"
+  export LOOPCODER_VERSION="0.8.0"
+  export LOOPCODER_INSTALL_DIR="relative/bin"
+  export HOME="${rel_case}/home"
+  export TMPDIR="${rel_case}/tmp"
+  export PATH="${rel_case}/bin:/usr/bin:/bin"
+  export SHELL="/bin/sh"
+  export INSTALL_ARCHIVE_FIXTURE="${rel_case}/loopcoder_0.8.0_darwin_arm64.tar.gz"
+  export INSTALL_ARCHIVE_SHA="${rel_case}/archive.sha256"
+  export INSTALL_CURL_LOG="${rel_case}/curl.log"
+  export INSTALL_COSIGN_LOG="${rel_case}/cosign.log"
+  /bin/sh "${installer}"
+) >"${rel_case}/stdout.txt" 2>"${rel_case}/stderr.txt"
+rel_status="$?"
+set -e
+if [[ "${rel_status}" -ne 1 ]]; then
+  echo "path_relative_rejected: expected exit 1, got ${rel_status}" >&2
+  exit 1
+fi
+assert_contains "${rel_case}/stderr.txt" "LOOPCODER_INSTALL_DIR must be an absolute path"
+
 fi
 
 run_interruption_case() {
