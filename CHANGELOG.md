@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Release smoke is Go + bash only (spec 1058)** - removed
+  `scripts/release-smoke.ps1`, `scripts/self-bootstrap-smoke.ps1`, and
+  `scripts/install.ps1`. Acceptance lives in `internal/releasesmoke` with thin
+  drivers `scripts/release-smoke.sh` and `scripts/self-bootstrap-smoke.sh`.
+  Schema assertions bind to `storage.CurrentSchemaVersion` (no hard-coded
+  current generation). Release workflow no longer uses `pwsh`.
+
 ## [0.8.1] - 2026-07-19
 
 v0.8.1 is the **production-path closure** release for native Darwin arm64. It

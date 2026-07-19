@@ -54,11 +54,16 @@ evidence remain available without presenting the release as final.
 
 The v0.8 native smoke job runs on the supported `darwin/arm64` host:
 
-```powershell
-pwsh scripts/release-smoke.ps1 -Version 0.8.0 -PreviousVersion 0.7.0
+```bash
+bash scripts/release-smoke.sh --version 0.8.1 --previous 0.7.0
 ```
 
-The smoke script targets the staged draft release. It downloads the current
+Implementation lives in `internal/releasesmoke` (Go); the shell driver is a thin
+wrapper. PowerShell release smoke is removed (spec 1058). Schema upgrade
+assertions use `storage.CurrentSchemaVersion` as the target (legacy source 9
+remains the only intentional hard-coded schema anchor).
+
+The smoke targets the staged draft release. It downloads the current
 platform archive through `gh release download`, verifies `SHA256SUMS` with
 cosign, checks the archive checksum, runs
 `loopcoder version`, confirms the source checkout has no tracked `.loopcoder/`
@@ -67,12 +72,12 @@ registry / `doctor --format json` / `migrate local-state --dry-run` /
 `report --format json` path, invokes the self-bootstrap acceptance smoke for
 nested run-tree observability, confirms the selected binary recognizes itself
 as already latest, and verifies upgrade from the previous release when
-`-PreviousVersion` is set. For a v0.7.0 predecessor it also creates a real
+`--previous` is set. For a v0.7.0 predecessor it also creates a real
 schema-9 database with that published binary, proves `migrate storage` planning
-is read-only, applies schema 9 through 30, checks idempotent replay and the
-verified owner-only backup, then proves the restored backup opens with v0.7.0.
-It is verification-only and must not create tags, publish releases, or upload
-assets.
+is read-only, applies schema 9 through `CurrentSchemaVersion`, checks
+idempotent replay and the verified owner-only backup, then proves the restored
+backup opens with v0.7.0. It is verification-only and must not create tags,
+publish releases, or upload assets.
 
 Provider live smoke, including Grok, is not part of required CI or default
 release smoke. It is an explicit operator diagnostic only, must be enabled by
@@ -195,8 +200,8 @@ Before tagging v0.8.0, run the self-bootstrap acceptance path in
 [`self-bootstrap.md`](self-bootstrap.md). At minimum, the release record must
 include:
 
-- the scripted smoke result from `pwsh scripts/self-bootstrap-smoke.ps1
-  -Version 0.8.0 -Binary <staged-binary>`;
+- the scripted smoke result from
+  `bash scripts/self-bootstrap-smoke.sh --version <ver> --binary <staged-binary>`;
 - the staged candidate binary path, SHA-256, version stamp, and proof that the
   same archive is later eligible for publication;
 - native `darwin/arm64` host evidence;
@@ -210,9 +215,10 @@ include:
 - zero paid provider calls and no private credential dependency;
 - issue-to-PR-to-candidate-SHA evidence for the v0.8.0 implementation issues;
 - the normal consumer artifact smoke,
-  `pwsh scripts/release-smoke.ps1 -Version 0.8.0 -PreviousVersion 0.7.0`;
-- schema-9 planning, owner-only backup, atomic schema-30 application,
-  idempotent replay, and a copied backup opened by v0.7.0;
+  `bash scripts/release-smoke.sh --version <ver> --previous 0.7.0`;
+- schema-9 planning, owner-only backup, atomic application to
+  `CurrentSchemaVersion`, idempotent replay, and a copied backup opened by
+  v0.7.0;
 - the completed go/no-go report from
   [`v0.8.0-go-no-go.md`](v0.8.0-go-no-go.md), attached to the release
   readiness issue.
