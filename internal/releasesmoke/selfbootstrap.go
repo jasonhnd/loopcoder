@@ -59,10 +59,19 @@ func RunSelfBootstrap(opts SelfBootstrapOptions) error {
 	if out, err := clone.CombinedOutput(); err != nil {
 		return fmt.Errorf("clone smoke repository: %w\n%s", err, out)
 	}
-	// Tag/CI checkouts are often detached. Bounded-write authority needs an exact
-	// base revision named by --base-branch main; pin main to the clone tip.
+	// Tag/CI checkouts are often detached. Nested bounded-write resolves
+	// origin/<base-branch> to an exact object id (see cli/nested.go). Pin local
+	// main and origin/main to the clone tip so --base-branch main works.
 	if out, err := exec.Command("git", "-C", repoPath, "checkout", "-B", "main").CombinedOutput(); err != nil {
 		return fmt.Errorf("pin smoke clone main branch: %w\n%s", err, out)
+	}
+	headOut, err := exec.Command("git", "-C", repoPath, "rev-parse", "HEAD").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("resolve smoke clone HEAD: %w\n%s", err, headOut)
+	}
+	head := strings.TrimSpace(string(headOut))
+	if out, err := exec.Command("git", "-C", repoPath, "update-ref", "refs/remotes/origin/main", head).CombinedOutput(); err != nil {
+		return fmt.Errorf("pin smoke clone origin/main: %w\n%s", err, out)
 	}
 
 	repoRuntimeBefore, err := repoRuntimeInventory(repoPath)
