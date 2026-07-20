@@ -781,14 +781,14 @@ lines only.
 - shipped-doc: **R0.1 Product charter** - define user, default one-worker workflow, <!-- lc:u=lc-7304f225c290 -->
   ownership boundaries, GitHub/local/provider authorities, default/advanced
   modes, and explicit non-goals.
-- doc: **R0.2 External inspiration ledger** - pin Gas City, Beads, Plexus, and Orca; <!-- lc:u=lc-c785349ec276 -->
+- shipped-doc: **R0.2 External inspiration ledger** - pin Gas City, Beads, Plexus, and Orca; <!-- lc:u=lc-c785349ec276 -->
   record revisions and licenses,
   adopted concepts, rejected assumptions, rewrite-only policy, and provenance
   review checklist.
 - planned-doc: **R0.3 v0.8 disposition map** - map every current top-level subsystem to
   keep, consolidate, compatibility-only, or remove; name the owning v0.9
   component and deletion gate.
-- planned-doc: **R0.4 Operational SLOs** - define the report-delivery contract:
+- doc: **R0.4 Operational SLOs** - define the report-delivery contract:
   start,
   state-change, terminal, and five-minute reports; versioned event/current-
   status fields; final-mile delivery stages; follow/replay cursor; stop/join
