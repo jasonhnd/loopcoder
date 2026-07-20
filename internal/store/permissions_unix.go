@@ -147,6 +147,16 @@ func inspectPermissionTarget(target permissionTarget, repair bool) (PermissionIt
 		return item, nil
 	}
 
+	// Fail closed when the path is not owned by the current process user.
+	// Mode bits alone are insufficient: a world-readable path owned by
+	// another uid is still an integrity violation for local store state.
+	if err := requireCurrentUserOwner(info); err != nil {
+		item.Secure = false
+		item.Unsafe = true
+		item.Message = err.Error()
+		return item, nil
+	}
+
 	if item.BeforeMode&^target.mode == 0 {
 		item.Message = "owner-only"
 		return item, nil
@@ -165,6 +175,18 @@ func inspectPermissionTarget(target permissionTarget, repair bool) (PermissionIt
 	item.Secure = true
 	item.Message = fmt.Sprintf("tightened from %04o to %04o", item.BeforeMode, item.AfterMode)
 	return item, nil
+}
+
+func requireCurrentUserOwner(info os.FileInfo) error {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat == nil {
+		return fmt.Errorf("unable to read posix owner identity")
+	}
+	uid := uint32(os.Getuid())
+	if stat.Uid != uid {
+		return fmt.Errorf("owned by uid %d, want current uid %d", stat.Uid, uid)
+	}
+	return nil
 }
 
 func ensureOwnerOnlyDir(target permissionTarget) error {
