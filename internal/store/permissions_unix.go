@@ -37,6 +37,19 @@ func CheckPermissions(path string) (PermissionReport, error) {
 		Supported: true,
 		Secure:    true,
 	}
+	if err := inspectAncestorPathBoundary(path); err != nil {
+		report.Secure = false
+		report.Message = err.Error()
+		report.Items = append(report.Items, PermissionItem{
+			Path:    path,
+			Kind:    "path boundary",
+			Exists:  true,
+			Secure:  false,
+			Unsafe:  true,
+			Message: err.Error(),
+		})
+		return report, nil
+	}
 	for _, target := range storePermissionTargets(path) {
 		item, err := inspectPermissionTarget(target, false)
 		if err != nil {
@@ -55,6 +68,9 @@ func ensurePermissionsForOpen(path string) error {
 	path = filepath.Clean(strings.TrimSpace(path))
 	if path == "." || path == "" {
 		return fmt.Errorf("open store: path is required")
+	}
+	if err := inspectAncestorPathBoundary(path); err != nil {
+		return fmt.Errorf("open store: insecure path boundary for %s: %w", path, err)
 	}
 	for _, target := range storeDirectoryTargets(path) {
 		if err := ensureOwnerOnlyDir(target); err != nil {
@@ -95,6 +111,9 @@ func storePermissionTargets(path string) []permissionTarget {
 }
 
 func storeDirectoryTargets(path string) []permissionTarget {
+	// Immediate data directory must be owner-only (0700).
+	// Ancestor directories are checked separately for symlink escape and
+	// foreign ownership without requiring every parent to be 0700 (e.g. $HOME).
 	return []permissionTarget{
 		{
 			path: filepath.Dir(path),
@@ -102,6 +121,62 @@ func storeDirectoryTargets(path string) []permissionTarget {
 			mode: ownerOnlyDirMode,
 			dir:  true,
 		},
+	}
+}
+
+// inspectAncestorPathBoundary walks path components from the leaf upward and
+// fails closed on:
+//   - any symlink component
+//   - foreign ownership of the database path or its data directory
+//   - foreign ownership of further ancestors while still inside a current-user
+//     owned prefix (so a user-owned intermediate cannot redirect via symlink
+//     into another principal's tree)
+//
+// System ancestors owned by another uid (for example /var or /Users) stop the
+// walk without error once the user-owned prefix has been validated. Mode 0700
+// is enforced only on the data directory and database file targets.
+func inspectAncestorPathBoundary(path string) error {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if path == "" || path == "." {
+		return fmt.Errorf("path is required")
+	}
+	dataDir := filepath.Dir(path)
+	current := path
+	seen := map[string]bool{}
+	for {
+		if seen[current] {
+			return fmt.Errorf("path cycle while inspecting ancestors of %s", path)
+		}
+		seen[current] = true
+		info, err := os.Lstat(current)
+		if err != nil {
+			if os.IsNotExist(err) {
+				parent := filepath.Dir(current)
+				if parent == current {
+					return nil
+				}
+				current = parent
+				continue
+			}
+			return fmt.Errorf("inspect ancestor %s: %w", current, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("ancestor path component is a symlink: %s", current)
+		}
+		ownerErr := requireCurrentUserOwner(info)
+		if ownerErr != nil {
+			// Database file and data directory must always be owned by us.
+			if current == path || current == dataDir {
+				return fmt.Errorf("ancestor %s: %w", current, ownerErr)
+			}
+			// Foreign-owned system parent ends the walk after user-owned prefix.
+			return nil
+		}
+		parent := filepath.Dir(current)
+		if parent == current || parent == string(filepath.Separator) || parent == "." {
+			return nil
+		}
+		current = parent
 	}
 }
 

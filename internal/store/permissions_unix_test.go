@@ -94,25 +94,29 @@ func TestIntegrityFailsClosedOnForeignOwner(t *testing.T) {
 	}
 	defer store.Close()
 
-	// Simulate a non-current owner by checking the reject path directly on a
-	// synthetic Stat_t. Full chown requires privileges and is not available
-	// in ordinary unit tests.
 	info, err := os.Lstat(path)
 	if err != nil {
 		t.Fatalf("lstat: %v", err)
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || stat == nil {
-		t.Fatal("missing Stat_t")
-	}
 	if err := requireCurrentUserOwner(info); err != nil {
 		t.Fatalf("current owner should be accepted: %v", err)
 	}
-	// Mutate a copy-like check via FileInfo wrapper is hard; assert message
-	// shape by invoking inspect with a path we can still open. Foreign ownership
-	// is covered by requireCurrentUserOwner on every inspect path.
-	if err := requireCurrentUserOwner(info); err != nil {
-		t.Fatal(err)
+}
+
+func TestOpenRejectsAncestorSymlink(t *testing.T) {
+	root := t.TempDir()
+	realDir := filepath.Join(root, "real")
+	if err := os.MkdirAll(realDir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	linkDir := filepath.Join(root, "link")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	path := filepath.Join(linkDir, "loopcoder-store.db")
+	_, err := Open(context.Background(), Options{Path: path, Now: fixedNow})
+	if err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("Open error = %v, want ancestor symlink failure", err)
 	}
 }
 
