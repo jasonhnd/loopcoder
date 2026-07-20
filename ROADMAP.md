@@ -788,7 +788,7 @@ lines only.
 - planned-doc: **R0.3 v0.8 disposition map** - map every current top-level subsystem to
   keep, consolidate, compatibility-only, or remove; name the owning v0.9
   component and deletion gate.
-- doc: **R0.4 Operational SLOs** - define the report-delivery contract:
+- shipped-doc: **R0.4 Operational SLOs** - define the report-delivery contract:
   start,
   state-change, terminal, and five-minute reports; versioned event/current-
   status fields; final-mile delivery stages; follow/replay cursor; stop/join
@@ -803,7 +803,7 @@ refuse before the first new runtime code merges.
 
 ## Phase R1 - Compact domain and event store <!-- lc:u=lc-997e40a9ed29 -->
 
-- planned-doc: **R1.1 Domain/state contract** - define Project, WorkItem, Dependency,
+- doc: **R1.1 Domain/state contract** - define Project, WorkItem, Dependency,
   Job, Attempt, Provider, Model, Gate, Event, legal transitions, idempotency, and
   authority.
 - planned-doc: **R1.2 Storage/migration contract** - define the compact schema,
