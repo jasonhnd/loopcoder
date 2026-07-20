@@ -72,31 +72,9 @@ func ensurePermissionsForOpen(path string) error {
 	if path == "." || path == "" {
 		return fmt.Errorf("open store: path is required")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("create data directory %s: %w", filepath.Dir(path), err)
-	}
-	info, err := os.Lstat(path)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("inspect database file %s: %w", path, err)
-		}
-		file, createErr := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
-		if createErr != nil {
-			if !os.IsExist(createErr) {
-				return fmt.Errorf("create database file %s: %w", path, createErr)
-			}
-		} else if closeErr := file.Close(); closeErr != nil {
-			return fmt.Errorf("create database file %s: close: %w", path, closeErr)
-		}
-		return nil
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("database file %s is a symlink; refusing to open", path)
-	}
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("database file %s is not a regular file; refusing to open", path)
-	}
-	return nil
+	// Foundation store requires owner-only guarantees. Until Windows DACL
+	// hardening exists, fail closed rather than opening an unverified path.
+	return fmt.Errorf("open store: %s", windowsPermissionMessage)
 }
 
 func hardenSQLiteSidecars(string) error { return nil }

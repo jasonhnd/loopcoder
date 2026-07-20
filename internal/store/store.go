@@ -336,7 +336,17 @@ func checkIntegrity(ctx context.Context, path string, db *sql.DB) error {
 	if unsafe := firstUnsafePermissionItem(permissions); unsafe != nil {
 		return fmt.Errorf("store integrity: unsafe storage path %s: %s", unsafe.Path, unsafe.Message)
 	}
-	if permissions.Supported && !permissions.Secure {
+	if !permissions.Supported {
+		// Platforms without owner-only enforcement cannot satisfy the
+		// foundation integrity contract. Fail closed instead of proceeding
+		// with Supported=false/Secure=false.
+		msg := permissions.Message
+		if strings.TrimSpace(msg) == "" {
+			msg = "owner-only store permission enforcement is unsupported on this platform"
+		}
+		return fmt.Errorf("store integrity: %s", msg)
+	}
+	if !permissions.Secure {
 		for _, item := range permissions.Items {
 			if item.Exists && !item.Secure {
 				return fmt.Errorf("store integrity: insecure %s %s: %s", item.Kind, item.Path, item.Message)
