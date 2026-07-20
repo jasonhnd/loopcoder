@@ -29,6 +29,14 @@ is developed. No v0.9 candidate binary, tag, or install path may replace v0.8.1
 as the production or self-bootstrap controller before the R8 release gate
 passes on the integrated release SHA.
 
+Gate A has one narrow dogfood exception: after its bootstrap-visibility canary
+passes, the new read-only event follower and host adapter may run beside the
+pinned v0.8.1 controller to make later self-bootstrap work visible. That
+observer may read v0.8.1 receipt/outbox data through an explicit compatibility
+source, but it may not dispatch providers, mutate v0.8 state, own work, write
+GitHub delivery state, or replace the v0.8.1 controller. This exception is an
+operator-visibility aid, not an intermediate release or controller promotion.
+
 v0.9.0 is not a fourth feature layer on top of the v0.8 implementation. It is a
 controlled replacement and consolidation of the core path, with old commands
 kept as compatibility shims only until the new path has proven parity. The only
@@ -97,15 +105,20 @@ requirements:
 | Gas City | [`9ddbea5`](https://github.com/gastownhall/gascity/tree/9ddbea5c0b4b3cebf09fc36c0f88a8c52f9dd991) | [MIT](https://github.com/gastownhall/gascity/blob/9ddbea5c0b4b3cebf09fc36c0f88a8c52f9dd991/LICENSE) | Reconciliation, runtime/session control, formulas, durable work, append-only events |
 | Beads | [`f9b2020`](https://github.com/gastownhall/beads/tree/f9b20203e851a48c976cfd0e155b413dd80cb5cf) | [MIT](https://github.com/gastownhall/beads/blob/f9b20203e851a48c976cfd0e155b413dd80cb5cf/LICENSE) | Issue lifecycle, dependency readiness, atomic claim/close, audit history, compaction |
 | Plexus | [`95c8519`](https://github.com/mcowger/plexus/tree/95c8519a931ba85a5a91e57312cdd4d6cd382da0) | [MIT](https://github.com/mcowger/plexus/blob/95c8519a931ba85a5a91e57312cdd4d6cd382da0/LICENSE) | Provider inventory, quota windows, health, cooldown, target selection, observations |
+| Orca | [`53aeeb7`](https://github.com/stablyai/orca/tree/53aeeb710c45aa22738f891ad60ba3886163e67b) | [MIT](https://github.com/stablyai/orca/blob/53aeeb710c45aa22738f891ad60ba3886163e67b/LICENSE) | Host-side agent state, PTY/session evidence, operator feed, notifications, worktree/control-plane boundaries |
 
 Primary architecture references are Gas City's
 [`how-gas-city-works.md`](https://github.com/gastownhall/gascity/blob/9ddbea5c0b4b3cebf09fc36c0f88a8c52f9dd991/docs/getting-started/how-gas-city-works.md),
 Beads'
 [`PROJECT_CHARTER.md`](https://github.com/gastownhall/beads/blob/f9b20203e851a48c976cfd0e155b413dd80cb5cf/engdocs/PROJECT_CHARTER.md),
 and Plexus'
-[`CONFIGURATION.md`](https://github.com/mcowger/plexus/blob/95c8519a931ba85a5a91e57312cdd4d6cd382da0/docs/CONFIGURATION.md).
+[`CONFIGURATION.md`](https://github.com/mcowger/plexus/blob/95c8519a931ba85a5a91e57312cdd4d6cd382da0/docs/CONFIGURATION.md),
+plus Orca's pinned
+[`README.md`](https://github.com/stablyai/orca/blob/53aeeb710c45aa22738f891ad60ba3886163e67b/README.md)
+and official
+[`orchestration`](https://docs.onorca.dev/orchestration/overview) documentation.
 
-All three top-level projects are MIT-licensed at the pinned revisions. MIT
+All four top-level projects are MIT-licensed at the pinned revisions. MIT
 permits use, modification, redistribution, sublicensing, and sale, provided its
 copyright and permission notice is retained in copies or substantial portions.
 Beads also carries a separate
@@ -176,7 +189,7 @@ as part of the parent process tree.
 
 ### Go-native target architecture
 
-The new core has seven logical responsibilities. These are boundaries, not a
+The new core has eight logical responsibilities. These are boundaries, not a
 mandate to create one package per noun or duplicate existing packages.
 
 | Component | Owned responsibility | Primary inspiration |
@@ -188,6 +201,7 @@ mandate to create one package per noun or duplicate existing packages.
 | Supervisor | Process-tree resources, liveness, evidence progress, timeout, cleanup | LoopCoder operational failures plus Gas City lifecycle |
 | Delivery | Worktree, Git, PR, CI watcher, verifier, merge/release gates | Existing LoopCoder |
 | Store and Events | SQLite transactions, append-only events, compact projections, reports | Beads atomicity plus Gas City events |
+| Host Bridge | Follow stream, cursor acknowledgement, delivery evidence, reference adapters | LoopCoder contracts plus Orca operator-visibility boundaries |
 
 The v0.9 core vocabulary is intentionally small: `Project`, `WorkItem`,
 `Dependency`, `Job`, `Attempt`, `Provider`, `Model`, `Gate`, and `Event`. Gas
@@ -265,6 +279,36 @@ Do not adopt:
   subscription quota merely to refresh performance rankings.
 - Routing unsupported coding CLIs through an API compatibility layer without an
   explicit end-to-end compatibility proof.
+
+#### Orca
+
+Adopt through independent Go implementation and a versioned host boundary:
+
+- Separate provider-process truth, normalized operator state, and host
+  rendering instead of treating model prose as progress.
+- Combine process/PTY evidence and supported native agent hooks, with an honest
+  fallback when a host exposes no structured state surface.
+- Present a compact current status, ordered event feed, attention notification,
+  and terminal result from one underlying event stream.
+- Fence completion and heartbeat evidence with task, dispatch, and execution
+  identity so stale or wrong senders cannot close current work.
+- Keep a silent wait connection alive without turning transport activity into
+  semantic progress or invoking a model.
+- Preserve a clean client/control-plane boundary so a future remote host can
+  display server-owned work without becoming execution truth.
+
+Do not adopt:
+
+- A full IDE, editor, source-control UI, mobile client, SSH workspace manager,
+  remote server, or parallel-agent fleet as v0.9.0 scope.
+- Prompt-only heartbeat or `worker_done` messages as authoritative lifecycle
+  evidence.
+- Default permission-bypass flags, silent unrestricted execution, or host-side
+  mutation of LoopCoder policy.
+- A second orchestration database or host-owned task state that competes with
+  LoopCoder's atomic event/attempt store.
+- Provider credential refresh, token custody, or undocumented quota access as
+  part of the host bridge.
 
 ### Work Graph contract
 
@@ -409,8 +453,10 @@ attempt, resource budget, and merge boundary.
 ### Resource and progress supervisor
 
 The supervisor, not the model, generates the mandatory progress receipt. At
-least every five minutes while an attempt is active, it emits a compact report
-from observable evidence:
+attempt start, on every consequential state change, and at least every five
+minutes while an attempt remains active, it emits a compact report from
+observable evidence. A report is a versioned event and current-status
+projection, not prose that exists only in a provider transcript. It includes:
 
 - phase and elapsed time;
 - provider/model/effort and attempt identity;
@@ -424,6 +470,15 @@ consecutive intervals with no meaningful evidence progress trigger a bounded
 diagnostic and then cancel/detach according to policy, returning control to the
 operator. The supervisor may never hide for hours behind `go test`, a pre-push
 hook, CI polling, or a provider stream.
+
+The minimum attempt states are `queued`, `starting`, `working`,
+`waiting_external`, `blocked_user`, `verifying`, `delivering`, `succeeded`,
+`failed`, and `lost`. Every progress event carries a schema version, project,
+job, attempt, dispatch, monotonic sequence, occurrence time, state, phase,
+bounded summary, last evidence, next action, blocker, and source. A transport
+keepalive may be emitted every 15 seconds to keep a follow connection alive,
+but it is not semantic progress and never resets the five-minute receipt or
+no-progress clocks.
 
 Initial self-hosting defaults:
 
@@ -466,9 +521,18 @@ calls, PRs, or merges.
 `loopcoder run` stays attached by default and streams bounded structured events
 and readable receipts. Explicit detached execution starts a LoopCoder-owned
 supervisor only for the lifetime of that job; it is not an always-on host daemon.
-`loopcoder status` and `loopcoder attach` replay from a durable cursor, so a host
-session may close and reopen without losing reports or adopting raw provider
-process ownership.
+`loopcoder status` reads the compact current projection. The stable follow
+surface is:
+
+```text
+loopcoder events --run <run-id> --after <sequence> --follow --format jsonl
+```
+
+It first replays ordered durable events after the cursor and then follows new
+events without invoking a model. `loopcoder attach` and host integrations use
+that same reader rather than implementing a second polling path. A host session
+may close, restart, and resume from its acknowledged cursor without losing or
+duplicating reports and without adopting raw provider process ownership.
 
 Host integrations consume the same versioned report contract:
 
@@ -476,12 +540,26 @@ Host integrations consume the same versioned report contract:
   Claude Code, hooks, and future clients.
 - Pretty text is compact and designed for humans, but never parsed back as
   machine state.
-- A host relay acknowledges a receipt cursor; failure to relay remains visible
-  and does not block local process supervision or fabricate delivery.
+- The final-mile delivery stages are `persisted`, `streamed`, `host_accepted`,
+  `rendered`, and `seen`. Core and adapters may claim only the highest stage
+  they can prove. Writing SQLite or stderr is never reported as user-visible.
+- A host relay acknowledges a receipt cursor and its proven delivery stage;
+  failure to relay remains visible and does not block local process supervision
+  or fabricate delivery.
 - Raw provider logs remain bounded local evidence and are not dumped into chat
   as the progress interface.
 - No host adapter may bypass resource admission, mutate route decisions, or
   convert an ambiguous provider state into success.
+
+The generic terminal adapter is the reference machine/human implementation.
+Gate A also requires one real interactive-host adapter, initially Paseo, that
+subscribes to the same follow stream and renders start, periodic, state-change,
+blocker, and terminal reports in an operator-visible surface. Host detection,
+profile metadata, stderr output, and mocked conformance fixtures alone do not
+satisfy that requirement. Codex, Claude Code, Orca, and future hosts implement
+the same adapter contract; a host without a documented inbound rendering or
+notification surface must degrade honestly to terminal or operating-system
+notification rather than claim in-session delivery.
 
 ### Multiple repositories, private repositories, and computers
 
@@ -560,6 +638,11 @@ to ship:
 - Documentation and contract merge before implementation; implementation does
   not redesign a merged contract inside a code PR.
 - Five-minute supervisor receipts are mandatory during all self-hosting work.
+- The Gate A visibility implementation is the only bootstrap exception to
+  automated final-mile receipts. Until its real-host canary passes, its
+  conductor must publish a manual five-minute status block; after it passes,
+  all later gates must use the read-only observer beside v0.8.1 and manual
+  silence longer than five minutes is a stop condition.
 - Heavy full-repository gates run once on remote CI, not repeatedly on the
   owner's computer or in pre-push hooks.
 - A red required check gets one diagnosis and one scoped repair. Repeated broad
@@ -593,12 +676,12 @@ release remains v0.9.0.
 
 | Gate | Scope | Code slices | Notes |
 | --- | --- | --- | --- |
-| Gate A | R0 + R1 | 6 | R0.5, R1.3-R1.7 (plus R0/R1 docs before code) |
+| Gate A | R0 + R1 + bootstrap R5.7/R6.6 | 8 | R0.5, R1.3-R1.7, R5.7, and R6.6; visibility priority order below |
 | Gate B | R2 | 4 | R2.2-R2.5 |
 | Gate C | R3.1-R3.10 | 9 | R3.1 is documentation; R3.2-R3.10 are code (provider core + Codex + Claude) |
 | Gate D | R3.11-R3.17 + R4 | 11 | Antigravity/Grok/future kit + Router |
-| Gate E | R5 | 8 | Runtime and Supervisor |
-| Gate F | R6 | 7 | Direct `loopcoder run` vertical slice |
+| Gate E | remaining R5 | 7 | Runtime and Supervisor except R5.7, already proven in Gate A |
+| Gate F | remaining R6 | 6 | Direct `loopcoder run` vertical slice except R6.6, already proven in Gate A |
 | Gate G | R7 | 5 | Explicit bounded workflow mode |
 | Gate H | R8 | 6 | Migration, deletion, release qualification |
 
@@ -623,6 +706,38 @@ Gate activation rules:
   **v0.9.0** ship as the sole public release from this roadmap.
 - v0.8.1 remains the public production and self-bootstrap controller until the
   R8 release gate passes; no intermediate v0.9 candidate may replace it.
+
+#### Gate A bootstrap-visibility order and exit
+
+The visibility failure in v0.8.1 is a product-contract failure, not a late UI
+polish item: persisted receipts that no active host renders are not delivered
+reports. Gate A therefore pulls the existing R5.7 and R6.6 slices forward
+without adding implementation slices or changing the single final release.
+
+After the already-active R0.2 slice completes, Gate A prioritizes R0.4, R1.1,
+R1.2, R1.3, R1.4, R1.7, R5.7, and R6.6 in that order. R0.3, R0.5, R1.5, and
+R1.6 then complete the remaining Gate A contract and storage work. The pulled-
+forward slices use deterministic fake attempts and read-only v0.8.1 receipt
+fixtures; they do not require a provider adapter, router, worktree delivery, or
+the later macOS Runtime to exist.
+
+Gate B must not open until a 12-minute no-provider-output canary proves all of
+the following in both the generic terminal and the real Paseo adapter:
+
+- visible reports at start, by minute five, by minute ten, and within five
+  seconds of terminal state;
+- immediate visible state-change and blocker reports independent of the
+  periodic timer;
+- disconnect/restart replay from an acknowledged cursor exactly once;
+- truthful `persisted`/`streamed`/`host_accepted`/`rendered` evidence without
+  treating stderr or database writes as user visibility;
+- zero model calls for report generation, keepalive, follow, or replay;
+- a killed fake worker becomes `lost` and no follower, timer, descriptor, or
+  child process remains after stop.
+
+Once this canary passes, the observer is dogfooded beside v0.8.1 for every
+remaining gate. A regression that restores more than five minutes of
+operator-visible silence closes the current gate until repaired.
 
 ### Planned slices
 
@@ -666,15 +781,19 @@ lines only.
 - shipped-doc: **R0.1 Product charter** - define user, default one-worker workflow, <!-- lc:u=lc-7304f225c290 -->
   ownership boundaries, GitHub/local/provider authorities, default/advanced
   modes, and explicit non-goals.
-- doc: **R0.2 External inspiration ledger** - pin upstream revisions, licenses, <!-- lc:u=lc-c785349ec276 -->
+- doc: **R0.2 External inspiration ledger** - pin Gas City, Beads, Plexus, and Orca; <!-- lc:u=lc-c785349ec276 -->
+  record revisions and licenses,
   adopted concepts, rejected assumptions, rewrite-only policy, and provenance
   review checklist.
 - planned-doc: **R0.3 v0.8 disposition map** - map every current top-level subsystem to
   keep, consolidate, compatibility-only, or remove; name the owning v0.9
   component and deletion gate.
-- planned-doc: **R0.4 Operational SLOs** - five-minute reports, stop/join deadline,
-  resource ceilings, zero-model waits, issue duration, retry budget, and no
-  duplicate PR/provider execution.
+- planned-doc: **R0.4 Operational SLOs** - define the report-delivery contract:
+  start,
+  state-change, terminal, and five-minute reports; versioned event/current-
+  status fields; final-mile delivery stages; follow/replay cursor; stop/join
+  deadline; resource ceilings; zero-model waits; issue duration; retry budget;
+  and no duplicate PR/provider execution.
 - planned-code: **R0.5 Baseline measurement command** - report current binary startup,
   one dry-run path, process count, CPU/RSS, database/table count, package count,
   local test duration, and report latency without changing repository state.
@@ -694,7 +813,8 @@ refuse before the first new runtime code merges.
   owner-only permissions, integrity check, and close behavior without domain
   writes.
 - planned-code: **R1.4 Append-only event and cursor API** - idempotency key,
-  monotonic sequence, ordered replay, and projection checkpoint primitives.
+  monotonic sequence, ordered replay, compact current-status projection, and
+  projection/host checkpoint primitives.
 - planned-code: **R1.5 SQLite contention/restart policy** - WAL, busy classification,
   bounded retry, transaction rollback, abrupt-restart, and two-connection tests.
 - planned-code: **R1.6 Project identity projection** - GitHub identity, path aliases,
@@ -799,8 +919,11 @@ call.
   descendant measurement, threshold actions, and real child-process fixtures.
 - planned-code: **R5.6 Progress evidence collectors** - bounded process, filesystem,
   Git, focused-test, PR, and CI observations without rendering or model prose.
-- planned-code: **R5.7 Receipt timer/store/rendering** - mandatory five-minute timer,
-  event persistence, JSON contract, compact text, deduplication, and restart.
+- planned-code: **R5.7 Receipt timer/store/rendering** - pulled forward into Gate A;
+  immediate start/state-change/terminal events, mandatory five-minute timer,
+  15-second transport keepalive separation, event/current-status persistence,
+  JSON contract, compact text, deduplication, restart, and read-only v0.8.1
+  receipt compatibility fixtures.
 - planned-code: **R5.8 No-progress and stall policy** - two-interval policy, bounded
   diagnostic, cancellation/detach, interactive prompt detection, and return of
   user control.
@@ -824,9 +947,12 @@ zero descendant processes after success, cancellation, timeout, and crash.
   create one PR, and make replay return the existing PR.
 - planned-code: **R6.5 Zero-model CI/approval watcher** - event/cursor-based waiting,
   five-minute receipts, restart recovery, and no busy/model polling.
-- planned-code: **R6.6 Host-neutral attach/report stream** - attached and explicit
-  detached operation, JSONL cursors, compact pretty projection, relay
-  acknowledgement, and terminal/Paseo/Codex/Claude Code conformance fixtures.
+- planned-code: **R6.6 Host-neutral attach/report stream** - pulled forward into
+  Gate A; `events --after --follow` replay/live JSONL, attached and explicit
+  detached observation, compact pretty projection, proven delivery-stage
+  acknowledgement, generic terminal reference adapter, real Paseo adapter and
+  canary, plus Codex/Claude Code/Orca/future-host conformance fixtures and
+  honest fallback behavior.
 - planned-code: **R6.7 Independent verifier and gate** - different eligible provider,
   read-only evidence, remote checks, structured verdict, and explicit merge
   authority.
@@ -890,8 +1016,12 @@ v0.9.0 is not releasable unless all of the following are demonstrated:
 
 - One-command direct path from a real GitHub issue to one PR and a structured
   verification result.
-- Progress appears at least every five minutes without asking the model to
-  narrate status.
+- A real 12-minute silent-worker canary produces operator-visible reports at
+  start, minute five, minute ten, and terminal state in the generic terminal
+  and Paseo reference adapter without asking a model to narrate status.
+- Host disconnect/restart replays each report exactly once from a cursor, and
+  delivery evidence never calls SQLite persistence or stderr output
+  `rendered` or `seen`.
 - Waiting 30 minutes for CI or quota reset makes zero provider/model calls.
 - Default local execution never exceeds configured worker/test/process/CPU/RSS
   limits and leaves zero descendants after stop.
