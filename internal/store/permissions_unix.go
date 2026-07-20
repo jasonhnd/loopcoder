@@ -272,11 +272,28 @@ func requireCurrentUserOwner(info os.FileInfo) error {
 	if !ok || stat == nil {
 		return fmt.Errorf("unable to read posix owner identity")
 	}
-	uid := uint32(os.Getuid())
+	uid, err := currentProcessUID()
+	if err != nil {
+		return err
+	}
 	if stat.Uid != uid {
 		return fmt.Errorf("owned by uid %d, want current uid %d", stat.Uid, uid)
 	}
 	return nil
+}
+
+// currentProcessUID returns the current process uid as a uint32 suitable for
+// comparison with syscall.Stat_t.Uid. Getuid is a non-negative process
+// credential on supported Unix platforms.
+func currentProcessUID() (uint32, error) {
+	uid := os.Getuid()
+	if uid < 0 {
+		return 0, fmt.Errorf("unable to resolve current process uid")
+	}
+	if uint64(uid) > uint64(^uint32(0)) {
+		return 0, fmt.Errorf("current process uid %d exceeds uint32 range", uid)
+	}
+	return uint32(uid), nil // #nosec G115 -- bounded by the uint32 max check above
 }
 
 func ensureOwnerOnlyDir(target permissionTarget) error {
