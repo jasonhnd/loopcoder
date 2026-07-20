@@ -666,7 +666,7 @@ lines only.
 - shipped-doc: **R0.1 Product charter** - define user, default one-worker workflow, <!-- lc:u=lc-7304f225c290 -->
   ownership boundaries, GitHub/local/provider authorities, default/advanced
   modes, and explicit non-goals.
-- doc: **R0.2 External inspiration ledger** - pin upstream revisions, licenses,
+- doc: **R0.2 External inspiration ledger** - pin upstream revisions, licenses, <!-- lc:u=lc-c785349ec276 -->
   adopted concepts, rejected assumptions, rewrite-only policy, and provenance
   review checklist.
 - planned-doc: **R0.3 v0.8 disposition map** - map every current top-level subsystem to
