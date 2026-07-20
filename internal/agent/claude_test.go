@@ -214,6 +214,17 @@ func TestClaudeRunnerCreatesSensitiveFilesPrivate(t *testing.T) {
 	assertPrivateFileMode(t, claudeMCPConfigPath(logPath))
 }
 
+func TestClaudeRunnerRejectsBoundedWriteBeforeLaunch(t *testing.T) {
+	result, err := (ClaudeRunner{}).Run(context.Background(), Invocation{
+		WorktreePath: t.TempDir(),
+		LogPath:      filepath.Join(t.TempDir(), "claude.log"),
+		BoundedWrite: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot be isolated") {
+		t.Fatalf("result=%#v error=%v, want prelaunch bounded-write refusal", result, err)
+	}
+}
+
 func TestBuildClaudeReadOnlyVerifierArgs(t *testing.T) {
 	schema := `{"type":"object"}`
 	got := BuildClaudeArgs(Invocation{

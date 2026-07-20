@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/audit"
 	"github.com/jasonhnd/loopcoder/internal/budget"
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
@@ -46,6 +47,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/report"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
 	"github.com/jasonhnd/loopcoder/internal/reportquery"
+	"github.com/jasonhnd/loopcoder/internal/routing"
 	"github.com/jasonhnd/loopcoder/internal/runstatus"
 	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 	"github.com/jasonhnd/loopcoder/internal/scaffold"
@@ -55,6 +57,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/upgrade"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 	"github.com/jasonhnd/loopcoder/internal/verify"
+	"github.com/jasonhnd/loopcoder/internal/waitstate"
 	"github.com/jasonhnd/loopcoder/internal/worker"
 )
 
@@ -70,50 +73,63 @@ type BuildInfo struct {
 }
 
 type Deps struct {
-	NewGitHubReader             func(repoPath string) orchestration.GitHubReader
-	NewIssueWriter              func(repoPath string) compiler.IssueWriter
-	NewPreProdWriter            func(repoPath string) orchestration.PreProdWriter
-	NewPromoteWriter            func(repoPath string) orchestration.PromotionWriter
-	ProcessAlive                func(pid int) bool
-	Now                         func() time.Time
-	RuntimeGOOS                 string
-	RuntimeGOARCH               string
-	IsTerminal                  func(w io.Writer) bool
-	TerminalWidth               func(w io.Writer) int
-	Stdin                       io.Reader
-	BuildInfo                   BuildInfo
-	ComputeReadySet             func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
-	Tick                        func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
-	Discover                    func(ctx context.Context, opts perception.Options) (perception.Report, error)
-	Compile                     func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
-	Dispatch                    func(ctx context.Context, opts worker.Options) (worker.Result, error)
-	Loopreview                  func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
-	Promote                     func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
-	Recover                     func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
-	Verify                      func(ctx context.Context, opts verify.Options) verify.Result
-	Audit                       func(ctx context.Context, opts audit.Options) (audit.Result, error)
-	Doctor                      func(ctx context.Context, opts doctor.Options) doctor.Report
-	ProviderInventory           func(ctx context.Context, opts providerinventory.Options) (providerinventory.Report, error)
-	ProviderInventoryRefresh    func(ctx context.Context, report providerinventory.Report, now time.Time) error
-	ProviderQuotaRefresh        func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.RefreshResult, error)
-	ProviderQuotaStatus         func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error)
-	Init                        func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
-	Upgrade                     func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
-	MigrateLocalState           func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error)
-	MigrateStorage              func(ctx context.Context, opts storage.SchemaMigrationOptions) (storage.SchemaMigrationResult, error)
-	SkillInstall                func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
-	StatePush                   func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
-	StatePull                   func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
-	LeaseAcquire                func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
-	LeaseRelease                func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
-	StartDetachedDispatch       func(ctx context.Context, args []string, logPath string) (int, error)
-	KillProcessTree             func(pid int) error
-	KillProcessGroup            func(pgid int) error
-	ProcessAuthority            func(pid int, observedAt time.Time) (string, error)
-	VerifyProcessAuthority      func(pid int, authority string) error
-	DetachedSupervisorCadence   time.Duration
-	DetachedStorageBusyTimeout  time.Duration
-	DetachedStorageWriteTxRetry storage.WriteTxRetryOptions
+	NewGitHubReader          func(repoPath string) orchestration.GitHubReader
+	NewIssueWriter           func(repoPath string) compiler.IssueWriter
+	NewPreProdWriter         func(repoPath string) orchestration.PreProdWriter
+	NewPromoteWriter         func(repoPath string) orchestration.PromotionWriter
+	ProcessAlive             func(pid int) bool
+	Now                      func() time.Time
+	// WaitClock optionally overrides the provider-free wait clock for tests.
+	WaitClock                waitstate.Clock
+	RuntimeGOOS              string
+	RuntimeGOARCH            string
+	IsTerminal               func(w io.Writer) bool
+	TerminalWidth            func(w io.Writer) int
+	Stdin                    io.Reader
+	BuildInfo                BuildInfo
+	ComputeReadySet          func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
+	Tick                     func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
+	Discover                 func(ctx context.Context, opts perception.Options) (perception.Report, error)
+	Compile                  func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
+	Dispatch                 func(ctx context.Context, opts worker.Options) (worker.Result, error)
+	AgentLookup              func(provider string) (agent.Runner, error)
+	Loopreview               func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
+	Promote                  func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
+	Recover                  func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
+	Verify                   func(ctx context.Context, opts verify.Options) verify.Result
+	Audit                    func(ctx context.Context, opts audit.Options) (audit.Result, error)
+	Doctor                   func(ctx context.Context, opts doctor.Options) doctor.Report
+	ProviderInventory        func(ctx context.Context, opts providerinventory.Options) (providerinventory.Report, error)
+	ProviderInventoryRefresh func(ctx context.Context, report providerinventory.Report, now time.Time) error
+	ProviderQuotaRefresh     func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.RefreshResult, error)
+	ProviderQuotaStatus      func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error)
+	RouteExplain             func(ctx context.Context, store storage.Store, request routing.StoredRouteRequest) (routing.RouteOperationResult, error)
+	RouteDecide              func(ctx context.Context, store storage.Store, request routing.StoredRouteRequest) (routing.RouteOperationResult, error)
+	// ResolveWorkerDispatchRoute selects provider/model/effort for ordinary
+	// Worker dispatch from a persisted route decision. Production default never
+	// falls back to an empty-provider Codex default.
+	ResolveWorkerDispatchRoute func(ctx context.Context, input WorkerDispatchRouteInput) (WorkerDispatchRouteResult, error)
+	// ResolveVerifierDispatchRoute selects an independent read-only verifier
+	// from a persisted route decision. Production default never reuses the
+	// worker silently when independence policy fails.
+	ResolveVerifierDispatchRoute func(ctx context.Context, input VerifierDispatchRouteInput) (VerifierDispatchRouteResult, error)
+	Init                         func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error)
+	Upgrade                      func(ctx context.Context, opts upgrade.Options) (upgrade.Result, error)
+	MigrateLocalState            func(ctx context.Context, opts localmigrate.Options) (localmigrate.Result, error)
+	MigrateStorage               func(ctx context.Context, opts storage.SchemaMigrationOptions) (storage.SchemaMigrationResult, error)
+	SkillInstall                 func(ctx context.Context, opts SkillInstallOptions) (SkillInstallResult, error)
+	StatePush                    func(ctx context.Context, opts statebranch.PushOptions) (statebranch.PushResult, error)
+	StatePull                    func(ctx context.Context, opts statebranch.PullOptions) (statebranch.PullResult, error)
+	LeaseAcquire                 func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	LeaseRelease                 func(ctx context.Context, opts statebranch.LeaseOptions) (statebranch.LeaseResult, error)
+	StartDetachedDispatch        func(ctx context.Context, args []string, logPath string) (int, error)
+	KillProcessTree              func(pid int) error
+	KillProcessGroup             func(pgid int) error
+	ProcessAuthority             func(pid int, observedAt time.Time) (string, error)
+	VerifyProcessAuthority       func(pid int, authority string) error
+	DetachedSupervisorCadence    time.Duration
+	DetachedStorageBusyTimeout   time.Duration
+	DetachedStorageWriteTxRetry  storage.WriteTxRetryOptions
 }
 
 var commands = []Command{
@@ -122,6 +138,8 @@ var commands = []Command{
 	{Name: "models", Summary: "list static provider model and depth registry entries"},
 	{Name: "projects", Summary: "manage the machine-local project registry"},
 	{Name: "providers", Summary: "refresh bounded provider CLI installation inventory"},
+	{Name: "route", Summary: "explain or persist a provider-neutral route decision"},
+	{Name: "wait", Summary: "provider-free local waits (quota-reset, …)"},
 	{Name: "delivery", Summary: "plan and gate v0.8 DeliveryRun approvals"},
 	{Name: "budget", Summary: "exercise local quota usage budget accounting"},
 	{Name: "audit", Summary: "run a read-only repository security audit"},
@@ -222,6 +240,7 @@ func DefaultDeps() Deps {
 		Dispatch: func(ctx context.Context, opts worker.Options) (worker.Result, error) {
 			return worker.Dispatch(ctx, opts, worker.DefaultDeps())
 		},
+		AgentLookup: agent.Lookup,
 		Loopreview: func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error) {
 			return loopreview.Run(ctx, opts, loopreview.DefaultDeps())
 		},
@@ -253,6 +272,14 @@ func DefaultDeps() Deps {
 		},
 		ProviderQuotaStatus: func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error) {
 			return quotaLifecycle.Status(ctx, req)
+		},
+		RouteExplain: routing.ExplainStoredRoute,
+		RouteDecide:  routing.DecideStoredRoute,
+		ResolveWorkerDispatchRoute: func(ctx context.Context, input WorkerDispatchRouteInput) (WorkerDispatchRouteResult, error) {
+			return resolveWorkerDispatchRouteProduction(ctx, input, routing.DecideStoredRoute)
+		},
+		ResolveVerifierDispatchRoute: func(ctx context.Context, input VerifierDispatchRouteInput) (VerifierDispatchRouteResult, error) {
+			return resolveVerifierDispatchRouteProduction(ctx, input, routing.DecideStoredRoute)
 		},
 		Init: func(ctx context.Context, opts scaffold.Options) (scaffold.Result, error) {
 			return scaffold.Init(ctx, opts, scaffold.DefaultDeps())
@@ -457,6 +484,12 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "providers" {
 		return runProviders(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "route" {
+		return runRoute(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "wait" {
+		return runWait(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "delivery" {
 		return runDelivery(args[1:], stdout, stderr, deps)
@@ -668,6 +701,10 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		printProvidersHelp(w)
 		return
 	}
+	if command.Name == "route" {
+		printRouteHelp(w)
+		return
+	}
 	if command.Name == "delivery" {
 		printDeliveryHelp(w)
 		return
@@ -699,7 +736,7 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --run-id string             run id (default generated)")
 		fmt.Fprintln(w, "  --attempt int               attempt number (default 1)")
 		fmt.Fprintln(w, "  --recovery-context string   prior recovery context to append to the prompt")
-		fmt.Fprintln(w, "  --provider string           worker provider (default \"codex\")")
+		fmt.Fprintln(w, "  --provider string           explicit worker provider pin (unpinned work uses route decide)")
 		fmt.Fprintln(w, "  --model string              optional worker model override for this run")
 		fmt.Fprintln(w, "  --effort string             optional worker reasoning effort override for this run")
 		fmt.Fprintln(w, "  --timeout duration          optional worker hard-cap override for this dispatch")
@@ -4683,23 +4720,113 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "dispatch: %v\n", err)
 		return 1
 	}
-	selection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
-		Role:           "worker",
-		Provider:       opts.Provider,
-		Model:          opts.Model,
-		Effort:         opts.Effort,
-		ConfigProvider: cfg.Adapters.Worker,
-		ConfigModel:    cfg.Worker.Model,
-		ConfigEffort:   cfg.Worker.ReasoningEffort,
-		Strict:         cfg.Models.Strict || strict,
-		Warnings:       commandWarningsWriter(outputMode, stderr),
-	})
-	if !ok {
-		return 1
+
+	// Capture explicit CLI pins before route resolution. Config adapter defaults
+	// are not treated as production pins; unpinned work must go through route
+	// decide and never fall back to empty-provider Codex.
+	explicitProvider := strings.TrimSpace(opts.Provider)
+	explicitModel := strings.TrimSpace(opts.Model)
+	explicitEffort := strings.TrimSpace(opts.Effort)
+	resolveRoute := deps.ResolveWorkerDispatchRoute
+	if resolveRoute == nil && deps.RouteDecide != nil {
+		// Production-shaped deps: build durable evidence then decide.
+		decide := deps.RouteDecide
+		resolveRoute = func(ctx context.Context, input WorkerDispatchRouteInput) (WorkerDispatchRouteResult, error) {
+			return resolveWorkerDispatchRouteProduction(ctx, input, decide)
+		}
 	}
-	opts.Provider = selection.Provider
-	opts.Model = selection.Model
-	opts.Effort = selection.Effort
+	if resolveRoute != nil {
+		routeResult, routeErr := resolveRoute(context.Background(), WorkerDispatchRouteInput{
+			RepoPath:         resolvedRepo,
+			RunID:            opts.RunID,
+			IssueNumber:      opts.IssueNumber,
+			IssueTitle:       opts.IssueTitle,
+			IssueBody:        opts.IssueBody,
+			Attempt:          opts.Attempt,
+			ExplicitProvider: explicitProvider,
+			ExplicitModel:    explicitModel,
+			ExplicitEffort:   explicitEffort,
+			HostName:         "loopcoder-cli",
+			Now:              deps.Now(),
+		})
+		if routeErr != nil {
+			if routeResult.Outcome == routing.RouteOutcomeNoRoute || strings.Contains(routeErr.Error(), "no_route") {
+				fmt.Fprintf(stderr, "dispatch: no_route: %v\n", routeErr)
+				if routeResult.RoutingDecisionID != "" {
+					fmt.Fprintf(stderr, "dispatch: routing_decision_id=%s decision_key=%s\n", routeResult.RoutingDecisionID, routeResult.DecisionKey)
+				}
+				return 20
+			}
+			fmt.Fprintf(stderr, "dispatch: route decide: %v\n", routeErr)
+			return 1
+		}
+		if routeResult.Outcome == routing.RouteOutcomeNoRoute {
+			fmt.Fprintf(stderr, "dispatch: no_route: no eligible worker provider for this task\n")
+			if routeResult.RoutingDecisionID != "" {
+				fmt.Fprintf(stderr, "dispatch: routing_decision_id=%s decision_key=%s\n", routeResult.RoutingDecisionID, routeResult.DecisionKey)
+			}
+			return 20
+		}
+		opts.Provider = routeResult.Provider
+		opts.Model = routeResult.Model
+		opts.Effort = routeResult.Effort
+		opts.RoutingDecisionID = routeResult.RoutingDecisionID
+		// Explicit --provider is a durable pin: typed auto-fallback is refused.
+		opts.RoutePinned = explicitProvider != ""
+		if strings.TrimSpace(opts.RunID) == "" && strings.TrimSpace(routeResult.DeliveryRunID) != "" {
+			opts.RunID = routeResult.DeliveryRunID
+		}
+		selection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
+			Role:           "worker",
+			Provider:       opts.Provider,
+			Model:          opts.Model,
+			Effort:         opts.Effort,
+			ConfigProvider: opts.Provider,
+			ConfigModel:    opts.Model,
+			ConfigEffort:   opts.Effort,
+			Strict:         cfg.Models.Strict || strict,
+			Warnings:       commandWarningsWriter(outputMode, stderr),
+		})
+		if !ok {
+			return 1
+		}
+		opts.Provider = selection.Provider
+		opts.Model = selection.Model
+		opts.Effort = selection.Effort
+		if explicitProvider != "" && !strings.EqualFold(opts.Provider, explicitProvider) {
+			fmt.Fprintf(stderr, "dispatch: route decision provider %q does not honor explicit pin %q\n", opts.Provider, explicitProvider)
+			return 1
+		}
+		if outputMode.Format == "text" {
+			fmt.Fprintf(stderr, "dispatch: route decision %s provider=%s model=%s effort=%s replayed=%t\n",
+				opts.RoutingDecisionID, opts.Provider, opts.Model, opts.Effort, routeResult.Replayed)
+		}
+	} else {
+		// Partial test deps without a route resolver: require an explicit pin.
+		// Never invent empty-provider Codex. Config model/effort may still apply
+		// under the pinned provider.
+		if explicitProvider == "" {
+			fmt.Fprintln(stderr, "dispatch: unpinned worker requires a route decision; pass --provider for an explicit pin or use production deps with RouteDecide")
+			return 2
+		}
+		selection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
+			Role:           "worker",
+			Provider:       explicitProvider,
+			Model:          explicitModel,
+			Effort:         explicitEffort,
+			ConfigProvider: explicitProvider,
+			ConfigModel:    cfg.Worker.Model,
+			ConfigEffort:   cfg.Worker.ReasoningEffort,
+			Strict:         cfg.Models.Strict || strict,
+			Warnings:       commandWarningsWriter(outputMode, stderr),
+		})
+		if !ok {
+			return 1
+		}
+		opts.Provider = selection.Provider
+		opts.Model = selection.Model
+		opts.Effort = selection.Effort
+	}
 
 	if !detach && !foreground && !supervisorRun {
 		defaultDetached, err := shouldDefaultDetachedForHost(cfg, stdout, stderr, deps)
@@ -4739,6 +4866,9 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 		}
 		fmt.Fprintf(stderr, "dispatch: %v\n", err)
 	}
+	// Connect typed provider failures to bounded fallback after launch returns.
+	// Never relaunches a provider here (avoids import cycles and retry loops).
+	result = applyTypedFallbackAfterDispatch(context.Background(), opts.RepoPath, opts, result, deps.Now, stderr)
 	if result.Report == nil {
 		if result.Reconciliation == nil {
 			fmt.Fprintln(stderr, "dispatch: dispatch report is missing")
@@ -6141,24 +6271,94 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "loopreview: %v\n", err)
 		return loopreviewCommandFailureExitCode
 	}
-	selection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
-		Role:           "verifier",
-		Provider:       opts.Provider,
-		Model:          opts.Model,
-		Effort:         opts.Effort,
-		ConfigProvider: cfg.Adapters.Verifier,
-		ConfigModel:    cfg.Verifier.Model,
-		ConfigEffort:   cfg.Verifier.ReasoningEffort,
-		Strict:         cfg.Models.Strict || strict,
-		Warnings:       commandWarningsWriter(outputMode, stderr),
-	})
-	if !ok {
-		return loopreviewCommandFailureExitCode
-	}
-	opts.Provider = selection.Provider
-	opts.Model = selection.Model
-	opts.Effort = selection.Effort
+	explicitProvider := strings.TrimSpace(opts.Provider)
+	explicitModel := strings.TrimSpace(opts.Model)
+	explicitEffort := strings.TrimSpace(opts.Effort)
 	workerProvider := strings.TrimSpace(cfg.Adapters.Worker)
+	resolveVerifier := deps.ResolveVerifierDispatchRoute
+	if resolveVerifier == nil && deps.RouteDecide != nil {
+		decide := deps.RouteDecide
+		resolveVerifier = func(ctx context.Context, input VerifierDispatchRouteInput) (VerifierDispatchRouteResult, error) {
+			return resolveVerifierDispatchRouteProduction(ctx, input, decide)
+		}
+	}
+	if resolveVerifier != nil {
+		routeResult, routeErr := resolveVerifier(context.Background(), VerifierDispatchRouteInput{
+			RepoPath:         resolvedRepo,
+			PRNumber:         opts.PRNumber,
+			WorkerProvider:   workerProvider,
+			WorkerModel:      strings.TrimSpace(cfg.Worker.Model),
+			ExplicitProvider: explicitProvider,
+			ExplicitModel:    explicitModel,
+			ExplicitEffort:   explicitEffort,
+			HostName:         "loopcoder-cli",
+			Now:              deps.Now(),
+		})
+		if routeErr != nil {
+			if routeResult.Outcome == routing.RouteOutcomeNoRoute || strings.Contains(routeErr.Error(), "no_route") {
+				fmt.Fprintf(stderr, "loopreview: needs-human: %v\n", routeErr)
+				if routeResult.RoutingDecisionID != "" {
+					fmt.Fprintf(stderr, "loopreview: routing_decision_id=%s decision_key=%s\n", routeResult.RoutingDecisionID, routeResult.DecisionKey)
+				}
+				return 2 // clean needs-human for independent-verifier unavailability
+			}
+			fmt.Fprintf(stderr, "loopreview: route decide: %v\n", routeErr)
+			return loopreviewCommandFailureExitCode
+		}
+		opts.Provider = routeResult.Provider
+		opts.Model = routeResult.Model
+		opts.Effort = routeResult.Effort
+		selection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
+			Role:           "verifier",
+			Provider:       opts.Provider,
+			Model:          opts.Model,
+			Effort:         opts.Effort,
+			ConfigProvider: opts.Provider,
+			ConfigModel:    opts.Model,
+			ConfigEffort:   opts.Effort,
+			Strict:         cfg.Models.Strict || strict,
+			Warnings:       commandWarningsWriter(outputMode, stderr),
+		})
+		if !ok {
+			return loopreviewCommandFailureExitCode
+		}
+		opts.Provider = selection.Provider
+		opts.Model = selection.Model
+		opts.Effort = selection.Effort
+		if explicitProvider != "" && !strings.EqualFold(opts.Provider, explicitProvider) {
+			fmt.Fprintf(stderr, "loopreview: route decision provider %q does not honor explicit pin %q\n", opts.Provider, explicitProvider)
+			return loopreviewCommandFailureExitCode
+		}
+		if workerProvider != "" && strings.EqualFold(opts.Provider, workerProvider) {
+			fmt.Fprintf(stderr, "loopreview: needs-human: verifier %q is not independent of worker %q\n", opts.Provider, workerProvider)
+			return 2
+		}
+		fmt.Fprintf(commandWarningsWriter(outputMode, stderr), "loopreview: route decision %s provider=%s model=%s effort=%s replayed=%t\n",
+			routeResult.RoutingDecisionID, opts.Provider, opts.Model, opts.Effort, routeResult.Replayed)
+	} else {
+		// Partial test deps: require explicit pin; never invent empty→claude.
+		if explicitProvider == "" {
+			fmt.Fprintln(stderr, "loopreview: unpinned verifier requires a route decision; pass --provider for an explicit pin or use production deps with RouteDecide")
+			return loopreviewCommandFailureExitCode
+		}
+		selection, ok := resolveAndValidateRoleSelection(roleSelectionInput{
+			Role:           "verifier",
+			Provider:       explicitProvider,
+			Model:          explicitModel,
+			Effort:         explicitEffort,
+			ConfigProvider: explicitProvider,
+			ConfigModel:    cfg.Verifier.Model,
+			ConfigEffort:   cfg.Verifier.ReasoningEffort,
+			Strict:         cfg.Models.Strict || strict,
+			Warnings:       commandWarningsWriter(outputMode, stderr),
+		})
+		if !ok {
+			return loopreviewCommandFailureExitCode
+		}
+		opts.Provider = selection.Provider
+		opts.Model = selection.Model
+		opts.Effort = selection.Effort
+	}
 	if warning := config.ReviewerNotWorkerWarning(config.Adapters{
 		Worker:   workerProvider,
 		Verifier: opts.Provider,

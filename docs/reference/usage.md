@@ -23,11 +23,11 @@ Per-project prerequisites: `git`, authenticated `gh`, at least one
 authenticated provider CLI (`codex` and/or `claude`), and a GitHub remote with
 push access.
 
-1. Install the v0.8.0 binary once per supported macOS Apple Silicon machine,
+1. Install the v0.8.1 binary once per supported macOS Apple Silicon machine,
    shared across all local projects.
 
    ```text
-   curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.0
+   curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.1
    ```
 
    Windows, Linux, WSL, containers, and Intel macOS are not supported by the
@@ -156,26 +156,28 @@ default.
 
 ## Install
 
-The supported v0.8.0 consumer distribution is GitHub Releases on native macOS
-Apple Silicon only. Tagged v0.8.0 releases publish
+The supported v0.8.x consumer distribution is GitHub Releases on native macOS
+Apple Silicon only. Tagged releases publish
 `loopcoder_<version>_darwin_arm64.tar.gz`, plus `SHA256SUMS` and signature
 material. The installer rejects unsupported hosts before release lookup,
 download, temporary directory creation, install directory creation, binary
 replacement, or PATH/profile mutation. On the supported host, it verifies the
 `SHA256SUMS` signature with cosign before trusting checksums, installs under
-`~/.loopcoder/bin`, and updates or prints PATH instructions. The installer does
-not require Go.
+`~/.loopcoder/bin` (or absolute `LOOPCODER_INSTALL_DIR`), and updates or prints
+PATH instructions for that same directory. The installer does not require Go.
 
-The default install directory is the supported documented path. v0.8.0 can
-place the binary in an absolute `LOOPCODER_INSTALL_DIR`, but its PATH/profile
-guidance still targets `~/.loopcoder/bin`; custom-directory setup is therefore
-not supported as a complete installer flow.
+The default install directory is `~/.loopcoder/bin`. Set absolute
+`LOOPCODER_INSTALL_DIR` to place the binary elsewhere; PATH detection, shell
+profile updates, and printed instructions all use that same resolved directory.
+Set `LOOPCODER_NO_MODIFY_PATH=1` to print PATH instructions without editing
+profiles. Profile edits are idempotent and quote paths that contain spaces.
 
 ```text
-curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.0
+curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.1
+LOOPCODER_INSTALL_DIR="$HOME/tools/loopcoder" curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.1
 ```
 
-To choose a different supported v0.8.x release, replace `0.8.0` with the
+To choose a different supported v0.8.x release, replace `0.8.1` with the
 desired version. v0.7.0 remains the final legacy multi-platform release for
 Windows, Linux, WSL, containers, and Intel macOS.
 
@@ -188,7 +190,7 @@ loopcoder version
 `go install` remains available for users who already have Go:
 
 ```text
-go install github.com/jasonhnd/loopcoder/cmd/loopcoder@v0.8.0
+go install github.com/jasonhnd/loopcoder/cmd/loopcoder@v0.8.1
 ```
 
 From a source checkout, you can also build a development binary locally:
@@ -1081,7 +1083,7 @@ loopcoder state pull --repo .
 loopcoder lease acquire --repo . --run-id <run-id>
 loopcoder lease release --repo . --run-id <run-id>
 
-loopcoder upgrade --version 0.8.0
+loopcoder upgrade --version 0.8.1
 
 loopcoder hook conductor-reporter
 loopcoder hook conductor-relay-guard
@@ -1116,6 +1118,12 @@ loopcoder report --repo . --run <run-id> --format json
 loopcoder delivery plan --project-id <project-id> --run-id <run-id> --format json
 loopcoder delivery decide --project-id <project-id> --run-id <run-id> --action approve --expected-authorization-fingerprint <sha256:...>
 loopcoder delivery continue --project-id <project-id> --run-id <run-id> --expected-authorization-fingerprint <sha256:...>
+
+loopcoder wait quota-reset --until <RFC3339>
+loopcoder wait quota-reset --until <RFC3339> --format json
+loopcoder wait approval --repo <path> --run <delivery-run-id> [--format text|json]
+loopcoder wait outbox --repo <path> --run <delivery-run-id> [--obligation <id>] [--format text|json]
+loopcoder wait detached-worker --repo <path> --run <run-id> [--format text|json]
 ```
 
 `hook` is for host hook integration rather than normal customer workflow.
@@ -1152,10 +1160,108 @@ proposal still matches the expected fingerprint, that an active approval exists
 and is not expired, and only then advances the DeliveryRun to a schedulable
 state. It does not dispatch workers or launch providers.
 
+### Provider-Free Local Wait (v0.8.1 candidate)
+
+`loopcoder wait` is a provider-free local wait surface. Production subcommands:
+
+- `wait quota-reset` — wall-clock wait for a known quota reset time
+- `wait approval` — durable `delivery_runs.approval_status` (approve/reject/expire)
+- `wait outbox` — durable progress delivery obligations
+- `wait detached-worker` — durable detached run terminal/lost/ambiguous states
+
+Each stored wait uses the shared waitstate machine, five-minute receipts, and a
+project-local restart checkpoint. None launch a provider. `wait quota-reset`
+waits only on a known reset time using the wall clock. It emits optional
+five-minute wait receipts, never launches a
+provider, and never polls provider quota APIs. Unknown or past reset times are
+rejected rather than treated as zero or unlimited capacity.
+
+```text
+loopcoder wait quota-reset --until 2026-07-17T18:00:00Z --format json
+loopcoder wait approval --repo . --run <delivery-run-id> --format json
+loopcoder wait outbox --repo . --run <delivery-run-id> --format json
+loopcoder wait detached-worker --repo . --run <run-id> --format json
+```
+
+### Route Explain and Decide (v0.8.1 candidate)
+
+`loopcoder route` exposes the deterministic routing boundary without launching
+a provider or refreshing provider telemetry. Both operations require stable
+`project`, `DeliveryRun`, immutable `TaskRequirement`, and execution-attempt
+decision identities. The referenced TaskRequirement supplies the authoritative
+role, permission, side-effect, capability, network, quality, and task-fit
+requirements. `--budget-class` and `--deadline-class` optionally select the
+existing `very-short`, `short`, or `medium` task-fit bands; omitted values use
+the TaskRequirement-derived floor, and an explicit weaker value is rejected.
+The budget class only parameterizes existing task-equivalent quota-headroom
+scoring. The deadline class only gates quota-reset compatibility and expiry
+scoring; it is not an absolute execution deadline. Durable hard budget policy
+remains authoritative, and the CLI does not accept prompt text.
+
+```text
+loopcoder route explain \
+  --project-id <project-id> \
+  --run-id <run-id> \
+  --task-requirement-id <task-requirement-id> \
+  --decision-key worker-attempt-1 \
+  --profile balanced-v1 \
+  --budget-class short \
+  --deadline-class short \
+  --format json
+
+loopcoder route decide \
+  --project-id <project-id> \
+  --run-id <run-id> \
+  --task-requirement-id <task-requirement-id> \
+  --decision-key worker-attempt-1 \
+  --pin-provider grok \
+  --pin-model <model-capability-id> \
+  --pin-reason "operator-selected route" \
+  --format json
+```
+
+`route explain` opens an existing current-schema database through fail-closed
+read-only storage. It does not create paths, repair permissions, apply
+migrations, or write. It loads the scoped cached provider inventory and model
+catalog, quota telemetry, availability and circuit-breaker state, budget
+summaries, task- and decision-key-applicable policy inputs, runtime
+capabilities, and any prior first-decision authority. It calculates the current
+route, reports the prior decision ID separately, and fingerprint-binds that
+prior authority without replacing the current evaluation. An optional pin
+narrows only that explanation and is not persisted.
+
+`route decide` validates the same evidence and, in one write transaction,
+persists an optional provenance-bound task- and decision-key-scoped pin, one
+immutable first routing decision, and its durable first-authority mapping for a
+caller to consume before launch. It does not gate legacy dispatch. Reusing the
+same decision key returns the first authority even if later re-evaluation
+history exists. A changed task requirement, delivery-run authorization, policy
+profile or fingerprint, resolved class, runtime host, or explicit pin fails with
+`ErrRoutingFingerprintMismatch`; it never silently falls back to Codex. An
+unknown pin reference fails before persistence with a typed missing-reference
+error. A known but hard-ineligible pin produces a typed `no_route`.
+Unsupported permissions, disabled or unusable providers, and unknown or stale
+hard telemetry remain explicit candidate rejections. Zero generated candidates
+return `needs-human` generation status and an actionable inventory refresh and
+configuration diagnostic.
+
+Text is the default output. `--format json` emits exactly one bounded JSON
+object: `loopcoder.route_operation.v1` for a route result or
+`loopcoder.route_error.v1` for input, storage, service-invariant, or rendering
+failure. Both carry `provider_calls: 0`. A valid selection exits `0`, invalid
+input exits `2`, typed storage/routing failures exit `1`, and a complete typed
+`no_route` result exits `20`. Output is capped at 1 MiB and redacts credentials,
+personal paths, control characters, and sensitive dynamic JSON keys. It carries
+record identities and bounded diagnostics rather than raw provider responses
+or prompt bodies. Refresh telemetry separately with
+`loopcoder providers refresh --repo . --format json`; neither route operation
+performs discovery, network access, provider login, or provider invocation.
+
 ### Nested Child Plans
 
-`loopcoder nested run` is the v1 nested-plan command, but no real-provider
-nested execution mode is supported in v0.8.0:
+`loopcoder nested run` is the v1 nested-plan command. Its production executor
+accepts mutation-free `read-only` children through the registered Codex,
+Claude, and Grok read-only adapters:
 
 ```text
 loopcoder nested run --repo . --plan child-plan.json --provider codex
@@ -1187,19 +1293,86 @@ active, but it does not promise universal exactly-once external side effects
 after a crash; ambiguous side effects must be resolved with receipts,
 idempotency keys, or `needs-human`.
 
-In v0.8.0, production-provider `write` and `orchestrate` children are refused
-before dispatch. The command accepts a `read-only` child but sends it through
-the ordinary Worker adapter without an enforceable mutation-free permission,
-so that accepted path is also unsafe for real providers. Do not use Codex,
-Claude, Grok, Antigravity, Gemini, or any other real provider with `nested run`
-in v0.8.0. The command's plan, scheduler, persistence, claim, recovery, and
-permission records are implementation inventory and deterministic-test
-infrastructure, not proof of a safe product bridge.
+`orchestrate` children are refused before persistence, claim acquisition, or
+launch with stable reason code `orchestrate_unsupported`. A read-only child consumes
+the persisted immutable execution contract, requires a registered provider/host
+combination, and invokes the provider with the adapter's explicit read-only
+mode. It does not route through Worker dispatch and does not create a branch,
+worktree, commit, or pull request.
+
+Immediately before launch, LoopCoder persists a private baseline outside the
+checkout. The baseline distinguishes existing user dirt and fingerprints the
+checkout, tracked and untracked content (including ignored files), index,
+refs/HEAD, local Git config, hooks, linked worktree inventory and contents, and
+guarded LoopCoder project state. Post-run verification always runs, including
+after provider failure, cancellation, or timeout. A changed or inconclusive
+surface produces `needs-human` with outcome `read_only_policy_violation`, a
+path-free `read_only_enforcement` audit, and preserved private evidence. The
+executor never calls the result successful and never attempts remediation.
+Interrupted baselines are verified before any relaunch; prior violations remain
+blocked for human review.
+
+A `write` child is registered only for Codex, Grok, and the deterministic test
+provider. Claude remains read-only because its inherited project settings and
+hooks cannot currently be proven isolated. A bounded-write claim resolves and
+pins the exact `origin/<base-branch>` commit, then creates or adopts one
+detached worktree below the machine-local LoopCoder temporary root. Every claim
+generation has its own private enforcement record and worktree. The executor
+rejects an empty path scope, branch authority, pull-request or data mutation
+scope, network capability, delegation, and unsupported providers before
+launch. Issue numbers may remain descriptive scope metadata; they do not grant
+remote mutation authority.
+
+Codex runs with its ephemeral workspace-write sandbox, network and both default
+temporary-directory write exceptions disabled, user configuration and
+repository rules ignored, MCP and login shells disabled, and multi-agent
+execution disabled. Its generated shell inherits only the core environment,
+keeps the default secret-name filter, and receives the trusted Git overrides
+explicitly. Grok runs in its strict edit-only sandbox with Bash, web, MCP, and
+sub-agents disabled. Both receive private Git configuration that disables
+interactive credentials and transport protocols and installs deny hooks for
+commit, merge, rebase, and push. These launch controls are defense in depth;
+post-run verification remains authoritative.
+
+The bounded-write verifier compares the complete isolated worktree tree and the
+guarded parent/sibling/Git/project surfaces captured before launch. Only changes
+under the contract's exact canonical path scope enter the content-free
+`mutation_manifest`; changes to any other file, parent or sibling worktree,
+index, ref, hook, local/global config, remote, credential file, or LoopCoder
+state produce `needs-human` with outcome `write_scope_policy_violation`.
+Allowed changes are never staged, committed, pushed, merged, tagged, released,
+or copied back automatically. The detached worktree and local attempt remain
+available for inspection. A successful attempt is reusable only when its
+private evidence, pinned base, worktree identity, and original contract still
+match; a widened replay or stale claim generation cannot publish a manifest or
+terminal completion.
+
+Gemini, Antigravity, unknown adapters, unsupported host profiles,
+provider-native delegation, and per-child provider overrides without a matching
+executor registration fail before launch. Provider-native requests return
+`provider_native_bridge_required` plus remediation and create no child claim,
+lifecycle transition, budget use, worktree, or provider process. This remains
+true when a provider advertises native sub-agents: adapter availability and
+provider capability inventory are not delegation support. In particular,
+Gemini's current safe mode disables the repository-inspection tools needed by
+this executor, while Antigravity has no supported read-only adapter.
+
+Nested Codex invocations disable `multi_agent` and ignore inherited user and
+repository configuration. Nested Claude invocations expose only the explicit
+read-only tool allowlist, and nested Grok invocations pass `--no-subagents`.
+Every nested provider invocation also carries a mandatory code-level
+no-delegation flag and an immutable prompt rule. Prompt text, environment
+variables, adapter defaults, and host metadata cannot opt back into native
+delegation.
 
 The reserved `test-subprocess` provider exists only for deterministic local and
-release smoke tests. It executes each child item's `scope.commands` as real local
-subprocesses and writes ordinary local attempt/report records without calling a
-remote provider.
+release smoke tests. It executes each child item's `scope.commands` as real
+local subprocesses without calling a remote provider. Read-only children use
+the guarded baseline audit; write children run in the same detached worktree
+and bounded-manifest path as production adapters. Release smoke includes both a
+forbidden read-only mutation and an allowed bounded-write mutation. The
+packaged binary must reject the former without deleting evidence and must keep
+the latter out of the parent checkout while reporting its manifest.
 
 ## Exit Codes
 

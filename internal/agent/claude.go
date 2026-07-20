@@ -61,6 +61,12 @@ func (ClaudeRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	if strings.TrimSpace(inv.LogPath) == "" {
 		return Result{ExitCode: -1}, errors.New("claude log path is required")
 	}
+	if inv.BoundedWrite {
+		return Result{ExitCode: -1}, errors.New("claude bounded-write mode is not registered because project settings and hooks cannot be isolated")
+	}
+	if err := validateNestedDelegationBoundary(inv); err != nil {
+		return Result{ExitCode: -1}, err
+	}
 	mcpServers, err := mcpServersForInvocation(inv)
 	if err != nil {
 		return Result{ExitCode: -1}, fmt.Errorf("claude MCP configuration: %w", err)

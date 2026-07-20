@@ -15,7 +15,9 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/hostprofile"
 	"github.com/jasonhnd/loopcoder/internal/progress"
+	"github.com/jasonhnd/loopcoder/internal/routing"
 	"github.com/jasonhnd/loopcoder/internal/storage"
+	"github.com/jasonhnd/loopcoder/internal/worker"
 )
 
 const (
@@ -32,8 +34,9 @@ func printDeliveryHelp(w io.Writer) {
 	fmt.Fprintln(w, "  loopcoder delivery plan --project-id <id> --run-id <id> [--format text|json]")
 	fmt.Fprintln(w, "  loopcoder delivery decide --project-id <id> --run-id <id> --action approve|reject|edit|expire|supersede --expected-authorization-fingerprint <sha256:...>")
 	fmt.Fprintln(w, "  loopcoder delivery continue --project-id <id> --run-id <id> --expected-authorization-fingerprint <sha256:...>")
+	fmt.Fprintln(w, "  loopcoder delivery claim-dispatch --project-id <id> --run-id <id> --expected-authorization-fingerprint <sha256:...> [--repo <path>]")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Approval-gated DeliveryRun plan, decide, and continue operations.")
+	fmt.Fprintln(w, "Approval-gated DeliveryRun plan, decide, continue, and single-task claim-dispatch operations.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
 	fmt.Fprintln(w, "  --db string                         storage database path (default $LOOPCODER_HOME/data/loopcoder.db)")
@@ -65,6 +68,8 @@ func runDelivery(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return runDeliveryDecide(args[1:], stdout, stderr, deps)
 	case "continue":
 		return runDeliveryContinue(args[1:], stdout, stderr, deps)
+	case "claim-dispatch":
+		return runDeliveryClaimDispatch(args[1:], stdout, stderr, deps)
 	default:
 		fmt.Fprintf(stderr, "delivery: unknown subcommand %q\n", args[0])
 		return 2
@@ -230,6 +235,201 @@ func runDeliveryContinue(args []string, stdout, stderr io.Writer, deps Deps) int
 		return deliveryExitCode(err)
 	}
 	return renderDeliveryOutput(stdout, stderr, common.Format, result, renderContinueText)
+}
+
+func runDeliveryClaimDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.Dispatch == nil {
+		deps.Dispatch = DefaultDeps().Dispatch
+	}
+	if deps.Now == nil {
+		deps.Now = DefaultDeps().Now
+	}
+	fs := flag.NewFlagSet("delivery claim-dispatch", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	common := deliveryFlags{}
+	common.bind(fs)
+	var expected, actorID, idempotencyKey, repoPath, provider, model, effort string
+	fs.StringVar(&expected, "expected-authorization-fingerprint", "", "expected authorization fingerprint")
+	fs.StringVar(&actorID, "actor-id", "local-user", "actor id")
+	fs.StringVar(&idempotencyKey, "idempotency-key", "", "idempotency key")
+	fs.StringVar(&repoPath, "repo", "", "repository path for worker dispatch")
+	fs.StringVar(&provider, "provider", "", "optional explicit worker provider pin")
+	fs.StringVar(&model, "model", "", "optional worker model pin")
+	fs.StringVar(&effort, "effort", "", "optional worker effort pin")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if err := common.validate("delivery claim-dispatch"); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	if strings.TrimSpace(repoPath) == "" {
+		fmt.Fprintln(stderr, "delivery claim-dispatch: --repo is required to dispatch a claimed task")
+		return 2
+	}
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "delivery claim-dispatch: %v\n", err)
+		return 1
+	}
+	store, closeStore, err := openDeliveryStoreForCLI(context.Background(), common.DBPath, deps)
+	if err != nil {
+		fmt.Fprintf(stderr, "delivery claim-dispatch: %v\n", err)
+		return 1
+	}
+	defer closeStore()
+	progressRecorder, stopProgress, err := deliveryProgressSupervisorForCLI(store, common.ProjectID, common.RunID, stderr)
+	if err != nil {
+		fmt.Fprintf(stderr, "delivery claim-dispatch: progress receipts unavailable: %v\n", err)
+		return 1
+	}
+	defer func() {
+		if err := stopProgress(); err != nil {
+			fmt.Fprintf(stderr, "delivery claim-dispatch: progress receipt shutdown: %v\n", err)
+		}
+	}()
+	hostEnforcement := deliveryHostEnforcement()
+	claim, err := delivery.ClaimOneReadyTask(context.Background(), store, delivery.ClaimDispatchOptions{
+		ProjectID:                        common.ProjectID,
+		DeliveryRunID:                    common.RunID,
+		ExpectedAuthorizationFingerprint: expected,
+		Actor:                            deliveryActor(actorID),
+		Host:                             deliveryHost(deps),
+		IdempotencyKey:                   idempotencyKey,
+		ExecutorID:                       "loopcoder-cli-claim-dispatch",
+		Now:                              deps.Now().UTC(),
+		HostEnforcement:                  hostEnforcement,
+		Progress:                         progressRecorder,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "delivery claim-dispatch: %v\n", err)
+		if common.Format == "json" {
+			_ = renderDeliveryError(stdout, "delivery.claim-dispatch", common.ProjectID, common.RunID, hostEnforcement, err)
+		}
+		return deliveryExitCode(err)
+	}
+	type claimDispatchReceipt struct {
+		delivery.ClaimDispatchResult
+		RoutingDecisionID string `json:"routing_decision_id,omitempty"`
+		Provider          string `json:"provider,omitempty"`
+		Model             string `json:"model,omitempty"`
+		Effort            string `json:"effort,omitempty"`
+		WorkerRunID       string `json:"worker_run_id,omitempty"`
+		WorkerDispatched  bool   `json:"worker_dispatched"`
+		ProviderInvoked   bool   `json:"provider_invoked,omitempty"`
+	}
+	receipt := claimDispatchReceipt{ClaimDispatchResult: claim}
+	if !claim.Claimed {
+		return renderDeliveryOutput(stdout, stderr, common.Format, receipt, func(w io.Writer, r claimDispatchReceipt) error {
+			fmt.Fprintf(w, "delivery claim-dispatch: no ready task\n")
+			fmt.Fprintf(w, "project_id: %s\n", r.ProjectID)
+			fmt.Fprintf(w, "delivery_run_id: %s\n", r.DeliveryRunID)
+			fmt.Fprintf(w, "outcome: %s\n", r.Outcome)
+			fmt.Fprintf(w, "next_action: %s\n", r.NextAction)
+			return nil
+		})
+	}
+	if claim.IssueNumber <= 0 {
+		fmt.Fprintln(stderr, "delivery claim-dispatch: claimed task has no issue number for worker dispatch")
+		return 1
+	}
+
+	// Route through persisted worker decision, then launch exactly once.
+	resolveRoute := deps.ResolveWorkerDispatchRoute
+	if resolveRoute == nil && deps.RouteDecide != nil {
+		decide := deps.RouteDecide
+		resolveRoute = func(ctx context.Context, input WorkerDispatchRouteInput) (WorkerDispatchRouteResult, error) {
+			return resolveWorkerDispatchRouteProduction(ctx, input, decide)
+		}
+	}
+	workerOpts := worker.Options{
+		RepoPath:    resolvedRepo,
+		IssueNumber: claim.IssueNumber,
+		IssueTitle:  firstNonEmptyCLI(claim.TaskTitle, fmt.Sprintf("Delivery task %s", claim.TaskKey)),
+		RunID:       claim.DeliveryRunID + ":" + claim.AttemptID,
+		Attempt:     int(claim.ClaimGeneration),
+		Provider:    provider,
+		Model:       model,
+		Effort:      effort,
+		Stderr:      stderr,
+	}
+	if resolveRoute != nil {
+		routeResult, routeErr := resolveRoute(context.Background(), WorkerDispatchRouteInput{
+			RepoPath:         resolvedRepo,
+			RunID:            workerOpts.RunID,
+			IssueNumber:      workerOpts.IssueNumber,
+			IssueTitle:       workerOpts.IssueTitle,
+			Attempt:          workerOpts.Attempt,
+			ExplicitProvider: strings.TrimSpace(provider),
+			ExplicitModel:    strings.TrimSpace(model),
+			ExplicitEffort:   strings.TrimSpace(effort),
+			HostName:         "loopcoder-cli",
+			Now:              deps.Now(),
+		})
+		if routeErr != nil {
+			if routeResult.Outcome == routing.RouteOutcomeNoRoute || strings.Contains(routeErr.Error(), "no_route") {
+				fmt.Fprintf(stderr, "delivery claim-dispatch: no_route after claim: %v\n", routeErr)
+				receipt.RoutingDecisionID = routeResult.RoutingDecisionID
+				receipt.NextAction = "claimed task has no eligible worker route; inspect inventory and policy"
+				if common.Format == "json" {
+					_ = json.NewEncoder(stdout).Encode(receipt)
+				}
+				return 20
+			}
+			fmt.Fprintf(stderr, "delivery claim-dispatch: route decide: %v\n", routeErr)
+			return 1
+		}
+		workerOpts.Provider = routeResult.Provider
+		workerOpts.Model = routeResult.Model
+		workerOpts.Effort = routeResult.Effort
+		workerOpts.RoutingDecisionID = routeResult.RoutingDecisionID
+		receipt.RoutingDecisionID = routeResult.RoutingDecisionID
+		receipt.Provider = routeResult.Provider
+		receipt.Model = routeResult.Model
+		receipt.Effort = routeResult.Effort
+	} else if strings.TrimSpace(provider) == "" {
+		fmt.Fprintln(stderr, "delivery claim-dispatch: unpinned worker requires route decide; pass --provider or production RouteDecide deps")
+		return 2
+	} else {
+		workerOpts.Provider = provider
+		workerOpts.Model = model
+		workerOpts.Effort = effort
+		receipt.Provider = provider
+		receipt.Model = model
+		receipt.Effort = effort
+	}
+
+	result, dispatchErr := deps.Dispatch(context.Background(), workerOpts)
+	result = applyTypedFallbackAfterDispatch(context.Background(), workerOpts.RepoPath, workerOpts, result, deps.Now, stderr)
+	receipt.WorkerDispatched = true
+	receipt.WorkerRunID = result.RunID
+	receipt.ProviderInvoked = result.ProviderInvoked
+	if dispatchErr != nil {
+		fmt.Fprintf(stderr, "delivery claim-dispatch: worker dispatch: %v\n", dispatchErr)
+		if strings.TrimSpace(result.NextAction) != "" {
+			receipt.NextAction = result.NextAction
+		} else {
+			receipt.NextAction = "inspect claimed attempt and recover ambiguous launch; do not claim another task automatically"
+		}
+		if common.Format == "json" {
+			_ = json.NewEncoder(stdout).Encode(receipt)
+		}
+		return 1
+	}
+	receipt.NextAction = "monitor worker run and continue delivery after terminal outcome"
+	return renderDeliveryOutput(stdout, stderr, common.Format, receipt, func(w io.Writer, r claimDispatchReceipt) error {
+		fmt.Fprintf(w, "delivery claim-dispatch: claimed and dispatched one task\n")
+		fmt.Fprintf(w, "project_id: %s\n", r.ProjectID)
+		fmt.Fprintf(w, "delivery_run_id: %s\n", r.DeliveryRunID)
+		fmt.Fprintf(w, "task_id: %s\n", r.TaskID)
+		fmt.Fprintf(w, "attempt_id: %s\n", r.AttemptID)
+		fmt.Fprintf(w, "issue: %d\n", r.IssueNumber)
+		fmt.Fprintf(w, "routing_decision_id: %s\n", r.RoutingDecisionID)
+		fmt.Fprintf(w, "provider: %s\n", r.Provider)
+		fmt.Fprintf(w, "worker_run_id: %s\n", r.WorkerRunID)
+		fmt.Fprintf(w, "next_action: %s\n", r.NextAction)
+		return nil
+	})
 }
 
 type deliveryFlags struct {

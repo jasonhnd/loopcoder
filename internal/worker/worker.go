@@ -21,6 +21,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/mcp"
 	"github.com/jasonhnd/loopcoder/internal/pathid"
 	"github.com/jasonhnd/loopcoder/internal/progress"
+	"github.com/jasonhnd/loopcoder/internal/provideroutcome"
 	"github.com/jasonhnd/loopcoder/internal/providerreconcile"
 	"github.com/jasonhnd/loopcoder/internal/recovery"
 	"github.com/jasonhnd/loopcoder/internal/reporter"
@@ -53,10 +54,17 @@ type Options struct {
 	Provider        string
 	Model           string
 	Effort          string
-	Timeout         time.Duration
-	ConfigFromBase  bool
-	KeepWorktree    bool
-	Stderr          io.Writer
+	// RoutingDecisionID is the persisted route decision that authorized this
+	// worker launch. Empty only when a test or legacy caller injects an
+	// already-selected provider without going through route decide.
+	RoutingDecisionID string
+	// RoutePinned is true when the launch provider came from an explicit
+	// --provider pin. Pinned launches never auto-fallback.
+	RoutePinned    bool
+	Timeout        time.Duration
+	ConfigFromBase bool
+	KeepWorktree   bool
+	Stderr         io.Writer
 	// BeforeProviderCall runs after provider-free adoption/reconciliation and
 	// immediately before the provider runner. Callers use it to durably reserve
 	// a budget slot; returning an error prevents the provider launch.
@@ -64,25 +72,38 @@ type Options struct {
 }
 
 type Result struct {
-	OK              bool                       `json:"ok"`
-	ProviderInvoked bool                       `json:"provider_invoked,omitempty"`
-	Issue           int                        `json:"issue"`
-	Branch          string                     `json:"branch"`
-	RunID           string                     `json:"run_id"`
-	PR              string                     `json:"pr"`
-	Summary         string                     `json:"summary"`
-	AttemptPath     string                     `json:"attempt_path"`
-	Status          string                     `json:"status"`
-	Outcome         string                     `json:"outcome,omitempty"`
-	ProviderOutcome string                     `json:"provider_outcome,omitempty"`
-	DeliveryOutcome string                     `json:"delivery_outcome,omitempty"`
-	Evidence        []string                   `json:"evidence,omitempty"`
-	ExitCode        int                        `json:"exit_code"`
-	LogBytes        int64                      `json:"log_bytes"`
-	Reason          string                     `json:"reason,omitempty"`
-	NextAction      string                     `json:"next_action,omitempty"`
-	Reconciliation  *providerreconcile.Receipt `json:"provider_reconciliation,omitempty"`
-	Report          *reporter.Report           `json:"report,omitempty"`
+	OK              bool   `json:"ok"`
+	ProviderInvoked bool   `json:"provider_invoked,omitempty"`
+	Issue           int    `json:"issue"`
+	Branch          string `json:"branch"`
+	RunID           string `json:"run_id"`
+	PR              string `json:"pr"`
+	Summary         string `json:"summary"`
+	AttemptPath     string `json:"attempt_path"`
+	Status          string `json:"status"`
+	Outcome         string `json:"outcome,omitempty"`
+	ProviderOutcome string `json:"provider_outcome,omitempty"`
+	// FailureClass is the structured provideroutcome class for failed attempts.
+	FailureClass string `json:"failure_class,omitempty"`
+	// FallbackTrigger is the routing fallback trigger derived from FailureClass.
+	FallbackTrigger string `json:"fallback_trigger,omitempty"`
+	// AutoFallbackAllowed is false for needs-human classes (ambiguous, auth, etc).
+	AutoFallbackAllowed bool `json:"auto_fallback_allowed,omitempty"`
+	// FallbackApplied is true when a bounded successor route was decided.
+	FallbackApplied bool `json:"fallback_applied,omitempty"`
+	// FallbackNeedsHuman is true when typed fallback refused auto succession.
+	FallbackNeedsHuman bool   `json:"fallback_needs_human,omitempty"`
+	FallbackDecisionID string `json:"fallback_decision_id,omitempty"`
+	// FallbackCandidateID is the successor routing candidate when selected.
+	FallbackCandidateID string `json:"fallback_candidate_id,omitempty"`
+	DeliveryOutcome     string `json:"delivery_outcome,omitempty"`
+	Evidence            []string                   `json:"evidence,omitempty"`
+	ExitCode            int                        `json:"exit_code"`
+	LogBytes            int64                      `json:"log_bytes"`
+	Reason              string                     `json:"reason,omitempty"`
+	NextAction          string                     `json:"next_action,omitempty"`
+	Reconciliation      *providerreconcile.Receipt `json:"provider_reconciliation,omitempty"`
+	Report              *reporter.Report           `json:"report,omitempty"`
 }
 
 type Outcome string
@@ -246,14 +267,19 @@ func Dispatch(ctx context.Context, opts Options, deps Deps) (result Result, err 
 	agentResult, agentErr := runAgent(ctx, dispatch, invocation)
 	if agentResult.Hung {
 		result, err = handleHungOrPartialWork(ctx, dispatch, agentResult)
+		result = attachTypedFailure(dispatch, result, agentResult, err)
 		return result, err
 	}
 	if agentErr != nil {
-		return providerFailureResult(dispatch, agentResult, fmt.Sprintf("%s exec failed: %v", dispatch.opts.Provider, agentErr)), fmt.Errorf("%s exec failed: %w", dispatch.opts.Provider, agentErr)
+		result = providerFailureResult(dispatch, agentResult, fmt.Sprintf("%s exec failed: %v", dispatch.opts.Provider, agentErr))
+		result = attachTypedFailure(dispatch, result, agentResult, agentErr)
+		return result, fmt.Errorf("%s exec failed: %w", dispatch.opts.Provider, agentErr)
 	}
 	if agentResult.ExitCode != 0 {
 		err := fmt.Errorf("%s exec failed (exit %d). See %s", dispatch.opts.Provider, agentResult.ExitCode, dispatch.logPath)
-		return providerFailureResult(dispatch, agentResult, err.Error()), err
+		result = providerFailureResult(dispatch, agentResult, err.Error())
+		result = attachTypedFailure(dispatch, result, agentResult, err)
+		return result, err
 	}
 	return commitAndOpenPR(ctx, dispatch, agentResult)
 }
@@ -272,7 +298,7 @@ func prepareDispatch(ctx context.Context, opts Options, deps Deps) (*dispatchCon
 		return nil, errors.New("issue title is required")
 	}
 	if strings.TrimSpace(opts.Provider) == "" {
-		opts.Provider = "codex"
+		return nil, errors.New("provider is required; unpinned worker dispatch must resolve a persisted route decision before launch")
 	}
 	agentRunner, lookupErr := deps.AgentLookup(opts.Provider)
 	if lookupErr != nil {
@@ -1007,6 +1033,57 @@ func providerFailureResult(dispatch *dispatchContext, agentResult agent.Result, 
 		Reason:          "outcome=provider_failed evidence=" + reason,
 		NextAction:      "inspect the provider log and retry provider execution if appropriate",
 	}
+}
+
+// attachTypedFailure classifies the provider attempt into a stable class and
+// fallback trigger without error-string matching. Production wiring of
+// routing.ApplyTypedProviderFailure lives in the CLI layer to avoid an import
+// cycle (worker → routing → orchestration → worker).
+func attachTypedFailure(dispatch *dispatchContext, result Result, agentResult agent.Result, runErr error) Result {
+	class := provideroutcome.Classify(agentResult, runErr)
+	result.FailureClass = string(class)
+	result.FallbackTrigger = string(provideroutcome.FallbackTrigger(class))
+	result.AutoFallbackAllowed = provideroutcome.AllowsAutomaticFallback(class)
+	decisionID := ""
+	pinned := false
+	if dispatch != nil {
+		decisionID = strings.TrimSpace(dispatch.opts.RoutingDecisionID)
+		pinned = dispatch.opts.RoutePinned
+	}
+	evidence := []string{
+		"failure_class=" + string(class),
+		"fallback_trigger=" + result.FallbackTrigger,
+		fmt.Sprintf("auto_fallback_allowed=%t", result.AutoFallbackAllowed),
+		fmt.Sprintf("route_pinned=%t", pinned),
+	}
+	if decisionID != "" {
+		evidence = append(evidence, "routing_decision_id="+decisionID)
+	}
+	if provideroutcome.NeedsHuman(class) {
+		result.Outcome = string(OutcomeNeedsHuman)
+		result.FallbackNeedsHuman = true
+		result.NextAction = "needs-human: typed provider outcome forbids automatic fallback; inspect evidence and decide"
+		result.Evidence = compactEvidence(append(result.Evidence, evidence...))
+		return result
+	}
+	result.Evidence = compactEvidence(append(result.Evidence, evidence...))
+	if !result.AutoFallbackAllowed {
+		result.NextAction = "typed failure recorded; automatic fallback is not allowed for this class"
+		return result
+	}
+	if decisionID == "" {
+		result.NextAction = "typed failure recorded; no routing decision present so automatic fallback is unavailable"
+		return result
+	}
+	if pinned {
+		result.FallbackNeedsHuman = true
+		result.Outcome = string(OutcomeNeedsHuman)
+		result.NextAction = "needs-human: explicit pin forbids automatic fallback without owner authorization"
+		return result
+	}
+	// CLI applies routing.ApplyTypedProviderFailure after Dispatch returns.
+	result.NextAction = "apply bounded fallback for trigger " + result.FallbackTrigger + " against routing decision " + decisionID
+	return result
 }
 
 func reconcileBeforeProviderLaunch(ctx context.Context, dispatch *dispatchContext) providerreconcile.Receipt {

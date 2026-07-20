@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -57,6 +58,29 @@ func BuildCodexArgs(inv Invocation) []string {
 	}
 	if inv.ReadOnly {
 		args = append(args, "-s", "read-only")
+		if inv.DisableDelegation {
+			args = append(args,
+				"--ephemeral",
+				"--ignore-user-config",
+				"--ignore-rules",
+				"--disable", "multi_agent",
+			)
+		}
+	} else if inv.BoundedWrite {
+		args = append(args,
+			"-s", "workspace-write",
+			"--ephemeral",
+			"--ignore-user-config",
+			"--ignore-rules",
+			"--disable", "multi_agent",
+			"-c", "sandbox_workspace_write.network_access=false",
+			"-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+			"-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+			"-c", `shell_environment_policy.inherit="core"`,
+			"-c", "shell_environment_policy.ignore_default_excludes=false",
+			"-c", "allow_login_shell=false",
+		)
+		args = append(args, codexShellEnvironmentArgs(inv.Environment)...)
 	} else {
 		args = append(args, "--dangerously-bypass-approvals-and-sandbox")
 	}
@@ -81,12 +105,49 @@ func BuildCodexArgs(inv Invocation) []string {
 	return args
 }
 
+func codexShellEnvironmentArgs(environment map[string]string) []string {
+	keys := make([]string, 0, len(environment))
+	for key := range environment {
+		if validShellEnvironmentKey(key) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	args := make([]string, 0, len(keys)*2)
+	for _, key := range keys {
+		args = append(args, "-c", "shell_environment_policy.set."+key+"="+strconv.Quote(environment[key]))
+	}
+	return args
+}
+
+func validShellEnvironmentKey(key string) bool {
+	if key == "" {
+		return false
+	}
+	for index, char := range key {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || char == '_' || (index > 0 && char >= '0' && char <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 func (ExecCodexRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	if strings.TrimSpace(inv.LogPath) == "" {
 		return Result{ExitCode: -1}, errors.New("codex log path is required")
 	}
+	if inv.ReadOnly && inv.BoundedWrite {
+		return Result{ExitCode: -1}, errors.New("codex invocation cannot be both read-only and bounded-write")
+	}
+	if err := validateNestedDelegationBoundary(inv); err != nil {
+		return Result{ExitCode: -1}, err
+	}
 	if _, err := mcpServersForInvocation(inv); err != nil {
 		return Result{ExitCode: -1}, fmt.Errorf("codex MCP configuration: %w", err)
+	}
+	if inv.BoundedWrite && len(mcpServersForArgs(inv)) > 0 {
+		return Result{ExitCode: -1}, errors.New("codex bounded-write invocation cannot enable MCP servers")
 	}
 	if strings.TrimSpace(inv.OutputSchema) != "" {
 		if err := writeSensitiveFile(codexSchemaPath(inv.LogPath), []byte(inv.OutputSchema)); err != nil {
@@ -114,6 +175,7 @@ func (ExecCodexRunner) Run(ctx context.Context, inv Invocation) (Result, error) 
 	defer logFile.Close()
 
 	cmd := exec.CommandContext(ctx, "codex", BuildCodexArgs(inv)...)
+	cmd.Env = environmentWithOverrides(os.Environ(), inv.Environment)
 	cmd.Stdin = prompt
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -205,7 +267,7 @@ func mcpServersForArgs(inv Invocation) []MCPServer {
 
 func mcpServersForInvocation(inv Invocation) ([]MCPServer, error) {
 	return config.MCPServersForInvocation(config.MCP{Servers: inv.MCPServers}, config.MCPInvocationOptions{
-		Role:                     inv.Role,
+		Role:                     mcpInvocationRole(inv.Role),
 		ReadOnly:                 inv.ReadOnly,
 		InvocationRoleError:      "invalid invocation role",
 		InvocationRoleErrorValue: inv.Role,

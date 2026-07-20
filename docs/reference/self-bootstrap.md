@@ -32,19 +32,24 @@ unsupported.
 Run from a LoopCoder source checkout on Darwin arm64:
 
 ```text
-pwsh scripts/self-bootstrap-smoke.ps1 -Version 0.8.0
+bash scripts/self-bootstrap-smoke.sh --version 0.8.1
 ```
 
 For release evidence, pass the binary extracted from the staged candidate:
 
 ```text
-pwsh scripts/self-bootstrap-smoke.ps1 \
-  -Version 0.8.0 \
-  -Binary <staged-candidate>/loopcoder \
-  -KeepArtifacts
+bash scripts/self-bootstrap-smoke.sh \
+  --version 0.8.1 \
+  --binary <staged-candidate>/loopcoder \
+  --keep-artifacts
 ```
 
-The script may build a local development binary only when `-Binary` is absent.
+Implementation lives in `internal/releasesmoke` (Go). The shell driver only sets
+environment and runs `go test`. Schema assertions bind to
+`storage.CurrentSchemaVersion` — never a hard-coded current generation.
+PowerShell drivers are removed (spec 1058).
+
+The script may build a local development binary only when `--binary` is absent.
 It records the selected binary path, SHA-256, and `loopcoder version` output so
 a release run can prove that self-bootstrap consumed the same candidate later
 eligible for publication.
@@ -62,19 +67,66 @@ The smoke proves all of the following:
 - registered run payloads are written below
   `$LOOPCODER_HOME/projects/<project_id>/`, not the repository;
 - `migrate storage` planning is read-only and reports the current source and
-  target schema without creating a backup for a fresh schema-30 database;
+  target schema (`source == target == CurrentSchemaVersion`, status `current`)
+  without creating a backup for a fresh already-current database;
 - a deterministic three-child graph executes with dependency-aware fan-out and
   fan-in, durable parent/child identity, and no remote provider call;
+- a forbidden read-only mutation returns the typed policy outcome and remains
+  preserved for diagnosis instead of being reset or deleted;
+- an allowed write runs in exactly one detached machine-local worktree, leaves
+  the parent file hash unchanged, emits a passed bounded mutation manifest, and
+  is cleaned up explicitly by the smoke harness after evidence is recorded;
 - `status` and `report` both produce representative human output and valid JSON
   for the same run tree;
 - progress, report, and doctor artifacts are retained only under the temporary
-  evidence directory when `-KeepArtifacts` is used;
+  evidence directory when `--keep-artifacts` is used;
 - doctor reports database, registry, nested-run, provider compatibility, and
   host-profile evidence honestly, while optional missing provider login or
   GitHub readiness remains visible rather than fabricated as success;
 - no new runtime payload appears under the registered repository's
   `.loopcoder/runs`, `.loopcoder/logs`, `.loopcoder/recovery`, or
   `.loopcoder/relay` paths.
+
+## v0.8.1 Nested Permission Matrix
+
+The v0.8.1 release smoke extends this acceptance path with
+`scripts/nested-permission-matrix-smoke.sh`. The macOS release job downloads the
+single signed candidate artifact produced by the build job, verifies
+`SHA256SUMS`, extracts it once, and passes that exact binary directly to the
+matrix. The matrix does not rebuild or substitute the candidate.
+
+The blocking matrix uses a fresh temporary repository and `LOOPCODER_HOME`, the
+deterministic `test-subprocess` provider, and no network or provider
+credentials. It runs seven cases and one replay per case: successful read-only,
+read-only mutation, in-scope bounded write, out-of-scope write, orchestrate
+refusal, unbridged provider-native refusal, and unknown-permission refusal. It
+asserts provider launch counts, child lifecycle and claim evidence, parent
+aggregation, progress receipts, audit reason codes, parent/worktree isolation,
+replay behavior, and the absence of repository-local runtime payload.
+
+The resource ceiling is fixed at 14 invocations, one concurrent child, depth
+two, a 20-second timeout per invocation, and five minutes for the complete
+matrix. A failure writes only
+`loopcoder.nested_permission_matrix_diagnostic.v1`: the failed case, a stable
+failure code, and completed sanitized summaries. The release workflow retains
+that failure bundle for seven days and caps it at 64 KiB. Successful sanitized
+matrix evidence is retained as a private GitHub Actions artifact for 90 days;
+it is not added to the three public release assets. Neither artifact contains
+raw provider output, prompts, credentials, or machine paths.
+
+Real-provider canaries are separate, non-blocking, and operator-initiated. They
+are never run on pull-request events and require the explicit protected gate:
+
+```text
+LOOPCODER_REAL_PROVIDER_SMOKE=1 bash scripts/nested-permission-real-provider-smoke.sh \
+  --binary <packaged-binary> --provider codex --permission read-only
+```
+
+Read-only canaries are exposed only for the registered Codex, Claude, and Grok
+executors. Bounded-write canaries are exposed only for Codex and Grok. They use
+the operator's existing provider installation and authentication; no forked PR
+receives secrets, and neither Grok nor any other real provider is a blocking
+release canary in this matrix.
 
 ## v0.7.0 Upgrade And Rollback Smoke
 

@@ -44,6 +44,9 @@ const (
 	NestedEventChildFinished = "nested.child.finished"
 	NestedEventParentDone    = "nested.parent.finished"
 
+	NestedOutcomeReadOnlyPolicyViolation   = "read_only_policy_violation"
+	NestedOutcomeWriteScopePolicyViolation = "write_scope_policy_violation"
+
 	ReplayActionNew     = "new"
 	ReplayActionReused  = "reused"
 	ReplayActionResumed = "resumed"
@@ -59,7 +62,7 @@ var (
 	nestedClaimRenewEvery    = nestedClaimLeaseDuration / 3
 )
 
-type ChildRunExecutor func(ctx context.Context, child ChildRunPlan) (ChildRunResult, error)
+type ChildRunExecutor func(ctx context.Context, request ChildExecutionRequest) (ChildRunResult, error)
 type RecordNestedEventFunc func(repoPath, runID string, event state.Event) error
 type TaskBoundaryRouteReevaluationFunc func(context.Context, TaskBoundaryRouteReevaluationEvent) error
 
@@ -93,6 +96,14 @@ type NestedScheduleOptions struct {
 	// AllowUnbudgetedLocalTest is reserved for the CLI's deterministic
 	// test-subprocess provider. Real provider routes must leave it false.
 	AllowUnbudgetedLocalTest bool
+	// NativeBridge is the only authority that can enable provider-native child
+	// execution. No production bridge is registered in v0.8.1.
+	NativeBridge ProviderNativeBridge
+
+	// ResolveChildRoute, when set, selects a provider/model for each unpinned
+	// child from the immutable execution contract before plan persistence and
+	// claim/launch. Replay reuses the durable decision via the resolver.
+	ResolveChildRoute ChildRouteResolver
 
 	Execute                       ChildRunExecutor
 	RecordEvent                   RecordNestedEventFunc
@@ -121,50 +132,65 @@ type ChildRunPlan struct {
 }
 
 type NestedScheduleReport struct {
-	Version          int              `json:"version"`
-	RepoPath         string           `json:"repo_path"`
-	BaseBranch       string           `json:"base_branch"`
-	ParentRunID      string           `json:"parent_run_id"`
-	Status           string           `json:"status"`
-	StartedAt        string           `json:"started_at"`
-	FinishedAt       string           `json:"finished_at"`
-	ConcurrencyLimit int              `json:"concurrency_limit"`
-	Children         []ChildRunResult `json:"children"`
-	Summary          NestedSummary    `json:"summary"`
+	Version            int                       `json:"version"`
+	RepoPath           string                    `json:"repo_path"`
+	BaseBranch         string                    `json:"base_branch"`
+	ParentRunID        string                    `json:"parent_run_id"`
+	Status             string                    `json:"status"`
+	Outcome            string                    `json:"outcome,omitempty"`
+	StartedAt          string                    `json:"started_at"`
+	FinishedAt         string                    `json:"finished_at"`
+	ConcurrencyLimit   int                       `json:"concurrency_limit"`
+	Children           []ChildRunResult          `json:"children"`
+	Summary            NestedSummary             `json:"summary"`
+	ExecutorCapability *NestedExecutorCapability `json:"executor_capability,omitempty"`
+	Refusals           []NestedPermissionRefusal `json:"refusals,omitempty"`
 }
 
 type ChildRunResult struct {
-	ID                  string           `json:"id"`
-	ChildKey            string           `json:"child_key,omitempty"`
-	Title               string           `json:"title,omitempty"`
-	Role                string           `json:"role,omitempty"`
-	RunID               string           `json:"run_id"`
-	Issue               int              `json:"issue,omitempty"`
-	Scope               ChildScope       `json:"scope"`
-	Permission          string           `json:"permission"`
-	DependsOn           []string         `json:"depends_on,omitempty"`
-	Aggregation         ChildAggregation `json:"aggregation"`
-	Required            bool             `json:"required,omitempty"`
-	Optional            bool             `json:"optional,omitempty"`
-	Ordinal             int              `json:"ordinal"`
-	Depth               int              `json:"depth"`
-	Status              string           `json:"status"`
-	ReplayAction        string           `json:"replay_action,omitempty"`
-	ClaimOutcome        string           `json:"claim_outcome,omitempty"`
-	ClaimOwner          string           `json:"claim_owner,omitempty"`
-	ClaimGeneration     int64            `json:"claim_generation,omitempty"`
-	LeaseExpiresAt      string           `json:"lease_expires_at,omitempty"`
-	ClaimPhase          string           `json:"claim_phase,omitempty"`
-	ProviderKey         string           `json:"provider_idempotency_key,omitempty"`
-	ProviderReceipt     string           `json:"provider_receipt,omitempty"`
-	StartedAt           string           `json:"started_at,omitempty"`
-	FinishedAt          string           `json:"finished_at,omitempty"`
-	Error               string           `json:"error,omitempty"`
-	Reason              string           `json:"reason,omitempty"`
-	NextAction          string           `json:"next_action,omitempty"`
-	AttemptPath         string           `json:"attempt_path,omitempty"`
-	RecoveryContextPath string           `json:"recovery_context_path,omitempty"`
-	Report              *reporter.Report `json:"report,omitempty"`
+	ID                  string                          `json:"id"`
+	ChildKey            string                          `json:"child_key,omitempty"`
+	Title               string                          `json:"title,omitempty"`
+	Role                string                          `json:"role,omitempty"`
+	RunID               string                          `json:"run_id"`
+	Issue               int                             `json:"issue,omitempty"`
+	Scope               ChildScope                      `json:"scope"`
+	Permission          string                          `json:"permission"`
+	DependsOn           []string                        `json:"depends_on,omitempty"`
+	Aggregation         ChildAggregation                `json:"aggregation"`
+	Required            bool                            `json:"required,omitempty"`
+	Optional            bool                            `json:"optional,omitempty"`
+	Ordinal             int                             `json:"ordinal"`
+	Depth               int                             `json:"depth"`
+	Status              string                          `json:"status"`
+	Outcome             string                          `json:"outcome,omitempty"`
+	ReplayAction        string                          `json:"replay_action,omitempty"`
+	ClaimOutcome        string                          `json:"claim_outcome,omitempty"`
+	ClaimOwner          string                          `json:"claim_owner,omitempty"`
+	ClaimGeneration     int64                           `json:"claim_generation,omitempty"`
+	LeaseExpiresAt      string                          `json:"lease_expires_at,omitempty"`
+	ClaimPhase          string                          `json:"claim_phase,omitempty"`
+	ProviderKey         string                          `json:"provider_idempotency_key,omitempty"`
+	ProviderReceipt     string                          `json:"provider_receipt,omitempty"`
+	ContractSchema      string                          `json:"execution_contract_schema,omitempty"`
+	ContractFingerprint string                          `json:"execution_contract_fingerprint,omitempty"`
+	StartedAt           string                          `json:"started_at,omitempty"`
+	FinishedAt          string                          `json:"finished_at,omitempty"`
+	Error               string                          `json:"error,omitempty"`
+	Reason              string                          `json:"reason,omitempty"`
+	NextAction          string                          `json:"next_action,omitempty"`
+	AttemptPath         string                          `json:"attempt_path,omitempty"`
+	RecoveryContextPath string                          `json:"recovery_context_path,omitempty"`
+	Report              *reporter.Report                `json:"report,omitempty"`
+	ReadOnlyEnforcement *state.ReadOnlyEnforcementAudit `json:"read_only_enforcement,omitempty"`
+	MutationManifest    *state.MutationManifestAudit    `json:"mutation_manifest,omitempty"`
+	WorktreePath        string                          `json:"worktree_path,omitempty"`
+	RoutingDecisionID   string                          `json:"routing_decision_id,omitempty"`
+	RouteAdapterID      string                          `json:"route_adapter_id,omitempty"`
+	RouteModel          string                          `json:"route_model,omitempty"`
+	RouteOutcome        string                          `json:"route_outcome,omitempty"`
+	RouteReason         string                          `json:"route_reason,omitempty"`
+	RouteReplayed       bool                            `json:"route_replayed,omitempty"`
 }
 
 type NestedSummary struct {
@@ -278,17 +304,117 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		return NestedScheduleReport{}, err
 	}
 	plan.Items = children
-	if err := persistAcceptedChildPlan(ctx, opts, *plan, started); err != nil {
+	delegationCapability := NestedExecutorCapability{
+		ExecutorID:             "nested-scheduler",
+		RegistrationID:         "builtin:nested-scheduler:v1",
+		EnforceablePermissions: []string{string(reporter.PermissionReadOnly), string(reporter.PermissionWrite)},
+		NativeBridge:           opts.NativeBridge,
+	}
+	if _, provider, ok := nestedNativeBridgeIdentity(opts.NativeBridge); ok {
+		delegationCapability.Provider = provider
+	}
+	if err := CheckNestedDelegationCapabilities(plan, delegationCapability); err != nil {
+		var permissionErr *PermissionNotEnforceableError
+		if errors.As(err, &permissionErr) {
+			return NestedPermissionRefusalReport(opts.RepoPath, opts.BaseBranch, *plan, delegationCapability, permissionErr, started), nil
+		}
 		return NestedScheduleReport{}, err
+	}
+	executionRequests := make([]ChildExecutionRequest, len(children))
+	routeDecisions := make([]ChildRouteDecision, len(children))
+	routeBlocked := make([]string, len(children))
+	for i, child := range children {
+		executionRequests[i], err = BuildChildExecutionRequest(opts.RepoPath, *plan, child)
+		if err != nil {
+			return NestedScheduleReport{}, err
+		}
+		if opts.ResolveChildRoute == nil {
+			continue
+		}
+		// Parent cancellation must not start new child routing.
+		if err := ctx.Err(); err != nil {
+			routeBlocked[i] = fmt.Sprintf("parent cancelled before child route: %v", err)
+			continue
+		}
+		// Explicit pins and prior authority on the contract still go through the
+		// resolver so permission and capability checks stay uniform.
+		decision, routeErr := opts.ResolveChildRoute(ctx, executionRequests[i])
+		if routeErr != nil {
+			if decision.RoutingDecisionID != "" || decision.ZeroProviderLaunches {
+				routeDecisions[i] = decision
+				routeBlocked[i] = routeErr.Error()
+				if decision.AdapterID != "" {
+					// Keep the refused decision on the contract for audit when a
+					// durable decision id exists but launch is blocked.
+					if applied, applyErr := ApplyChildRouteDecision(executionRequests[i], decision); applyErr == nil {
+						executionRequests[i] = applied
+					}
+				}
+				continue
+			}
+			return NestedScheduleReport{}, fmt.Errorf("child %q route: %w", child.ChildKey, routeErr)
+		}
+		if decision.ZeroProviderLaunches || strings.TrimSpace(decision.AdapterID) == "" {
+			routeDecisions[i] = decision
+			if strings.TrimSpace(decision.Outcome) == "" {
+				decision.Outcome = "no_route"
+			}
+			routeBlocked[i] = firstNonEmptyChild(decision.ChosenReason, "no eligible nested child route")
+			continue
+		}
+		applied, applyErr := ApplyChildRouteDecision(executionRequests[i], decision)
+		if applyErr != nil {
+			return NestedScheduleReport{}, fmt.Errorf("child %q apply route: %w", child.ChildKey, applyErr)
+		}
+		executionRequests[i] = applied
+		routeDecisions[i] = decision
+		// Carry route budget authority onto the child plan metadata used by
+		// claim/launch reservation (separate from the immutable execution contract).
+		children[i].Metadata = mergeNestedRouteBudgetAuthority(children[i].Metadata, decision, applied)
+	}
+	if err := persistAcceptedChildPlan(ctx, opts, *plan, executionRequests, started); err != nil {
+		return NestedScheduleReport{}, err
+	}
+	executionAuditRequests := make([]ChildExecutionRequest, len(executionRequests))
+	for i := range executionRequests {
+		executionAuditRequests[i] = cloneChildExecutionRequest(executionRequests[i])
+		if opts.Store == nil {
+			continue
+		}
+		persisted, ok, err := storage.LoadChildExecutionRequest(ctx, opts.Store, executionRequests[i].RunID)
+		if err != nil {
+			return NestedScheduleReport{}, err
+		}
+		if ok && persisted.LegacyAmbiguous {
+			executionAuditRequests[i].SchemaVersion = persisted.SchemaVersion
+			executionAuditRequests[i].ContractFingerprint = persisted.ContractFingerprint
+		}
 	}
 	results := make([]ChildRunResult, len(children))
 	dispatchJobs := make([]int, 0, len(children))
 	plannedAttempts := 0
 	for i, child := range children {
-		result := childResultFromPlan(child)
+		result := childResultFromExecutionRequest(child, executionAuditRequests[i])
+		result = applyChildRouteToResult(result, executionAuditRequests[i], routeDecisions[i])
 		if result.ReplayAction == "" {
 			result.ReplayAction = ReplayActionNew
 			children[i].ReplayAction = ReplayActionNew
+		}
+		if blocked := strings.TrimSpace(routeBlocked[i]); blocked != "" {
+			result.Status = NestedStatusNeedsHuman
+			result.Error = blocked
+			result.Reason = blocked
+			result.NextAction = "inspect the nested child route decision before replaying"
+			result.FinishedAt = state.FormatTimestamp(started)
+			if err := storage.TransitionChildRunStatus(ctx, opts.Store, opts.ParentRunID, child.RunID, result.Status, result.FinishedAt, "nested child route gate"); err != nil {
+				return NestedScheduleReport{}, err
+			}
+			if err := recordNestedEvent(opts, opts.ParentRunID, child, result, NestedEventChildFinished, started); err != nil {
+				return NestedScheduleReport{}, err
+			}
+			emitNestedChildProgress(ctx, opts, child, result, NestedEventChildFinished, started, true)
+			results[i] = withNestedDecision(result)
+			continue
 		}
 		if replayed, ok := replay[child.ChildKey]; ok {
 			durableStatus := strings.TrimSpace(replayed.Status)
@@ -421,7 +547,8 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 	}
 	runChild := func(index int) {
 		child := children[index]
-		result := childResultFromPlan(child)
+		executionRequest := executionRequests[index]
+		result := childResultFromExecutionRequest(child, executionRequest)
 		result.Status = NestedStatusRunning
 		claimAt := runtimeClock().UTC()
 		executorID := nestedExecutorID(opts.ParentRunID)
@@ -524,6 +651,38 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			return
 		}
 		phaseAt := clock().UTC()
+		boundRecord, bindErr := storage.BindChildExecutionRequestClaim(ctx, opts.Store, child.RunID, claim.ExecutorID, claim.ClaimGeneration, executionRequest.ContractFingerprint, storage.ClaimPhaseClaimed, state.FormatTimestamp(phaseAt))
+		if bindErr != nil {
+			result.Status = NestedStatusNeedsHuman
+			result.Error = bindErr.Error()
+			result.NextAction = "inspect the durable child execution contract before replaying"
+			result.FinishedAt = state.FormatTimestamp(clock().UTC())
+			if persistErr := storage.RejectClaimedChildExecutionRequest(ctx, opts.Store, opts.ParentRunID, child.RunID, claim.ExecutorID, claim.ClaimGeneration, result.FinishedAt, "child execution contract gate"); persistErr != nil {
+				setCompleteErr(persistErr)
+				markSuppressParentDone()
+				return
+			}
+			results[index] = withNestedDecision(result)
+			return
+		}
+		if opts.Store != nil {
+			executionRequest, err = childExecutionRequestFromRecord(boundRecord)
+		} else {
+			executionRequest, err = bindChildExecutionRequest(executionRequest, claim.ClaimGeneration, storage.ClaimPhaseClaimed)
+		}
+		if err != nil {
+			result.Status = NestedStatusNeedsHuman
+			result.Error = err.Error()
+			result.NextAction = "repair the durable child execution contract before replaying"
+			result.FinishedAt = state.FormatTimestamp(clock().UTC())
+			if persistErr := storage.RejectClaimedChildExecutionRequest(ctx, opts.Store, opts.ParentRunID, child.RunID, claim.ExecutorID, claim.ClaimGeneration, result.FinishedAt, "child execution contract decode gate"); persistErr != nil {
+				setCompleteErr(persistErr)
+				markSuppressParentDone()
+				return
+			}
+			results[index] = withNestedDecision(result)
+			return
+		}
 		if nativeAgent {
 			nativeRegistration, err = storage.ValidateNativeChildLaunch(ctx, opts.Store, child.RunID, claim.ExecutorID, claim.ClaimGeneration)
 			if err != nil {
@@ -564,6 +723,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			return
 		}
 		result.ClaimPhase = storage.ClaimPhaseExecuting
+		executionRequest.LifecycleStatus = NestedStatusRunning
 		if nativeAgent {
 			if nativeRegistration, err = storage.TransitionAgentRegistration(ctx, opts.Store, nativeRegistration.ChildAgentID, storage.AgentActionHeartbeat, claim.ExecutorID, claim.ClaimGeneration, state.FormatTimestamp(phaseAt)); err != nil {
 				result.Status = NestedStatusNeedsHuman
@@ -590,15 +750,49 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		emitNestedChildProgress(ctx, opts, child, result, NestedEventChildRunning, parseOrClock(result.StartedAt, clock), false)
 
 		stopHeartbeat := startNestedClaimHeartbeat(opts.Store, child.RunID, claim.ExecutorID, claim.ClaimGeneration, runtimeClock)
-		executed, err := opts.Execute(ctx, child)
+		executor := opts.Execute
+		if nativeAgent {
+			executor = opts.NativeBridge.Execute
+		}
+		executed, err := executor(ctx, cloneChildExecutionRequest(executionRequest))
 		heartbeatErr := stopHeartbeat()
+		if contractErr := validateChildExecutionResult(executionRequest, executed); contractErr != nil {
+			executed = ChildRunResult{
+				Status:     NestedStatusNeedsHuman,
+				Error:      contractErr.Error(),
+				Reason:     contractErr.Error(),
+				NextAction: "inspect the executor boundary before replaying this child",
+			}
+			err = nil
+		}
 		if err == nil && strings.TrimSpace(executed.Status) == "" {
 			executed.Status = NestedStatusFailed
 		}
 		result = mergeChildResult(result, executed)
 		if err != nil {
-			result.Status = normalizeNestedStatus(state.FailureStatus(err))
-			result.Error = err.Error()
+			var policyViolation interface{ ChildExecutionPolicyViolation() }
+			if errors.As(err, &policyViolation) {
+				outcome := NestedOutcomeReadOnlyPolicyViolation
+				var outcomeError interface{ ChildExecutionPolicyOutcome() string }
+				if errors.As(err, &outcomeError) {
+					if candidate := strings.TrimSpace(outcomeError.ChildExecutionPolicyOutcome()); candidate != "" {
+						outcome = candidate
+					}
+				}
+				result.Status = NestedStatusNeedsHuman
+				result.Outcome = outcome
+				result.Error = err.Error()
+				if outcome == NestedOutcomeWriteScopePolicyViolation {
+					result.Reason = "the bounded-write child changed or could not conclusively verify an authorized state surface"
+					result.NextAction = "inspect the preserved bounded-write enforcement evidence before any replay"
+				} else {
+					result.Reason = "the read-only child changed or could not conclusively verify a guarded state surface"
+					result.NextAction = "inspect the preserved read-only enforcement evidence before any replay"
+				}
+			} else {
+				result.Status = normalizeNestedStatus(state.FailureStatus(err))
+				result.Error = err.Error()
+			}
 		}
 		result.Status = normalizeNestedStatus(result.Status)
 		if result.FinishedAt == "" {
@@ -618,6 +812,19 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			markSuppressParentDone()
 		}
 		if storage.IsStaleChildRunClaim(completeClaimErr) {
+			// A stale owner may retain private evidence for diagnosis, but it must
+			// never publish a mutation manifest, provider receipt, or attempt as if
+			// its generation had completed the durable child run.
+			result.MutationManifest = nil
+			result.ReadOnlyEnforcement = nil
+			result.WorktreePath = ""
+			result.ProviderReceipt = ""
+			result.AttemptPath = ""
+			result.RecoveryContextPath = ""
+			result.Report = nil
+			result.Outcome = ""
+			result.Reason = ""
+			result.FinishedAt = ""
 			result.Status = NestedStatusNeedsHuman
 			result.Error = completeClaimErr.Error()
 			result.NextAction = "observe the current durable child owner before publishing terminal state"
@@ -648,7 +855,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 		for index := range pending {
 			if blocked, ok := blockedByNestedDependency(children[index], children, results); ok {
 				delete(pending, index)
-				result := childResultFromPlan(children[index])
+				result := childResultFromExecutionRequest(children[index], executionAuditRequests[index])
 				result.Status = NestedStatusBlocked
 				result.Error = blocked
 				finishedAt := clock().UTC()
@@ -676,7 +883,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			if emittedWaiting[index] || intSliceContains(ready, index) {
 				continue
 			}
-			waiting := childResultFromPlan(children[index])
+			waiting := childResultFromExecutionRequest(children[index], executionAuditRequests[index])
 			waiting.Status = NestedStatusWaiting
 			emitNestedChildProgress(ctx, opts, children[index], waiting, "nested.child.waiting", clock().UTC(), false)
 			emittedWaiting[index] = true
@@ -687,7 +894,7 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 			delete(pending, index)
 			select {
 			case <-ctx.Done():
-				result := childResultFromPlan(children[index])
+				result := childResultFromExecutionRequest(children[index], executionAuditRequests[index])
 				result.Status = normalizeNestedStatus(state.FailureStatus(ctx.Err()))
 				if result.Status == "" {
 					result.Status = NestedStatusCancelled
@@ -758,6 +965,13 @@ func ScheduleNestedRuns(ctx context.Context, opts NestedScheduleOptions) (Nested
 	}
 	report.Summary = nestedSummary(results)
 	report.Status = nestedParentStatus(results)
+	for _, child := range results {
+		if isNestedPolicyViolationOutcome(child.Outcome) {
+			report.Outcome = child.Outcome
+			report.Status = NestedStatusNeedsHuman
+			break
+		}
+	}
 	if !parentDoneSuppressed() {
 		parentCtx := ctx
 		var cancelParent context.CancelFunc
@@ -1120,9 +1334,12 @@ func firstJSONDiff(left, right any, path string) string {
 	return path
 }
 
-func persistAcceptedChildPlan(ctx context.Context, opts NestedScheduleOptions, plan ChildPlan, started time.Time) error {
+func persistAcceptedChildPlan(ctx context.Context, opts NestedScheduleOptions, plan ChildPlan, requests []ChildExecutionRequest, started time.Time) error {
 	if opts.Store == nil {
 		return nil
+	}
+	if len(requests) != len(plan.Items) {
+		return fmt.Errorf("persist accepted child plan: child/request count mismatch")
 	}
 	planJSON, err := json.Marshal(plan)
 	if err != nil {
@@ -1140,7 +1357,8 @@ func persistAcceptedChildPlan(ctx context.Context, opts NestedScheduleOptions, p
 	}
 	children := make([]storage.RunNode, 0, len(plan.Items))
 	edges := make([]storage.RunEdgeRecord, 0, len(plan.Items))
-	for _, item := range plan.Items {
+	requestRecords := make([]storage.ChildExecutionRequestRecord, 0, len(plan.Items))
+	for i, item := range plan.Items {
 		scopeJSON, err := json.Marshal(item.Scope)
 		if err != nil {
 			return fmt.Errorf("marshal child %q scope: %w", item.ChildKey, err)
@@ -1174,8 +1392,29 @@ func persistAcceptedChildPlan(ctx context.Context, opts NestedScheduleOptions, p
 			CreatedAt:       createdAt,
 			UpdatedAt:       createdAt,
 		})
+		requestJSON, err := json.Marshal(requests[i])
+		if err != nil {
+			return fmt.Errorf("marshal child %q execution request: %w", item.ChildKey, err)
+		}
+		requestRecords = append(requestRecords, storage.ChildExecutionRequestRecord{
+			ChildRunID:          requests[i].RunID,
+			ParentRunID:         requests[i].ParentRunID,
+			PlanID:              requests[i].PlanID,
+			ChildKey:            requests[i].ChildKey,
+			SchemaVersion:       requests[i].SchemaVersion,
+			RequestJSON:         string(requestJSON),
+			ContractFingerprint: requests[i].ContractFingerprint,
+			RepositoryIdentity:  requests[i].RepositoryIdentity,
+			CheckoutIdentity:    requests[i].CheckoutIdentity,
+			Permission:          requests[i].Permission,
+			ScopeJSON:           string(scopeJSON),
+			ClaimGeneration:     requests[i].ClaimGeneration,
+			LifecycleStatus:     requests[i].LifecycleStatus,
+			CreatedAt:           createdAt,
+			UpdatedAt:           createdAt,
+		})
 	}
-	return storage.PersistChildPlanGraph(ctx, opts.Store, parent, children, storage.ChildPlanRecord{
+	return storage.PersistChildPlanGraphWithExecutionRequests(ctx, opts.Store, parent, children, storage.ChildPlanRecord{
 		PlanID:         plan.PlanID,
 		ParentRunID:    plan.ParentRunID,
 		RootRunID:      plan.RootRunID,
@@ -1184,7 +1423,7 @@ func persistAcceptedChildPlan(ctx context.Context, opts NestedScheduleOptions, p
 		MaxConcurrency: plan.MaxConcurrency,
 		PlanJSON:       string(planJSON),
 		CreatedAt:      createdAt,
-	}, edges)
+	}, edges, requestRecords)
 }
 
 func readyNestedChildren(children []ChildRunPlan, results []ChildRunResult, pending map[int]bool) []int {
@@ -1267,6 +1506,16 @@ func childResultFromPlan(child ChildRunPlan) ChildRunResult {
 	}
 }
 
+func childResultFromExecutionRequest(child ChildRunPlan, request ChildExecutionRequest) ChildRunResult {
+	result := childResultFromPlan(child)
+	result.ContractSchema = request.SchemaVersion
+	result.ContractFingerprint = request.ContractFingerprint
+	result.RoutingDecisionID = strings.TrimSpace(request.ProviderDecision.RoutingDecisionID)
+	result.RouteAdapterID = firstNonEmptyChild(request.ProviderDecision.AdapterID, request.Work.Provider)
+	result.RouteModel = firstNonEmptyChild(request.Work.Model, request.ProviderDecision.ModelCapabilityID)
+	return result
+}
+
 func mergeChildResult(base, result ChildRunResult) ChildRunResult {
 	if strings.TrimSpace(result.ID) != "" {
 		base.ID = strings.TrimSpace(result.ID)
@@ -1311,6 +1560,9 @@ func mergeChildResult(base, result ChildRunResult) ChildRunResult {
 	if strings.TrimSpace(result.Status) != "" {
 		base.Status = strings.TrimSpace(result.Status)
 	}
+	if strings.TrimSpace(result.Outcome) != "" {
+		base.Outcome = strings.TrimSpace(result.Outcome)
+	}
 	if strings.TrimSpace(result.ReplayAction) != "" {
 		base.ReplayAction = strings.TrimSpace(result.ReplayAction)
 	}
@@ -1341,6 +1593,20 @@ func mergeChildResult(base, result ChildRunResult) ChildRunResult {
 	base.AttemptPath = strings.TrimSpace(result.AttemptPath)
 	base.RecoveryContextPath = strings.TrimSpace(result.RecoveryContextPath)
 	base.Report = result.Report
+	if result.ReadOnlyEnforcement != nil {
+		audit := *result.ReadOnlyEnforcement
+		audit.Violations = append([]state.ReadOnlyEnforcementViolation(nil), result.ReadOnlyEnforcement.Violations...)
+		base.ReadOnlyEnforcement = &audit
+	}
+	if result.MutationManifest != nil {
+		audit := *result.MutationManifest
+		audit.Changes = append([]state.MutationManifestChange(nil), result.MutationManifest.Changes...)
+		audit.Violations = append([]state.MutationManifestViolation(nil), result.MutationManifest.Violations...)
+		base.MutationManifest = &audit
+	}
+	if strings.TrimSpace(result.WorktreePath) != "" {
+		base.WorktreePath = strings.TrimSpace(result.WorktreePath)
+	}
 	if strings.TrimSpace(result.StartedAt) != "" {
 		base.StartedAt = strings.TrimSpace(result.StartedAt)
 	}
@@ -1348,6 +1614,15 @@ func mergeChildResult(base, result ChildRunResult) ChildRunResult {
 		base.FinishedAt = strings.TrimSpace(result.FinishedAt)
 	}
 	return base
+}
+
+func isNestedPolicyViolationOutcome(outcome string) bool {
+	switch strings.TrimSpace(outcome) {
+	case NestedOutcomeReadOnlyPolicyViolation, NestedOutcomeWriteScopePolicyViolation:
+		return true
+	default:
+		return false
+	}
 }
 
 func nestedExecutorID(parentRunID string) string {
@@ -1429,6 +1704,54 @@ func schedulerAuthorityFromChild(child ChildRunPlan) schedulerAuthorityMetadata 
 		authority.SubAgentID = strings.TrimSpace(child.RunID)
 	}
 	return authority
+}
+
+// mergeNestedRouteBudgetAuthority copies production route budget fields into
+// child plan metadata so claim/launch can reserve against a durable policy.
+func mergeNestedRouteBudgetAuthority(existing []byte, decision ChildRouteDecision, request ChildExecutionRequest) []byte {
+	authority := schedulerAuthorityMetadata{}
+	if len(existing) > 0 {
+		_ = json.Unmarshal(existing, &authority)
+	}
+	set := func(dst *string, value string) {
+		if v := strings.TrimSpace(value); v != "" {
+			*dst = v
+		}
+	}
+	set(&authority.ProjectID, decision.ProjectID)
+	set(&authority.DeliveryRunID, decision.DeliveryRunID)
+	set(&authority.TaskID, decision.TaskID)
+	set(&authority.AdapterID, decision.AdapterID)
+	set(&authority.ProviderInstallationID, decision.ProviderInstallationID)
+	set(&authority.AccountProfileID, decision.AccountProfileID)
+	set(&authority.ModelCapabilityID, decision.ModelCapabilityID)
+	set(&authority.RoutingDecisionID, decision.RoutingDecisionID)
+	set(&authority.RoutingFingerprint, decision.RoutingFingerprint)
+	set(&authority.PlanFingerprint, decision.PlanFingerprint)
+	set(&authority.PolicyFingerprint, decision.PolicyFingerprint)
+	set(&authority.AuthorizationFingerprint, decision.AuthorizationFingerprint)
+	if request.RunID != "" {
+		authority.SubAgentID = strings.TrimSpace(request.RunID)
+	}
+	if decision.BudgetRequestedValue > 0 {
+		authority.BudgetRequestedValue = decision.BudgetRequestedValue
+	} else if authority.BudgetRequestedValue <= 0 && strings.TrimSpace(decision.RoutingDecisionID) != "" {
+		authority.BudgetRequestedValue = 1
+	}
+	if strings.TrimSpace(authority.BudgetQuantityKind) == "" {
+		authority.BudgetQuantityKind = "local-policy"
+	}
+	if strings.TrimSpace(authority.BudgetUnit) == "" {
+		authority.BudgetUnit = "local-policy-unit"
+	}
+	if strings.TrimSpace(authority.BudgetWindowKind) == "" {
+		authority.BudgetWindowKind = "unbounded"
+	}
+	payload, err := json.Marshal(authority)
+	if err != nil {
+		return existing
+	}
+	return payload
 }
 
 func nestedSchedulerProviderRoute(child ChildRunPlan, authority schedulerAuthorityMetadata) string {

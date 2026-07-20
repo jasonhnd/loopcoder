@@ -413,7 +413,9 @@ func catalogEntryFromModel(adapterID string, model models.Model) CatalogInputEnt
 		CanonicalModelID:    model.Name,
 		DisplayName:         model.Name,
 		LifecycleState:      LifecycleAvailable,
-		AvailabilityState:   AvailabilityUnknown,
+		// Adapter-declared static registry models are product-available for routing.
+		// Account restriction and auth readiness remain separate gates.
+		AvailabilityState:   AvailabilityAvailable,
 		ReadOnly:            CapabilityUnknown,
 		JSONOutput:          CapabilityUnknown,
 		NestedSubagents:     CapabilityUnknown,

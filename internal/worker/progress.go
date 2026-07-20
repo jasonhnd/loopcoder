@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +42,20 @@ func newProgressRecorder(ctx context.Context, opts Options, deps Deps, roots run
 	if validateOwnership != nil {
 		progressStore = ownershipValidatedProgressStore{Store: store, validate: validateOwnership}
 	}
+	// Negotiate an active foreground sink for the current host profile.
+	// Human-readable progress uses warnings/stderr so strict machine JSON
+	// stdout stays clean. Durable outbox remains always-on via the store path.
+	preferJSONL := strings.EqualFold(strings.TrimSpace(os.Getenv("LOOPCODER_PROGRESS_JSONL")), "1") ||
+		strings.EqualFold(strings.TrimSpace(os.Getenv("LOOPCODER_PROGRESS_JSONL")), "true")
+	sink, negotiation, contract := progresshost.NegotiateActiveSink(progresshost.ActiveSinkOptions{
+		HumanWriter: warnings,
+		PreferJSONL: preferJSONL,
+		Getenv:      os.Getenv,
+		Now:         deps.Now,
+	})
+	if warnings != nil {
+		fmt.Fprintf(warnings, "[loopcoder] progress sink negotiated: %s host=%s (%s)\n", negotiation.Selected, contract.Profile, negotiation.Reason)
+	}
 	emitter, err := progress.NewEmitter(progress.EmitterOptions{
 		Store:              progressStore,
 		ProjectID:          roots.ProjectID,
@@ -49,6 +64,7 @@ func newProgressRecorder(ctx context.Context, opts Options, deps Deps, roots run
 		CorrelationID:      jobID,
 		MaxSilenceInterval: deps.ProgressMaxSilence,
 		Clock:              deps.ProgressClock,
+		Deliver:            progress.DeliveryFuncFromSink(sink),
 		DeliveryObligation: progresshost.CurrentObligationFactory(),
 	})
 	if err != nil {

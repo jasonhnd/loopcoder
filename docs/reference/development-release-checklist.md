@@ -206,6 +206,17 @@ When push, PR creation, or report publication fails:
 - [ ] Run install into a temporary location.
 - [ ] Run upgrade and already-latest behavior.
 - [ ] Run deterministic self-bootstrap with zero paid provider calls.
+- [ ] Run the seven-case packaged nested-permission matrix and all seven
+      terminal replays against the same installed candidate binary.
+- [ ] Confirm executed cases launch once, replays launch zero times, and
+      unsupported modes create no provider, lifecycle, claim, or progress
+      state.
+- [ ] Confirm read-only and write violations cannot aggregate to parent
+      success, and their stable audit/reason codes are present.
+- [ ] Confirm the matrix stays within 14 invocations, concurrency one, depth
+      two, 20 seconds per invocation, and five minutes overall.
+- [ ] Confirm any retained permission-matrix diagnostic is at most 64 KiB and
+      contains no raw output, prompt, credential, or machine path.
 - [ ] Confirm runtime state remains outside the registered repository.
 - [ ] Confirm human and JSON output describe the same run identities and
       outcomes.

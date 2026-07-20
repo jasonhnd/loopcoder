@@ -2,6 +2,10 @@
 
 This reference records release-documentation rules that apply to every loopcoder version bump.
 
+For the current production-closure candidate, follow the concrete operator
+checklist in [`v0.8.1-release-runbook.md`](v0.8.1-release-runbook.md) (gate,
+canaries, Apple trust, tag, publish).
+
 ## Required Release Documentation
 
 Every version bump must rewrite all three release-facing surfaces:
@@ -50,11 +54,16 @@ evidence remain available without presenting the release as final.
 
 The v0.8 native smoke job runs on the supported `darwin/arm64` host:
 
-```powershell
-pwsh scripts/release-smoke.ps1 -Version 0.8.0 -PreviousVersion 0.7.0
+```bash
+bash scripts/release-smoke.sh --version 0.8.1 --previous 0.7.0
 ```
 
-The smoke script targets the staged draft release. It downloads the current
+Implementation lives in `internal/releasesmoke` (Go); the shell driver is a thin
+wrapper. PowerShell release smoke is removed (spec 1058). Schema upgrade
+assertions use `storage.CurrentSchemaVersion` as the target (legacy source 9
+remains the only intentional hard-coded schema anchor).
+
+The smoke targets the staged draft release. It downloads the current
 platform archive through `gh release download`, verifies `SHA256SUMS` with
 cosign, checks the archive checksum, runs
 `loopcoder version`, confirms the source checkout has no tracked `.loopcoder/`
@@ -63,12 +72,12 @@ registry / `doctor --format json` / `migrate local-state --dry-run` /
 `report --format json` path, invokes the self-bootstrap acceptance smoke for
 nested run-tree observability, confirms the selected binary recognizes itself
 as already latest, and verifies upgrade from the previous release when
-`-PreviousVersion` is set. For a v0.7.0 predecessor it also creates a real
+`--previous` is set. For a v0.7.0 predecessor it also creates a real
 schema-9 database with that published binary, proves `migrate storage` planning
-is read-only, applies schema 9 through 30, checks idempotent replay and the
-verified owner-only backup, then proves the restored backup opens with v0.7.0.
-It is verification-only and must not create tags, publish releases, or upload
-assets.
+is read-only, applies schema 9 through `CurrentSchemaVersion`, checks
+idempotent replay and the verified owner-only backup, then proves the restored
+backup opens with v0.7.0. It is verification-only and must not create tags,
+publish releases, or upload assets.
 
 Provider live smoke, including Grok, is not part of required CI or default
 release smoke. It is an explicit operator diagnostic only, must be enabled by
@@ -191,8 +200,8 @@ Before tagging v0.8.0, run the self-bootstrap acceptance path in
 [`self-bootstrap.md`](self-bootstrap.md). At minimum, the release record must
 include:
 
-- the scripted smoke result from `pwsh scripts/self-bootstrap-smoke.ps1
-  -Version 0.8.0 -Binary <staged-binary>`;
+- the scripted smoke result from
+  `bash scripts/self-bootstrap-smoke.sh --version <ver> --binary <staged-binary>`;
 - the staged candidate binary path, SHA-256, version stamp, and proof that the
   same archive is later eligible for publication;
 - native `darwin/arm64` host evidence;
@@ -206,9 +215,10 @@ include:
 - zero paid provider calls and no private credential dependency;
 - issue-to-PR-to-candidate-SHA evidence for the v0.8.0 implementation issues;
 - the normal consumer artifact smoke,
-  `pwsh scripts/release-smoke.ps1 -Version 0.8.0 -PreviousVersion 0.7.0`;
-- schema-9 planning, owner-only backup, atomic schema-30 application,
-  idempotent replay, and a copied backup opened by v0.7.0;
+  `bash scripts/release-smoke.sh --version <ver> --previous 0.7.0`;
+- schema-9 planning, owner-only backup, atomic application to
+  `CurrentSchemaVersion`, idempotent replay, and a copied backup opened by
+  v0.7.0;
 - the completed go/no-go report from
   [`v0.8.0-go-no-go.md`](v0.8.0-go-no-go.md), attached to the release
   readiness issue.
@@ -216,6 +226,33 @@ include:
 This acceptance path is verification-only. It must not force production
 auto-merge, fake success without PR evidence, or depend on paid provider
 services that are not available to the operator.
+
+## v0.8.1 Packaged Nested Permission Matrix
+
+The v0.8.1 release record must include the packaged nested-permission matrix
+result for all seven permission outcomes and their replays, including
+zero-launch refusal evidence, progress receipts, deterministic audit/reason
+codes, parent/worktree isolation, and a matching candidate SHA-256.
+
+The packaged permission matrix is bounded to seven cases, fourteen invocations,
+one concurrent child, depth two, 20 seconds per invocation, and five minutes
+overall. Its blocking provider is always `test-subprocess` with zero paid calls
+and no network. On failure, the release workflow uploads the sanitized
+`loopcoder.nested_permission_matrix_diagnostic.v1` bundle for seven days, with
+a 64 KiB size ceiling; raw outputs, prompts, credentials, and machine paths are
+excluded.
+
+The successful sanitized evidence JSON is retained as a private GitHub Actions
+artifact for 90 days. It is release evidence, not a public release asset, so
+the published release remains limited to the macOS arm64 archive, checksums,
+and Sigstore bundle.
+
+Protected real-provider canaries are opt-in only through
+`scripts/nested-permission-real-provider-smoke.sh` and
+`LOOPCODER_REAL_PROVIDER_SMOKE=1`. The script refuses pull-request events and
+supports only registered contracts: Codex, Claude, and Grok for read-only;
+Codex and Grok for bounded write. These canaries are non-blocking and never
+receive fork PR secrets.
 
 Historical changelog entries, release notes, go/no-go records, and accepted
 specs are release history. Do not terminology-sweep old release evidence merely

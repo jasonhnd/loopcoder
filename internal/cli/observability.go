@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
@@ -173,7 +174,85 @@ func nestedJSONPayload(report orchestration.NestedScheduleReport) any {
 
 func nestedObservability(report orchestration.NestedScheduleReport) observability.Document {
 	items := make([]observability.RenderItem, 0, len(report.Children))
+	evidence := make([]observability.Evidence, 0)
 	for _, child := range report.Children {
+		if audit := child.ReadOnlyEnforcement; audit != nil {
+			severity := "info"
+			if audit.Verification != "passed" {
+				severity = "error"
+			}
+			evidence = append(evidence, observability.Evidence{
+				Type: "read-only-enforcement", Code: audit.Verification, Severity: severity,
+				Section: "nested", Kind: audit.Mode,
+				Message: fmt.Sprintf("baseline=%s post_run=%s recovered=%t", audit.BaselineFingerprint, audit.PostRunFingerprint, audit.Recovered),
+				SourceRefs: []observability.SourceRef{{
+					Table: "read_only_enforcement", RecordID: child.RunID,
+					DeliveryRunID: child.RunID, Provenance: "durable-read-only-audit",
+				}},
+			})
+			for _, violation := range audit.Violations {
+				evidence = append(evidence, observability.Evidence{
+					Type: "read-only-policy-violation", Code: violation.Code, Severity: "error",
+					Section: "nested", Kind: violation.Surface,
+					Message: fmt.Sprintf("target=%s before=%s after=%s", violation.TargetID, violation.BeforeHash, violation.AfterHash),
+					SourceRefs: []observability.SourceRef{{
+						Table: "read_only_enforcement", RecordID: violation.TargetID,
+						DeliveryRunID: child.RunID, Field: violation.Surface, Provenance: "durable-read-only-audit",
+					}},
+				})
+			}
+		}
+		if manifest := child.MutationManifest; manifest != nil {
+			severity := "info"
+			if manifest.Verification != "passed" {
+				severity = "error"
+			}
+			evidence = append(evidence, observability.Evidence{
+				Type: "bounded-write-manifest", Code: manifest.Verification, Severity: severity,
+				Section: "nested", Kind: manifest.Mode,
+				Message: fmt.Sprintf("base=%s manifest=%s changes=%d violations=%d recovered=%t", manifest.BaseRevision, manifest.ManifestFingerprint, len(manifest.Changes), len(manifest.Violations), manifest.Recovered),
+				SourceRefs: []observability.SourceRef{{
+					Table: "mutation_manifest", RecordID: child.RunID,
+					DeliveryRunID: child.RunID, Provenance: "durable-bounded-write-audit",
+				}},
+			})
+			for _, violation := range manifest.Violations {
+				evidence = append(evidence, observability.Evidence{
+					Type: "bounded-write-policy-violation", Code: violation.Code, Severity: "error",
+					Section: "nested", Kind: violation.Surface,
+					Message: fmt.Sprintf("target=%s before=%s after=%s", violation.TargetID, violation.BeforeHash, violation.AfterHash),
+					SourceRefs: []observability.SourceRef{{
+						Table: "mutation_manifest", RecordID: violation.TargetID,
+						DeliveryRunID: child.RunID, Field: violation.Surface, Provenance: "durable-bounded-write-audit",
+					}},
+				})
+			}
+		}
+		if report.Outcome == orchestration.NestedOutcomePermissionNotEnforceable {
+			provider := ""
+			if report.ExecutorCapability != nil {
+				provider = report.ExecutorCapability.Provider
+			}
+			items = append(items, observability.RenderItem{
+				ID:         firstNonEmptyNested(child.ChildKey, child.ID, "nested-permission-refusal"),
+				Kind:       "nested-permission-preflight",
+				Status:     child.Status,
+				Provider:   provider,
+				Permission: child.Permission,
+				Reason:     child.Reason,
+				NextAction: child.NextAction,
+				Confidence: "exact",
+				Freshness:  "preflight",
+				SourceRefs: []observability.SourceRef{{
+					Table:         "nested_plan_input",
+					RecordID:      firstNonEmptyNested(child.ID, child.ChildKey, "nested-permission-refusal"),
+					DeliveryRunID: report.ParentRunID,
+					Field:         "permission",
+					Provenance:    "ephemeral_preflight",
+				}},
+			})
+			continue
+		}
 		if child.Report != nil {
 			items = append(items, observability.ItemFromReport(child.RunID, "nested-child", child.Status, child.Reason, child.NextAction, *child.Report, []observability.SourceRef{{
 				Table:         "run_edges",
@@ -202,7 +281,7 @@ func nestedObservability(report orchestration.NestedScheduleReport) observabilit
 	return observability.NewDocument("nested", observability.Correlation{
 		DeliveryRunID: report.ParentRunID,
 		Source:        "nested",
-	}, items, nil)
+	}, items, evidence)
 }
 
 func recoveryObservability(opts recovery.Options, result recovery.Result) observability.Document {

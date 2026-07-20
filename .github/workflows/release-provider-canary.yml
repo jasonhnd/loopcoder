@@ -1,0 +1,407 @@
+# Protected release provider canaries (#1020 blocking Codex/Claude,
+# #1021 non-blocking Grok/Antigravity).
+#
+# Never runs secret-bearing work on pull_request events or fork contexts.
+# Fixture jobs always run on workflow_dispatch for harness verification.
+# Live jobs require the release-canary environment + LOOPCODER_REAL_PROVIDER_CANARY
+# and authenticated provider CLIs on the trusted runner.
+# Non-blocking live jobs never hold the workflow summary.
+name: Release provider canaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: fixture (deterministic) or live (paid, protected)
+        required: true
+        default: fixture
+        type: choice
+        options:
+          - fixture
+          - live
+      include_non_blocking:
+        description: Also run non-blocking Grok/Antigravity canaries (live mode)
+        required: false
+        default: true
+        type: boolean
+      candidate_sha:
+        description: Source SHA for evidence records (optional)
+        required: false
+        type: string
+      artifact_name:
+        description: Workflow artifact name containing the darwin/arm64 archive (live only)
+        required: false
+        default: release-darwin-arm64
+        type: string
+      expected_digest:
+        description: Expected SHA-256 of the loopcoder binary inside the archive (live only)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-provider-canary-${{ github.ref }}-${{ inputs.mode }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  guard:
+    name: trust guard
+    runs-on: macos-15
+    steps:
+      - name: Refuse forks and pull_request contexts
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPO_FORK: ${{ github.event.repository.fork }}
+        run: |
+          set -euo pipefail
+          case "${EVENT_NAME}" in
+            pull_request|pull_request_target)
+              echo "release provider canaries never run on pull_request events" >&2
+              exit 78
+              ;;
+          esac
+          if [[ "${REPO_FORK}" == "true" ]]; then
+            echo "release provider canaries refuse forked repositories" >&2
+            exit 78
+          fi
+          if [[ "${GITHUB_REPOSITORY}" != "jasonhnd/loopcoder" ]]; then
+            echo "release provider canaries only run on jasonhnd/loopcoder" >&2
+            exit 78
+          fi
+
+  fixture-matrix:
+    name: fixture matrix (${{ matrix.provider }}/${{ matrix.scenario }})
+    needs: guard
+    if: ${{ inputs.mode == 'fixture' }}
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Blocking providers (hard-fail on typed failures).
+          - { provider: codex, scenario: success, expect: 0 }
+          - { provider: codex, scenario: auth_failure, expect: 1 }
+          - { provider: codex, scenario: timeout, expect: 1 }
+          - { provider: codex, scenario: cancel, expect: 1 }
+          - { provider: claude, scenario: success, expect: 0 }
+          - { provider: claude, scenario: quota_failure, expect: 1 }
+          - { provider: claude, scenario: malformed_output, expect: 1 }
+          - { provider: claude, scenario: missing_cli, expect: 1 }
+          # Non-blocking providers (soft not_available / soft-fail exit 0).
+          - { provider: grok, scenario: success, expect: 0 }
+          - { provider: grok, scenario: missing_cli, expect: 0 }
+          - { provider: grok, scenario: model_unavailable, expect: 0 }
+          - { provider: grok, scenario: auth_failure, expect: 0 }
+          - { provider: antigravity, scenario: success, expect: 0 }
+          - { provider: antigravity, scenario: not_available, expect: 0 }
+          - { provider: antigravity, scenario: auth_failure, expect: 0 }
+          - { provider: antigravity, scenario: missing_cli, expect: 0 }
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Run fixture canary
+        id: canary
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/canary-evidence"
+          set +e
+          bash scripts/release-provider-canary.sh \
+            --mode fixture \
+            --provider "${{ matrix.provider }}" \
+            --scenario "${{ matrix.scenario }}" \
+            --artifact-dir "${RUNNER_TEMP}/canary-evidence" \
+            --candidate-sha "${{ inputs.candidate_sha || github.sha }}"
+          status=$?
+          set -e
+          echo "exit_code=${status}" >>"$GITHUB_OUTPUT"
+          test "${status}" -eq "${{ matrix.expect }}"
+
+      - name: Upload sanitized evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: canary-fixture-${{ matrix.provider }}-${{ matrix.scenario }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/canary-evidence/release-provider-canary-*.json
+          if-no-files-found: error
+          retention-days: 30
+
+  fixture-selftest:
+    name: fixture harness self-test
+    needs: guard
+    if: ${{ inputs.mode == 'fixture' }}
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Run release-provider-canary_test.sh
+        run: bash scripts/release-provider-canary_test.sh
+
+  # Build the candidate once for this workflow run so both provider jobs share
+  # identical bytes. When a prior release artifact is supplied, prefer that.
+  live-candidate:
+    name: prepare live candidate
+    needs: guard
+    if: ${{ inputs.mode == 'live' }}
+    runs-on: macos-15
+    environment: release-canary
+    outputs:
+      binary_sha256: ${{ steps.digest.outputs.binary_sha256 }}
+    env:
+      GO_VERSION: '1.26.5'
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ inputs.candidate_sha || github.sha }}
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+          cache: true
+
+      - name: Build darwin/arm64 candidate package
+        id: digest
+        run: |
+          set -euo pipefail
+          test "$(go env GOOS)" = "darwin"
+          test "$(go env GOARCH)" = "arm64"
+          version="canary"
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          commit="${{ inputs.candidate_sha || github.sha }}"
+          mkdir -p "${RUNNER_TEMP}/package"
+          CGO_ENABLED=0 go build \
+            -trimpath \
+            -ldflags "-s -w -X main.version=${version} -X main.commit=${commit} -X main.date=${build_date}" \
+            -o "${RUNNER_TEMP}/package/loopcoder" \
+            ./cmd/loopcoder
+          test -x "${RUNNER_TEMP}/package/loopcoder"
+          digest="$(shasum -a 256 "${RUNNER_TEMP}/package/loopcoder" | awk '{print $1}')"
+          echo "binary_sha256=${digest}" >>"$GITHUB_OUTPUT"
+          if [[ -n "${{ inputs.expected_digest }}" && "${digest}" != "${{ inputs.expected_digest }}" ]]; then
+            echo "candidate digest ${digest} != expected ${{ inputs.expected_digest }}" >&2
+            exit 1
+          fi
+          tar -C "${RUNNER_TEMP}/package" -czf "${RUNNER_TEMP}/loopcoder_canary_darwin_arm64.tar.gz" loopcoder
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: canary-candidate-${{ github.run_id }}
+          path: ${{ runner.temp }}/loopcoder_canary_darwin_arm64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  live-codex:
+    name: live canary (codex)
+    needs: [guard, live-candidate]
+    if: ${{ inputs.mode == 'live' }}
+    runs-on: macos-15
+    environment: release-canary
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: canary-candidate-${{ github.run_id }}
+          path: ${{ runner.temp }}/candidate
+
+      - name: Run live codex canary
+        env:
+          LOOPCODER_REAL_PROVIDER_CANARY: "1"
+          CANDIDATE_SHA: ${{ inputs.candidate_sha || github.sha }}
+          EXPECTED_DIGEST: ${{ needs.live-candidate.outputs.binary_sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/extract" "${RUNNER_TEMP}/canary-evidence"
+          archive="${RUNNER_TEMP}/candidate/loopcoder_canary_darwin_arm64.tar.gz"
+          tar -xzf "${archive}" -C "${RUNNER_TEMP}/extract"
+          bash scripts/release-provider-canary.sh \
+            --mode live \
+            --provider codex \
+            --binary "${RUNNER_TEMP}/extract/loopcoder" \
+            --timeout-seconds 180 \
+            --max-calls 1 \
+            --artifact-dir "${RUNNER_TEMP}/canary-evidence" \
+            --candidate-sha "${CANDIDATE_SHA}" \
+            --expected-digest "${EXPECTED_DIGEST}"
+
+      - name: Upload sanitized codex evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: canary-live-codex-${{ github.run_id }}
+          path: ${{ runner.temp }}/canary-evidence/release-provider-canary-codex.json
+          if-no-files-found: error
+          retention-days: 90
+
+  live-claude:
+    name: live canary (claude)
+    needs: [guard, live-candidate]
+    if: ${{ inputs.mode == 'live' }}
+    runs-on: macos-15
+    environment: release-canary
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: canary-candidate-${{ github.run_id }}
+          path: ${{ runner.temp }}/candidate
+
+      - name: Run live claude canary
+        env:
+          LOOPCODER_REAL_PROVIDER_CANARY: "1"
+          CANDIDATE_SHA: ${{ inputs.candidate_sha || github.sha }}
+          EXPECTED_DIGEST: ${{ needs.live-candidate.outputs.binary_sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/extract" "${RUNNER_TEMP}/canary-evidence"
+          archive="${RUNNER_TEMP}/candidate/loopcoder_canary_darwin_arm64.tar.gz"
+          tar -xzf "${archive}" -C "${RUNNER_TEMP}/extract"
+          bash scripts/release-provider-canary.sh \
+            --mode live \
+            --provider claude \
+            --binary "${RUNNER_TEMP}/extract/loopcoder" \
+            --timeout-seconds 180 \
+            --max-calls 1 \
+            --artifact-dir "${RUNNER_TEMP}/canary-evidence" \
+            --candidate-sha "${CANDIDATE_SHA}" \
+            --expected-digest "${EXPECTED_DIGEST}"
+
+      - name: Upload sanitized claude evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: canary-live-claude-${{ github.run_id }}
+          path: ${{ runner.temp }}/canary-evidence/release-provider-canary-claude.json
+          if-no-files-found: error
+          retention-days: 90
+
+  # Non-blocking live canaries (#1021). Failures/not_available never fail summary.
+  live-grok:
+    name: live canary (grok, non-blocking)
+    needs: [guard, live-candidate]
+    if: ${{ inputs.mode == 'live' && inputs.include_non_blocking }}
+    runs-on: macos-15
+    environment: release-canary
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: canary-candidate-${{ github.run_id }}
+          path: ${{ runner.temp }}/candidate
+      - name: Run live grok canary
+        env:
+          LOOPCODER_REAL_PROVIDER_CANARY: "1"
+          CANDIDATE_SHA: ${{ inputs.candidate_sha || github.sha }}
+          EXPECTED_DIGEST: ${{ needs.live-candidate.outputs.binary_sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/extract" "${RUNNER_TEMP}/canary-evidence"
+          archive="${RUNNER_TEMP}/candidate/loopcoder_canary_darwin_arm64.tar.gz"
+          tar -xzf "${archive}" -C "${RUNNER_TEMP}/extract"
+          bash scripts/release-provider-canary.sh \
+            --mode live \
+            --provider grok \
+            --binary "${RUNNER_TEMP}/extract/loopcoder" \
+            --timeout-seconds 180 \
+            --max-calls 1 \
+            --artifact-dir "${RUNNER_TEMP}/canary-evidence" \
+            --candidate-sha "${CANDIDATE_SHA}" \
+            --expected-digest "${EXPECTED_DIGEST}"
+      - name: Upload sanitized grok evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: canary-live-grok-${{ github.run_id }}
+          path: ${{ runner.temp }}/canary-evidence/release-provider-canary-grok.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+  live-antigravity:
+    name: live canary (antigravity, non-blocking)
+    needs: [guard, live-candidate]
+    if: ${{ inputs.mode == 'live' && inputs.include_non_blocking }}
+    runs-on: macos-15
+    environment: release-canary
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: canary-candidate-${{ github.run_id }}
+          path: ${{ runner.temp }}/candidate
+      - name: Run live antigravity canary
+        env:
+          LOOPCODER_REAL_PROVIDER_CANARY: "1"
+          CANDIDATE_SHA: ${{ inputs.candidate_sha || github.sha }}
+          EXPECTED_DIGEST: ${{ needs.live-candidate.outputs.binary_sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/extract" "${RUNNER_TEMP}/canary-evidence"
+          archive="${RUNNER_TEMP}/candidate/loopcoder_canary_darwin_arm64.tar.gz"
+          tar -xzf "${archive}" -C "${RUNNER_TEMP}/extract"
+          bash scripts/release-provider-canary.sh \
+            --mode live \
+            --provider antigravity \
+            --binary "${RUNNER_TEMP}/extract/loopcoder" \
+            --timeout-seconds 180 \
+            --max-calls 1 \
+            --artifact-dir "${RUNNER_TEMP}/canary-evidence" \
+            --candidate-sha "${CANDIDATE_SHA}" \
+            --expected-digest "${EXPECTED_DIGEST}"
+      - name: Upload sanitized antigravity evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: canary-live-antigravity-${{ github.run_id }}
+          path: ${{ runner.temp }}/canary-evidence/release-provider-canary-antigravity.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+  summary:
+    name: canary summary
+    needs:
+      - guard
+      - fixture-matrix
+      - fixture-selftest
+      - live-candidate
+      - live-codex
+      - live-claude
+      - live-grok
+      - live-antigravity
+    if: always()
+    runs-on: macos-15
+    steps:
+      - name: Report job matrix
+        run: |
+          set -euo pipefail
+          printf 'mode=%s\n' "${{ inputs.mode }}"
+          printf 'guard=%s fixture_matrix=%s fixture_selftest=%s live_candidate=%s live_codex=%s live_claude=%s live_grok=%s live_antigravity=%s\n' \
+            "${{ needs.guard.result }}" \
+            "${{ needs.fixture-matrix.result }}" \
+            "${{ needs.fixture-selftest.result }}" \
+            "${{ needs.live-candidate.result }}" \
+            "${{ needs.live-codex.result }}" \
+            "${{ needs.live-claude.result }}" \
+            "${{ needs.live-grok.result }}" \
+            "${{ needs.live-antigravity.result }}"
+          if [[ "${{ inputs.mode }}" == "fixture" ]]; then
+            test "${{ needs.guard.result }}" = "success"
+            test "${{ needs.fixture-matrix.result }}" = "success"
+            test "${{ needs.fixture-selftest.result }}" = "success"
+          else
+            # Only blocking Codex/Claude can fail the release canary summary.
+            test "${{ needs.guard.result }}" = "success"
+            test "${{ needs.live-candidate.result }}" = "success"
+            test "${{ needs.live-codex.result }}" = "success"
+            test "${{ needs.live-claude.result }}" = "success"
+            printf 'non-blocking grok=%s antigravity=%s (informational only)\n' \
+              "${{ needs.live-grok.result }}" \
+              "${{ needs.live-antigravity.result }}"
+          fi

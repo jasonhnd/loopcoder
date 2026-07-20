@@ -2235,6 +2235,7 @@ func TestPrepareDispatchDefaultsAndResolvesDependencies(t *testing.T) {
 		RepoPath:    repo,
 		IssueNumber: 509,
 		IssueTitle:  "Split worker dispatch",
+		Provider:    "codex",
 	}, Deps{
 		AgentLookup: func(provider string) (agent.Runner, error) {
 			gotProvider = provider
@@ -2266,6 +2267,18 @@ func TestPrepareDispatchDefaultsAndResolvesDependencies(t *testing.T) {
 	}
 	if dispatch.warnings == nil {
 		t.Fatal("warnings writer was nil")
+	}
+}
+
+
+func TestPrepareDispatchRequiresProvider(t *testing.T) {
+	_, err := prepareDispatch(context.Background(), Options{
+		RepoPath:    t.TempDir(),
+		IssueNumber: 509,
+		IssueTitle:  "Split worker dispatch",
+	}, Deps{Now: fixedNow})
+	if err == nil || !strings.Contains(err.Error(), "provider is required") {
+		t.Fatalf("prepareDispatch error = %v, want provider is required", err)
 	}
 }
 

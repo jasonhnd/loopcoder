@@ -37,7 +37,7 @@ func TestOpenCreatesFreshDatabase(t *testing.T) {
 	if !health.Exists || !health.OK || health.SchemaVersion != CurrentSchemaVersion {
 		t.Fatalf("health = %#v, want existing healthy schema %d", health, CurrentSchemaVersion)
 	}
-	for _, table := range []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "run_claims", "usage_records", "usage_reconciliations", "budget_policies", "budget_reservations", "budget_aggregates", "quota_budget_events", "role_definitions", "routing_policy_profiles", "routing_policy_inputs", "routing_legacy_model_mappings", "routing_events", "fallback_decisions", "replan_decisions", "verification_decisions", "verification_decision_members", "handoff_transactions", "nested_scheduler_resource_reservations", "progress_delivery_obligations", "progress_delivery_attempts", "progress_delivery_attempt_results", "progress_delivery_acknowledgments", "progress_delivery_replay_cursors", "detached_run_supervisors", "provider_execution_authorities"} {
+	for _, table := range []string{"migrations", "projects", "runs", "run_events", "run_edges", "reports", "child_plans", "run_claims", "child_execution_requests", "usage_records", "usage_reconciliations", "budget_policies", "budget_reservations", "budget_aggregates", "quota_budget_events", "role_definitions", "routing_policy_profiles", "routing_policy_inputs", "routing_legacy_model_mappings", "routing_events", "fallback_decisions", "replan_decisions", "verification_decisions", "verification_decision_members", "handoff_transactions", "nested_scheduler_resource_reservations", "progress_delivery_obligations", "progress_delivery_attempts", "progress_delivery_attempt_results", "progress_delivery_acknowledgments", "progress_delivery_replay_cursors", "detached_run_supervisors", "provider_execution_authorities"} {
 		if !tableExists(t, store, table) {
 			t.Fatalf("missing table %s", table)
 		}
@@ -50,6 +50,14 @@ func TestOpenCreatesFreshDatabase(t *testing.T) {
 	}
 	if migrationName != "provider execution authority" {
 		t.Fatalf("migration 30 name = %q", migrationName)
+	}
+	if err := store.WithTx(ctx, func(tx Tx) error {
+		return tx.QueryRow(ctx, `SELECT name FROM migrations WHERE version = 31`).Scan(&migrationName)
+	}); err != nil {
+		t.Fatalf("query migration 31: %v", err)
+	}
+	if migrationName != "versioned child execution requests" {
+		t.Fatalf("migration 31 name = %q", migrationName)
 	}
 	for _, column := range []string{"next_attempt_at", "ack_policy", "required_ack"} {
 		if !tableColumnExists(t, store, "progress_delivery_obligations", column) {

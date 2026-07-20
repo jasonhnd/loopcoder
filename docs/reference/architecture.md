@@ -278,8 +278,10 @@ Progress generation, persistence, and delivery-outbox components can create
 durable five-minute receipts, but v0.8.0 has no exact-artifact proof that active
 work delivers them unsolicited to the initiating host. Restartable local
 state-machine implementations exist for CI, approval, quota-reset, outbox, and
-worker-terminal waiting; only the local GitHub CI waiter is connected as a
-supported product path. Recovery reconciles live provider authority before
+worker-terminal waiting. The local GitHub CI waiter is connected through
+orchestration, while approval, delivery-outbox, and detached-worker waits are
+reachable as shipped `loopcoder wait` product paths against durable local
+state (zero provider calls, restartable checkpoints). Recovery reconciles live provider authority before
 redispatch, adopts existing PRs and already-applied delivery effects
 idempotently, and fences concurrent recovery so useful provider work is not
 executed twice. Ambiguous external effects become `needs-human` rather than an
@@ -287,8 +289,16 @@ automatic takeover. Design rationale:
 [`../specs/0041-resilience.md`](../specs/0041-resilience.md).
 
 Nested child infrastructure adds a SQLite-backed ownership layer around child
-claims. The scheduler persists the accepted child plan and run graph, then a
-claim transaction atomically records `run_claims.executor_id`,
+claims. Before the accepted child plan is persisted, each unpinned child may
+resolve a permission-safe route from its immutable execution contract. The
+selected adapter/model/effort is written into `provider_decision` and `work`
+and becomes the only launch authority for that child. Different children in one
+plan may select different eligible providers when policy and nested permission
+enforcement allow it. Explicit child pins and a global `--provider` pin pass
+the same nested matrix. Orchestrate permission and unbridged provider-native
+delegation remain refused before claim. Parent cancellation blocks new child
+routing. The scheduler then persists the accepted child plan and run graph, and
+a claim transaction atomically records `run_claims.executor_id`,
 `claim_generation`, `claimed_at`, `lease_expires_at`, and `heartbeat_at` while
 moving the child run and parent edge to `running`. A scheduler that loses to an
 active claim reports the owner and lease as an observation and does not call the
@@ -298,11 +308,29 @@ allow controlled takeover by a new generation, but uncertain external side
 effects still route to receipts/idempotency checks or `needs-human`; loopcoder
 does not claim universal exactly-once side effects across crashes.
 
-These ownership mechanics do not make real-provider nested execution a
-supported v0.8.0 path. Production-provider write and orchestrate modes are
-refused. The accepted read-only mode reaches the ordinary Worker adapter
-without an enforceable mutation-free permission, so it is also unsafe for real
-providers. `test-subprocess` is deterministic test infrastructure only.
+The nested read-only execution boundary is separate from Worker dispatch.
+Codex, Claude, and Grok must negotiate their explicit read-only adapter mode;
+unsupported providers and hosts fail before launch. The executor persists a
+private repository/project-state baseline outside the checkout and verifies it
+after every provider outcome. Existing user dirt is part of the baseline, while
+changes to checkout content, the index, refs, config, hooks, linked worktrees,
+or guarded LoopCoder state produce a path-free typed policy violation and
+`needs-human`. Evidence is preserved and no automatic remediation occurs.
+
+The nested bounded-write boundary is also separate from Worker dispatch. Codex
+and Grok may edit only one detached, machine-local worktree for the fenced claim
+generation; Claude and unsupported providers fail before launch. The immutable
+contract must contain a non-empty canonical path scope and no branch, network,
+remote-side-effect, or delegation authority. A private authority record pins
+the first exact base commit. Pre-run and post-run snapshots compare the full
+child tree plus the parent checkout, sibling worktrees, Git refs/index/config/
+hooks/credentials, and guarded LoopCoder state. Only authorized file changes
+enter the bounded manifest. Policy violations force `needs-human`, successful
+manifests are reconciled before replay, and a stale generation is fenced from
+publishing its manifest or completion. The executor never stages, commits,
+pushes, merges, tags, publishes, or copies changes back. Orchestrate and
+provider-native modes remain refused. `test-subprocess` is deterministic test
+infrastructure only, but runs through the same permission-specific enforcement.
 
 ### Delivery Guardrails
 
@@ -367,10 +395,32 @@ against the deterministic floor whenever they apply. Operator, policy, schema,
 and adapter notes live in
 [`task-requirement-classification.md`](task-requirement-classification.md).
 
-The classifier and routing packages are internal implementation inventory in
-v0.8.0. Ordinary unpinned `dispatch` still defaults directly to Codex, and no
-shipped route-explain/route-decide service makes a persisted routing decision
-authoritative.
+For the frozen v0.8.0 release, the classifier and routing packages were internal
+implementation inventory: ordinary unpinned `dispatch` defaulted directly to
+Codex and no shipped route-explain/route-decide service made a persisted routing
+decision authoritative.
+
+The v0.8.1 candidate adds a narrow product boundary at `loopcoder route`.
+`route explain` opens an existing current-schema store read-only and builds a
+provider-neutral current decision from the referenced durable TaskRequirement,
+scoped cached inventory and model catalog, quota, availability, budget, active
+policy, runtime, and task-fit classes without creating, migrating, repairing,
+or writing the database. A prior first-decision authority is exposed separately
+and fingerprint-bound to the explanation rather than substituted for current
+state. `route decide` atomically persists the optional validated task- and
+decision-key-scoped pin, one immutable first decision, and a durable authority
+mapping; replay uses that first authority and rejects changed pin, task,
+profile/policy, delivery-run authorization, resolved class, or runtime-host
+identity. When
+candidate generation completes, both paths return explicit rejection reasons
+and a typed `no_route` rather than selecting Codex by default. Zero generated
+candidates return an actionable `needs-human` inventory diagnostic.
+They do not refresh telemetry or launch providers. On the v0.8.1 `pre-prod`
+candidate, ordinary unpinned Worker `dispatch` calls `route decide` before
+provider launch: the persisted decision is the only source of
+provider/model/effort, explicit `--provider` pins are durable route constraints,
+and `no_route` launches zero providers. The v0.8.0 empty-provider Codex default
+remains historical fact for the frozen public release.
 
 ### Self-Improvement
 

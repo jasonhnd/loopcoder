@@ -42,51 +42,111 @@ const (
 )
 
 type Attempt struct {
-	Version             int               `json:"version,omitempty"`
-	JobID               string            `json:"job_id"`
-	Issue               int               `json:"issue"`
-	Attempt             int               `json:"attempt"`
-	Provider            string            `json:"provider,omitempty"`
-	PID                 *int              `json:"pid,omitempty"`
-	Phase               string            `json:"phase,omitempty"`
-	Status              string            `json:"status,omitempty"`
-	Branch              string            `json:"branch,omitempty"`
-	RecoveryContextPath string            `json:"recovery_context_path,omitempty"`
-	StartedAt           string            `json:"started_at,omitempty"`
-	HeartbeatAt         string            `json:"heartbeat_at,omitempty"`
-	LastProgressAt      string            `json:"last_progress_at,omitempty"`
-	LogBytes            *int64            `json:"log_bytes,omitempty"`
-	ExitCode            *int              `json:"exit_code,omitempty"`
-	Error               string            `json:"error,omitempty"`
-	Usage               *reporter.Usage   `json:"usage,omitempty"`
-	Report              *reporter.Report  `json:"report,omitempty"`
-	CostUSD             *float64          `json:"cost_usd,omitempty"`
-	ArtifactDecision    *ArtifactDecision `json:"artifact_decision,omitempty"`
-	Path                string            `json:"path,omitempty"`
-	LastWriteUTC        time.Time         `json:"-"`
+	Version             int                       `json:"version,omitempty"`
+	JobID               string                    `json:"job_id"`
+	Issue               int                       `json:"issue"`
+	Attempt             int                       `json:"attempt"`
+	Provider            string                    `json:"provider,omitempty"`
+	PID                 *int                      `json:"pid,omitempty"`
+	Phase               string                    `json:"phase,omitempty"`
+	Status              string                    `json:"status,omitempty"`
+	Branch              string                    `json:"branch,omitempty"`
+	RecoveryContextPath string                    `json:"recovery_context_path,omitempty"`
+	StartedAt           string                    `json:"started_at,omitempty"`
+	HeartbeatAt         string                    `json:"heartbeat_at,omitempty"`
+	LastProgressAt      string                    `json:"last_progress_at,omitempty"`
+	LogBytes            *int64                    `json:"log_bytes,omitempty"`
+	ExitCode            *int                      `json:"exit_code,omitempty"`
+	Error               string                    `json:"error,omitempty"`
+	Summary             string                    `json:"summary,omitempty"`
+	Usage               *reporter.Usage           `json:"usage,omitempty"`
+	Report              *reporter.Report          `json:"report,omitempty"`
+	CostUSD             *float64                  `json:"cost_usd,omitempty"`
+	ArtifactDecision    *ArtifactDecision         `json:"artifact_decision,omitempty"`
+	ReadOnlyEnforcement *ReadOnlyEnforcementAudit `json:"read_only_enforcement,omitempty"`
+	MutationManifest    *MutationManifestAudit    `json:"mutation_manifest,omitempty"`
+	WorktreePath        string                    `json:"worktree_path,omitempty"`
+	Path                string                    `json:"path,omitempty"`
+	LastWriteUTC        time.Time                 `json:"-"`
 }
 
 type AttemptRecord struct {
-	Version             int               `json:"version"`
-	JobID               string            `json:"job_id"`
-	Issue               int               `json:"issue"`
-	Attempt             int               `json:"attempt"`
-	Provider            string            `json:"provider"`
-	PID                 int               `json:"pid"`
-	Phase               string            `json:"phase"`
-	Status              string            `json:"status"`
-	Branch              string            `json:"branch,omitempty"`
-	RecoveryContextPath string            `json:"recovery_context_path,omitempty"`
-	StartedAt           string            `json:"started_at"`
-	HeartbeatAt         string            `json:"heartbeat_at"`
-	LastProgressAt      string            `json:"last_progress_at"`
-	LogBytes            int64             `json:"log_bytes"`
-	ExitCode            *int              `json:"exit_code"`
-	Error               *string           `json:"error"`
-	Usage               *reporter.Usage   `json:"usage,omitempty"`
-	Report              *reporter.Report  `json:"report,omitempty"`
-	CostUSD             *float64          `json:"cost_usd,omitempty"`
-	ArtifactDecision    *ArtifactDecision `json:"artifact_decision,omitempty"`
+	Version             int                       `json:"version"`
+	JobID               string                    `json:"job_id"`
+	Issue               int                       `json:"issue"`
+	Attempt             int                       `json:"attempt"`
+	Provider            string                    `json:"provider"`
+	PID                 int                       `json:"pid"`
+	Phase               string                    `json:"phase"`
+	Status              string                    `json:"status"`
+	Branch              string                    `json:"branch,omitempty"`
+	RecoveryContextPath string                    `json:"recovery_context_path,omitempty"`
+	StartedAt           string                    `json:"started_at"`
+	HeartbeatAt         string                    `json:"heartbeat_at"`
+	LastProgressAt      string                    `json:"last_progress_at"`
+	LogBytes            int64                     `json:"log_bytes"`
+	ExitCode            *int                      `json:"exit_code"`
+	Error               *string                   `json:"error"`
+	Summary             string                    `json:"summary,omitempty"`
+	Usage               *reporter.Usage           `json:"usage,omitempty"`
+	Report              *reporter.Report          `json:"report,omitempty"`
+	CostUSD             *float64                  `json:"cost_usd,omitempty"`
+	ArtifactDecision    *ArtifactDecision         `json:"artifact_decision,omitempty"`
+	ReadOnlyEnforcement *ReadOnlyEnforcementAudit `json:"read_only_enforcement,omitempty"`
+	MutationManifest    *MutationManifestAudit    `json:"mutation_manifest,omitempty"`
+	WorktreePath        string                    `json:"worktree_path,omitempty"`
+}
+
+// ReadOnlyEnforcementAudit is the path-free, durable public evidence that a
+// read-only child left every guarded state surface unchanged. Raw local paths
+// remain confined to the private enforcement record outside the checkout.
+type ReadOnlyEnforcementAudit struct {
+	Mode                string                         `json:"mode"`
+	Verification        string                         `json:"verification"`
+	BaselineFingerprint string                         `json:"baseline_fingerprint"`
+	PostRunFingerprint  string                         `json:"post_run_fingerprint,omitempty"`
+	Recovered           bool                           `json:"recovered_after_interruption"`
+	Violations          []ReadOnlyEnforcementViolation `json:"violations"`
+}
+
+type ReadOnlyEnforcementViolation struct {
+	Code       string `json:"code"`
+	Surface    string `json:"surface"`
+	TargetID   string `json:"target_id"`
+	BeforeHash string `json:"before_hash"`
+	AfterHash  string `json:"after_hash"`
+}
+
+// MutationManifestAudit is the bounded, content-free public projection of one
+// isolated nested write worktree. Full tree and protected-state snapshots stay
+// in the private enforcement record; the preserved worktree path is carried as
+// a separate local diagnostic field.
+type MutationManifestAudit struct {
+	Mode                string                      `json:"mode"`
+	Verification        string                      `json:"verification"`
+	WorktreeID          string                      `json:"worktree_id"`
+	BaseRevision        string                      `json:"base_revision"`
+	BaselineFingerprint string                      `json:"baseline_fingerprint"`
+	PostRunFingerprint  string                      `json:"post_run_fingerprint,omitempty"`
+	ManifestFingerprint string                      `json:"manifest_fingerprint,omitempty"`
+	Recovered           bool                        `json:"recovered_after_interruption"`
+	Changes             []MutationManifestChange    `json:"changes"`
+	Violations          []MutationManifestViolation `json:"violations"`
+}
+
+type MutationManifestChange struct {
+	Path       string `json:"path"`
+	Kind       string `json:"kind"`
+	BeforeHash string `json:"before_hash"`
+	AfterHash  string `json:"after_hash"`
+}
+
+type MutationManifestViolation struct {
+	Code       string `json:"code"`
+	Surface    string `json:"surface"`
+	TargetID   string `json:"target_id"`
+	BeforeHash string `json:"before_hash"`
+	AfterHash  string `json:"after_hash"`
 }
 
 type ArtifactDecision struct {
@@ -538,27 +598,31 @@ func legacyRecoveryBriefPath(repoPath, runID, jobID string) string {
 }
 
 type attemptJSON struct {
-	Version             int               `json:"version"`
-	JobID               string            `json:"job_id"`
-	Issue               json.RawMessage   `json:"issue"`
-	Attempt             json.RawMessage   `json:"attempt"`
-	Provider            string            `json:"provider"`
-	PID                 json.RawMessage   `json:"pid"`
-	Phase               string            `json:"phase"`
-	Status              string            `json:"status"`
-	Branch              string            `json:"branch"`
-	RecoveryContextPath string            `json:"recovery_context_path"`
-	StartedAt           string            `json:"started_at"`
-	HeartbeatAt         string            `json:"heartbeat_at"`
-	LastProgressAt      string            `json:"last_progress_at"`
-	LogBytes            json.RawMessage   `json:"log_bytes"`
-	ExitCode            json.RawMessage   `json:"exit_code"`
-	Error               string            `json:"error"`
-	Usage               *reporter.Usage   `json:"usage"`
-	Report              *reporter.Report  `json:"report"`
-	LegacyReport        *reporter.Report  `json:"attestation"`
-	CostUSD             json.RawMessage   `json:"cost_usd"`
-	ArtifactDecision    *ArtifactDecision `json:"artifact_decision"`
+	Version             int                       `json:"version"`
+	JobID               string                    `json:"job_id"`
+	Issue               json.RawMessage           `json:"issue"`
+	Attempt             json.RawMessage           `json:"attempt"`
+	Provider            string                    `json:"provider"`
+	PID                 json.RawMessage           `json:"pid"`
+	Phase               string                    `json:"phase"`
+	Status              string                    `json:"status"`
+	Branch              string                    `json:"branch"`
+	RecoveryContextPath string                    `json:"recovery_context_path"`
+	StartedAt           string                    `json:"started_at"`
+	HeartbeatAt         string                    `json:"heartbeat_at"`
+	LastProgressAt      string                    `json:"last_progress_at"`
+	LogBytes            json.RawMessage           `json:"log_bytes"`
+	ExitCode            json.RawMessage           `json:"exit_code"`
+	Error               string                    `json:"error"`
+	Summary             string                    `json:"summary"`
+	Usage               *reporter.Usage           `json:"usage"`
+	Report              *reporter.Report          `json:"report"`
+	LegacyReport        *reporter.Report          `json:"attestation"`
+	CostUSD             json.RawMessage           `json:"cost_usd"`
+	ArtifactDecision    *ArtifactDecision         `json:"artifact_decision"`
+	ReadOnlyEnforcement *ReadOnlyEnforcementAudit `json:"read_only_enforcement"`
+	MutationManifest    *MutationManifestAudit    `json:"mutation_manifest"`
+	WorktreePath        string                    `json:"worktree_path"`
 }
 
 func readAttempt(path, fileName string) (Attempt, bool) {
@@ -583,7 +647,7 @@ func readAttempt(path, fileName string) (Attempt, bool) {
 	}
 
 	branch := strings.TrimSpace(raw.Branch)
-	if branch == "" {
+	if branch == "" && raw.Phase != "nested_read_only_verified" && raw.Phase != "nested_write_verified" {
 		if attemptNumber > 1 {
 			branch = fmt.Sprintf("loop/issue-%d-retry-%d", issue, attemptNumber)
 		} else {
@@ -623,13 +687,36 @@ func readAttempt(path, fileName string) (Attempt, bool) {
 		LogBytes:            rawInt64Ptr(raw.LogBytes),
 		ExitCode:            rawIntPtr(raw.ExitCode),
 		Error:               raw.Error,
+		Summary:             raw.Summary,
 		Usage:               cloneUsage(raw.Usage),
 		Report:              cloneReport(report),
 		CostUSD:             rawFloat64Ptr(raw.CostUSD),
 		ArtifactDecision:    cloneArtifactDecision(raw.ArtifactDecision),
+		ReadOnlyEnforcement: cloneReadOnlyEnforcement(raw.ReadOnlyEnforcement),
+		MutationManifest:    cloneMutationManifest(raw.MutationManifest),
+		WorktreePath:        strings.TrimSpace(raw.WorktreePath),
 		Path:                path,
 		LastWriteUTC:        lastWrite,
 	}, true
+}
+
+func cloneMutationManifest(manifest *MutationManifestAudit) *MutationManifestAudit {
+	if manifest == nil {
+		return nil
+	}
+	clone := *manifest
+	clone.Changes = append([]MutationManifestChange(nil), manifest.Changes...)
+	clone.Violations = append([]MutationManifestViolation(nil), manifest.Violations...)
+	return &clone
+}
+
+func cloneReadOnlyEnforcement(audit *ReadOnlyEnforcementAudit) *ReadOnlyEnforcementAudit {
+	if audit == nil {
+		return nil
+	}
+	clone := *audit
+	clone.Violations = append([]ReadOnlyEnforcementViolation(nil), audit.Violations...)
+	return &clone
 }
 
 func cloneArtifactDecision(decision *ArtifactDecision) *ArtifactDecision {

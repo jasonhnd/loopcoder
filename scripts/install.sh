@@ -18,11 +18,14 @@ usage() {
 		'Usage:' \
 		'  install.sh [--version VERSION]' \
 		'' \
-		'Installs loopcoder from GitHub Releases into ~/.loopcoder/bin.' \
+		'Installs loopcoder from GitHub Releases into ~/.loopcoder/bin by default.' \
+		'Override the install directory with LOOPCODER_INSTALL_DIR (absolute path).' \
+		'Set LOOPCODER_NO_MODIFY_PATH=1 to print PATH instructions without editing profiles.' \
 		'' \
 		'Examples:' \
 		'  curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh' \
-		'  curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.3.3'
+		'  curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.3.3' \
+		'  LOOPCODER_INSTALL_DIR="$HOME/tools/loopcoder" curl -fsSL .../install.sh | sh'
 }
 
 fail() {
@@ -116,7 +119,16 @@ fi
 [ -n "${HOME:-}" ] || fail "HOME is not set"
 if [ -z "$BIN_DIR" ]; then
 	BIN_DIR="$HOME/.loopcoder/bin"
+else
+	# Require an absolute install directory so PATH/profile lines are unambiguous.
+	case "$BIN_DIR" in
+		/*) ;;
+		*) fail "LOOPCODER_INSTALL_DIR must be an absolute path, got: $BIN_DIR" ;;
+	esac
 fi
+# Resolve once; every install, PATH, and profile path reuses this value.
+BIN_DIR="${BIN_DIR%/}"
+[ -n "$BIN_DIR" ] || fail "install directory resolved to empty"
 
 need_cmd curl
 need_cmd tar
@@ -203,20 +215,61 @@ verify_checksums_signature() {
 	fi
 }
 
+# Emit a single-quoted shell literal for path values that may contain spaces
+# or other metacharacters. Safe for profile lines on zsh/bash/sh.
+shell_single_quote() {
+	printf "'"
+	# Close, escape, and reopen around each embedded single quote.
+	printf '%s' "$1" | sed "s/'/'\\\\''/g"
+	printf "'"
+}
+
+# One export line for the resolved install directory.
+path_export_line() {
+	printf 'export PATH=%s:$PATH\n' "$(shell_single_quote "$BIN_DIR")"
+}
+
+# True when the profile already references this install directory (literal
+# absolute path, or the portable $HOME/.loopcoder/bin form for the default).
+profile_has_bin_dir() {
+	profile="$1"
+	if grep -F "$BIN_DIR" "$profile" >/dev/null 2>&1; then
+		return 0
+	fi
+	default_bin="$HOME/.loopcoder/bin"
+	if [ "$BIN_DIR" = "$default_bin" ]; then
+		if grep -F '$HOME/.loopcoder/bin' "$profile" >/dev/null 2>&1; then
+			return 0
+		fi
+	fi
+	return 1
+}
+
 print_path_instructions() {
 	profile_label="$1"
 	reload_command="$2"
 	printf '\n%s is not on PATH.\n' "$BIN_DIR"
 	printf 'Add this line to %s:\n' "$profile_label"
-	printf '  export PATH="$HOME/.loopcoder/bin:$PATH"\n'
-	printf 'Then run:\n'
-	printf '  %s\n' "$reload_command"
+	printf '  '
+	path_export_line
+	if [ -n "$reload_command" ]; then
+		printf 'Then run:\n'
+		printf '  %s\n' "$reload_command"
+	fi
 }
 
 ensure_path() {
 	case ":${PATH:-}:" in
 		*":$BIN_DIR:"*)
 			printf '%s is already on PATH.\n' "$BIN_DIR"
+			return
+			;;
+	esac
+
+	# Explicit opt-out: print guidance only, never edit profiles.
+	case "${LOOPCODER_NO_MODIFY_PATH:-}" in
+		1|true|TRUE|yes|YES)
+			print_path_instructions "your shell profile" ""
 			return
 			;;
 	esac
@@ -244,18 +297,18 @@ ensure_path() {
 			reload_command=". ~/.profile"
 			;;
 		*)
-			print_path_instructions "your $shell_name profile" "export PATH=\"\$HOME/.loopcoder/bin:\$PATH\""
+			print_path_instructions "your $shell_name profile" ""
 			return
 			;;
 	esac
 
 	if { [ -f "$profile" ] || touch "$profile" 2>/dev/null; } && [ -w "$profile" ]; then
-		if grep -F ".loopcoder/bin" "$profile" >/dev/null 2>&1; then
+		if profile_has_bin_dir "$profile"; then
 			printf 'A loopcoder PATH entry already exists in %s.\n' "$profile_label"
 		else
 			{
 				printf '\n# loopcoder\n'
-				printf 'export PATH="$HOME/.loopcoder/bin:$PATH"\n'
+				path_export_line
 			} >>"$profile" || {
 				print_path_instructions "$profile_label" "$reload_command"
 				return

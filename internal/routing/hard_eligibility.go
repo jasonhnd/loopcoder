@@ -129,8 +129,50 @@ type Policy struct {
 	AllowHalfOpenBreakerProbe   bool
 }
 
+// BudgetClass is the policy-approved task-equivalent consumption band used by
+// the existing headroom scorer. It does not replace typed budget policy units
+// or authorize paid overage.
+type BudgetClass string
+
+const (
+	BudgetClassVeryShort BudgetClass = "very-short"
+	BudgetClassShort     BudgetClass = "short"
+	BudgetClassMedium    BudgetClass = "medium"
+)
+
+// DeadlineClass is the policy-approved task-fit band used by the existing
+// quota reset compatibility gate and expiry-urgency scorer. It is not an
+// absolute execution deadline.
+type DeadlineClass string
+
+const (
+	DeadlineClassVeryShort DeadlineClass = "very-short"
+	DeadlineClassShort     DeadlineClass = "short"
+	DeadlineClassMedium    DeadlineClass = "medium"
+)
+
+func ValidBudgetClass(value BudgetClass) bool {
+	switch BudgetClass(strings.TrimSpace(string(value))) {
+	case BudgetClassVeryShort, BudgetClassShort, BudgetClassMedium:
+		return true
+	default:
+		return false
+	}
+}
+
+func ValidDeadlineClass(value DeadlineClass) bool {
+	switch DeadlineClass(strings.TrimSpace(string(value))) {
+	case DeadlineClassVeryShort, DeadlineClassShort, DeadlineClassMedium:
+		return true
+	default:
+		return false
+	}
+}
+
 type Inputs struct {
 	Requirement        taskrequirements.TaskRequirement
+	BudgetClass        BudgetClass
+	DeadlineClass      DeadlineClass
 	RoleDefinitions    []RoleDefinition
 	Candidates         []Candidate
 	Inventory          providerinventory.Report
@@ -224,7 +266,7 @@ func FilterHardEligibility(inputs Inputs) Result {
 			candidate.CircuitBreakerIDs = breakerIDsForCandidate(candidate, inputs.CircuitBreakers)
 		}
 		if candidate.AvailabilityScoreID == "" {
-			if score, ok := scoreByCandidate[availabilityKey(candidate)]; ok {
+			if score, ok := lookupAvailabilityScore(candidate, scoreByCandidate); ok {
 				candidate.AvailabilityScoreID = score.AvailabilityScoreID
 			}
 		}
@@ -274,8 +316,12 @@ func FilterHardEligibility(inputs Inputs) Result {
 		}
 		reasons = append(reasons, evaluatePermissionAndSideEffects(requirement, candidate, roleDef, hasRoleDef)...)
 		reasons = append(reasons, evaluateRuntimeCompatibility(contract, hostName, requirement, candidate, roleDef, hasRoleDef)...)
-		reasons = append(reasons, evaluateQuota(requirement, candidate, quotaByID, policy, inputs.OptimizationPolicy, inputs.Now)...)
-		reasons = append(reasons, evaluateBudgets(candidate, budgetByID, policy)...)
+		deadlineClass := inputs.DeadlineClass
+		if deadlineClass == "" {
+			deadlineClass = DeadlineClass(taskClassForRequirement(requirement))
+		}
+		reasons = append(reasons, evaluateQuota(requirement, deadlineClass, candidate, quotaByID, policy, inputs.OptimizationPolicy, inputs.Now)...)
+		reasons = append(reasons, evaluateBudgets(candidate, budgetByID, policy, requirement)...)
 		reasons = append(reasons, evaluateAvailability(candidate, scoreByID, scoreByCandidate, policy)...)
 		reasons = append(reasons, evaluateBreakers(candidate, breakerByID, policy)...)
 		reasons = append(reasons, evaluateManualUnavailable(candidate, inputs.ManualUnavailable)...)
@@ -574,16 +620,25 @@ func evaluateRuntimeCompatibility(contract runtimecap.Contract, hostName string,
 	return nil
 }
 
-func evaluateQuota(requirement taskrequirements.TaskRequirement, candidate Candidate, quotaByID map[string]providerinventory.QuotaSnapshot, policy Policy, optimization OptimizationPolicy, now time.Time) []RejectionReason {
+func evaluateQuota(requirement taskrequirements.TaskRequirement, deadlineClass DeadlineClass, candidate Candidate, quotaByID map[string]providerinventory.QuotaSnapshot, policy Policy, optimization OptimizationPolicy, now time.Time) []RejectionReason {
 	var reasons []RejectionReason
 	var sawFreshExact bool
 	var sawFreshEstimate bool
 	var sawUsableCapacity bool
-	if len(candidate.QuotaSnapshotIDs) == 0 {
+	// Drop grant-required / not-collected placeholders so they do not hard-block
+	// low-risk routes when operators have not granted quota telemetry network.
+	activeSnapshotIDs := filterCollectedQuotaSnapshotIDs(candidate.QuotaSnapshotIDs, quotaByID)
+	if len(activeSnapshotIDs) == 0 {
+		if allowMissingQuotaEvidence(requirement, policy) {
+			return nil
+		}
 		return []RejectionReason{reason(RejectQuotaConfidenceInsufficient, taskrequirements.ErrRequirementConfidenceInsufficientCode, "fresh quota capacity evidence is required", nil, nil)}
 	}
+	candidate.QuotaSnapshotIDs = activeSnapshotIDs
 	optimization = normalizeHardOptimizationPolicy(optimization)
-	taskClass := taskClassForRequirement(requirement)
+	if deadlineClass == "" {
+		deadlineClass = DeadlineClass(taskClassForRequirement(requirement))
+	}
 	for _, id := range candidate.QuotaSnapshotIDs {
 		snapshot, ok := quotaByID[id]
 		if !ok {
@@ -626,8 +681,8 @@ func evaluateQuota(requirement taskrequirements.TaskRequirement, candidate Candi
 				snapshotUsable = false
 			} else {
 				band := resetBandForDuration(optimization.ResetBands, resetAt.Sub(now.UTC()))
-				if !taskClassAllowedInBand(taskClass, band.MaxTaskClass) {
-					reasons = append(reasons, reason(RejectQuotaResetIncompatible, taskrequirements.ErrCapabilityUnsupportedCode, "task class "+taskClass+" exceeds reset window "+band.Name+" max "+band.MaxTaskClass, nil, []string{snapshot.QuotaSnapshotID}))
+				if !taskClassAllowedInBand(string(deadlineClass), band.MaxTaskClass) {
+					reasons = append(reasons, reason(RejectQuotaResetIncompatible, taskrequirements.ErrCapabilityUnsupportedCode, "deadline class "+string(deadlineClass)+" exceeds reset window "+band.Name+" max "+band.MaxTaskClass, nil, []string{snapshot.QuotaSnapshotID}))
 					snapshotUsable = false
 				}
 			}
@@ -672,9 +727,55 @@ func quotaConfidenceAllowedForCapacity(confidence providerinventory.Confidence, 
 	return !policy.RequireExactQuota && policy.EvidencePolicy == EvidenceAllowEstimated && confidence == providerinventory.ConfidenceEstimated
 }
 
-func evaluateBudgets(candidate Candidate, budgetByID map[string]budget.Summary, policy Policy) []RejectionReason {
+// filterCollectedQuotaSnapshotIDs drops grant-required / not-collected placeholders.
+func filterCollectedQuotaSnapshotIDs(ids []string, quotaByID map[string]providerinventory.QuotaSnapshot) []string {
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		snapshot, ok := quotaByID[id]
+		if !ok {
+			continue
+		}
+		if quotaSnapshotIsUncollectedPlaceholder(snapshot) {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
+func quotaSnapshotIsUncollectedPlaceholder(snapshot providerinventory.QuotaSnapshot) bool {
+	if snapshot.Confidence == providerinventory.ConfidenceUnavailable {
+		return true
+	}
+	if strings.TrimSpace(snapshot.TerminalErrorCode) == "ErrQuotaCollectionGrantRequired" {
+		return true
+	}
+	for _, gap := range snapshot.GapReasons {
+		switch strings.TrimSpace(gap) {
+		case "quota-collection-not-granted", "not-collected":
+			return true
+		}
+	}
+	return false
+}
+
+func allowMissingQuotaEvidence(requirement taskrequirements.TaskRequirement, policy Policy) bool {
+	if policy.RequireExactQuota {
+		return false
+	}
+	// Low-risk work may route without paid quota telemetry grants.
+	return requirement.RiskTier == taskrequirements.RiskLow || requirement.RiskTier == ""
+}
+
+func allowMissingBudgetEvidence(requirement taskrequirements.TaskRequirement) bool {
+	return requirement.RiskTier == taskrequirements.RiskLow || requirement.RiskTier == ""
+}
+
+func evaluateBudgets(candidate Candidate, budgetByID map[string]budget.Summary, policy Policy, requirement taskrequirements.TaskRequirement) []RejectionReason {
 	if len(candidate.BudgetPolicyIDs) == 0 {
-		if policy.RequireBudgetEvidence {
+		// No configured budget policies: low-risk routes may proceed. Higher
+		// risk still requires explicit budget authority when the policy says so.
+		if policy.RequireBudgetEvidence && !allowMissingBudgetEvidence(requirement) {
 			return []RejectionReason{reason(RejectBudgetExhausted, taskrequirements.ErrRequirementConfidenceInsufficientCode, "budget evidence is required", nil, nil)}
 		}
 		return nil
@@ -699,7 +800,7 @@ func evaluateBudgets(candidate Candidate, budgetByID map[string]budget.Summary, 
 func evaluateAvailability(candidate Candidate, scoreByID map[string]availability.Score, scoreByCandidate map[string]availability.Score, policy Policy) []RejectionReason {
 	score, ok := scoreByID[candidate.AvailabilityScoreID]
 	if !ok {
-		score, ok = scoreByCandidate[availabilityKey(candidate)]
+		score, ok = lookupAvailabilityScore(candidate, scoreByCandidate)
 	}
 	if !ok {
 		if policy.RequireAvailabilityEvidence {
@@ -989,8 +1090,10 @@ func matchesSelector(candidate Candidate, adapterID, installationID, accountID, 
 	if strings.TrimSpace(accountID) != "" && candidate.AccountProfileID != strings.TrimSpace(accountID) {
 		return false
 	}
-	if strings.TrimSpace(modelID) != "" && candidate.ModelCapabilityID != strings.TrimSpace(modelID) {
-		return false
+	if pin := strings.TrimSpace(modelID); pin != "" {
+		if candidate.ModelCapabilityID != pin && candidate.CanonicalModelID != pin {
+			return false
+		}
 	}
 	if strings.TrimSpace(invocationProfileKey) != "" && candidate.InvocationProfileKey != strings.TrimSpace(invocationProfileKey) {
 		return false
@@ -1122,10 +1225,42 @@ func mapAvailabilityScores(values []availability.Score) (map[string]availability
 	byCandidate := map[string]availability.Score{}
 	for _, value := range values {
 		byID[value.AvailabilityScoreID] = value
-		key := value.Scope.AdapterID + "\x00" + value.Scope.ProviderInstallationID + "\x00" + value.Scope.AccountProfileID + "\x00" + value.Scope.ModelCapabilityID
-		byCandidate[key] = value
+		adapterID := strings.TrimSpace(value.Scope.AdapterID)
+		installationID := strings.TrimSpace(value.Scope.ProviderInstallationID)
+		accountID := strings.TrimSpace(value.Scope.AccountProfileID)
+		modelID := strings.TrimSpace(value.Scope.ModelCapabilityID)
+		// Exact scope always wins / overwrites so later matching evidence (e.g.
+		// project exhaustion) replaces an earlier good score for that scope.
+		full := adapterID + "\x00" + installationID + "\x00" + accountID + "\x00" + modelID
+		byCandidate[full] = value
+		// Derived inventory scores often omit account. Index partial keys only
+		// when empty so exact account-scoped evidence is never shadowed.
+		if accountID == "" {
+			partial := adapterID + "\x00" + installationID + "\x00" + "\x00" + modelID
+			if _, exists := byCandidate[partial]; !exists {
+				byCandidate[partial] = value
+			}
+			broad := adapterID + "\x00" + "\x00" + "\x00" + modelID
+			if _, exists := byCandidate[broad]; !exists {
+				byCandidate[broad] = value
+			}
+		}
 	}
 	return byID, byCandidate
+}
+
+func availabilityLookupKeys(adapterID, installationID, accountID, modelID string) []string {
+	adapterID = strings.TrimSpace(adapterID)
+	installationID = strings.TrimSpace(installationID)
+	accountID = strings.TrimSpace(accountID)
+	modelID = strings.TrimSpace(modelID)
+	// Prefer exact account scope, then installation+model without account, then
+	// adapter+model only (derived scores).
+	return []string{
+		adapterID + "\x00" + installationID + "\x00" + accountID + "\x00" + modelID,
+		adapterID + "\x00" + installationID + "\x00" + "\x00" + modelID,
+		adapterID + "\x00" + "\x00" + "\x00" + modelID,
+	}
 }
 
 func mapBreakers(values []availability.CircuitBreaker) map[string]availability.CircuitBreaker {
@@ -1216,6 +1351,15 @@ func constraintMatchesCandidate(constraint CandidateConstraint, candidate Candid
 
 func availabilityKey(candidate Candidate) string {
 	return candidate.AdapterID + "\x00" + candidate.ProviderInstallationID + "\x00" + candidate.AccountProfileID + "\x00" + candidate.ModelCapabilityID
+}
+
+func lookupAvailabilityScore(candidate Candidate, scoreByCandidate map[string]availability.Score) (availability.Score, bool) {
+	for _, key := range availabilityLookupKeys(candidate.AdapterID, candidate.ProviderInstallationID, candidate.AccountProfileID, candidate.ModelCapabilityID) {
+		if score, ok := scoreByCandidate[key]; ok {
+			return score, true
+		}
+	}
+	return availability.Score{}, false
 }
 
 func capabilitySummary(model providerinventory.ModelCapability) map[string]any {

@@ -47,7 +47,11 @@ func TestRunDarwinArm64ProviderAuthorityIdentifiesProviderProcessGroup(t *testin
 	}
 	outerPID := os.Getpid()
 	var started StartedProcess
-	cmd := exec.Command("/bin/sleep", "0.1")
+	// Keep the provider child alive long enough for OnStart + VerifySnapshot to
+	// observe a stable live process group under CI package contention. A 100ms
+	// sleep can exit before identity verification and fail closed as a group
+	// mismatch instead of proving provider-led authority.
+	cmd := exec.Command("/bin/sleep", "2")
 	result, err := Run(context.Background(), cmd, Options{
 		HardCap: 5 * time.Second,
 		RunID:   "run-authority-fixture",

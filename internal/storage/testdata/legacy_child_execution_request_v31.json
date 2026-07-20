@@ -1,0 +1,22 @@
+{
+  "record": {
+    "child_run_id": "run-contract-child",
+    "parent_run_id": "run-contract-parent",
+    "plan_id": "plan-contract",
+    "child_key": "contract-child",
+    "schema_version": "legacy.ambiguous",
+    "request_json": "{}",
+    "contract_fingerprint": "",
+    "repository_identity": "",
+    "checkout_identity": "",
+    "permission": "write",
+    "scope_json": "{\"repo\":\".\",\"paths\":[\"src\"],\"issues\":[1005]}",
+    "claim_generation": 0,
+    "lifecycle_status": "needs-human",
+    "legacy_ambiguous": true,
+    "created_at": "2026-07-17T02:00:00Z",
+    "updated_at": "2026-07-17T02:00:00Z"
+  },
+  "run_status": "needs-human",
+  "edge_status": "needs-human"
+}

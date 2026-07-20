@@ -4,12 +4,12 @@
 
 **Turn a delivery need into reviewed pull requests -- without leaving the chat.**
 
-[![Version](https://img.shields.io/badge/version-v0.8.0-brightgreen.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v0.8.1-brightgreen.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Claude Code Skill](https://img.shields.io/badge/Claude%20Code-Skill-green.svg)](SKILL.md)
 [![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-black.svg)](docs/specs/0884-macos-arm64-only.md)
 
-[What it is](#what-it-is) | [The loop](#the-loop) | [Install](#install) | [Usage](#usage) | [Upgrade](#upgrade-from-070-to-080) | [How it works](#how-it-works) | [Design](#design)
+[What it is](#what-it-is) | [The loop](#the-loop) | [Install](#install) | [Usage](#usage) | [Upgrade](#upgrade-from-070-080-to-081) | [How it works](#how-it-works) | [Design](#design)
 
 </div>
 
@@ -17,21 +17,20 @@
 
 loopcoder is a local delivery-loop toolkit. Its intended workflow turns a need
 into GitHub issues, provider-backed work in isolated git worktrees, pull
-requests, independent review, and gated promotion. The shipped v0.8.0 binary
-contains those building blocks, but not every intended orchestration path is
-connected or approved for production use.
+requests, independent review, and gated promotion. The v0.8.1 binary connects
+the product paths that were incomplete in v0.8.0 (routing, nested permissions,
+waiters, progress hosts, installer PATH, and release evidence harnesses).
 
 It removes the copy-paste churn of AI coding: ask the model, paste issues into GitHub, run an agent, review the diff, repeat. With loopcoder that loop runs from the conversation. One chat. No window-switching. New scaffolds write `adapters.gate: human-merge` so humans choose production merges explicitly; legacy empty or missing gate configs still normalize to `auto` at runtime for compatibility. Repo-facing artifacts and worker summaries are written in English.
 
-v0.8.0 is the current public release for native macOS Apple Silicon
-(`darwin/arm64`) only. Its artifact integrity, platform gate, and documented
-v0.7-to-v0.8 SQLite migration passed the publication gates. A post-publication
-audit found gaps between several internal contracts and their shipped product
-paths, so use v0.8.0 for controlled canary and development work, not unattended
-end-to-end production orchestration. The binding status of routing, verifier
-independence, nested execution, progress, waiters, providers, signing, and the
-installer is in the
-[`v0.8.0 capability and support matrix`](docs/reference/v0.8.0-capability-matrix.md).
+v0.8.1 is the current release line for native macOS Apple Silicon
+(`darwin/arm64`) only. Fixture and packaged product-path gates pass on the
+candidate; live Codex/Claude canaries remain owner-gated for product-path Full
+GO. Live Apple Developer ID + notarize is recommended for Gatekeeper-friendly
+public downloads and is optional for product-path GO. See the
+[`v0.8.1 release runbook`](docs/reference/v0.8.1-release-runbook.md),
+[`capability matrix`](docs/reference/v0.8.0-capability-matrix.md), and
+[host progress visibility contracts](docs/reference/progress-hosts.md).
 
 ## The loop
 
@@ -47,16 +46,15 @@ flowchart LR
   prod -. next layer .-> plan
 ```
 
-This diagram is the intended loop, not a claim that every edge is production
-supported in v0.8.0. The worker defaults to `codex`; `codex`, `claude`, `grok`,
-and `antigravity` have registered Worker adapters with different evidence and
-permission limits. The older direct `gemini` adapter remains experimental.
-The verifier is configured separately and should differ from the worker, but
-v0.8.0 does not route or enforce that independence automatically. At runtime,
-an empty or missing production gate normalizes to `auto` for legacy
-compatibility. New `loopcoder init --repo .` scaffolds write
-`adapters.gate: human-merge`; pass `--gate auto` or edit `.delivery.yml` only
-after reviewing the capability matrix and the repository's own gates.
+This diagram is the intended loop. In v0.8.1, unpinned workers route through
+`route decide` before launch; verifiers route independently via `loopreview`.
+`codex`, `claude`, `grok`, and `antigravity` have registered Worker adapters
+with different evidence and permission limits. The older direct `gemini`
+adapter remains experimental. At runtime, an empty or missing production gate
+normalizes to `auto` for legacy compatibility. New `loopcoder init --repo .`
+scaffolds write `adapters.gate: human-merge`; pass `--gate auto` or edit
+`.delivery.yml` only after reviewing the capability matrix and the
+repository's own gates.
 
 ## What it looks like
 
@@ -72,49 +70,71 @@ loop  > done. 2 PRs promoted, 0 blocked.
 
 ## Install
 
-Install the public v0.8.0 release on native macOS Apple Silicon
+Install the public **v0.8.1** release on native macOS Apple Silicon
 (`darwin/arm64`) with the no-Go shell installer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.0
+curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.1
 ```
 
-Windows, Linux, WSL, containers, and Intel macOS are not supported by the
-current v0.8.0 installer. Users who need those hosts should remain on the
-historical v0.7.0 release.
+Custom install directory (PATH, profile lines, and printed instructions all use
+the same directory; re-runs are idempotent):
+
+```bash
+LOOPCODER_INSTALL_DIR="$HOME/tools/loopcoder" \
+  curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.1
+```
+
+Guidance only (do not edit shell profiles):
+
+```bash
+LOOPCODER_NO_MODIFY_PATH=1 \
+  curl -fsSL https://raw.githubusercontent.com/jasonhnd/loopcoder/main/scripts/install.sh | sh -s -- --version 0.8.1
+```
+
+Windows, Linux, WSL, containers, and Intel macOS are **not** supported by the
+v0.8 installer. Users who need those hosts should remain on the historical
+**v0.7.0** release.
 
 Or install with Go on the supported host:
 
 ```bash
-go install github.com/jasonhnd/loopcoder/cmd/loopcoder@v0.8.0
+go install github.com/jasonhnd/loopcoder/cmd/loopcoder@v0.8.1
 ```
 
 Then confirm the binary:
 
 ```bash
-loopcoder version
+loopcoder version   # expect platform=darwin/arm64
+loopcoder doctor
 ```
 
-For a first consumer repository, follow the [`Quickstart (new project)`](docs/reference/usage.md#quickstart-new-project): install once, run `loopcoder version`, run `loopcoder init --repo .`, install the playbook and project conductor hooks with `loopcoder skill install --repo .`, run `loopcoder doctor --repo .`, run `loopcoder report --repo .`, then drive dispatch, `tick`, and `loopreview` through `/loopcoder <your need>`.
+For a first consumer repository, follow the [`Quickstart (new project)`](docs/reference/usage.md#quickstart-new-project): install once, run `loopcoder version`, run `loopcoder init --repo .`, install the playbook and project conductor hooks with `loopcoder skill install --repo .`, run `loopcoder projects register --repo .`, run `loopcoder doctor --repo .`, run `loopcoder report --repo .`, then drive dispatch, `tick`, and `loopreview` through `/loopcoder <your need>`.
 
 Prerequisites on `PATH`: `git`, authenticated `gh`, and at least one registered
-provider CLI. The release installer verifies the Sigstore-signed
-`SHA256SUMS` before trusting checksums, using cosign on the script path. This
-proves archive integrity; the v0.8.0 binary is not Apple Developer ID signed or
-notarized. `codex` is the default worker, `antigravity` uses executable `agy`,
-and the direct `gemini` adapter is experimental/unverified. Provider
-registration is not proof of authentication, usable capacity, safe role
-support, or exact-release real-provider evidence; consult the capability
-matrix before dispatch.
+provider CLI. The release installer verifies the Sigstore-signed `SHA256SUMS`
+before trusting checksums (cosign on the script path). That proves **archive
+integrity and release provenance**. Apple Developer ID + notarize is
+**optional** for product-path GO; when the published Mach-O is not notarized,
+prefer the installer + Sigstore path or `go install` rather than expecting
+Gatekeeper to treat a browser download like a notarized desktop app.
+`codex` is the default worker, `claude` is the usual independent verifier,
+`antigravity` uses executable `agy`, and the direct `gemini` adapter is
+experimental/unverified. Provider registration is not proof of authentication,
+usable capacity, safe role support, or exact-release real-provider evidence;
+consult the capability matrix before unattended dispatch.
 
-Current v0.8.0 support is native macOS Apple Silicon only (`darwin/arm64`). See [`docs/reference/usage.md`](docs/reference/usage.md) for setup and end-to-end usage. loopcoder is also usable as a Claude Code skill; point the `loopcoder` skill at this repo.
+**v0.8.1 support is native macOS Apple Silicon only (`darwin/arm64`).** See
+[`docs/reference/usage.md`](docs/reference/usage.md) for setup and end-to-end
+usage. loopcoder is also usable as a Claude Code skill; point the `loopcoder`
+skill at this repo.
 
-## Upgrade From 0.7.0 To 0.8.0
+## Upgrade From 0.7.0 / 0.8.0 To 0.8.1
 
 On native macOS Apple Silicon, upgrade the binary, inspect the storage plan before running any stateful v0.8 command, apply it explicitly, then refresh each project's hooks and run doctor:
 
 ```text
-loopcoder upgrade --version 0.8.0
+loopcoder upgrade --version 0.8.1
 loopcoder version
 loopcoder migrate storage --format json
 loopcoder migrate storage --apply --format json
@@ -124,7 +144,7 @@ loopcoder migrate local-state --repo . --dry-run
 loopcoder doctor --repo .
 ```
 
-`loopcoder upgrade --version 0.8.0` selects only the signed Darwin arm64 archive and swaps the machine-level binary atomically. `migrate storage` is plan-only unless `--apply` is present; the apply path verifies an owner-only schema-9 backup, then migrates schema 9 through 30 atomically. Stop all LoopCoder processes before migration or rollback. Each project must still run `loopcoder skill install --repo <repo>` to refresh project hook settings and local `.git/info/exclude` protection. `projects register` records the checkout in the machine-local registry, while `migrate local-state --dry-run` previews older repo-local `.loopcoder/` imports. See [storage migration](docs/reference/storage-migration.md) for interruption, backup, and offline rollback rules.
+`loopcoder upgrade --version 0.8.1` selects only the signed Darwin arm64 archive and swaps the machine-level binary atomically. `migrate storage` is plan-only unless `--apply` is present; the apply path verifies an owner-only schema-9 backup, then migrates schema 9 through 30 atomically. Stop all LoopCoder processes before migration or rollback. Each project must still run `loopcoder skill install --repo <repo>` to refresh project hook settings and local `.git/info/exclude` protection. `projects register` records the checkout in the machine-local registry, while `migrate local-state --dry-run` previews older repo-local `.loopcoder/` imports. See [storage migration](docs/reference/storage-migration.md) for interruption, backup, and offline rollback rules.
 
 Windows, Linux/Ubuntu, WSL, containers used as a LoopCoder runtime, Intel macOS, and Rosetta/amd64 macOS are unsupported in v0.8.0. Those users should remain on the final legacy multi-platform release, v0.7.0, or contribute to a separately approved future platform roadmap. Re-running the v0.8.0 upgrade reports the selected version as already latest.
 
@@ -161,10 +181,11 @@ loopcoder ready-set     --repo .              # classify ready vs blocked work
 loopcoder delivery plan --project-id <id> --run-id <id> --format json # side-effect-free v0.8 DeliveryRun proposal
 loopcoder delivery decide --project-id <id> --run-id <id> --action approve --expected-authorization-fingerprint <sha256:...>
 loopcoder delivery continue --project-id <id> --run-id <id> --expected-authorization-fingerprint <sha256:...>
+loopcoder wait quota-reset --until <RFC3339>  # provider-free local wait for a known quota reset
 loopcoder tick          --repo .              # run one unattended delivery pass
 loopcoder trigger goal-loop --repo .          # advanced: run an automation trigger
 loopcoder promote      --repo .               # may change production branch when gates pass
-loopcoder upgrade --version 0.8.0             # signed Darwin arm64 self-upgrade
+loopcoder upgrade --version 0.8.1             # signed Darwin arm64 self-upgrade
 loopcoder dispatch-wave --repo .              # dispatch the current ready wave
 loopcoder dispatch      --repo . --issue-number 41 --issue-title "Add /healthz endpoint" --provider claude --strict
 loopcoder dispatch      --repo . --issue-number 41 --issue-title "Add /healthz endpoint" --foreground
@@ -190,6 +211,15 @@ loopcoder ps --repo .                         # list loopcoder-managed worker pr
 loopcoder kill --repo . --run <run-id>        # terminate loopcoder-managed processes for one run
 loopcoder kill --repo . --all                 # terminate all loopcoder-managed processes for this repo
 loopcoder attest        --role conductor --provider codex-cli --model gpt-5 --permission orchestrate --action "dispatch issue #41" --duration-ms 120000 --total-tokens 12345
+```
+
+The v0.8.1 candidate additionally exposes routing as an explicit, provider-
+neutral operation. These commands do not launch a provider or change the
+legacy unpinned `dispatch` default:
+
+```bash
+loopcoder route explain --project-id <id> --run-id <id> --task-requirement-id <id> --decision-key <key> --format json
+loopcoder route decide --project-id <id> --run-id <id> --task-requirement-id <id> --decision-key <key> --format json
 ```
 
 Machine-local registry and migration commands retained from v0.7.0 include:
@@ -357,15 +387,24 @@ During the 0.6.x transition window, readers accept legacy `[attestation]` header
 - Conductor: a configured agent session that coordinates available commands
   and keeps the final human gate.
 - Worker: `loopcoder dispatch` can run one explicitly selected registered
-  provider for one issue in a fresh git worktree, then open a PR. Unpinned
-  dispatch defaults directly to Codex in v0.8.0; automatic product routing is
-  not wired.
+  provider for one issue in a fresh git worktree, then open a PR. On the
+  v0.8.1 candidate, unpinned Worker dispatch persists a route decision before
+  launch and uses that selection as the only provider/model/effort authority;
+  explicit `--provider` is a durable pin. Frozen v0.8.0 still defaults unpinned
+  dispatch directly to Codex.
 - Nested orchestration: `loopcoder nested run --plan <file.json>` persists and
-  schedules bounded child-plan records. Production-provider write and
-  orchestrate modes are refused, while the accepted read-only path does not
-  enforce mutation-free behavior in the Worker adapter. Therefore no
-  real-provider nested mode is supported in v0.8.0. The reserved
-  `test-subprocess` provider is deterministic test infrastructure only.
+  schedules bounded child-plan records. The read-only executor supports Codex,
+  Claude, and Grok through explicit provider read-only modes, then compares a
+  durable pre-run repository/project-state baseline with the post-run state.
+  Existing user dirt is preserved as baseline; any tracked, untracked, index,
+  ref, config, hook, linked-worktree, or guarded LoopCoder-state change becomes
+  a typed `needs-human` policy violation and is never remediated automatically.
+  Bounded write is registered only for Codex and Grok and is verified in an
+  isolated detached worktree. Orchestrate, provider-native, and unregistered
+  provider/host routes are refused before persistence, claim, or provider
+  launch. Provider feature advertising is inventory evidence, not delegation
+  authority. The reserved `test-subprocess` provider is deterministic test
+  infrastructure and passes through the same enforcement.
 - Verifier: `loopcoder loopreview` returns a structured `pass`, `fail`, or
   `needs-human` verdict. Codex and Claude have historical mechanism smoke
   evidence, not protected exact-v0.8.0 canaries; provider independence is
@@ -422,19 +461,43 @@ During the 0.6.x transition window, readers accept legacy `[attestation]` header
 - [`docs/learnings.md`](docs/learnings.md) -- append-only operational learnings.
 - [`CHANGELOG.md`](CHANGELOG.md) -- release history.
 
+## What's new in v0.8.1
+
+Compared with v0.8.0 (contracts without full product wiring):
+
+| Path | v0.8.1 |
+| --- | --- |
+| Unpinned Worker `dispatch` | Persists route decision, then launches selected provider |
+| Independent `loopreview` | Verifier route + independence policy |
+| DeliveryRun | `claim-dispatch` for one ready task |
+| Nested children | Permission-safe route before claim/launch; live Codex/Claude canaries pass |
+| Provider failure | Typed classification → bounded fallback wiring |
+| Wait | Provider-free `approval` / `outbox` / `detached-worker` / `quota-reset` |
+| Progress hosts | Codex / Claude / Paseo / generic contracts |
+| Installer | `LOOPCODER_INSTALL_DIR` honored for PATH/profile/instructions |
+| Release | Canaries + product-path go/no-go gate; Apple live optional |
+
+Full narrative: [`.github/release-notes/v0.8.1.md`](.github/release-notes/v0.8.1.md) and
+[`CHANGELOG.md`](CHANGELOG.md).
+
 ## Status
 
-v0.8.0 is the current public release for native macOS Apple Silicon only. Its
-immutable artifact passed the documented integrity, migration, deterministic
-smoke, and publication gates. Its post-publication support classification is
-controlled canary/development because automatic routing, permission-safe
-nested execution, routed Verifier independence, several waiter/progress paths,
-exact-release real-provider canaries, Apple platform trust, and custom install
-directory guidance are incomplete. See the
-[`binding capability matrix`](docs/reference/v0.8.0-capability-matrix.md). The
+v0.8.1 is the current release line for native macOS Apple Silicon only. Product
+paths for routing, nested permissions, waiters, progress hosts, installer PATH,
+and release evidence harnesses are connected. Fixture and packaged go/no-go
+gates pass; **product-path Full GO** requires owner-run live Codex/Claude
+canaries against the freeze digest. Live Apple Developer ID + notarize is
+optional (recommended for Gatekeeper-friendly public downloads). See the
+[`v0.8.1 release runbook`](docs/reference/v0.8.1-release-runbook.md),
+[`v0.8.1 go/no-go gate`](docs/reference/v0.8.1-go-no-go.md),
+[`capability matrix`](docs/reference/v0.8.0-capability-matrix.md), and
+[host progress visibility contracts](docs/reference/progress-hosts.md). The
 repository keeps `gate: human-merge` for LoopCoder-core safety.
 
-v0.7.0 remains available as the final legacy multi-platform release. Its historical artifacts and completed [`v0.7.0 go/no-go report`](docs/reference/v0.7.0-go-no-go.md) are preserved without implying v0.8.0 support for Windows, Linux, WSL, containers, Intel macOS, or Rosetta.
+v0.7.0 remains available as the final legacy multi-platform release. v0.8.0
+remains the prior Darwin arm64 public tag. Historical
+[`v0.8.0`](docs/reference/v0.8.0-go-no-go.md) and
+[`v0.7.0`](docs/reference/v0.7.0-go-no-go.md) go/no-go records are preserved.
 
 ## License
 

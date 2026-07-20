@@ -28,6 +28,36 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/worker"
 )
 
+
+func observabilityDispatchRoute(deps Deps) Deps {
+	if deps.ResolveWorkerDispatchRoute == nil {
+		deps.ResolveWorkerDispatchRoute = func(_ context.Context, input WorkerDispatchRouteInput) (WorkerDispatchRouteResult, error) {
+			provider := strings.TrimSpace(input.ExplicitProvider)
+			if provider == "" {
+				provider = "codex"
+			}
+			model := strings.TrimSpace(input.ExplicitModel)
+			if model == "" {
+				model = "gpt-5.5"
+			}
+			effort := strings.TrimSpace(input.ExplicitEffort)
+			if effort == "" {
+				effort = "high"
+			}
+			return WorkerDispatchRouteResult{
+				Provider:          provider,
+				Model:             model,
+				Effort:            effort,
+				RoutingDecisionID: "rd-observability-test",
+				DecisionKey:       fmt.Sprintf("worker:issue-%d:attempt-1", input.IssueNumber),
+				Outcome:           "selected",
+				DeliveryRunID:     input.RunID,
+			}, nil
+		}
+	}
+	return deps
+}
+
 func TestObservabilityJSONLCommandAdaptersEmitMachineRecordsOnly(t *testing.T) {
 	clearGitSelectionEnvForFixture(t)
 	t.Setenv("GH_REPO", "")
@@ -43,7 +73,7 @@ func TestObservabilityJSONLCommandAdaptersEmitMachineRecordsOnly(t *testing.T) {
 	dispatchRepo := t.TempDir()
 	nestedRepo := t.TempDir()
 	planPath := writeNestedPlanFixture(t, nestedRepo, []orchestration.ChildRunPlan{
-		nestedPlanItem("alpha", 864, nil, true, "read-only", nil),
+		nestedPlanItem("alpha", 864, nil, true, "write", nil),
 	}, 1)
 	detached := seedDetachedRecoverObservabilityFixture(t, repoState)
 
@@ -186,7 +216,7 @@ func TestObservabilityJSONLCommandAdaptersEmitMachineRecordsOnly(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			tc.deps.Now = fixedCLINow
-			exitCode := RunWithDeps(tc.args, &stdout, &stderr, tc.deps)
+			exitCode := RunWithDeps(tc.args, &stdout, &stderr, observabilityDispatchRoute(tc.deps))
 			if exitCode != 0 && !(tc.allowExit1 && exitCode == 1) {
 				t.Fatalf("RunWithDeps exit=%d stderr=%q stdout=%q", exitCode, stderr.String(), stdout.String())
 			}
@@ -288,7 +318,7 @@ func TestObservabilityLegacyJSONKeepsSchemaAndEmbedsCanonicalDocument(t *testing
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			tc.deps.Now = fixedCLINow
-			code := RunWithDeps(tc.args, &stdout, &stderr, tc.deps)
+			code := RunWithDeps(tc.args, &stdout, &stderr, observabilityDispatchRoute(tc.deps))
 			if code != 0 && !(tc.allowExitOne && code == 1) {
 				t.Fatalf("RunWithDeps exit=%d stderr=%q stdout=%q", code, stderr.String(), stdout.String())
 			}
@@ -538,13 +568,13 @@ func TestObservabilityHumanAdapterUsesInjectedTerminalCapabilities(t *testing.T)
 	var stdout, stderr bytes.Buffer
 	record := validDispatchReport()
 	result := validDispatchResult(record)
-	exitCode := RunWithDeps([]string{"dispatch", "--repo", t.TempDir(), "--issue-number", "864", "--issue-title", "Observability"}, &stdout, &stderr, Deps{
+	exitCode := RunWithDeps([]string{"dispatch", "--repo", t.TempDir(), "--issue-number", "864", "--issue-title", "Observability"}, &stdout, &stderr, observabilityDispatchRoute(Deps{
 		IsTerminal:    func(io.Writer) bool { return true },
 		TerminalWidth: func(io.Writer) int { return 48 },
 		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
 			return result, nil
 		},
-	})
+	}))
 	if exitCode != 0 {
 		t.Fatalf("RunWithDeps exit=%d stderr=%q", exitCode, stderr.String())
 	}
@@ -660,7 +690,7 @@ func TestObservabilityGoldenMatrix(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			tc.deps.Now = fixedCLINow
-			code := RunWithDeps(tc.args, &stdout, &stderr, tc.deps)
+			code := RunWithDeps(tc.args, &stdout, &stderr, observabilityDispatchRoute(tc.deps))
 			if tc.name == "dispatch_cancelled_stderr.golden" {
 				if code == 0 || stdout.Len() != 0 {
 					t.Fatalf("cancelled dispatch code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
@@ -705,11 +735,11 @@ func TestObservabilityStreamFailuresKeepMachineOutputParseable(t *testing.T) {
 	}
 
 	var cancelOut, cancelErr bytes.Buffer
-	cancelCode := RunWithDeps([]string{"dispatch", "--repo", repo, "--issue-number", "864", "--issue-title", "Observability", "--format", "jsonl"}, &cancelOut, &cancelErr, Deps{
+	cancelCode := RunWithDeps([]string{"dispatch", "--repo", repo, "--issue-number", "864", "--issue-title", "Observability", "--format", "jsonl"}, &cancelOut, &cancelErr, observabilityDispatchRoute(Deps{
 		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
 			return worker.Result{}, context.Canceled
 		},
-	})
+	}))
 	if cancelCode == 0 || cancelOut.Len() != 0 || !strings.Contains(cancelErr.String(), "context canceled") {
 		t.Fatalf("cancelled dispatch code=%d stdout=%q stderr=%q", cancelCode, cancelOut.String(), cancelErr.String())
 	}

@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -23,14 +24,16 @@ import (
 )
 
 const (
-	DecisionSchema           = "loopcoder.routing_decision.v1"
-	DecisionKindRouting      = "routing"
-	DefaultProfileID         = "rprof_balanced_v1"
-	DefaultProfileVersion    = "balanced-v1"
-	DefaultTieBreakSeed      = "0804-routing-balanced-v1"
-	CandidateGenerationFull  = "complete"
-	DecisionStatusSelected   = "selected"
-	DecisionStatusNoEligible = "no-eligible-candidate"
+	DecisionSchema                = "loopcoder.routing_decision.v1"
+	DecisionKindRouting           = "routing"
+	DefaultProfileID              = "rprof_balanced_v1"
+	DefaultProfileVersion         = "balanced-v1"
+	DefaultTieBreakSeed           = "0804-routing-balanced-v1"
+	CandidateGenerationFull       = "complete"
+	CandidateGenerationNeedsHuman = "needs-human"
+	CandidateGenerationZeroReason = "candidate generation produced zero candidates from scoped provider inventory; run loopcoder providers refresh --repo . --format json and ensure a matching provider installation and model capability are configured"
+	DecisionStatusSelected        = "selected"
+	DecisionStatusNoEligible      = "no-eligible-candidate"
 
 	StrategyQualityFirst     = "quality-first"
 	StrategyBalanced         = "balanced"
@@ -133,6 +136,8 @@ type DecisionInput struct {
 	PlanFingerprint          string
 	PolicyFingerprint        string
 	AuthorizationFingerprint string
+	PriorRoutingDecisionID   string
+	PriorRoutingFingerprint  string
 	RoutingPolicyProfileID   string
 	RoutingPolicyProfile     RoutingPolicyProfile
 	PolicyInputRecords       []PolicyInputRecord
@@ -159,6 +164,8 @@ type ComponentScore struct {
 	ResetAt           string                           `json:"reset_at,omitempty"`
 	ResetWindow       string                           `json:"reset_window,omitempty"`
 	TaskClass         string                           `json:"task_class,omitempty"`
+	BudgetClass       BudgetClass                      `json:"budget_class,omitempty"`
+	DeadlineClass     DeadlineClass                    `json:"deadline_class,omitempty"`
 	ReserveBasisBP    int64                            `json:"reserve_basis_points,omitempty"`
 	ExpectedWaste     *int64                           `json:"expected_waste_avoided,omitempty"`
 	Confidence        providerinventory.Confidence     `json:"confidence"`
@@ -196,6 +203,10 @@ type RoutingDecision struct {
 	RoleDefinitionID          string                     `json:"role_definition_id"`
 	PlanFingerprint           string                     `json:"plan_fingerprint"`
 	PolicyFingerprint         string                     `json:"policy_fingerprint"`
+	AuthorizationFingerprint  string                     `json:"authorization_fingerprint,omitempty"`
+	RuntimeHostName           string                     `json:"runtime_host_name,omitempty"`
+	BudgetClass               BudgetClass                `json:"budget_class"`
+	DeadlineClass             DeadlineClass              `json:"deadline_class"`
 	RoutingFingerprint        string                     `json:"routing_fingerprint"`
 	InputRecordRefs           []InputRecordRef           `json:"input_record_refs"`
 	CandidateGenerationStatus string                     `json:"candidate_generation_status"`
@@ -373,6 +384,12 @@ func BuildRoutingDecision(input DecisionInput) (RoutingDecision, error) {
 	if err := validateOverrideDecisionScope(input.OverrideProvenance, input.DeliveryRunID, input.Inputs.Requirement.TaskID); err != nil {
 		return RoutingDecision{}, err
 	}
+	budgetClass, deadlineClass, err := resolveTaskFitClasses(input.Inputs.Requirement, input.Inputs.BudgetClass, input.Inputs.DeadlineClass)
+	if err != nil {
+		return RoutingDecision{}, err
+	}
+	input.Inputs.BudgetClass = budgetClass
+	input.Inputs.DeadlineClass = deadlineClass
 	if err := validateDecisionInput(input, policy); err != nil {
 		return RoutingDecision{}, err
 	}
@@ -382,7 +399,14 @@ func BuildRoutingDecision(input DecisionInput) (RoutingDecision, error) {
 	input.OverrideProvenance = redactOverrideProvenance(input.OverrideProvenance)
 	eligibility := FilterHardEligibility(input.Inputs)
 	refs := inputRefs(input, eligibility)
-	routingFingerprint, err := routingFingerprint(input, policy, eligibility, refs)
+	scored := scoreCandidates(eligibility.Eligible, input.Inputs, policy, input.Now)
+	generationStatus := CandidateGenerationFull
+	generationReason := ""
+	if len(eligibility.Eligible) == 0 && len(eligibility.Rejected) == 0 {
+		generationStatus = CandidateGenerationNeedsHuman
+		generationReason = CandidateGenerationZeroReason
+	}
+	routingFingerprint, err := routingFingerprint(input, policy, eligibility, scored, refs, generationStatus, generationReason)
 	if err != nil {
 		return RoutingDecision{}, err
 	}
@@ -403,34 +427,42 @@ func BuildRoutingDecision(input DecisionInput) (RoutingDecision, error) {
 		RoleDefinitionID:          strings.TrimSpace(input.RoleDefinitionID),
 		PlanFingerprint:           strings.TrimSpace(input.PlanFingerprint),
 		PolicyFingerprint:         strings.TrimSpace(input.PolicyFingerprint),
+		AuthorizationFingerprint:  strings.TrimSpace(input.AuthorizationFingerprint),
+		RuntimeHostName:           sanitize.Text(strings.TrimSpace(input.Inputs.HostName)),
+		BudgetClass:               input.Inputs.BudgetClass,
+		DeadlineClass:             input.Inputs.DeadlineClass,
 		RoutingFingerprint:        routingFingerprint,
 		InputRecordRefs:           refs,
-		CandidateGenerationStatus: CandidateGenerationFull,
+		CandidateGenerationStatus: generationStatus,
 		EligibleCandidates:        nonNilCandidates(eligibility.Eligible),
 		RejectedCandidates:        nonNilRejectedCandidates(eligibility.Rejected),
 		UserPinRefs:               nonNilStrings(pinIDs(input.Inputs.Pins)),
 		FallbackChain:             []string{},
 		BreakerGateRefs:           nonNilStrings(breakerRefs(eligibility)),
-		PolicyInputRecords:        nonNilPolicyInputRecords(input.PolicyInputRecords),
+		PolicyInputRecords:        safePolicyInputRecords(input.PolicyInputRecords),
 		OverrideProvenance:        nonNilOverrideProvenance(input.OverrideProvenance),
 		OptimizationPolicy:        policy,
 		RejectedSummary:           rejectedSummary(eligibility.Rejected),
 		CreatedAt:                 delivery.CanonicalTimestamp(input.Now),
 		UpdatedAt:                 delivery.CanonicalTimestamp(input.Now),
-		DecidedBy:                 input.DecidedBy,
-		Host:                      input.Host,
+		DecidedBy:                 safeDeliveryActor(input.DecidedBy),
+		Host:                      safeDeliveryHost(input.Host),
 	}
 	if hasRoutingPolicyProfile(input.RoutingPolicyProfile) {
 		profile := input.RoutingPolicyProfile
 		decision.RoutingPolicyProfile = &profile
 	}
 	decision.RoutingDecisionID = routingDecisionID(decision.ProjectID, decision.DeliveryRunID, decision.DecisionKey, decision.TaskID, decision.RoutingFingerprint)
-	decision.ScoredCandidates = scoreCandidates(eligibility.Eligible, input.Inputs, policy, input.Now)
+	decision.ScoredCandidates = scored
 	decision.HeuristicComponents = heuristicComponents(decision.ScoredCandidates)
 	if len(decision.ScoredCandidates) == 0 {
 		decision.DecisionStatus = DecisionStatusNoEligible
 		decision.TerminalErrorCode = blockedErrorCode(eligibility.Rejected)
-		decision.ChosenReason = "no hard-eligible candidates remain after deterministic eligibility"
+		if generationReason != "" {
+			decision.ChosenReason = generationReason
+		} else {
+			decision.ChosenReason = "no hard-eligible candidates remain after deterministic eligibility"
+		}
 		return decision, nil
 	}
 	chosen := decision.ScoredCandidates[0]
@@ -564,6 +596,7 @@ func prepareDecisionInputFromStore(ctx context.Context, store storage.Store, inp
 	if err != nil {
 		return input, err
 	}
+	records = policyInputsForTask(records, input.Inputs.Requirement.TaskID, input.DecisionKey)
 	if err := validateStoredPolicyInputsForDecision(records, input, profileID, activeFingerprint); err != nil {
 		return input, err
 	}
@@ -719,12 +752,59 @@ func redactOverrideProvenance(overrides []OverrideProvenance) []OverrideProvenan
 		out[i].Reason = redactSensitiveText(out[i].Reason)
 		out[i].Source = redactSensitiveText(out[i].Source)
 		out[i].Scope = canonicalManualOverrideScope(out[i])
+		out[i].Actor = safeDeliveryActor(out[i].Actor)
+		out[i].Host = safeDeliveryHost(out[i].Host)
 	}
 	return out
 }
 
 func redactSensitiveText(value string) string {
 	return sanitize.Text(value)
+}
+
+func safeDeliveryActor(actor delivery.Actor) delivery.Actor {
+	return delivery.Actor{
+		ActorKind:         sanitize.Text(actor.ActorKind),
+		ActorID:           sanitize.Text(actor.ActorID),
+		DecisionAuthority: sanitize.Text(actor.DecisionAuthority),
+		Source:            sanitize.Text(actor.Source),
+	}
+}
+
+func safeDeliveryHost(host delivery.Host) delivery.Host {
+	return delivery.Host{
+		HostKind:         sanitize.Text(host.HostKind),
+		HostID:           sanitize.Text(host.HostID),
+		LoopcoderVersion: sanitize.Text(host.LoopcoderVersion),
+		Platform:         sanitize.Text(host.Platform),
+	}
+}
+
+func safePolicyInputRecords(records []PolicyInputRecord) []PolicyInputRecord {
+	if len(records) == 0 {
+		return []PolicyInputRecord{}
+	}
+	out := make([]PolicyInputRecord, 0, len(records))
+	for _, record := range records {
+		out = append(out, PolicyInputRecord{
+			SchemaVersion:          record.SchemaVersion,
+			RecordVersion:          record.RecordVersion,
+			RoutingPolicyInputID:   record.RoutingPolicyInputID,
+			InputKind:              record.InputKind,
+			ProjectID:              record.ProjectID,
+			DeliveryRunID:          record.DeliveryRunID,
+			RoutingPolicyProfileID: record.RoutingPolicyProfileID,
+			PolicyFingerprint:      record.PolicyFingerprint,
+			Scope:                  record.Scope,
+			DecisionKey:            record.DecisionKey,
+			Status:                 record.Status,
+			ExpiresAt:              record.ExpiresAt,
+			Constraint:             record.Constraint,
+			ValidationStatus:       record.ValidationStatus,
+			Diagnostics:            []PolicyDiagnostic{},
+		})
+	}
+	return out
 }
 
 func resolveStoredDecisionProfile(ctx context.Context, store storage.Store, input DecisionInput) (RoutingPolicyProfile, error) {
@@ -827,7 +907,103 @@ func loadRunAuthorizationFingerprint(ctx context.Context, store storage.Store, p
 }
 
 func ExplainJSON(decision RoutingDecision) ([]byte, error) {
-	return delivery.CanonicalJSON(decision)
+	payload, err := delivery.CanonicalJSON(decision)
+	if err != nil {
+		return nil, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, fmt.Errorf("decode canonical routing explain JSON: %w", err)
+	}
+	return delivery.CanonicalJSON(redactJSONStrings(value))
+}
+
+func redactJSONStrings(value any) any {
+	switch typed := value.(type) {
+	case string:
+		return sanitize.Text(typed)
+	case []any:
+		redacted := make([]any, len(typed))
+		for index, child := range typed {
+			redacted[index] = redactJSONStrings(child)
+		}
+		return redacted
+	case map[string]any:
+		return redactJSONMap(typed)
+	default:
+		return value
+	}
+}
+
+type redactedJSONMapEntry struct {
+	value          any
+	canonicalValue string
+	keyUnchanged   bool
+}
+
+// redactJSONMap sanitizes dynamic JSON keys as well as values. Multiple input
+// keys can collapse to the same redaction marker, so collisions receive a
+// deterministic ordinal suffix. Existing sanitized keys are reserved first so
+// a generated suffix cannot overwrite another entry, and ordering is based on
+// redacted values rather than secret source keys.
+func redactJSONMap(values map[string]any) map[string]any {
+	groups := make(map[string][]redactedJSONMapEntry, len(values))
+	reserved := make(map[string]struct{}, len(values))
+	for key, child := range values {
+		baseKey := sanitize.Text(key)
+		if baseKey == "" && key != "" {
+			baseKey = "[REDACTED_KEY]"
+		}
+		redactedValue := redactJSONStrings(child)
+		canonicalValue, _ := json.Marshal(redactedValue)
+		groups[baseKey] = append(groups[baseKey], redactedJSONMapEntry{
+			value:          redactedValue,
+			canonicalValue: string(canonicalValue),
+			keyUnchanged:   key == baseKey,
+		})
+		reserved[baseKey] = struct{}{}
+	}
+
+	baseKeys := make([]string, 0, len(groups))
+	for key := range groups {
+		baseKeys = append(baseKeys, key)
+	}
+	sort.Strings(baseKeys)
+
+	redacted := make(map[string]any, len(values))
+	used := make(map[string]struct{}, len(values))
+	for _, baseKey := range baseKeys {
+		entries := groups[baseKey]
+		sort.Slice(entries, func(i, j int) bool {
+			if entries[i].keyUnchanged != entries[j].keyUnchanged {
+				return entries[i].keyUnchanged
+			}
+			return entries[i].canonicalValue < entries[j].canonicalValue
+		})
+		for index, entry := range entries {
+			outputKey := baseKey
+			if index > 0 {
+				outputKey = uniqueRedactedJSONKey(baseKey, reserved, used)
+			}
+			redacted[outputKey] = entry.value
+			used[outputKey] = struct{}{}
+		}
+	}
+	return redacted
+}
+
+func uniqueRedactedJSONKey(baseKey string, reserved, used map[string]struct{}) string {
+	for ordinal := 2; ; ordinal++ {
+		candidate := baseKey + "#" + strconv.Itoa(ordinal)
+		if _, exists := reserved[candidate]; exists {
+			continue
+		}
+		if _, exists := used[candidate]; !exists {
+			return candidate
+		}
+	}
 }
 
 func ExplainHuman(decision RoutingDecision) string {
@@ -836,9 +1012,21 @@ func ExplainHuman(decision RoutingDecision) string {
 		fmt.Fprintf(&b, "selected %s: %s\n", decision.ChosenCandidateID, decision.ChosenReason)
 	} else {
 		fmt.Fprintf(&b, "blocked %s: %s\n", decision.DecisionStatus, decision.TerminalErrorCode)
+		if decision.CandidateGenerationStatus != CandidateGenerationFull {
+			fmt.Fprintf(&b, "candidate generation: %s\n", decision.CandidateGenerationStatus)
+		}
+		if decision.ChosenReason != "" {
+			fmt.Fprintf(&b, "reason: %s\n", decision.ChosenReason)
+		}
 	}
 	if decision.RoutingPolicyProfile != nil {
 		fmt.Fprintf(&b, "profile %s version %s fingerprint %s\n", decision.RoutingPolicyProfile.ProfileKey, decision.RoutingPolicyProfile.ProfileVersion, decision.RoutingPolicyProfile.PolicyFingerprint)
+	}
+	if decision.BudgetClass != "" || decision.DeadlineClass != "" {
+		fmt.Fprintf(&b, "task fit budget_class=%s deadline_class=%s\n", decision.BudgetClass, decision.DeadlineClass)
+	}
+	if decision.RuntimeHostName != "" {
+		fmt.Fprintf(&b, "runtime host %s\n", decision.RuntimeHostName)
 	}
 	policy := decision.OptimizationPolicy
 	fmt.Fprintf(&b, "strategy %s version %s target_utilization=%s completion_reserve=%s verification_reserve=%s paid_overage=%t\n",
@@ -877,7 +1065,7 @@ func ExplainHuman(decision RoutingDecision) string {
 	for _, rejected := range decision.RejectedCandidates {
 		fmt.Fprintf(&b, "- %s: %s\n", rejected.Candidate.RoutingCandidateID, candidateLabel(rejected.Candidate)+" "+rejectionExplanation(rejected.Reasons))
 	}
-	return strings.TrimSpace(b.String())
+	return sanitize.Text(strings.TrimSpace(b.String()))
 }
 
 func normalizeOptimizationPolicy(policy OptimizationPolicy, profileID string) (OptimizationPolicy, error) {
@@ -1041,37 +1229,66 @@ func validateResetBands(bands []ResetBand) error {
 	return nil
 }
 
-func routingFingerprint(input DecisionInput, policy OptimizationPolicy, result Result, refs []InputRecordRef) (string, error) {
+func routingFingerprint(input DecisionInput, policy OptimizationPolicy, result Result, scored []ScoredCandidate, refs []InputRecordRef, generationStatus, generationReason string) (string, error) {
+	providerInventory := providerInventoryFingerprintProjection(input.Inputs.Inventory)
+	policyInputRecords := safePolicyInputRecords(input.PolicyInputRecords)
+	overrideProvenance := redactOverrideProvenance(input.OverrideProvenance)
 	payload := map[string]any{
-		"schema_version":      "loopcoder.routing_fingerprint_input.v1",
-		"decision_key":        input.DecisionKey,
-		"project_id":          input.ProjectID,
-		"delivery_run_id":     input.DeliveryRunID,
-		"task_requirement_id": input.TaskRequirementID,
-		"role_definition_id":  input.RoleDefinitionID,
-		"role_definitions":    input.Inputs.RoleDefinitions,
-		"plan_fingerprint":    input.PlanFingerprint,
-		"policy_fingerprint":  firstNonEmpty(input.PolicyFingerprint, policy.PolicyFingerprint),
-		"hard_policy":         input.Inputs.Policy,
-		"optimization_policy": policy,
-		"input_record_refs":   refs,
-		"eligible_candidates": result.Eligible,
-		"rejected_candidates": result.Rejected,
-		"user_pins":           input.Inputs.Pins,
-		"exclusions":          input.Inputs.Exclusions,
-		"worker_route":        input.Inputs.WorkerRoute,
+		"schema_version":              "loopcoder.routing_fingerprint_input.v1",
+		"decision_key":                input.DecisionKey,
+		"project_id":                  input.ProjectID,
+		"delivery_run_id":             input.DeliveryRunID,
+		"task_requirement_id":         input.TaskRequirementID,
+		"role_definition_id":          input.RoleDefinitionID,
+		"role_definitions":            input.Inputs.RoleDefinitions,
+		"plan_fingerprint":            input.PlanFingerprint,
+		"policy_fingerprint":          firstNonEmpty(input.PolicyFingerprint, policy.PolicyFingerprint),
+		"authorization_fingerprint":   input.AuthorizationFingerprint,
+		"prior_routing_decision_id":   input.PriorRoutingDecisionID,
+		"prior_routing_fingerprint":   input.PriorRoutingFingerprint,
+		"budget_class":                input.Inputs.BudgetClass,
+		"deadline_class":              input.Inputs.DeadlineClass,
+		"candidate_generation_status": generationStatus,
+		"candidate_generation_reason": generationReason,
+		"hard_policy":                 input.Inputs.Policy,
+		"optimization_policy":         policy,
+		"runtime_contract":            input.Inputs.RuntimeContract,
+		"host_name":                   input.Inputs.HostName,
+		"provider_inventory":          providerInventory,
+		"availability":                input.Inputs.Availability,
+		"circuit_breakers":            input.Inputs.CircuitBreakers,
+		"budgets":                     input.Inputs.Budgets,
+		"input_record_refs":           refs,
+		"eligible_candidates":         result.Eligible,
+		"rejected_candidates":         result.Rejected,
+		"scored_candidates":           scored,
+		"user_pins":                   input.Inputs.Pins,
+		"exclusions":                  input.Inputs.Exclusions,
+		"worker_route":                input.Inputs.WorkerRoute,
 	}
 	if hasRoutingPolicyProfile(input.RoutingPolicyProfile) {
 		payload["routing_profile"] = input.RoutingPolicyProfile
 	}
-	if len(input.OverrideProvenance) > 0 {
-		payload["override_provenance"] = input.OverrideProvenance
+	if len(overrideProvenance) > 0 {
+		payload["override_provenance"] = overrideProvenance
 	}
-	if len(input.PolicyInputRecords) > 0 {
-		payload["policy_input_records"] = input.PolicyInputRecords
+	if len(policyInputRecords) > 0 {
+		payload["policy_input_records"] = policyInputRecords
 	}
 	digest, _, err := delivery.DigestCanonicalJSON(payload)
 	return digest, err
+}
+
+// providerInventoryFingerprintProjection binds the scoped inventory evidence
+// while excluding the report-generation clock. InventoryFingerprint is a
+// derived field, so it is reproduced from the same stable evidence projection
+// instead of trusting or fingerprinting a caller-supplied value.
+func providerInventoryFingerprintProjection(report providerinventory.Report) providerinventory.Report {
+	projection := report
+	projection.GeneratedAt = ""
+	projection.InventoryFingerprint = ""
+	projection.InventoryFingerprint = "sha256:" + hashCanonical(projection)
+	return projection
 }
 
 func scoreCandidates(candidates []Candidate, inputs Inputs, policy OptimizationPolicy, now time.Time) []ScoredCandidate {
@@ -1087,9 +1304,9 @@ func scoreCandidates(candidates []Candidate, inputs Inputs, policy OptimizationP
 			}
 			switch name {
 			case ComponentExpiryUrgency:
-				components = append(components, scoreExpiryUrgency(candidate, inputs.Requirement, quotaByID, policy, now))
+				components = append(components, scoreExpiryUrgency(candidate, inputs.Requirement, inputs.DeadlineClass, quotaByID, policy, now))
 			case ComponentTaskHeadroom:
-				components = append(components, scoreTaskHeadroom(candidate, inputs.Requirement, quotaByID, policy, now))
+				components = append(components, scoreTaskHeadroom(candidate, inputs.Requirement, inputs.BudgetClass, inputs.DeadlineClass, quotaByID, policy, now))
 			case ComponentCapacityTrust:
 				components = append(components, scoreCapacityTrust(candidate, quotaByID, policy))
 			case ComponentAvailability:
@@ -1158,21 +1375,26 @@ func scoreQuality(candidate Candidate, requirement taskrequirements.TaskRequirem
 	return component(ComponentQualityFit, score, policy, providerinventory.ConfidenceEstimated, true, "quality fit uses policy quality floor until conformance records are persisted", nil, nil, nil)
 }
 
-func scoreExpiryUrgency(candidate Candidate, requirement taskrequirements.TaskRequirement, quotaByID map[string]providerinventory.QuotaSnapshot, policy OptimizationPolicy, now time.Time) ComponentScore {
+func scoreExpiryUrgency(candidate Candidate, requirement taskrequirements.TaskRequirement, deadlineClass DeadlineClass, quotaByID map[string]providerinventory.QuotaSnapshot, policy OptimizationPolicy, now time.Time) ComponentScore {
+	if deadlineClass == "" {
+		deadlineClass = DeadlineClass(taskClassForRequirement(requirement))
+	}
 	selected, ok := selectedQuotaSnapshot(candidate, quotaByID)
 	if !ok {
-		return component(ComponentExpiryUrgency, 0, policy, providerinventory.ConfidenceUnknown, true, "expiry urgency requires fresh quota reset evidence", nil, candidate.QuotaSnapshotIDs, nil)
+		c := component(ComponentExpiryUrgency, 0, policy, providerinventory.ConfidenceUnknown, true, "expiry urgency requires fresh quota reset evidence", nil, candidate.QuotaSnapshotIDs, nil)
+		c.TaskClass = string(deadlineClass)
+		c.DeadlineClass = deadlineClass
+		return c
 	}
 	score := 0
 	windowName := "unknown"
-	taskClass := taskClassForRequirement(requirement)
 	var resetAt string
 	var expectedWaste *int64
 	if reset, resetOK := parseTime(selected.ResetAt); resetOK && reset.After(now.UTC()) {
 		resetAt = delivery.CanonicalTimestamp(reset)
 		band := resetBandForDuration(policy.ResetBands, reset.Sub(now.UTC()))
 		windowName = band.Name
-		if taskClassAllowedInBand(taskClass, band.MaxTaskClass) {
+		if taskClassAllowedInBand(string(deadlineClass), band.MaxTaskClass) {
 			score = band.ExpiryUrgencyScore
 			if selected.RemainingValue != nil {
 				waste := expectedWasteAvoided(*selected.RemainingValue, policy.TargetUtilizationBP)
@@ -1183,19 +1405,29 @@ func scoreExpiryUrgency(candidate Candidate, requirement taskrequirements.TaskRe
 	c := component(ComponentExpiryUrgency, score, policy, selected.Confidence, selected.Confidence != providerinventory.ConfidenceExact, "expiry urgency rewards eligible task-fit capacity before known reset windows", nil, []string{selected.QuotaSnapshotID}, selected.RemainingValue)
 	c.ResetAt = resetAt
 	c.ResetWindow = windowName
-	c.TaskClass = taskClass
+	c.TaskClass = string(deadlineClass)
+	c.DeadlineClass = deadlineClass
 	c.ExpectedWaste = expectedWaste
 	c.FreshnessState = selected.FreshnessState
 	return c
 }
 
-func scoreTaskHeadroom(candidate Candidate, requirement taskrequirements.TaskRequirement, quotaByID map[string]providerinventory.QuotaSnapshot, policy OptimizationPolicy, now time.Time) ComponentScore {
+func scoreTaskHeadroom(candidate Candidate, requirement taskrequirements.TaskRequirement, budgetClass BudgetClass, deadlineClass DeadlineClass, quotaByID map[string]providerinventory.QuotaSnapshot, policy OptimizationPolicy, now time.Time) ComponentScore {
+	if budgetClass == "" {
+		budgetClass = BudgetClass(taskClassForRequirement(requirement))
+	}
+	if deadlineClass == "" {
+		deadlineClass = DeadlineClass(taskClassForRequirement(requirement))
+	}
 	selected, ok := selectedQuotaSnapshot(candidate, quotaByID)
 	if !ok || selected.RemainingValue == nil {
-		return component(ComponentTaskHeadroom, 0, policy, providerinventory.ConfidenceUnknown, true, "task-equivalent headroom requires remaining quota evidence", nil, candidate.QuotaSnapshotIDs, nil)
+		c := component(ComponentTaskHeadroom, 0, policy, providerinventory.ConfidenceUnknown, true, "task-equivalent headroom requires remaining quota evidence", nil, candidate.QuotaSnapshotIDs, nil)
+		c.TaskClass = string(budgetClass)
+		c.BudgetClass = budgetClass
+		c.DeadlineClass = deadlineClass
+		return c
 	}
-	taskClass := taskClassForRequirement(requirement)
-	taskUnits := taskUnitsForClass(taskClass)
+	taskUnits := taskUnitsForClass(string(budgetClass))
 	usable := usableAfterReserves(*selected.RemainingValue, policy)
 	headroom := int64(0)
 	if taskUnits > 0 {
@@ -1208,7 +1440,7 @@ func scoreTaskHeadroom(candidate Candidate, requirement taskrequirements.TaskReq
 		resetAt = delivery.CanonicalTimestamp(reset)
 		band := resetBandForDuration(policy.ResetBands, reset.Sub(now.UTC()))
 		windowName = band.Name
-		if !taskClassAllowedInBand(taskClass, band.MaxTaskClass) {
+		if !taskClassAllowedInBand(string(deadlineClass), band.MaxTaskClass) {
 			score = 0
 		}
 	}
@@ -1216,7 +1448,9 @@ func scoreTaskHeadroom(candidate Candidate, requirement taskrequirements.TaskReq
 	c := component(ComponentTaskHeadroom, score, policy, selected.Confidence, selected.Confidence != providerinventory.ConfidenceExact, "task-equivalent headroom applies target utilization and reserves before scoring capacity", nil, []string{selected.QuotaSnapshotID}, &value)
 	c.ResetAt = resetAt
 	c.ResetWindow = windowName
-	c.TaskClass = taskClass
+	c.TaskClass = string(budgetClass)
+	c.BudgetClass = budgetClass
+	c.DeadlineClass = deadlineClass
 	c.ReserveBasisBP = policy.CompletionReserveBP + policy.VerificationReserveBP
 	c.FreshnessState = selected.FreshnessState
 	return c
@@ -1311,6 +1545,31 @@ func taskClassForRequirement(requirement taskrequirements.TaskRequirement) strin
 		return "short"
 	}
 	return "very-short"
+}
+
+func resolveTaskFitClasses(requirement taskrequirements.TaskRequirement, budgetClass BudgetClass, deadlineClass DeadlineClass) (BudgetClass, DeadlineClass, error) {
+	floor := taskClassForRequirement(requirement)
+	budgetClass = BudgetClass(strings.TrimSpace(string(budgetClass)))
+	deadlineClass = DeadlineClass(strings.TrimSpace(string(deadlineClass)))
+	if budgetClass == "" {
+		budgetClass = BudgetClass(floor)
+	}
+	if deadlineClass == "" {
+		deadlineClass = DeadlineClass(floor)
+	}
+	if !ValidBudgetClass(budgetClass) {
+		return "", "", &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: fmt.Sprintf("unknown budget_class %q", budgetClass)}
+	}
+	if !ValidDeadlineClass(deadlineClass) {
+		return "", "", &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: fmt.Sprintf("unknown deadline_class %q", deadlineClass)}
+	}
+	if taskClassRank(string(budgetClass)) < taskClassRank(floor) {
+		return "", "", &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: fmt.Sprintf("budget_class %q is weaker than task requirement floor %q", budgetClass, floor)}
+	}
+	if taskClassRank(string(deadlineClass)) < taskClassRank(floor) {
+		return "", "", &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: fmt.Sprintf("deadline_class %q is weaker than task requirement floor %q", deadlineClass, floor)}
+	}
+	return budgetClass, deadlineClass, nil
 }
 
 func taskClassAllowedInBand(taskClass, maxClass string) bool {
@@ -1614,7 +1873,11 @@ func routingTerminalError(code taskrequirements.ErrorCode) error {
 
 func inputRefs(input DecisionInput, result Result) []InputRecordRef {
 	refs := []InputRecordRef{}
+	providerInventory := providerInventoryFingerprintProjection(input.Inputs.Inventory)
 	quotaByID := mapQuotaSnapshots(input.Inputs.Inventory.QuotaSnapshots)
+	availabilityByID, _ := mapAvailabilityScores(input.Inputs.Availability)
+	budgetByID := mapBudgets(input.Inputs.Budgets)
+	breakerByID := mapBreakers(input.Inputs.CircuitBreakers)
 	addRef := func(kind, id, fingerprint string) {
 		id = strings.TrimSpace(id)
 		if id == "" {
@@ -1622,10 +1885,28 @@ func inputRefs(input DecisionInput, result Result) []InputRecordRef {
 		}
 		refs = append(refs, InputRecordRef{RecordKind: kind, RecordID: id, Fingerprint: fingerprint})
 	}
+	addRef("delivery_run_authorization", input.DeliveryRunID, input.AuthorizationFingerprint)
+	addRef("prior_routing_decision", input.PriorRoutingDecisionID, input.PriorRoutingFingerprint)
 	addRef("task_requirement", input.TaskRequirementID, input.Inputs.Requirement.TaskRequirementFingerprint)
 	if role, ok := ResolveRoleDefinition(input.Inputs.Requirement.RoleKey, input.Inputs.RoleDefinitions); ok {
 		fp := "sha256:" + hashCanonical(role)
 		addRef("role_definition", firstNonEmpty(input.RoleDefinitionID, role.RoleDefinitionID), fp)
+	}
+	addRef("provider_inventory", providerInventory.InventoryFingerprint, providerInventory.InventoryFingerprint)
+	for _, installation := range input.Inputs.Inventory.Installations {
+		addRef("provider_installation", installation.ProviderInstallationID, recordEvidenceFingerprint(installation))
+	}
+	for _, account := range input.Inputs.Inventory.AccountProfiles {
+		addRef("account_profile", account.AccountProfileID, recordEvidenceFingerprint(account))
+	}
+	for _, readiness := range input.Inputs.Inventory.AuthReadiness {
+		addRef("auth_readiness", readiness.AuthReadinessID, recordEvidenceFingerprint(readiness))
+	}
+	for _, catalog := range input.Inputs.Inventory.ModelCatalogSnapshots {
+		addRef("model_catalog_snapshot", catalog.ModelCatalogSnapshotID, recordEvidenceFingerprint(catalog))
+	}
+	for _, model := range input.Inputs.Inventory.ModelCapabilities {
+		addRef("model_capability", model.ModelCapabilityID, recordEvidenceFingerprint(model))
 	}
 	for _, candidate := range append([]Candidate{}, result.Eligible...) {
 		addRef("routing_candidate", candidate.RoutingCandidateID, candidate.CandidateFingerprint)
@@ -1633,13 +1914,13 @@ func inputRefs(input DecisionInput, result Result) []InputRecordRef {
 			addRef("quota_snapshot", id, quotaSnapshotFingerprint(quotaByID, id))
 		}
 		for _, id := range candidate.BudgetPolicyIDs {
-			addRef("budget_policy", id, "")
+			addRef("budget_policy", id, evidenceFingerprint(budgetByID, id))
 		}
 		if candidate.AvailabilityScoreID != "" {
-			addRef("availability_score", candidate.AvailabilityScoreID, "")
+			addRef("availability_score", candidate.AvailabilityScoreID, evidenceFingerprint(availabilityByID, candidate.AvailabilityScoreID))
 		}
 		for _, id := range candidate.CircuitBreakerIDs {
-			addRef("circuit_breaker", id, "")
+			addRef("circuit_breaker", id, evidenceFingerprint(breakerByID, id))
 		}
 	}
 	for _, rejected := range result.Rejected {
@@ -1647,7 +1928,12 @@ func inputRefs(input DecisionInput, result Result) []InputRecordRef {
 		addRef("routing_candidate", candidate.RoutingCandidateID, candidate.CandidateFingerprint)
 		for _, reason := range rejected.Reasons {
 			for _, id := range reason.EvidenceRecordIDs {
-				addRef("rejection_evidence", id, "")
+				fingerprint := firstNonEmpty(
+					evidenceFingerprint(availabilityByID, id),
+					evidenceFingerprint(budgetByID, id),
+					evidenceFingerprint(breakerByID, id),
+				)
+				addRef("rejection_evidence", id, fingerprint)
 			}
 			for _, id := range reason.SnapshotIDs {
 				addRef("rejection_snapshot", id, quotaSnapshotFingerprint(quotaByID, id))
@@ -1655,19 +1941,19 @@ func inputRefs(input DecisionInput, result Result) []InputRecordRef {
 		}
 	}
 	for _, pin := range input.Inputs.Pins {
-		addRef("user_pin", pin.PinID, "")
+		addRef("user_pin", pin.PinID, "sha256:"+hashCanonical(pin))
 	}
 	for _, exclusion := range input.Inputs.Exclusions {
-		addRef("user_exclusion", exclusion.ExclusionID, "")
+		addRef("user_exclusion", exclusion.ExclusionID, "sha256:"+hashCanonical(exclusion))
 	}
-	for _, record := range input.PolicyInputRecords {
-		addRef("routing_policy_input", record.RoutingPolicyInputID, record.PolicyFingerprint)
+	for _, record := range safePolicyInputRecords(input.PolicyInputRecords) {
+		addRef("routing_policy_input", record.RoutingPolicyInputID, recordEvidenceFingerprint(record))
 	}
 	if hasRoutingPolicyProfile(input.RoutingPolicyProfile) {
 		addRef("routing_policy_profile", input.RoutingPolicyProfile.RoutingPolicyProfileID, input.RoutingPolicyProfile.PolicyFingerprint)
 	}
-	for _, override := range input.OverrideProvenance {
-		addRef("override", override.OverrideID, override.PolicyFingerprint)
+	for _, override := range redactOverrideProvenance(input.OverrideProvenance) {
+		addRef("override", override.OverrideID, recordEvidenceFingerprint(override))
 	}
 	sort.Slice(refs, func(i, j int) bool {
 		if refs[i].RecordKind != refs[j].RecordKind {
@@ -1691,12 +1977,24 @@ func inputRefs(input DecisionInput, result Result) []InputRecordRef {
 	return deduped
 }
 
+func recordEvidenceFingerprint(value any) string {
+	return "sha256:" + hashCanonical(value)
+}
+
 func quotaSnapshotFingerprint(quotaByID map[string]providerinventory.QuotaSnapshot, id string) string {
 	snapshot, ok := quotaByID[id]
 	if !ok {
 		return ""
 	}
 	return "sha256:" + hashCanonical(snapshot)
+}
+
+func evidenceFingerprint[T any](values map[string]T, id string) string {
+	value, ok := values[id]
+	if !ok {
+		return ""
+	}
+	return "sha256:" + hashCanonical(value)
 }
 
 func breakerRefs(result Result) []string {
@@ -1804,13 +2102,6 @@ func nonNilOverrideProvenance(values []OverrideProvenance) []OverrideProvenance 
 	return values
 }
 
-func nonNilPolicyInputRecords(values []PolicyInputRecord) []PolicyInputRecord {
-	if values == nil {
-		return []PolicyInputRecord{}
-	}
-	return values
-}
-
 func hasRoutingPolicyProfile(profile RoutingPolicyProfile) bool {
 	return strings.TrimSpace(profile.RoutingPolicyProfileID) != "" ||
 		strings.TrimSpace(profile.ProfileKey) != "" ||
@@ -1856,6 +2147,13 @@ func validateDecisionInput(input DecisionInput, policy OptimizationPolicy) error
 	if !validFingerprint(input.PlanFingerprint) || !validFingerprint(input.PolicyFingerprint) || !validFingerprint(policy.PolicyFingerprint) {
 		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing decision fingerprints must be sha256 digests"}
 	}
+	if input.AuthorizationFingerprint != "" && !validFingerprint(input.AuthorizationFingerprint) {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing decision authorization fingerprint must be a sha256 digest"}
+	}
+	if (strings.TrimSpace(input.PriorRoutingDecisionID) == "") != (strings.TrimSpace(input.PriorRoutingFingerprint) == "") ||
+		(input.PriorRoutingFingerprint != "" && !validFingerprint(input.PriorRoutingFingerprint)) {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "prior routing decision id and sha256 fingerprint must be provided together"}
+	}
 	if input.TaskRequirementID != input.Inputs.Requirement.TaskRequirementID {
 		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "task_requirement_id does not match requirement record"}
 	}
@@ -1883,14 +2181,29 @@ func validateRoutingDecision(decision RoutingDecision) error {
 		decision.CandidateGenerationStatus == "" || decision.DecisionStatus == "" || decision.CreatedAt == "" || decision.UpdatedAt == "" {
 		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing decision has missing required fields"}
 	}
-	if decision.CandidateGenerationStatus != CandidateGenerationFull {
+	if decision.CandidateGenerationStatus != CandidateGenerationFull && decision.CandidateGenerationStatus != CandidateGenerationNeedsHuman {
 		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "unknown routing candidate generation status"}
 	}
 	if decision.DecisionStatus != DecisionStatusSelected && decision.DecisionStatus != DecisionStatusNoEligible {
 		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "unknown routing decision status"}
 	}
+	if decision.CandidateGenerationStatus == CandidateGenerationNeedsHuman &&
+		(decision.DecisionStatus != DecisionStatusNoEligible || decision.TerminalErrorCode != taskrequirements.ErrNoEligibleCandidateCode || len(decision.EligibleCandidates) != 0 || len(decision.RejectedCandidates) != 0 || len(decision.ScoredCandidates) != 0 || decision.ChosenReason != CandidateGenerationZeroReason) {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "needs-human candidate generation must be an actionable zero-candidate decision"}
+	}
 	if !validFingerprint(decision.PlanFingerprint) || !validFingerprint(decision.PolicyFingerprint) || !validFingerprint(decision.RoutingFingerprint) {
 		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing decision fingerprints must be sha256 digests"}
+	}
+	if decision.AuthorizationFingerprint != "" && !validFingerprint(decision.AuthorizationFingerprint) {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing decision authorization fingerprint must be a sha256 digest"}
+	}
+	// Empty class fields are accepted only for persisted pre-v0.8.1 decisions.
+	// Every newly built decision resolves both fields before persistence.
+	if decision.BudgetClass != "" && !ValidBudgetClass(decision.BudgetClass) {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing decision budget_class is invalid"}
+	}
+	if decision.DeadlineClass != "" && !ValidDeadlineClass(decision.DeadlineClass) {
+		return &taskrequirements.TypedError{Code: taskrequirements.ErrInvalidRecordCode, Message: "routing decision deadline_class is invalid"}
 	}
 	expectedPolicyFingerprint := decision.OptimizationPolicy.PolicyFingerprint
 	if decision.RoutingPolicyProfile != nil {
