@@ -806,10 +806,10 @@ refuse before the first new runtime code merges.
 - shipped-doc: **R1.1 Domain/state contract** - define Project, WorkItem, Dependency,
   Job, Attempt, Provider, Model, Gate, Event, legal transitions, idempotency, and
   authority.
-- doc: **R1.2 Storage/migration contract** - define the compact schema,
+- shipped-doc: **R1.2 Storage/migration contract** - define the compact schema,
   transaction boundaries, event cursor, v0.8 read-only import, backup, abort,
   rollback, and file permissions.
-- planned-code: **R1.3 Store open/schema foundation** - create/open, schema version,
+- code: **R1.3 Store open/schema foundation** - create/open, schema version,
   owner-only permissions, integrity check, and close behavior without domain
   writes.
 - planned-code: **R1.4 Append-only event and cursor API** - idempotency key,
