@@ -9,8 +9,7 @@ Format for loopcoder work units:
 - Use "## [epic] ..." for a slice DAG; add "- doc:" / "- code:" lines for explicit slices.
 -->
 
-## [epic] 0.9.0 - Owned Go-native development orchestration kernel
-
+## 0.9.0 - Owned Go-native development orchestration kernel <!-- lc:u=lc-b0e1d07c3d4c -->
 ### Status and release intent
 
 Planned major architecture release. This roadmap is design input, not an
@@ -642,9 +641,29 @@ entire gate—or the complete v0.9.0 backlog—in one step. Gates A-H bound whic
 slices may become eligible; they do not split the program into public v0.9.x
 intermediate releases. The only final public release remains **v0.9.0**.
 
-#### Phase R0 - Charter, provenance, and measurable baseline
+#### Active-slice lifecycle (compiler-visible count = 1)
 
-- doc: **R0.1 Product charter** - define user, default one-worker workflow,
+Compiler-visible active slices are only lines starting with `- doc:` or
+`- code:`. History uses `shipped-doc` / `shipped-code`. Future work stays
+`planned-doc` / `planned-code` (ignored by `loopcoder compile`).
+
+When the current active slice is completed and merged:
+
+1. Convert that slice from `doc`/`code` to `shipped-doc`/`shipped-code` in the
+   same activation change that advances the program.
+2. In that same activation PR, convert exactly one next
+   `planned-doc`/`planned-code` line to `doc`/`code`.
+3. Do not leave zero or more than one compiler-visible `doc`/`code` slice.
+
+This keeps the active compiler-visible count exact: **1**. The v0.8.1
+`[epic]` dark-migration expander must not be used for the v0.9.0 program;
+top-level units are ordinary `##` headings with explicit planned/doc/code
+lines only.
+
+
+## Phase R0 - Charter, provenance, and measurable baseline <!-- lc:u=lc-2a56dc031a9b -->
+
+- doc: **R0.1 Product charter** - define user, default one-worker workflow, <!-- lc:u=lc-7304f225c290 -->
   ownership boundaries, GitHub/local/provider authorities, default/advanced
   modes, and explicit non-goals.
 - planned-doc: **R0.2 External inspiration ledger** - pin upstream revisions, licenses,
@@ -663,7 +682,7 @@ intermediate releases. The only final public release remains **v0.9.0**.
 Exit: the owner can identify exactly what v0.9 will build, replace, retain, and
 refuse before the first new runtime code merges.
 
-#### Phase R1 - Compact domain and event store
+## Phase R1 - Compact domain and event store <!-- lc:u=lc-997e40a9ed29 -->
 
 - planned-doc: **R1.1 Domain/state contract** - define Project, WorkItem, Dependency,
   Job, Attempt, Provider, Model, Gate, Event, legal transitions, idempotency, and
@@ -686,7 +705,7 @@ refuse before the first new runtime code merges.
 Exit: deterministic storage tests pass under crash/replay/busy conditions with
 no repo-local state and no old-engine writes.
 
-#### Phase R2 - Work Graph
+## Phase R2 - Work Graph <!-- lc:u=lc-415c61df69c9 -->
 
 - planned-doc: **R2.1 Work Graph contract** - one-node default, edge semantics, graph
   bounds, ready set, claim/close guards, GitHub projection, and compaction.
@@ -702,7 +721,7 @@ no repo-local state and no old-engine writes.
 Exit: replay and two-process tests prove one claim, one terminal transition, and
 one GitHub external identity.
 
-#### Phase R3 - Provider Plane
+## Phase R3 - Provider Plane <!-- lc:u=lc-e00d552a3b1a -->
 
 - planned-doc: **R3.1 Provider adapter protocol** - versioned interface, timeout,
   redaction, auth ownership, quota source authority, model capability, and
@@ -744,7 +763,7 @@ one GitHub external identity.
 Exit: each installed provider can be discovered and explained independently;
 one failing adapter cannot block or corrupt the others.
 
-#### Phase R4 - Deterministic Router
+## Phase R4 - Deterministic Router <!-- lc:u=lc-dc8d98eaaedf -->
 
 - planned-doc: **R4.1 Routing policy** - hard eligibility, Luna/Tera/Soul mapping,
   explicit pins, quota expiry pressure, weekly reserve, cooldown, reliability,
@@ -763,7 +782,7 @@ Exit: a table-driven simulation covers all providers, short/weekly windows,
 unknown/stale evidence, exhaustion, and deterministic replay without a model
 call.
 
-#### Phase R5 - Runtime and Supervisor
+## Phase R5 - Runtime and Supervisor <!-- lc:u=lc-f6a32c5179e8 -->
 
 - planned-doc: **R5.1 Runtime/process contract** - process tree ownership, start,
   observe, signal, stop, join, recovery evidence, native sub-agent boundary, and
@@ -792,7 +811,7 @@ call.
 Exit: real macOS Apple Silicon tests prove bounded load, mandatory reports, and
 zero descendant processes after success, cancellation, timeout, and crash.
 
-#### Phase R6 - Direct delivery vertical slice
+## Phase R6 - Direct delivery vertical slice <!-- lc:u=lc-ddb33246f698 -->
 
 - planned-doc: **R6.1 `loopcoder run` operator contract** - command inputs, phases,
   prompts, outputs, side effects, stop/resume behavior, and human gates.
@@ -818,7 +837,7 @@ zero descendant processes after success, cancellation, timeout, and crash.
 Exit: a normal user needs one command and sees bounded progress through a
 complete real delivery path without understanding internal orchestration.
 
-#### Phase R7 - Explicit bounded workflow mode
+## Phase R7 - Explicit bounded workflow mode <!-- lc:u=lc-5b222f9715ef -->
 
 - planned-doc: **R7.1 Workflow definition/materialization contract** - reusable steps,
   immutable materialized graph, owner approval, bounds, roles, dependencies,
@@ -838,7 +857,7 @@ complete real delivery path without understanding internal orchestration.
 Exit: a three-node serial/parallel fixture survives restart and failure with no
 duplicate execution, no hidden child, and bounded local resources.
 
-#### Phase R8 - Migration, deletion, and production qualification
+## Phase R8 - Migration, deletion, and production qualification <!-- lc:u=lc-2eebb15e7398 -->
 
 - planned-doc: **R8.1 Compatibility/deprecation guide** - old command mapping, old/new
   state isolation, one-release warning period, v1.0 removal list, and operator
@@ -866,8 +885,7 @@ Exit: v0.9.0 ships only when the direct path is simpler to operate than v0.8.1,
 all release gates pass on the integrated release SHA, and the owner has accepted
 the deletion/deprecation report.
 
-### Release acceptance gates
-
+## Release acceptance gates <!-- lc:u=lc-68fd0fffcc19 -->
 v0.9.0 is not releasable unless all of the following are demonstrated:
 
 - One-command direct path from a real GitHub issue to one PR and a structured
@@ -895,8 +913,7 @@ v0.9.0 is not releasable unless all of the following are demonstrated:
   verification, test, race, security, install, upgrade, and real-product
   canaries.
 
-### Explicit non-goals for v0.9.0
-
+## Explicit non-goals for v0.9.0 <!-- lc:u=lc-4e2d92138b20 -->
 - Reimplementing or embedding Dolt.
 - Shipping a clone of Gas City, Beads, or Plexus under different names.
 - General-purpose issue tracking, team chat, provider API gateway, credential
@@ -909,7 +926,7 @@ v0.9.0 is not releasable unless all of the following are demonstrated:
 - Claiming authoritative quota where the provider exposes none.
 - Optimizing breadth before the one-worker direct path is proven reliable.
 
-## 0.6.1 — Customer-ready bridge release — shipped 2026-07-09
+## 0.6.1 — Customer-ready bridge release — shipped 2026-07-09 <!-- lc:u=lc-d90d80350dbf -->
 
 Shipped. v0.6.1 was the customer-ready bridge for the public 0.6 line.
 It packages the 0.6 capabilities for external consumers while keeping larger
@@ -930,7 +947,7 @@ scope for a later 0.7.0 line.
 - shipped-code: `report --format json` compatibility array plus richer `records`
   entries with source, run id, and local path.
 
-## 0.6.0 — Model & depth selection: discovery, validation, defaults (+ agy provider)
+## 0.6.0 — Model & depth selection: discovery, validation, defaults (+ agy provider) <!-- lc:u=lc-b9f16bd616c4 -->
 
 Implemented for the 0.6 line and released to customers through v0.6.1. Make models and their depth tiers discoverable, validated, and defaulted so operators
 choose without guessing. Target models: **claude, gpt (codex), gemini** — gemini reached **via
@@ -974,7 +991,7 @@ that the translation matched intent — validation catches *invalid* picks, the 
   doctor` checks agy OAuth login so a missing login fails clearly.
 - shipped-code: docs/reference — `loopcoder models` usage, model/depth config, agy setup + login.
 
-## 0.6.0 — reporter (attestation → reporter rename + light strengthening)
+## 0.6.0 — reporter (attestation → reporter rename + light strengthening) <!-- lc:u=lc-b8ffb03c1172 -->
 
 Implemented for the 0.6 line and released to customers through v0.6.1. Rename `attestation`→`reporter` **including the operator-visible
 `[attestation]`→`[reporter]` token** (a rename nobody can see is pointless) — Go package, type,
@@ -1015,7 +1032,7 @@ the new agy file in one pass instead of colliding with it.
 - shipped-code: docs/reference — reporter concept + attestation→reporter prose in usage.md/worker.md
   (CHANGELOG + shipped specs frozen).
 
-## 0.6.0 — Upgrade, migration & operational health (doctor)
+## 0.6.0 — Upgrade, migration & operational health (doctor) <!-- lc:u=lc-9fc4c1e04cdd -->
 
 Implemented for the 0.6 line and released to customers through v0.6.1. 0.6.0 is the first BREAKING release (reporter rename), so it must ship a clean upgrade
 from 0.5.x and a defined self-check. Everything we froze (`.attest` ledgers, CanonicalJSON field
@@ -1040,7 +1057,7 @@ names) migrates as a no-op; only renamed config keys and stale logs need real ha
   and establish a standing per-release rule in `docs/reference/releasing.md`: every version bump
   rewrites all three (changelog / release note / README), as complete and detailed as possible.
 
-## 0.5.3 — loopcoder audit (built-in security audit) — ✅ shipped v0.5.3 (2026-07-06)
+## 0.5.3 — loopcoder audit (built-in security audit) — ✅ shipped v0.5.3 (2026-07-06) <!-- lc:u=lc-4de0421522dd -->
 
 Shipped. `loopcoder audit` is a read-only, built-in security audit that institutionalizes
 catching the class of issue the external audit surfaced — on demand and in CI. Two layers: a
@@ -1060,7 +1077,7 @@ findings: the worker-layer prompt/recovery `0o600` gap (a 0.5.1 A1-scope miss) a
 `golang.org/x/sys` dependency vulnerability. The E1 ReadOnly boundary, H5 exit-code split,
 self-hosting guard, 0.5.1 hardening, and 0.5.2 behavior-preservation are all preserved.
 
-## 0.5.2 — Core refactor (behavior-preserving) — ✅ shipped v0.5.2 (2026-07-05)
+## 0.5.2 — Core refactor (behavior-preserving) — ✅ shipped v0.5.2 (2026-07-05) <!-- lc:u=lc-e8090e82a836 -->
 
 Shipped. Behavior-preserving internal restructuring for readability, testability, and reduced
 drift, with **zero observable behavior change** (proven by golden/inventory tests and
@@ -1076,7 +1093,7 @@ output); MCP validation consolidated into one shared parse-time validator (uncha
 accept/reject set, byte-identical provider argv); defaults/limits centralized into a new
 `internal/defaults` leaf package with no value tuning.
 
-## 0.5.1 — Security & robustness hardening — ✅ shipped v0.5.1 (2026-07-05)
+## 0.5.1 — Security & robustness hardening — ✅ shipped v0.5.1 (2026-07-05) <!-- lc:u=lc-839f686c0285 -->
 
 Shipped. Fixes every verified finding from the external security audit. loopcoder is a local
 single-operator dev CLI, so most were Low–Medium hardening rather than active-exploit fixes;
@@ -1092,7 +1109,7 @@ additive no-shell `argv` command form for the evidence producer + custom livenes
 failure reporting (runJSON / CreateIssue-UpdateIssue / codex log); and bounded hook / runstatus
 / worktree-liveness I/O.
 
-## 0.5.0 — Generalize loopcoder beyond code (domain profiles) — ✅ shipped v0.5.0 (2026-07-04)
+## 0.5.0 — Generalize loopcoder beyond code (domain profiles) — ✅ shipped v0.5.0 (2026-07-04) <!-- lc:u=lc-57919ccf2f3b -->
 
 Shipped. loopcoder is now a general autonomous-delivery engine for any verifiable,
 repo-based, AI-doable work (documents, content, data…), not only code — via purely-additive
