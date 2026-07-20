@@ -1869,10 +1869,11 @@ func printProvidersHelp(w io.Writer) {
 	fmt.Fprintln(w, "Refresh bounded provider CLI installation inventory and show cached quota status.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
-	fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
-	fmt.Fprintln(w, "  --base-branch string   base branch for .delivery.yml fallback (default \"main\")")
-	fmt.Fprintln(w, "  --format string        output format: text or json (default \"text\")")
-	fmt.Fprintln(w, "  --help                 show help")
+	fmt.Fprintln(w, "  --repo string                    repository path (default \".\")")
+	fmt.Fprintln(w, "  --base-branch string             base branch for .delivery.yml fallback (default \"main\")")
+	fmt.Fprintln(w, "  --grant-quota-telemetry string   comma-separated adapter ids (or \"all\") granted network for quota telemetry")
+	fmt.Fprintln(w, "  --format string                  output format: text or json (default \"text\")")
+	fmt.Fprintln(w, "  --help                           show help")
 }
 
 func printBudgetHelp(w io.Writer) {
@@ -1922,9 +1923,11 @@ func runProviders(args []string, stdout, stderr io.Writer, deps Deps) int {
 	repoPath := "."
 	baseBranch := lcdefaults.BaseBranch
 	format := "text"
+	grantQuotaTelemetry := ""
 	fs.StringVar(&repoPath, "repo", ".", "repository path")
 	fs.StringVar(&baseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
 	fs.StringVar(&format, "format", "text", "output format")
+	fs.StringVar(&grantQuotaTelemetry, "grant-quota-telemetry", "", "comma-separated adapter ids (or \"all\") granted network for quota telemetry")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -1950,13 +1953,19 @@ func runProviders(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "providers refresh: %v\n", err)
 		return 1
 	}
+	networkGrants, err := parseQuotaTelemetryGrants(grantQuotaTelemetry)
+	if err != nil {
+		fmt.Fprintf(stderr, "providers refresh: %v\n", err)
+		return 2
+	}
 	now := deps.Now()
 	if deps.ProviderQuotaRefresh != nil {
 		result, err := deps.ProviderQuotaRefresh(context.Background(), providerinventory.RefreshRequest{
-			RepoPath: resolvedRepo,
-			Config:   cfg,
-			Trigger:  providerinventory.RefreshTriggerExplicit,
-			Now:      func() time.Time { return now },
+			RepoPath:      resolvedRepo,
+			Config:        cfg,
+			NetworkGrants: networkGrants,
+			Trigger:       providerinventory.RefreshTriggerExplicit,
+			Now:           func() time.Time { return now },
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "providers refresh: %v\n", err)
@@ -1975,9 +1984,10 @@ func runProviders(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 0
 	}
 	report, err := deps.ProviderInventory(context.Background(), providerinventory.Options{
-		RepoPath: resolvedRepo,
-		Config:   cfg,
-		Now:      func() time.Time { return now },
+		RepoPath:      resolvedRepo,
+		Config:        cfg,
+		NetworkGrants: networkGrants,
+		Now:           func() time.Time { return now },
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "providers refresh: %v\n", err)
@@ -2110,6 +2120,48 @@ func runProvidersStatus(args []string, stdout, stderr io.Writer, deps Deps) int 
 	}
 	renderProviderQuotaStatusText(stdout, status)
 	return 0
+}
+
+// defaultRuntimeHostName returns a runtimecap-registered host profile name.
+// Unknown names hard-fail every route candidate as role-unsupported.
+func defaultRuntimeHostName() string {
+	if strings.TrimSpace(os.Getenv("PASEO_AGENT_ID")) != "" {
+		return "paseo-style"
+	}
+	return "generic-local"
+}
+
+// parseQuotaTelemetryGrants builds explicit network grants for quota telemetry.
+// Accepts comma-separated adapter ids, or "all" for the common official adapters.
+func parseQuotaTelemetryGrants(raw string) ([]providerinventory.NetworkGrant, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	adapters := []string{}
+	if strings.EqualFold(raw, "all") {
+		adapters = []string{"codex", "claude", "gemini", "antigravity", "grok"}
+	} else {
+		for _, part := range strings.Split(raw, ",") {
+			part = strings.TrimSpace(strings.ToLower(part))
+			if part == "" {
+				continue
+			}
+			adapters = append(adapters, part)
+		}
+	}
+	if len(adapters) == 0 {
+		return nil, fmt.Errorf("invalid --grant-quota-telemetry %q; want adapter ids or \"all\"", raw)
+	}
+	grants := make([]providerinventory.NetworkGrant, 0, len(adapters))
+	for _, adapterID := range adapters {
+		grants = append(grants, providerinventory.NetworkGrant{
+			ProviderID: adapterID,
+			Purpose:    providerinventory.NetworkPurposeQuotaTelemetry,
+			Scope:      providerinventory.NetworkScopeMachineInventory,
+		})
+	}
+	return grants, nil
 }
 
 func renderProviderRefreshText(stdout io.Writer, result providerinventory.RefreshResult) {
@@ -4746,7 +4798,7 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 			ExplicitProvider: explicitProvider,
 			ExplicitModel:    explicitModel,
 			ExplicitEffort:   explicitEffort,
-			HostName:         "loopcoder-cli",
+			HostName:         defaultRuntimeHostName(),
 			Now:              deps.Now(),
 		})
 		if routeErr != nil {
@@ -6291,7 +6343,7 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 			ExplicitProvider: explicitProvider,
 			ExplicitModel:    explicitModel,
 			ExplicitEffort:   explicitEffort,
-			HostName:         "loopcoder-cli",
+			HostName:         defaultRuntimeHostName(),
 			Now:              deps.Now(),
 		})
 		if routeErr != nil {
