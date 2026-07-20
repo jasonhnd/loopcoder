@@ -92,7 +92,13 @@ func resolveWorkerDispatchRouteProduction(ctx context.Context, input WorkerDispa
 	}
 	hostName := strings.TrimSpace(input.HostName)
 	if hostName == "" {
-		hostName = "loopcoder-cli"
+		// Must match a runtimecap host profile name; "loopcoder-cli" is not registered
+		// and hard-fails every candidate as role-unsupported / unknown_host.
+		if strings.TrimSpace(os.Getenv("PASEO_AGENT_ID")) != "" {
+			hostName = "paseo-style"
+		} else {
+			hostName = "generic-local"
+		}
 	}
 	actor := delivery.Actor{
 		ActorKind:         "system",

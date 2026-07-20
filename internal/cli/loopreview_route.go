@@ -73,7 +73,11 @@ func resolveVerifierDispatchRouteProduction(ctx context.Context, input VerifierD
 	runID := fmt.Sprintf("loopreview-pr-%d", input.PRNumber)
 	hostName := strings.TrimSpace(input.HostName)
 	if hostName == "" {
-		hostName = "loopcoder-cli"
+		if strings.TrimSpace(os.Getenv("PASEO_AGENT_ID")) != "" {
+			hostName = "paseo-style"
+		} else {
+			hostName = "generic-local"
+		}
 	}
 	actor := delivery.Actor{
 		ActorKind:         "system",
