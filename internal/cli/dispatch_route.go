@@ -98,7 +98,7 @@ func resolveWorkerDispatchRouteProduction(ctx context.Context, input WorkerDispa
 		ActorKind:         "system",
 		ActorID:           "loopcoder-dispatch",
 		Display:           "loopcoder dispatch",
-		DecisionAuthority: "worker-dispatch-route",
+		DecisionAuthority: "router",
 		Source:            "cli.dispatch",
 	}
 	host := delivery.Host{

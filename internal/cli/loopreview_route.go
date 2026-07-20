@@ -79,7 +79,7 @@ func resolveVerifierDispatchRouteProduction(ctx context.Context, input VerifierD
 		ActorKind:         "system",
 		ActorID:           "loopcoder-loopreview",
 		Display:           "loopcoder loopreview",
-		DecisionAuthority: "verifier-dispatch-route",
+		DecisionAuthority: "router",
 		Source:            "cli.loopreview",
 	}
 	host := delivery.Host{
