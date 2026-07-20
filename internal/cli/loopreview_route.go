@@ -82,6 +82,13 @@ func resolveVerifierDispatchRouteProduction(ctx context.Context, input VerifierD
 		DecisionAuthority: "router",
 		Source:            "cli.loopreview",
 	}
+	pinActor := delivery.Actor{
+		ActorKind:         "user",
+		ActorID:           "local-user",
+		Display:           "local user",
+		DecisionAuthority: "user",
+		Source:            "cli.loopreview",
+	}
 	host := delivery.Host{
 		HostKind:         "cli",
 		HostID:           hostName,
@@ -184,7 +191,7 @@ func resolveVerifierDispatchRouteProduction(ctx context.Context, input VerifierD
 		HostName:          hostName,
 		DecidedBy:         actor,
 		Host:              host,
-		PinActor:          actor,
+		PinActor:          pinActor,
 	}
 	if pin := strings.TrimSpace(input.ExplicitProvider); pin != "" {
 		request.Pin = &routing.CandidateConstraint{

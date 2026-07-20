@@ -101,6 +101,14 @@ func resolveWorkerDispatchRouteProduction(ctx context.Context, input WorkerDispa
 		DecisionAuthority: "router",
 		Source:            "cli.dispatch",
 	}
+	// Policy pin/exclusion rows require ActorKind=user (validatePolicyInput).
+	pinActor := delivery.Actor{
+		ActorKind:         "user",
+		ActorID:           "local-user",
+		Display:           "local user",
+		DecisionAuthority: "user",
+		Source:            "cli.dispatch",
+	}
 	host := delivery.Host{
 		HostKind:         "cli",
 		HostID:           hostName,
@@ -194,7 +202,7 @@ func resolveWorkerDispatchRouteProduction(ctx context.Context, input WorkerDispa
 		HostName:          hostName,
 		DecidedBy:         actor,
 		Host:              host,
-		PinActor:          actor,
+		PinActor:          pinActor,
 	}
 	if pinProvider := strings.TrimSpace(input.ExplicitProvider); pinProvider != "" {
 		request.Pin = &routing.CandidateConstraint{
