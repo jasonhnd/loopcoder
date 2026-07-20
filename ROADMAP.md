@@ -18,12 +18,22 @@ authorization to publish issues or begin implementation. Issue publication and
 implementation require a separate owner approval after the roadmap and its
 architecture documents are reviewed.
 
-v0.8.1 remains the production baseline and receives only approved P0/P1
-correctness, security, data-loss, runaway-process, and release-blocking fixes
-while v0.9.0 is developed. v0.9.0 is not a fourth feature layer on top of the
-v0.8 implementation. It is a controlled replacement and consolidation of the
-core path, with old commands kept as compatibility shims only until the new path
-has proven parity.
+The entire R0-R8 program is one final public release: **v0.9.0**. There are no
+intermediate public releases, no prerelease version numbers, and no
+v0.9.1-v0.9.7 (or similar) ship points. Internal progress uses development
+gates only; those gates are not versions and do not produce public packages.
+
+v0.8.1 remains the public production baseline and the self-bootstrap controller
+throughout v0.9 development. It receives only approved P0/P1 correctness,
+security, data-loss, runaway-process, and release-blocking fixes while v0.9.0
+is developed. No v0.9 candidate binary, tag, or install path may replace v0.8.1
+as the production or self-bootstrap controller before the R8 release gate
+passes on the integrated release SHA.
+
+v0.9.0 is not a fourth feature layer on top of the v0.8 implementation. It is a
+controlled replacement and consolidation of the core path, with old commands
+kept as compatibility shims only until the new path has proven parity. The only
+final release produced by this roadmap is v0.9.0 after all R0-R8 gates pass.
 
 ### Product mission
 
@@ -556,17 +566,81 @@ to ship:
 - A red required check gets one diagnosis and one scoped repair. Repeated broad
   repair loops require owner review.
 
+#### Architecture-release exception (v0.9.0 only)
+
+The self-hosting playbook normally budgets **8-12 implementation issues per
+minor public release**. That budget remains the default for ordinary minor
+work.
+
+v0.9.0 is an owner-approved, one-time **architecture-release exception**: the
+full R0-R8 program (14 documentation slices + 56 implementation slices = 70
+planned slices) ships as a single final public version, **v0.9.0**. The
+exception does **not** relax issue sizing, single-PR-in-flight, self-bootstrap
+controller rules, resource ceilings, or phase exit criteria. It only permits
+the cumulative implementation count across the whole architecture program to
+exceed 8-12 issues because those issues are serialized through internal
+development gates rather than intermediate public releases.
+
+This exception applies only to the v0.9.0 architecture program defined in this
+roadmap. Later minor releases return to the normal 8-12 implementation-issue
+budget unless the owner records a new, explicit exception.
+
+#### Internal development gates (not versions)
+
+Progress is tracked by **internal development gates**. Gates are not version
+numbers, not prereleases, and not public ship points. They exist only to bound
+activation, issue publication, and in-flight work while the single final
+release remains v0.9.0.
+
+| Gate | Scope | Code slices | Notes |
+| --- | --- | --- | --- |
+| Gate A | R0 + R1 | 6 | R0.5, R1.3-R1.7 (plus R0/R1 docs before code) |
+| Gate B | R2 | 4 | R2.2-R2.5 |
+| Gate C | R3.1-R3.10 | 9 | R3.1 is documentation; R3.2-R3.10 are code (provider core + Codex + Claude) |
+| Gate D | R3.11-R3.17 + R4 | 11 | Antigravity/Grok/future kit + Router |
+| Gate E | R5 | 8 | Runtime and Supervisor |
+| Gate F | R6 | 7 | Direct `loopcoder run` vertical slice |
+| Gate G | R7 | 5 | Explicit bounded workflow mode |
+| Gate H | R8 | 6 | Migration, deletion, release qualification |
+
+Gate activation rules:
+
+- Owner approval activates a **gate boundary**, not every slice inside that
+  gate. Opening Gate C means R3.1-R3.10 are the eligible set; it does not
+  convert or publish them in bulk.
+- Only **one** gate may be open at a time. The next gate must not open until
+  the prior gate's phase exit criteria pass.
+- Only **one** `planned-doc` or `planned-code` slice may be converted to
+  `doc`/`code` at a time. Never convert or compile an entire gate in one
+  activation PR.
+- At most **one** v0.9 documentation or implementation issue/PR may be in
+  flight at a time.
+- Each documentation slice must be accepted (merged and closed with exit
+  evidence) before its dependent code slice is activated or published.
+- The next slice starts only after the current slice is merged, closed, and
+  its cleanup/exit evidence is complete.
+- Completing a gate does **not** create a public release, tag, or controller
+  replacement. Only after Gate H (R8) and the final acceptance gates pass may
+  **v0.9.0** ship as the sole public release from this roadmap.
+- v0.8.1 remains the public production and self-bootstrap controller until the
+  R8 release gate passes; no intermediate v0.9 candidate may replace it.
+
 ### Planned slices
 
 The stable IDs below must survive later issue publication. Each bullet is one
 issue and one PR. Issues are not to be published until the owner approves the
-complete roadmap.
+complete roadmap and then opens the next internal development gate.
 
 Unapproved slices intentionally use `planned-doc` and `planned-code`, which the
-current `loopcoder compile` parser ignores. A small activation PR converts only
-the next owner-approved phase to `doc`/`code`; that phase is then compiled and
-executed to its exit gate before another phase is activated. Do not convert all
-phases or publish the complete v0.9.0 backlog at once.
+current `loopcoder compile` parser ignores. Activation is strictly serialized:
+owner approval opens one gate boundary; then exactly one planned slice is
+converted to `doc` or `code` in a small activation change; that single slice
+is published, delivered, merged, closed, and cleaned up with exit evidence
+before the next planned slice is converted. Dependent code slices wait until
+their documentation slices are accepted. Never convert, compile, or publish an
+entire gate—or the complete v0.9.0 backlog—in one step. Gates A-H bound which
+slices may become eligible; they do not split the program into public v0.9.x
+intermediate releases. The only final public release remains **v0.9.0**.
 
 #### Phase R0 - Charter, provenance, and measurable baseline
 
