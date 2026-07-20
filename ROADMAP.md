@@ -663,10 +663,10 @@ lines only.
 
 ## Phase R0 - Charter, provenance, and measurable baseline <!-- lc:u=lc-2a56dc031a9b -->
 
-- doc: **R0.1 Product charter** - define user, default one-worker workflow, <!-- lc:u=lc-7304f225c290 -->
+- shipped-doc: **R0.1 Product charter** - define user, default one-worker workflow, <!-- lc:u=lc-7304f225c290 -->
   ownership boundaries, GitHub/local/provider authorities, default/advanced
   modes, and explicit non-goals.
-- planned-doc: **R0.2 External inspiration ledger** - pin upstream revisions, licenses,
+- doc: **R0.2 External inspiration ledger** - pin upstream revisions, licenses,
   adopted concepts, rejected assumptions, rewrite-only policy, and provenance
   review checklist.
 - planned-doc: **R0.3 v0.8 disposition map** - map every current top-level subsystem to
