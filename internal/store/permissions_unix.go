@@ -37,7 +37,7 @@ func CheckPermissions(path string) (PermissionReport, error) {
 		Supported: true,
 		Secure:    true,
 	}
-	if err := inspectAncestorPathBoundary(path); err != nil {
+	if err := inspectAncestorPathBoundary(path, false); err != nil {
 		report.Secure = false
 		report.Message = err.Error()
 		report.Items = append(report.Items, PermissionItem{
@@ -69,7 +69,7 @@ func ensurePermissionsForOpen(path string) error {
 	if path == "." || path == "" {
 		return fmt.Errorf("open store: path is required")
 	}
-	if err := inspectAncestorPathBoundary(path); err != nil {
+	if err := inspectAncestorPathBoundary(path, true); err != nil {
 		return fmt.Errorf("open store: insecure path boundary for %s: %w", path, err)
 	}
 	for _, target := range storeDirectoryTargets(path) {
@@ -131,11 +131,14 @@ func storeDirectoryTargets(path string) []permissionTarget {
 //   - foreign ownership of further ancestors while still inside a current-user
 //     owned prefix (so a user-owned intermediate cannot redirect via symlink
 //     into another principal's tree)
+//   - group/other-writable directories in the current-user-owned prefix
 //
-// System ancestors owned by another uid (for example /var or /Users) stop the
-// walk without error once the user-owned prefix has been validated. Mode 0700
-// is enforced only on the data directory and database file targets.
-func inspectAncestorPathBoundary(path string) error {
+// When repair is true, group/other write bits on current-user-owned ancestor
+// directories are cleared. System ancestors owned by another uid (for example
+// /var or /Users) stop the walk without error once the user-owned prefix has
+// been validated. Mode 0700 is still enforced only on the data directory and
+// database file targets.
+func inspectAncestorPathBoundary(path string, repair bool) error {
 	path = filepath.Clean(strings.TrimSpace(path))
 	if path == "" || path == "." {
 		return fmt.Errorf("path is required")
@@ -171,6 +174,18 @@ func inspectAncestorPathBoundary(path string) error {
 			}
 			// Foreign-owned system parent ends the walk after user-owned prefix.
 			return nil
+		}
+		// Contract: parent directories must not be writable by other users.
+		if info.IsDir() {
+			if perm := info.Mode().Perm(); perm&0o022 != 0 {
+				if !repair {
+					return fmt.Errorf("ancestor directory %s is group/other-writable (mode %04o)", current, perm)
+				}
+				next := perm &^ 0o022
+				if err := os.Chmod(current, next); err != nil {
+					return fmt.Errorf("tighten ancestor directory %s from %04o to %04o: %w", current, perm, next, err)
+				}
+			}
 		}
 		parent := filepath.Dir(current)
 		if parent == current || parent == string(filepath.Separator) || parent == "." {
