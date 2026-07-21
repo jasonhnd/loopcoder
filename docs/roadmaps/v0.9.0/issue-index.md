@@ -1,7 +1,7 @@
 # LoopCoder v0.9.0 Issue Index
 
-Status: **READY FOR ORDINARY DEVELOPMENT**; publication and assignment remain
-owner-controlled.
+Status: **READY FOR CATALOG PUBLICATION AND ORDINARY DEVELOPMENT**; assignment
+and implementation remain owner-controlled.
 
 This index is the merge-order map for the ordinary-development v0.9.0 program.
 It is not input to `loopcoder compile`, and no row authorizes issue publication,
@@ -191,11 +191,12 @@ no children or repo-local runtime files, and has an explicit GO/NO-GO record.
 
 ## Publication And Ordering Rules
 
-1. Publish only owner-reviewed, dependency-ready issues. Phase files organize
-   ownership; they do not require publishing or implementing an entire phase at
-   once.
-2. Do not publish all 109 issues at once as an active backlog. Milestone entries
-   may exist, but only dependency-ready issues receive an implementation label.
+1. The owner may publish the complete reviewed catalog as planned milestone
+   entries. Phase files organize ownership; they do not authorize implementation
+   of an entire phase at once.
+2. Catalog publication is not activation. Issues with unmet dependencies receive
+   `status:planned`; only dependency-ready issues receive `status:ready`, and
+   assignment still requires a separate owner decision.
 3. No implementation starts merely because an issue exists. The owner selects
    the developer or agent, provider, model, effort, permissions, and base.
 4. Do not use LoopCoder to create, route, dispatch, monitor, verify, or merge any

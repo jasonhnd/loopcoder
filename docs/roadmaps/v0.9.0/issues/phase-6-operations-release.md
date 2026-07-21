@@ -796,15 +796,15 @@ service, source attachment, credential collection, or silent telemetry opt-in.
 ### Outcome and rationale
 
 Build one reproducible macOS Apple Silicon archive, generate checksums/SBOM,
-sign/attest through the accepted release identity, and publish update metadata as
-a draft without claiming Windows/Linux support.
+bind provenance and signatures to the accepted release identity, and publish
+update metadata as a draft without claiming Windows/Linux support.
 
 ### Scope and constraints
 
 - Build once from an exact protected commit in a clean hosted environment.
 - Include binary, license/notices, README/quickstart, version/commit metadata, and
   required static assets only.
-- Generate SHA-256 checksums, SBOM, provenance/attestation/signature, and draft
+- Generate SHA-256 checksums, SBOM, provenance/signature records, and draft
   release metadata tied to one archive digest.
 - Separate draft/build from publication approval; no local developer artifact may
   be promoted.
@@ -815,7 +815,7 @@ a draft without claiming Windows/Linux support.
 1. One `darwin/arm64` archive is produced from the exact release candidate SHA and
    is never rebuilt between qualification and publication.
 2. Binary reports version/commit/build source matching archive metadata.
-3. Checksum, SBOM, license/notices, provenance, and accepted signature/attestation
+3. Checksum, SBOM, license/notices, and accepted provenance/signature records
    verify against the exact archive.
 4. Release remains draft until V090-082/V090-083 and explicit publication
    approval.

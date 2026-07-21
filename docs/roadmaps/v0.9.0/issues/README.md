@@ -1,12 +1,13 @@
 # v0.9.0 Issue Publication Contract
 
-Status: **READY FOR ORDINARY DEVELOPMENT**; final GitHub publication and
-assignment remain owner-controlled.
+Status: **READY FOR CATALOG PUBLICATION AND ORDINARY DEVELOPMENT**; assignment
+and implementation remain owner-controlled.
 
 The seven phase files in this directory contain 109 proposed GitHub issue bodies.
-They are planning artifacts only. Do not publish, assign, implement, compile,
-dispatch, verify, merge, or close an issue until the owner explicitly approves
-the phase or named issue.
+The owner may approve publishing the complete catalog as planned milestone
+entries. Publication alone never authorizes assignment, implementation, compile,
+dispatch, verification, merge, or closure. Those actions require separate owner
+approval for a dependency-ready issue.
 
 ## Ordinary Development Only
 
@@ -161,10 +162,13 @@ evidence.
 
 1. Review the roadmap, disposition map, UI protocol, issue index, and this
    contract.
-2. Approve one dependency-ready issue or a bounded capability-gate backlog.
+2. Approve complete catalog publication, one dependency-ready issue, or a
+   bounded capability-gate backlog.
 3. Create the `v0.9.0` milestone and labels without assigning implementation.
-4. Publish dependency-ready issue bodies manually; preserve stable `V090-NNN`
-   IDs. Do not publish all 109 issues as an active implementation queue.
+4. Publish every owner-approved issue body with its stable `V090-NNN` ID. Catalog
+   entries whose dependencies are not accepted receive `status:planned`; only
+   dependency-ready entries receive `status:ready`. Never treat the complete
+   catalog as an active implementation queue.
 5. Assign one issue through ordinary development with an owner-selected developer
    or agent route.
 6. Merge only accepted evidence, update the issue index through a roadmap PR,
