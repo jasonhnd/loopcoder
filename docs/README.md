@@ -30,6 +30,7 @@ Every document is exactly one of these types:
 - [`reference/acceptance-harness.md`](reference/acceptance-harness.md): v0.9 deterministic acceptance fixtures and evidence manifests.
 - [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
 - [`reference/v09-home-layout.md`](reference/v09-home-layout.md): global `$LOOPCODER_HOME` layout and owner-only creation.
+- [`reference/project-authority-store.md`](reference/project-authority-store.md): project.db domain tables and immutable events.
 - [`reference/releasing.md`](reference/releasing.md): release documentation rules.
 - [`reference/self-bootstrap.md`](reference/self-bootstrap.md): v0.8.0 self-bootstrap acceptance checklist.
 - [`reference/stability-policy.md`](reference/stability-policy.md): 0.x stability policy.
