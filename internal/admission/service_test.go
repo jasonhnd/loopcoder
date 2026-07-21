@@ -194,7 +194,10 @@ func TestExpiredUnknownLivenessAttentionRequired(t *testing.T) {
 		IdempotencyKey: "exp-2", LeaseTTL: time.Minute,
 	})
 	if d2.Admitted {
-		t.Fatalf("should not reassign: %#v", d2)
+		t.Fatalf("should not reassign: %#v err=%v", d2, err)
+	}
+	if err != nil && !errors.Is(err, admission.ErrDenied) {
+		t.Fatalf("unexpected claim err: %v", err)
 	}
 	got, ok, err := svc.Get(ctx, d.ReservationID)
 	if err != nil || !ok {
@@ -203,17 +206,11 @@ func TestExpiredUnknownLivenessAttentionRequired(t *testing.T) {
 	if got.State != admission.StateAttentionRequired {
 		t.Fatalf("state=%s reason=%s", got.State, got.AttentionReason)
 	}
-	// Resolve with dead process allows release.
-	svcDead := openSvc(t, admission.StaticLivenessProbe{Live: false, Unknown: false}, func() time.Time { return clock })
-	// Same store? openSvc creates new home — for resolve use same svc with dead probe.
-	// Re-open service on same path by resolving via new service is hard; use ResolveAttention on same svc
-	// but swap live via constructing service on same machine is cleaner:
-	// Instead call ResolveAttention on original — AlwaysUnknown still unknown.
+	// Unknown liveness stays attention_required under resolve without release.
 	_, err = svc.ResolveAttention(ctx, d.ReservationID, false)
 	if !errors.Is(err, admission.ErrAttentionRequired) {
 		t.Fatalf("unknown resolve: %v", err)
 	}
-	_ = svcDead
 }
 
 func TestExpiredDeadProcessFreesBudget(t *testing.T) {
