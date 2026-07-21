@@ -28,6 +28,7 @@ Every document is exactly one of these types:
 - [`architecture/v0.9.0-threat-model.md`](architecture/v0.9.0-threat-model.md): v0.9 threat model, data classes, and capability enforcement inventory.
 - [`reference/effective-policy.md`](reference/effective-policy.md): v0.9 effective-policy precedence, freeze, provenance, and digest.
 - [`reference/acceptance-harness.md`](reference/acceptance-harness.md): v0.9 deterministic acceptance fixtures and evidence manifests.
+- [`reference/direct-path-canaries.md`](reference/direct-path-canaries.md): V090-036 docs/Go visible direct-path canaries and evidence contract.
 - [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
 - [`reference/v09-home-layout.md`](reference/v09-home-layout.md): global `$LOOPCODER_HOME` layout and owner-only creation.
 - [`reference/project-authority-store.md`](reference/project-authority-store.md): project.db domain tables and immutable events.
