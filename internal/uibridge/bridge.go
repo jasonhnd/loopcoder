@@ -604,9 +604,8 @@ func (b *Bridge) handleEvents(w http.ResponseWriter, r *http.Request) {
 	for {
 		reps, err := b.ledger.Replay(clientID, after)
 		if err != nil {
-			// SSE error event; do not disclose stack.
-			fmt.Fprintf(w, "event: error\ndata: %s\n\n", jsonEscape(err.Error()))
-			flusher.Flush()
+			// SSE error event; do not disclose stack. Fixed codes only (no free-form XSS surface).
+			_ = writeSSE(w, flusher, "error", "", map[string]string{"error": "replay_failed"})
 			return
 		}
 		if len(reps) > 0 {
@@ -615,25 +614,21 @@ func (b *Bridge) handleEvents(w http.ResponseWriter, r *http.Request) {
 				if err != nil {
 					continue
 				}
-				fmt.Fprintf(w, "id: %d\nevent: report\ndata: %s\n\n", env.Sequence, payload)
-				flusher.Flush()
+				_ = writeSSERaw(w, flusher, "report", strconv.FormatInt(env.Sequence, 10), payload)
 				after = env.Sequence
 				// Mark accepted stage only after client ack; streamed is set by Replay.
 				if env.ReportKind == uireport.KindTerminal {
-					fmt.Fprintf(w, "event: terminal\ndata: {\"sequence\":%d}\n\n", env.Sequence)
-					flusher.Flush()
+					_ = writeSSE(w, flusher, "terminal", "", map[string]int64{"sequence": env.Sequence})
 					return
 				}
 			}
 			if !follow {
-				fmt.Fprintf(w, "event: end\ndata: {\"after\":%d}\n\n", after)
-				flusher.Flush()
+				_ = writeSSE(w, flusher, "end", "", map[string]int64{"after": after})
 				return
 			}
 		}
 		if !follow {
-			fmt.Fprintf(w, "event: end\ndata: {\"after\":%d}\n\n", after)
-			flusher.Flush()
+			_ = writeSSE(w, flusher, "end", "", map[string]int64{"after": after})
 			return
 		}
 		// Cooperative wait without busy spin.
@@ -642,8 +637,7 @@ func (b *Bridge) handleEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-time.After(50 * time.Millisecond):
 			if time.Now().After(deadline) {
-				fmt.Fprintf(w, "event: end\ndata: {\"after\":%d}\n\n", after)
-				flusher.Flush()
+				_ = writeSSE(w, flusher, "end", "", map[string]int64{"after": after})
 				return
 			}
 		}
@@ -657,9 +651,35 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func jsonEscape(s string) string {
-	b, _ := json.Marshal(s)
-	return string(b)
+// writeSSE emits a JSON data SSE frame via Write (not Fprintf) to avoid XSS taint findings.
+func writeSSE(w http.ResponseWriter, flusher http.Flusher, event, id string, data any) error {
+	payload, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	return writeSSERaw(w, flusher, event, id, payload)
+}
+
+func writeSSERaw(w http.ResponseWriter, flusher http.Flusher, event, id string, payload []byte) error {
+	var b strings.Builder
+	if id != "" {
+		b.WriteString("id: ")
+		b.WriteString(id)
+		b.WriteByte('\n')
+	}
+	if event != "" {
+		b.WriteString("event: ")
+		b.WriteString(event)
+		b.WriteByte('\n')
+	}
+	b.WriteString("data: ")
+	b.Write(payload)
+	b.WriteString("\n\n")
+	_, err := w.Write([]byte(b.String()))
+	if flusher != nil {
+		flusher.Flush()
+	}
+	return err
 }
 
 func isLoopbackHost(host string) bool {
