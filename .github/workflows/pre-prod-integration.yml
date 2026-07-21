@@ -1,5 +1,8 @@
-# Re-run required checks on the exact integrated pre-prod SHA (merge-sha tier).
-# Next v0.9.0 feature work must wait for this SHA to be green.
+# Bounded merge-sha integration for pre-prod (NOT a full re-run of PR CI).
+# PR CI remains authoritative for verify/test/race/security.
+# This workflow only runs two distinct checks on the exact integrated SHA:
+#   - integration-verify  (policy/YAML/auth fixtures)
+#   - integration-canary  (provider-free deterministic canary, hard 5m ceiling)
 name: pre-prod-integration
 
 on:
@@ -9,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Optional git ref to evaluate (defaults to current pre-prod tip)"
+        description: "Optional git ref (defaults to push SHA)"
         required: false
         type: string
 
@@ -19,14 +22,12 @@ defaults:
 
 env:
   GO_VERSION: "1.26.5"
-  STATICCHECK_VERSION: "v0.7.0"
-  GOVULNCHECK_VERSION: "v1.6.0"
-  GOSEC_VERSION: "v2.27.1"
 
 jobs:
-  verify:
-    name: verify
+  integration-verify:
+    name: integration-verify
     runs-on: macos-15
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
@@ -38,37 +39,34 @@ jobs:
           check-latest: false
           cache: true
 
-      - name: Assert darwin/arm64 Go host
-        run: |
-          set -euo pipefail
-          test "$(go env GOOS)" = "darwin"
-          test "$(go env GOARCH)" = "arm64"
-
       - name: Record tested commit SHA
         run: |
           set -euo pipefail
           printf 'evidence_tier=merge-sha\n'
+          printf 'integration_job=integration-verify\n'
           printf 'tested_commit_sha=%s\n' "$(git rev-parse HEAD)"
-          printf 'integration_branch=pre-prod\n'
 
-      - name: YAML validity check
+      - name: YAML validity (workflows + delivery)
         run: |
           set -euo pipefail
           ruby -e '
             require "yaml"
             paths = [".delivery.yml"] + Dir.glob([".github/workflows/**/*.yml", ".github/workflows/**/*.yaml"]).select { |path| File.file?(path) }
             paths.sort.each { |path| YAML.load_file(path) }
+            puts "yaml_ok files=#{paths.size}"
           '
 
-      - name: Repository workflow policy
-        run: go test . -run 'TestV080WorkflowPolicy|TestStabilizationGatePolicy' -count=1
+      - name: Stabilization policy + authorization fixtures
+        run: |
+          set -euo pipefail
+          go test . -count=1 -timeout=2m -run 'TestStabilizationGatePolicy|TestV080WorkflowPolicy'
+          go test ./internal/evidence -count=1 -timeout=2m -run 'TestDocsOnly|TestPolicy|TestUnlinked|TestMultiple|TestNonPlanned|TestBodyOnly|TestPlannedWith|TestReady|TestBaseSHA'
+          IMPLEMENTATION_AUTH_OFFLINE=1 bash scripts/check-implementation-authorization.sh
 
-      - name: Implementation authorization offline fixtures
-        run: IMPLEMENTATION_AUTH_OFFLINE=1 bash scripts/check-implementation-authorization.sh
-
-  test:
-    name: test
+  integration-canary:
+    name: integration-canary
     runs-on: macos-15
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
@@ -84,79 +82,23 @@ jobs:
         run: |
           set -euo pipefail
           printf 'evidence_tier=merge-sha\n'
+          printf 'integration_job=integration-canary\n'
           printf 'tested_commit_sha=%s\n' "$(git rev-parse HEAD)"
 
-      - name: Go build
-        run: go build ./cmd/loopcoder
-
-      - name: Go vet
-        run: go vet ./...
-
-      - name: Go test
-        run: go test ./...
-
-  race:
-    name: race
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          ref: ${{ inputs.ref || github.sha }}
-          fetch-depth: 0
-
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          check-latest: false
-          cache: true
-
-      - name: Record tested commit SHA
+      - name: Provider-free integration canary (hard wall clock 5m)
+        timeout-minutes: 5
         run: |
           set -euo pipefail
-          printf 'evidence_tier=merge-sha\n'
-          printf 'tested_commit_sha=%s\n' "$(git rev-parse HEAD)"
-
-      - name: Affected-package race (full race on integration)
-        # On pre-prod tip, prefer full race for integration confidence.
-        run: bash scripts/ci-full-race.sh
-
-  security:
-    name: security
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          ref: ${{ inputs.ref || github.sha }}
-
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          check-latest: false
-          cache: true
-
-      - name: Record tested commit SHA
-        run: |
-          set -euo pipefail
-          printf 'evidence_tier=merge-sha\n'
-          printf 'tested_commit_sha=%s\n' "$(git rev-parse HEAD)"
-
-      - name: Install staticcheck
-        run: go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}
-
-      - name: Staticcheck
-        run: staticcheck ./...
-
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}
-
-      - name: Govulncheck
-        run: govulncheck ./...
-
-      - name: Build loopcoder for audit
-        run: |
-          set -euo pipefail
-          mkdir -p bin
-          go build -o bin/loopcoder ./cmd/loopcoder
-
-      - name: Security audit (SAST)
-        run: ./bin/loopcoder audit --repo . --layer sast
+          START="$(date +%s)"
+          # Deterministic, no provider, no network, no full suite.
+          go build -o /tmp/loopcoder-canary ./cmd/loopcoder
+          /tmp/loopcoder-canary version >/dev/null
+          go test ./internal/evidence -count=1 -timeout=90s
+          bash scripts/pre-push-sentinel.sh
+          END="$(date +%s)"
+          ELAPSED="$((END - START))"
+          printf 'integration_canary_elapsed_seconds=%s\n' "${ELAPSED}"
+          if [ "${ELAPSED}" -gt 300 ]; then
+            echo "integration-canary exceeded 300s wall clock" >&2
+            exit 1
+          fi

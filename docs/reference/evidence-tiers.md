@@ -115,12 +115,15 @@ bash scripts/pre-push-sentinel.sh
 
 ### Stabilization additions
 
-- Implementation PRs that close or implement `status:planned` issues without
-  explicit authorization fail the `verify` job
-  (`scripts/check-implementation-authorization.sh`).
-- Every push to `pre-prod` re-runs `verify` / `test` / `race` / `security` via
-  `.github/workflows/pre-prod-integration.yml` (`evidence_tier=merge-sha`).
-- Before the next feature item: `bash scripts/assert-pre-prod-green.sh`.
+- Non-documentation PRs must have exactly one GitHub
+  `closingIssuesReferences` entry whose issue is labeled
+  `implementation-authorized` (body text never authorizes). Enforced in PR
+  `verify` via `scripts/check-implementation-authorization.sh`.
+- Every push to `pre-prod` runs **bounded** jobs `integration-verify` and
+  `integration-canary` only (not a full re-suite of PR test/race/security).
+- Future implementation PRs fail closed when their exact pre-prod base SHA
+  lacks those integration checks (one-time bootstrap exception for closing
+  `#1092` only).
 - See [`v090-stabilization-gate.md`](v090-stabilization-gate.md).
 
 ### What developers run locally
@@ -130,7 +133,7 @@ bash scripts/pre-push-sentinel.sh
 | Before push | `bash scripts/pre-push-sentinel.sh` (via `core.hooksPath=hooks`) | Nothing yet |
 | After opening a PR | Optional focused package tests only when debugging | Required PR jobs `verify`, `test`, `race`, `security` plus authorization |
 | Before merge | Do not re-run repository-wide suites locally | Green required PR checks on the exact head SHA |
-| After merge to `pre-prod` | Do not start the next feature yet | Green `pre-prod-integration` jobs on the exact merge SHA (`assert-pre-prod-green.sh`) |
+| After merge to `pre-prod` | Optional local helper `assert-pre-prod-green.sh --sha <sha>` | Green **distinct** checks `integration-verify` + `integration-canary` on the exact merge SHA (not full PR suite) |
 | Before release | Do not run full race or packaging locally as a substitute | Release workflow evidence for the tag SHA and archive digest |
 
 If remote CI is red or unavailable, keep the PR unmergeable. Do **not** move

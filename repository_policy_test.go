@@ -1248,18 +1248,17 @@ func TestStabilizationGatePolicy(t *testing.T) {
 		t.Fatal("verify job must run implementation authorization check")
 	}
 
-	// Integrated pre-prod SHA must re-run the same four check names.
+	// Integrated pre-prod SHA runs bounded distinct checks only (not full PR suite).
 	integPath := filepath.Join(root, ".github", "workflows", "pre-prod-integration.yml")
 	if _, err := os.Stat(integPath); err != nil {
 		t.Fatalf("missing pre-prod integration workflow: %v", err)
 	}
 	integ := loadWorkflowPolicy(t, integPath)
-	for _, name := range requiredV080Contexts {
+	for _, name := range []string{"integration-verify", "integration-canary"} {
 		if _, ok := integ.Jobs[name]; !ok {
 			t.Fatalf("pre-prod-integration.yml missing required job %q", name)
 		}
 	}
-	// Trigger on pre-prod pushes.
 	raw, err := os.ReadFile(integPath)
 	if err != nil {
 		t.Fatal(err)
@@ -1270,6 +1269,19 @@ func TestStabilizationGatePolicy(t *testing.T) {
 	}
 	if !strings.Contains(text, "evidence_tier=merge-sha") {
 		t.Fatal("pre-prod integration must record merge-sha evidence tier")
+	}
+	if !strings.Contains(text, "name: integration-verify") || !strings.Contains(text, "name: integration-canary") {
+		t.Fatal("integration jobs must use distinct check names")
+	}
+	// Must not re-run full unit suite or full race as primary integration.
+	if strings.Contains(text, "go test ./...") {
+		t.Fatal("pre-prod integration must not run go test ./...")
+	}
+	if strings.Contains(text, "ci-full-race.sh") {
+		t.Fatal("pre-prod integration must not run full race suite")
+	}
+	if _, err := os.Stat(filepath.Join(root, "CODEOWNERS")); err != nil {
+		t.Fatal("missing CODEOWNERS for control plane")
 	}
 
 	// Local sentinel and hooks must exist (no full go test ./...).

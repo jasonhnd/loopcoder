@@ -1,4 +1,4 @@
-// Command checkimplauth evaluates implementation authorization for CI.
+// Command checkimplauth evaluates fail-closed implementation authorization.
 package main
 
 import (
@@ -7,53 +7,37 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/jasonhnd/loopcoder/internal/evidence"
 )
 
 func main() {
-	filesPath := flag.String("files", "", "path to newline-separated changed files")
-	issuesPath := flag.String("issues", "", "path to JSON array of linked issues")
-	bodyPath := flag.String("body", "", "path to PR body")
+	filesPath := flag.String("files", "", "newline-separated changed paths")
+	closingPath := flag.String("closing-issues", "", "JSON array of closingIssuesReferences")
+	baseSHA := flag.String("base-sha", "", "exact pre-prod base SHA for integration gate")
+	verifyOK := flag.String("base-verify-ok", "false", "base SHA passed integration-verify")
+	canaryOK := flag.String("base-canary-ok", "false", "base SHA passed integration-canary")
+	bootstrap1092 := flag.String("bootstrap-1092", "false", "one-time exception for stabilization PR closing #1092 only")
 	flag.Parse()
 
-	var paths []string
-	if *filesPath != "" {
-		f, err := os.Open(*filesPath)
+	paths := readLines(*filesPath)
+	var closing []evidence.ClosingIssue
+	if *closingPath != "" {
+		raw, err := os.ReadFile(*closingPath)
 		if err != nil {
 			fatal(err)
 		}
-		sc := bufio.NewScanner(f)
-		for sc.Scan() {
-			line := strings.TrimSpace(sc.Text())
-			if line != "" {
-				paths = append(paths, line)
-			}
-		}
-		_ = f.Close()
-	}
-
-	isImpl := evidence.IsImplementationChange(paths)
-	fmt.Printf("implementation_change=%v\n", isImpl)
-
-	var issues []evidence.LinkedIssueRef
-	if *issuesPath != "" {
-		raw, err := os.ReadFile(*issuesPath)
-		if err != nil {
-			fatal(err)
-		}
-		if err := json.Unmarshal(raw, &issues); err != nil {
-			fatal(err)
+		if err := json.Unmarshal(raw, &closing); err != nil {
+			fatal(fmt.Errorf("closing-issues json: %w", err))
 		}
 	}
-	// Also parse body for issue numbers if issues empty but body provided
-	if *bodyPath != "" {
-		body, _ := os.ReadFile(*bodyPath)
-		_ = body
-	}
 
-	d := evidence.EvaluateImplementationAuthorization(isImpl, issues, false)
+	fmt.Printf("documentation_only=%v\n", evidence.IsDocumentationOnly(paths))
+	fmt.Printf("implementation_change=%v\n", evidence.IsImplementationChange(paths))
+
+	d := evidence.EvaluateImplementationAuthorization(paths, closing)
 	fmt.Printf("allowed=%v\n", d.Allowed)
 	for _, r := range d.Reasons {
 		fmt.Printf("reason=%s\n", r)
@@ -62,10 +46,48 @@ func main() {
 		fmt.Printf("blocked_issue=%d\n", n)
 	}
 	if !d.Allowed {
-		fmt.Fprintln(os.Stderr, "implementation-authorization: REJECTED — status:planned issue without explicit authorization")
-		fmt.Fprintln(os.Stderr, "Grant with label status:authorized or body text 'Implementation authorization: granted'")
+		fmt.Fprintln(os.Stderr, "implementation-authorization: REJECTED")
+		fmt.Fprintln(os.Stderr, "Require exactly one closingIssuesReference with label implementation-authorized.")
 		os.Exit(1)
 	}
+
+	if evidence.IsImplementationChange(paths) {
+		boot := parseBool(*bootstrap1092) && len(closing) == 1 && closing[0].Number == 1092
+		g := evidence.EvaluateBaseSHAGate(*baseSHA, parseBool(*verifyOK), parseBool(*canaryOK), boot)
+		fmt.Printf("base_sha_allowed=%v\n", g.Allowed)
+		for _, r := range g.Reasons {
+			fmt.Printf("base_reason=%s\n", r)
+		}
+		if !g.Allowed {
+			fmt.Fprintln(os.Stderr, "implementation-authorization: base pre-prod SHA integration not green")
+			os.Exit(1)
+		}
+	}
+}
+
+func parseBool(s string) bool {
+	b, err := strconv.ParseBool(strings.TrimSpace(s))
+	return err == nil && b
+}
+
+func readLines(path string) []string {
+	if path == "" {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		fatal(err)
+	}
+	defer f.Close()
+	var out []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
 }
 
 func fatal(err error) {

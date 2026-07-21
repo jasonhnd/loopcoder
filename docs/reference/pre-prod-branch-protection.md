@@ -1,79 +1,70 @@
-# Proposed `pre-prod` Branch Protection (Owner-Applied)
+# `pre-prod` Branch Protection — Bootstrap vs Target
 
-This document is the **proposed** GitHub branch-protection configuration for
-the ordinary-development integration branch `pre-prod` during the v0.9.0
-stabilization gate.
+Automation in this repository **must not** modify GitHub administration
+settings. An owner applies protection manually.
 
-**Repository automation must not silently change these settings.** An owner
-with admin rights applies them in GitHub Settings (or via an explicit admin
-`gh api` session).
+## Hard prerequisite before “one approval” is meaningful
 
-## Required settings
+Today the repository effectively has a **single human collaborator**
+(`@jasonhnd`). If branch protection requires one approving review while the
+same account authors and must approve, the workflow **deadlocks**.
 
-| Setting | Required value |
+Therefore:
+
+1. **Development agents must use a separate GitHub bot/machine identity** with
+   write access to open PRs but **no admin and no bypass** of branch protection.
+2. **`@jasonhnd` remains owner/reviewer**.
+3. Only after that identity split may protection require **one owner approval**.
+
+CODEOWNERS for the authorization control plane is owned by `@jasonhnd` so that,
+after identity separation, the bot cannot merge control-plane changes without
+owner review.
+
+## Bootstrap mode (current single-account reality)
+
+Documented **honest** bootstrap settings for `pre-prod` while only one human
+can approve:
+
+| Setting | Bootstrap value |
 | --- | --- |
-| Branch | `pre-prod` |
 | Require a pull request before merging | **Yes** |
-| Required approving reviews | **1** (independent human reviewer; not the PR author) |
-| Dismiss stale reviews when new commits are pushed | Recommended: **Yes** |
-| Require review from Code Owners | Optional |
+| Required approving review count | **0** (avoid single-account deadlock) |
 | Require status checks to pass | **Yes** |
-| Require branches to be up to date before merging | **Yes** (strict) |
-| Required status check contexts | Exactly: `verify`, `test`, `race`, `security` |
-| Require conversation resolution | Recommended: **Yes** |
-| Do not allow bypassing the above settings | **Yes** for administrators during the gate (or document any break-glass) |
-| Restrict who can push | No direct pushes to `pre-prod` except break-glass |
+| Require branches to be up to date (strict) | **Yes** |
+| Required status check contexts (PR merge) | `verify`, `test`, `race`, `security` |
+| Enforce admins | Prefer **Yes** once bot has no admin |
+| Allow force pushes / deletions | **No** |
 
-## Required check names
+Post-merge integration checks `integration-verify` and `integration-canary`
+are **not** PR merge required contexts; they run on the integrated SHA after
+merge and gate **starting the next feature** via authorization base-SHA
+evaluation.
 
-These names must match both:
+## Target mode (after separate agent identity)
 
-1. job `name:` fields in `.github/workflows/ci.yml` / resulting check runs, and
-2. `.delivery.yml`:
+| Setting | Target value |
+| --- | --- |
+| Require a pull request before merging | **Yes** |
+| Required approving reviews | **1** from `@jasonhnd` (or CODEOWNERS) |
+| Dismiss stale reviews on new commits | **Yes** |
+| Require review from Code Owners | **Yes** for control-plane paths |
+| Require status checks (strict) | **Yes** |
+| Required PR contexts | `verify`, `test`, `race`, `security` |
+| Restrict push / no admin bypass for bot | **Yes** |
+
+## Required PR check names
+
+Must match `.delivery.yml`:
 
 ```yaml
 ci:
   checks: [verify, test, race, security]
 ```
 
-Optional bots (for example Greptile Review) must **not** be listed as required
-contexts unless the owner deliberately adds them to both protection and
-`.delivery.yml`.
+Optional bots (for example Greptile) must not be required unless deliberately
+added to both protection and `.delivery.yml`.
 
-## Integrated SHA re-validation
-
-After a PR merges to `pre-prod`, workflow
-`.github/workflows/pre-prod-integration.yml` re-runs the same four check names
-on the **exact merge commit**. Feature work for the next catalog item must not
-start until those checks are green for that SHA
-(`bash scripts/assert-pre-prod-green.sh`).
-
-## Example admin apply (manual; not run by ordinary agents)
-
-```bash
-# Illustrative only — owner executes after reviewing this document.
-gh api -X PUT "repos/jasonhnd/loopcoder/branches/pre-prod/protection" \
-  -H "Accept: application/vnd.github+json" \
-  --input - <<'JSON'
-{
-  "required_status_checks": {
-    "strict": true,
-    "contexts": ["verify", "test", "race", "security"]
-  },
-  "enforce_admins": true,
-  "required_pull_request_reviews": {
-    "required_approving_review_count": 1,
-    "dismiss_stale_reviews": true
-  },
-  "restrictions": null,
-  "required_conversation_resolution": true,
-  "allow_force_pushes": false,
-  "allow_deletions": false
-}
-JSON
-```
-
-## Readback verification
+## Readback (owner)
 
 ```bash
 gh api "repos/jasonhnd/loopcoder/branches/pre-prod/protection" --jq '{
@@ -83,5 +74,3 @@ gh api "repos/jasonhnd/loopcoder/branches/pre-prod/protection" --jq '{
   enforce_admins: .enforce_admins.enabled
 }'
 ```
-
-Expected readback: four contexts, `strict=true`, approvals `>= 1`.

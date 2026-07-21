@@ -1,0 +1,30 @@
+# Stabilization control plane — owner review required when agent identity is separated.
+# Trust boundary: PR CI runs PR-branch code; CODEOWNERS + non-admin agent identity
+# are prerequisites for treating authorization as review-enforced (not tamper-proof).
+
+# Authorization policy and pure evaluation
+/internal/evidence/ @jasonhnd
+
+# Enforcement scripts
+/scripts/check-implementation-authorization.sh @jasonhnd
+/scripts/assert-pre-prod-green.sh @jasonhnd
+/scripts/pre-push-sentinel.sh @jasonhnd
+/scripts/cmd/checkimplauth/ @jasonhnd
+
+# CI workflows that gate ordinary development
+/.github/workflows/ci.yml @jasonhnd
+/.github/workflows/pre-prod-integration.yml @jasonhnd
+
+# Repository policy tests and delivery checks
+/repository_policy_test.go @jasonhnd
+/.delivery.yml @jasonhnd
+/CODEOWNERS @jasonhnd
+
+# Local hook entrypoint
+/hooks/pre-push @jasonhnd
+/hooks/README.md @jasonhnd
+
+# Stabilization documentation
+/docs/reference/v090-stabilization-gate.md @jasonhnd
+/docs/reference/pre-prod-branch-protection.md @jasonhnd
+/docs/reference/evidence-tiers.md @jasonhnd

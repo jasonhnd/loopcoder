@@ -1,220 +1,220 @@
-// Package evidence helpers for implementation authorization (v0.9.0 stabilization).
+// Package evidence — implementation authorization for ordinary development.
 //
-// Catalog publication alone never authorizes implementation. Issues labeled
-// status:planned are blocked until an explicit authorization signal is present.
+// Trust boundary (honest): PR CI executes code from the PR branch. A hostile PR
+// can attempt to weaken the checker on that same branch. This policy is
+// repository-enforced only when combined with CODEOWNERS review, a non-admin
+// agent identity, and branch protection that the PR cannot bypass. It is not
+// tamper-proof against an admin or against self-approving authors.
+//
+// Fail-closed rules for non-documentation PRs:
+//  1. Exactly one GitHub closingIssuesReference is required.
+//  2. That issue must carry the owner-applied label implementation-authorized.
+//  3. status:ready, absence of status:planned, and body text never authorize.
+//  4. status:planned may proceed only together with implementation-authorized.
 package evidence
 
 import (
 	"fmt"
-	"regexp"
+	"path/filepath"
 	"strings"
 )
 
-// PlannedLabel is the catalog label that means "published, not authorized".
+// ImplementationAuthorizedLabel is the only owner-applied grant label.
+const ImplementationAuthorizedLabel = "implementation-authorized"
+
+// PlannedLabel is the catalog "published but not authorized" label.
 const PlannedLabel = "status:planned"
 
-// Authorized labels that explicitly grant implementation work.
-var AuthorizedLabels = []string{
-	"status:authorized",
-	"implementation-authorized",
-	"status:ready", // catalog ready-for-implementation (still needs non-planned)
-}
-
-// authorizationGrantedRe matches explicit grant text in issue or PR bodies.
-var authorizationGrantedRe = regexp.MustCompile(`(?i)implementation\s+authorization\s*:\s*\**\s*granted\b`)
-
-// LinkedIssueRef is a GitHub issue referenced by a PR (Closes/Fixes/etc.).
-type LinkedIssueRef struct {
+// ClosingIssue is one GitHub closingIssuesReference (from the GraphQL/API field).
+// Callers must populate this from GitHub's closingIssuesReferences — not from
+// a local regex over PR bodies.
+type ClosingIssue struct {
 	Number int
 	Title  string
 	Labels []string
 	Body   string
-	// Kind is "code" when the PR is treated as an implementation PR.
-	// Callers set this based on changed paths.
 }
 
 // AuthorizationDecision is the pure policy result for one PR.
 type AuthorizationDecision struct {
-	// Allowed is true when the PR may proceed under ordinary-development policy.
-	Allowed bool
-	// Reasons explain allow or deny (stable tokens for tests and CI logs).
-	Reasons []string
-	// BlockedIssues lists planned issues that lack authorization.
+	Allowed       bool
+	Reasons       []string
 	BlockedIssues []int
 }
 
-// IsImplementationChange reports whether any changed path is product
-// implementation (not pure docs/meta). Stabilization-only doc PRs are not
-// implementation changes.
-func IsImplementationChange(paths []string) bool {
+// IsDocumentationOnly reports whether every changed path is pure documentation.
+//
+// Policy, workflow, hooks, scripts, evidence/policy tests, and any Go code are
+// NOT documentation and return false.
+func IsDocumentationOnly(paths []string) bool {
+	if len(paths) == 0 {
+		// Empty diff is not an implementation land; treat as non-doc for fail-closed
+		// callers that still require a closing issue when not docs-only.
+		return false
+	}
 	for _, p := range paths {
 		p = strings.TrimSpace(p)
 		if p == "" {
 			continue
 		}
-		// Normalize
-		p = strings.ReplaceAll(p, "\\", "/")
-		switch {
-		case strings.HasPrefix(p, "docs/"),
-			strings.HasPrefix(p, ".github/"),
-			strings.HasPrefix(p, "hooks/"),
-			p == "ROADMAP.md",
-			p == "README.md",
-			p == "CHANGELOG.md",
-			p == "AGENTS.md",
-			p == "GEMINI.md",
-			p == "SKILL.md",
-			p == "LICENSE",
-			p == ".delivery.yml",
-			// Gate/policy scripts and their pure unit tests are control-plane, not product features.
-			strings.HasPrefix(p, "scripts/pre-push"),
-			strings.HasPrefix(p, "scripts/check-implementation"),
-			strings.HasPrefix(p, "scripts/assert-pre-prod"),
-			strings.HasPrefix(p, "scripts/cmd/checkimplauth/"),
-			strings.HasPrefix(p, "internal/evidence/"),
-			strings.HasSuffix(p, "_test.go") && strings.Contains(p, "evidence"),
-			p == "evidence_sentinel_test.go",
-			p == "repository_policy_test.go",
-			strings.HasSuffix(p, ".md"):
-			continue
-		case strings.HasPrefix(p, "internal/"),
-			strings.HasPrefix(p, "cmd/"),
-			strings.HasPrefix(p, "examples/"),
-			strings.HasSuffix(p, ".go"),
-			p == "go.mod",
-			p == "go.sum":
-			return true
-		default:
-			// Unknown path: treat as implementation to fail closed.
-			if !strings.HasSuffix(p, ".md") {
-				return true
-			}
+		p = filepath.ToSlash(p)
+		if !isDocPath(p) {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
-// IssueHasPlannedLabel reports whether labels include status:planned.
-func IssueHasPlannedLabel(labels []string) bool {
-	for _, l := range labels {
-		if strings.EqualFold(strings.TrimSpace(l), PlannedLabel) {
-			return true
-		}
+// IsImplementationChange is the inverse of IsDocumentationOnly for non-empty paths.
+func IsImplementationChange(paths []string) bool {
+	if len(paths) == 0 {
+		return false
 	}
-	return false
+	return !IsDocumentationOnly(paths)
 }
 
-// IssueExplicitlyAuthorized reports explicit implementation authorization.
-//
-// Authorization requires either:
-//  1. an authorized label (status:authorized or implementation-authorized), or
-//  2. body text matching "Implementation authorization: granted".
-//
-// Note: status:ready alone is NOT sufficient while status:planned is also
-// present. Catalog "ready" without removing planned remains blocked.
-func IssueExplicitlyAuthorized(labels []string, body string) bool {
-	planned := IssueHasPlannedLabel(labels)
-	hasAuthLabel := false
-	for _, l := range labels {
-		n := strings.ToLower(strings.TrimSpace(l))
-		if n == "status:authorized" || n == "implementation-authorized" {
-			hasAuthLabel = true
-			break
-		}
+func isDocPath(p string) bool {
+	// Explicit non-doc roots (policy / control plane).
+	switch {
+	case strings.HasPrefix(p, ".github/"),
+		strings.HasPrefix(p, "hooks/"),
+		strings.HasPrefix(p, "scripts/"),
+		strings.HasPrefix(p, "internal/"),
+		strings.HasPrefix(p, "cmd/"),
+		strings.HasPrefix(p, "examples/"),
+		p == "go.mod",
+		p == "go.sum",
+		p == ".delivery.yml",
+		p == "repository_policy_test.go",
+		p == "evidence_sentinel_test.go",
+		strings.HasSuffix(p, ".go"),
+		strings.HasSuffix(p, ".yml"),
+		strings.HasSuffix(p, ".yaml"),
+		strings.HasSuffix(p, ".sh"),
+		strings.HasSuffix(p, ".json") && !strings.HasPrefix(p, "docs/"):
+		return false
 	}
-	bodyGrant := authorizationGrantedRe.MatchString(body)
-	if hasAuthLabel || bodyGrant {
-		// Even with auth label, planned without grant body is still allowed if
-		// explicit auth label present — owner deliberately dual-labeled.
+
+	base := filepath.Base(p)
+	// Root markdown / license / skill manuals are documentation.
+	switch base {
+	case "README.md", "ROADMAP.md", "CHANGELOG.md", "LICENSE",
+		"AGENTS.md", "GEMINI.md", "SKILL.md", "DESIGN.md", "PROCESS.md":
 		return true
 	}
-	// status:ready without planned is treated as authorized for implementation.
-	if !planned {
-		for _, l := range labels {
-			if strings.EqualFold(strings.TrimSpace(l), "status:ready") {
-				return true
-			}
-		}
+	if strings.HasPrefix(p, "docs/") && (strings.HasSuffix(p, ".md") || strings.HasSuffix(p, ".json")) {
+		return true
 	}
-	_ = planned
+	// Any other path: fail closed as non-doc.
 	return false
 }
 
-// EvaluateImplementationAuthorization decides whether an ordinary-development
-// PR may implement work against the linked issues.
+// HasLabel reports a case-insensitive label match.
+func HasLabel(labels []string, want string) bool {
+	want = strings.ToLower(strings.TrimSpace(want))
+	for _, l := range labels {
+		if strings.ToLower(strings.TrimSpace(l)) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// IssueAuthorized reports whether the issue carries implementation-authorized.
+// Body text and status:ready are intentionally ignored.
+func IssueAuthorized(labels []string, _ string /* body ignored */) bool {
+	return HasLabel(labels, ImplementationAuthorizedLabel)
+}
+
+// EvaluateImplementationAuthorization decides whether a PR may land.
 //
-// Rules:
-//  1. Non-implementation PRs (docs/policy only) are always allowed.
-//  2. Implementation PRs with no linked issues are allowed only when
-//     allowUnlinkedImplementation is true (default false for product PRs).
-//  3. Any linked issue with status:planned and without explicit authorization
-//     blocks the PR.
-func EvaluateImplementationAuthorization(isImplementation bool, issues []LinkedIssueRef, allowUnlinkedImplementation bool) AuthorizationDecision {
+// closing must be the list from GitHub closingIssuesReferences (already
+// resolved). Zero or multiple entries fail closed for implementation PRs.
+func EvaluateImplementationAuthorization(paths []string, closing []ClosingIssue) AuthorizationDecision {
 	d := AuthorizationDecision{Allowed: true}
-	if !isImplementation {
-		d.Reasons = append(d.Reasons, "non_implementation_change")
+
+	if IsDocumentationOnly(paths) {
+		d.Reasons = append(d.Reasons, "documentation_only_exempt")
 		return d
 	}
-	if len(issues) == 0 {
-		if allowUnlinkedImplementation {
-			d.Reasons = append(d.Reasons, "unlinked_implementation_allowed")
-			return d
-		}
+
+	// Implementation / policy / workflow / scripts / hooks / config.
+	d.Reasons = append(d.Reasons, "implementation_or_policy_change")
+
+	if len(closing) == 0 {
 		d.Allowed = false
-		d.Reasons = append(d.Reasons, "implementation_requires_linked_authorized_issue")
+		d.Reasons = append(d.Reasons, "missing_closing_issue")
 		return d
 	}
-	for _, issue := range issues {
-		if IssueHasPlannedLabel(issue.Labels) && !IssueExplicitlyAuthorized(issue.Labels, issue.Body) {
-			d.Allowed = false
-			d.BlockedIssues = append(d.BlockedIssues, issue.Number)
-			d.Reasons = append(d.Reasons, fmt.Sprintf("issue_%d_status_planned_unauthorized", issue.Number))
-			continue
+	if len(closing) > 1 {
+		d.Allowed = false
+		d.Reasons = append(d.Reasons, "multiple_closing_issues")
+		for _, c := range closing {
+			d.BlockedIssues = append(d.BlockedIssues, c.Number)
 		}
-		if !IssueExplicitlyAuthorized(issue.Labels, issue.Body) && IssueHasPlannedLabel(issue.Labels) {
-			// already handled
-			continue
-		}
-		// Linked issue is either not planned, or planned+authorized.
-		if IssueHasPlannedLabel(issue.Labels) && IssueExplicitlyAuthorized(issue.Labels, issue.Body) {
-			d.Reasons = append(d.Reasons, fmt.Sprintf("issue_%d_planned_but_authorized", issue.Number))
-		}
+		return d
 	}
-	if d.Allowed {
-		d.Reasons = append(d.Reasons, "implementation_authorized")
+
+	issue := closing[0]
+	if !IssueAuthorized(issue.Labels, issue.Body) {
+		d.Allowed = false
+		d.BlockedIssues = append(d.BlockedIssues, issue.Number)
+		d.Reasons = append(d.Reasons, fmt.Sprintf("issue_%d_missing_implementation_authorized_label", issue.Number))
+		if HasLabel(issue.Labels, PlannedLabel) {
+			d.Reasons = append(d.Reasons, fmt.Sprintf("issue_%d_status_planned", issue.Number))
+		}
+		// Explicitly note that body grants are ignored.
+		if strings.Contains(strings.ToLower(issue.Body), "implementation authorization") {
+			d.Reasons = append(d.Reasons, "body_text_does_not_authorize")
+		}
+		return d
 	}
+
+	// Authorized (including planned + implementation-authorized).
+	if HasLabel(issue.Labels, PlannedLabel) {
+		d.Reasons = append(d.Reasons, fmt.Sprintf("issue_%d_planned_with_implementation_authorized", issue.Number))
+	} else {
+		d.Reasons = append(d.Reasons, fmt.Sprintf("issue_%d_implementation_authorized", issue.Number))
+	}
+	d.Reasons = append(d.Reasons, "implementation_authorized")
 	return d
 }
 
-// linkedIssueRe extracts issue numbers from closing keywords and explicit refs.
-var linkedIssueRe = regexp.MustCompile(`(?i)(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|related(?:\s+to)?|stabilization\s+for|implements?)\s*:?\s*#(\d+)`)
+// BaseSHAIntegrationGate describes whether a PR base pre-prod SHA is allowed.
+type BaseSHAIntegrationGate struct {
+	// Allowed when base SHA passed integration-verify + integration-canary,
+	// or a documented one-time bootstrap exception applies.
+	Allowed bool
+	Reasons []string
+}
 
-// ParseClosingIssueNumbers returns unique issue numbers referenced by PR body
-// closing keywords and explicit ref forms used by the stabilization gate.
-func ParseClosingIssueNumbers(body string) []int {
-	matches := linkedIssueRe.FindAllStringSubmatch(body, -1)
-	seen := map[int]struct{}{}
-	var out []int
-	for _, m := range matches {
-		if len(m) < 2 {
-			continue
-		}
-		var n int
-		for _, c := range m[1] {
-			if c < '0' || c > '9' {
-				n = 0
-				break
-			}
-			n = n*10 + int(c-'0')
-		}
-		if n == 0 {
-			continue
-		}
-		if _, ok := seen[n]; ok {
-			continue
-		}
-		seen[n] = struct{}{}
-		out = append(out, n)
+// EvaluateBaseSHAGate fails closed unless the exact pre-prod base SHA is green
+// or the narrow bootstrap exception is active.
+//
+// bootstrapException may be true only for the one-time stabilization PR that
+// closes #1092 (caller enforces that constraint).
+func EvaluateBaseSHAGate(baseSHA string, integrationVerifyOK, integrationCanaryOK, bootstrapException bool) BaseSHAIntegrationGate {
+	g := BaseSHAIntegrationGate{Allowed: true}
+	baseSHA = strings.TrimSpace(baseSHA)
+	if baseSHA == "" {
+		g.Allowed = false
+		g.Reasons = append(g.Reasons, "missing_base_sha")
+		return g
 	}
-	return out
+	if bootstrapException {
+		g.Reasons = append(g.Reasons, "bootstrap_exception_issue_1092")
+		return g
+	}
+	if !integrationVerifyOK {
+		g.Allowed = false
+		g.Reasons = append(g.Reasons, "base_sha_missing_integration_verify")
+	}
+	if !integrationCanaryOK {
+		g.Allowed = false
+		g.Reasons = append(g.Reasons, "base_sha_missing_integration_canary")
+	}
+	if g.Allowed {
+		g.Reasons = append(g.Reasons, "base_sha_integration_green")
+	}
+	return g
 }

@@ -16,20 +16,31 @@ actions.
 
 **Feature development is paused** after the owner freeze at
 `pre-prod@1a6fd6bd6a87232b23db2f6fa06de299604cf57e` until this gate’s controls
-are merged and the integrated `pre-prod` SHA is green.
+are merged and the **exact** integrated `pre-prod` SHA shows green
+`integration-verify` and `integration-canary` checks.
 
 Do **not** start `#1108` (V090-016) or any later catalog item until:
 
 1. the Stabilization Control Gate PR is owner-approved and merged;
-2. `bash scripts/assert-pre-prod-green.sh` passes for `origin/pre-prod`; and
-3. the next issue carries explicit implementation authorization (not merely
-   `status:planned` catalog publication).
+2. the exact `pre-prod` tip SHA has green **distinct** checks
+   `integration-verify` and `integration-canary` (PR `verify`/`test`/`race`/
+   `security` remain PR-authoritative and are not fully re-run post-merge);
+3. the next issue carries the owner-applied label `implementation-authorized`
+   and the PR has **exactly one** GitHub `closingIssuesReferences` entry; and
+4. development agents use a **separate non-admin** GitHub identity so owner
+   review is not a single-account deadlock (see branch-protection doc).
+
+Body text, `status:ready`, and catalog publication alone never authorize
+implementation. This CI policy is **not** tamper-proof: PR CI runs PR-branch
+code; CODEOWNERS + non-admin agents + protection are required for real review
+enforcement.
 
 Control surfaces:
 
 - [`docs/reference/v090-stabilization-gate.md`](docs/reference/v090-stabilization-gate.md)
 - [`docs/reference/pre-prod-branch-protection.md`](docs/reference/pre-prod-branch-protection.md)
 - [`docs/reference/evidence-tiers.md`](docs/reference/evidence-tiers.md)
+- `CODEOWNERS` (control plane owned by `@jasonhnd`)
 - GitHub issue `#1092` (evidence tiers + stabilization specification)
 
 Local hook requirement for every clone:
