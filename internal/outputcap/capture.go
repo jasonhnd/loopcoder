@@ -24,7 +24,6 @@ type Capture struct {
 	limits      Limits
 	stdout      *stream
 	stderr      *stream
-	excerpts    []Excerpt
 	excerptSeq  int
 	closed      bool
 	fault       error
