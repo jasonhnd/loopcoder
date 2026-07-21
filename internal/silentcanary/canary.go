@@ -404,10 +404,9 @@ func finish(
 	resourceState string,
 	clock *reportsched.MemoryClock,
 ) (Result, error) {
-	live := observer.LivePIDs()
-	// Final hygiene kill
+	// Final hygiene kill then re-check survivors.
 	cleanupPIDs(observer)
-	live = observer.LivePIDs()
+	live := observer.LivePIDs()
 
 	// Digest parity: all clients that rendered must share the last terminal digest if present.
 	parity := true
