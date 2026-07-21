@@ -42,6 +42,7 @@ Every document is exactly one of these types:
 - [`reference/gemini-observation.md`](reference/gemini-observation.md): V090-044 Gemini CLI discovery and catalog observation.
 - [`reference/gemini-invocation.md`](reference/gemini-invocation.md): V090-105 Gemini CLI invocation consolidation.
 - [`reference/gemini-quota-windows.md`](reference/gemini-quota-windows.md): V090-045 Gemini CLI quota-window normalization.
+- [`reference/antigravity-observation.md`](reference/antigravity-observation.md): V090-106 Antigravity discovery and catalog adapter.
 - [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
 - [`reference/v09-home-layout.md`](reference/v09-home-layout.md): global `$LOOPCODER_HOME` layout and owner-only creation.
 - [`reference/project-authority-store.md`](reference/project-authority-store.md): project.db domain tables and immutable events.
