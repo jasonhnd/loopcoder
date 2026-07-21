@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build darwin
 
 package store
 
@@ -27,6 +27,15 @@ type permissionTarget struct {
 // CheckPermissions inspects store path permissions without creating paths or
 // changing modes.
 func CheckPermissions(path string) (PermissionReport, error) {
+	if err := requireSupportedPlatform(); err != nil {
+		return PermissionReport{
+			Path:      filepath.Clean(strings.TrimSpace(path)),
+			Platform:  runtime.GOOS,
+			Supported: false,
+			Secure:    false,
+			Message:   err.Error(),
+		}, err
+	}
 	path = filepath.Clean(strings.TrimSpace(path))
 	if path == "." || path == "" {
 		return PermissionReport{}, fmt.Errorf("store permissions: path is required")

@@ -4,6 +4,10 @@
 // bootstrap, owner-only permissions, integrity checks, and close behavior.
 // It intentionally does not write domain projections, events, or other later
 // R1 tables; those arrive in subsequent slices.
+//
+// Product platform: darwin/arm64 only. Unsupported GOOS/GOARCH combinations
+// fail closed with ErrUnsupportedPlatform; there is no Windows/Linux permission
+// implementation on the v0.9 store path.
 package store
 
 import (
@@ -73,6 +77,9 @@ type Store struct {
 // foundation when the path is fresh, enforces owner-only permissions, and runs
 // fail-closed integrity validation before returning a handle.
 func Open(ctx context.Context, opts Options) (*Store, error) {
+	if err := requireSupportedPlatform(); err != nil {
+		return nil, fmt.Errorf("open store: %w", err)
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
