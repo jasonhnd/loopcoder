@@ -28,6 +28,7 @@ Every document is exactly one of these types:
 - [`architecture/v0.9.0-threat-model.md`](architecture/v0.9.0-threat-model.md): v0.9 threat model, data classes, and capability enforcement inventory.
 - [`reference/effective-policy.md`](reference/effective-policy.md): v0.9 effective-policy precedence, freeze, provenance, and digest.
 - [`reference/acceptance-harness.md`](reference/acceptance-harness.md): v0.9 deterministic acceptance fixtures and evidence manifests.
+- [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
 - [`reference/releasing.md`](reference/releasing.md): release documentation rules.
 - [`reference/self-bootstrap.md`](reference/self-bootstrap.md): v0.8.0 self-bootstrap acceptance checklist.
 - [`reference/stability-policy.md`](reference/stability-policy.md): 0.x stability policy.

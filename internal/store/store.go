@@ -50,6 +50,16 @@ type Options struct {
 	Now  func() time.Time
 
 	BusyTimeout time.Duration
+
+	// FormatIdentity overrides the durable format marker written and validated
+	// in store_metadata. Empty uses FormatIdentity (generic foundation).
+	// Machine and project authorities use distinct identities so one file cannot
+	// silently serve both roles.
+	FormatIdentity string
+
+	// AuthorityRole is an optional diagnostic label (for example "machine" or
+	// "project"). It does not change schema by itself; FormatIdentity does.
+	AuthorityRole string
 }
 
 // Metadata is the singleton store identity and schema state.
@@ -65,9 +75,11 @@ type Metadata struct {
 
 // Store is an open compact SQLite store handle.
 type Store struct {
-	path string
-	db   *sql.DB
-	now  func() time.Time
+	path           string
+	db             *sql.DB
+	now            func() time.Time
+	formatIdentity string
+	authorityRole  string
 
 	closeMu sync.Mutex
 	closed  bool
@@ -92,6 +104,12 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		return nil, errors.New("open store: path is required")
 	}
 
+	formatIdentity := strings.TrimSpace(opts.FormatIdentity)
+	if formatIdentity == "" {
+		formatIdentity = FormatIdentity
+	}
+	authorityRole := strings.TrimSpace(opts.AuthorityRole)
+
 	var store *Store
 	err := withOwnerOnlyUmask(func() error {
 		if err := ensurePermissionsForOpen(path); err != nil {
@@ -103,9 +121,11 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		}
 		db.SetMaxOpenConns(1)
 		opened := &Store{
-			path: path,
-			db:   db,
-			now:  normalizeNow(opts.Now),
+			path:           path,
+			db:             db,
+			formatIdentity: formatIdentity,
+			authorityRole:  authorityRole,
+			now:            normalizeNow(opts.Now),
 		}
 		if err := opened.configure(ctx, opts.BusyTimeout); err != nil {
 			_ = db.Close()
@@ -158,6 +178,22 @@ func (s *Store) Path() string {
 		return ""
 	}
 	return s.path
+}
+
+// ExpectedFormatIdentity returns the format identity this handle was opened with.
+func (s *Store) ExpectedFormatIdentity() string {
+	if s == nil {
+		return ""
+	}
+	return s.formatIdentity
+}
+
+// AuthorityRole returns the optional authority role label for this handle.
+func (s *Store) AuthorityRole() string {
+	if s == nil {
+		return ""
+	}
+	return s.authorityRole
 }
 
 // SchemaVersion returns the durable schema version recorded in store metadata.
@@ -278,7 +314,7 @@ func (s *Store) bootstrapFoundation(ctx context.Context) error {
 		created_at, last_successful_migration, last_migration_at
 	) VALUES (1, ?, ?, ?, ?, ?, ?, ?)`,
 		storeID,
-		FormatIdentity,
+		s.formatIdentity,
 		CurrentSchemaVersion,
 		CompatibilityFloor,
 		now,
@@ -314,8 +350,8 @@ func (s *Store) validateCurrentSchema(ctx context.Context, version int) error {
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
-	if meta.FormatIdentity != FormatIdentity {
-		return fmt.Errorf("open store: unsupported store format identity %q; want %q", meta.FormatIdentity, FormatIdentity)
+	if meta.FormatIdentity != s.formatIdentity {
+		return fmt.Errorf("open store: unsupported store format identity %q; want %q", meta.FormatIdentity, s.formatIdentity)
 	}
 	if meta.SchemaVersion != version {
 		return fmt.Errorf("open store: schema metadata version %d does not match migration ledger version %d", meta.SchemaVersion, version)
@@ -387,8 +423,9 @@ func checkIntegrity(ctx context.Context, path string, db *sql.DB) error {
 	if err != nil {
 		return fmt.Errorf("store integrity: %w", err)
 	}
-	if meta.FormatIdentity != FormatIdentity {
-		return fmt.Errorf("store integrity: unsupported store format identity %q", meta.FormatIdentity)
+	// format identity is validated at open against the handle's expected identity
+	if meta.FormatIdentity == "" {
+		return fmt.Errorf("store integrity: missing store format identity")
 	}
 	if meta.SchemaVersion != version {
 		return fmt.Errorf("store integrity: schema metadata version %d does not match migration ledger version %d", meta.SchemaVersion, version)
