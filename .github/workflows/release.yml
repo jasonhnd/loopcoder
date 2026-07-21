@@ -43,6 +43,12 @@ jobs:
           test "${actual_goos}" = "darwin"
           test "${actual_goarch}" = "arm64"
 
+      - name: Record tested commit SHA
+        run: |
+          set -euo pipefail
+          printf 'evidence_tier=release-artifact\n'
+          printf 'tested_commit_sha=%s\n' "${GITHUB_SHA}"
+
       - name: Full Go race suite
         run: bash scripts/ci-full-race.sh
 
@@ -93,6 +99,11 @@ jobs:
           # Build stages files under dist/package before tarring; remove so only the archive remains.
           rm -rf dist/package
           bash scripts/stage-draft-release.sh validate-archives
+          archive_digest="$(shasum -a 256 "dist/${archive}" | awk '{print $1}')"
+          printf 'evidence_tier=release-artifact\n'
+          printf 'tested_commit_sha=%s\n' "${COMMIT_SHA}"
+          printf 'archive_digest_sha256=%s\n' "${archive_digest}"
+          printf 'archive_name=%s\n' "${archive}"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

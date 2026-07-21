@@ -37,6 +37,12 @@ jobs:
           test "${actual_goos}" = "darwin"
           test "${actual_goarch}" = "arm64"
 
+      - name: Record tested commit SHA
+        run: |
+          set -euo pipefail
+          printf 'evidence_tier=pull-request\n'
+          printf 'tested_commit_sha=%s\n' "${GITHUB_SHA}"
+
       - name: YAML validity check
         run: |
           set -euo pipefail
@@ -89,6 +95,12 @@ jobs:
           test "${actual_goos}" = "darwin"
           test "${actual_goarch}" = "arm64"
 
+      - name: Record tested commit SHA
+        run: |
+          set -euo pipefail
+          printf 'evidence_tier=pull-request\n'
+          printf 'tested_commit_sha=%s\n' "${GITHUB_SHA}"
+
       - name: Go build
         run: go build ./cmd/loopcoder
 
@@ -123,6 +135,12 @@ jobs:
           test "${actual_goos}" = "darwin"
           test "${actual_goarch}" = "arm64"
 
+      - name: Record tested commit SHA
+        run: |
+          set -euo pipefail
+          printf 'evidence_tier=pull-request\n'
+          printf 'tested_commit_sha=%s\n' "${GITHUB_SHA}"
+
       - name: Go test changed packages (race detector)
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -148,6 +166,12 @@ jobs:
           printf 'Go host tuple: %s/%s\n' "${actual_goos}" "${actual_goarch}"
           test "${actual_goos}" = "darwin"
           test "${actual_goarch}" = "arm64"
+
+      - name: Record tested commit SHA
+        run: |
+          set -euo pipefail
+          printf 'evidence_tier=pull-request\n'
+          printf 'tested_commit_sha=%s\n' "${GITHUB_SHA}"
 
       - name: Install audit tools
         run: |
