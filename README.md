@@ -194,6 +194,8 @@ loopcoder relay list    --repo .              # inspect pending local relay bloc
 loopcoder relay flush   --repo .              # print pending relay blocks verbatim and clear them
 loopcoder resume        --repo .              # reconcile a run after an interruption
 loopcoder status        --repo .              # render local-only run status
+loopcoder run           --repo . --issue N --provider P --model M  # primary direct-path shell (explicit route; no auto-route until P4)
+loopcoder events        --repo .              # follow/list report events (thin surface)
 loopcoder attach        --repo . --run <run-id> # follow durable detached run progress
 loopcoder cancel        --repo . --run <run-id> # request detached run cancellation
 loopcoder report        --repo .              # list recent local reporter records

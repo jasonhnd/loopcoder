@@ -73,12 +73,12 @@ type BuildInfo struct {
 }
 
 type Deps struct {
-	NewGitHubReader          func(repoPath string) orchestration.GitHubReader
-	NewIssueWriter           func(repoPath string) compiler.IssueWriter
-	NewPreProdWriter         func(repoPath string) orchestration.PreProdWriter
-	NewPromoteWriter         func(repoPath string) orchestration.PromotionWriter
-	ProcessAlive             func(pid int) bool
-	Now                      func() time.Time
+	NewGitHubReader  func(repoPath string) orchestration.GitHubReader
+	NewIssueWriter   func(repoPath string) compiler.IssueWriter
+	NewPreProdWriter func(repoPath string) orchestration.PreProdWriter
+	NewPromoteWriter func(repoPath string) orchestration.PromotionWriter
+	ProcessAlive     func(pid int) bool
+	Now              func() time.Time
 	// WaitClock optionally overrides the provider-free wait clock for tests.
 	WaitClock                waitstate.Clock
 	RuntimeGOOS              string
@@ -133,41 +133,45 @@ type Deps struct {
 }
 
 var commands = []Command{
+	// Direct-path primary surface (V090-025): lead help with these.
+	{Name: "run", Summary: "primary direct-path run (explicit provider/model; no auto-route until P4)"},
+	{Name: "status", Summary: "render local delivery run status"},
+	{Name: "events", Summary: "follow project report events (cursor-based; thin alias surface)"},
+	{Name: "cancel", Summary: "request cancellation for a detached run"},
+	{Name: "doctor", Summary: "run read-only preflight checks"},
+	{Name: "providers", Summary: "refresh bounded provider CLI installation inventory"},
+	// Remaining commands (legacy / compatibility remain available).
 	{Name: "attest", Summary: "emit conductor self-report"},
 	{Name: "version", Summary: "print version and build information"},
 	{Name: "models", Summary: "list static provider model and depth registry entries"},
 	{Name: "projects", Summary: "manage the machine-local project registry"},
-	{Name: "providers", Summary: "refresh bounded provider CLI installation inventory"},
 	{Name: "route", Summary: "explain or persist a provider-neutral route decision"},
 	{Name: "wait", Summary: "provider-free local waits (quota-reset, …)"},
 	{Name: "delivery", Summary: "plan and gate v0.8 DeliveryRun approvals"},
 	{Name: "budget", Summary: "exercise local quota usage budget accounting"},
 	{Name: "audit", Summary: "run a read-only repository security audit"},
-	{Name: "doctor", Summary: "run read-only preflight checks"},
 	{Name: "init", Summary: "scaffold loopcoder files in the current repository"},
 	{Name: "discover", Summary: "discover CI failures and file GitHub issues"},
-	{Name: "compile", Summary: "compile ROADMAP.md into GitHub issues"},
-	{Name: "tick", Summary: "run one unattended delivery pass"},
-	{Name: "trigger", Summary: "run automation triggers for tick"},
+	{Name: "compile", Summary: "compile ROADMAP.md into GitHub issues (compatibility)"},
+	{Name: "tick", Summary: "run one unattended delivery pass (compatibility; not self-bootstrap)"},
+	{Name: "trigger", Summary: "run automation triggers for tick (compatibility)"},
 	{Name: "promote", Summary: "promote pre-prod to main"},
 	{Name: "upgrade", Summary: "self-update from GitHub Releases"},
 	{Name: "migrate", Summary: "plan storage upgrades or import legacy repo-local state"},
 	{Name: "skill", Summary: "install bundled playbook skill files"},
-	{Name: "dispatch", Summary: "dispatch one issue worker"},
-	{Name: "nested", Summary: "submit and execute a nested child plan"},
+	{Name: "dispatch", Summary: "dispatch one issue worker (compatibility)"},
+	{Name: "nested", Summary: "submit and execute a nested child plan (compatibility)"},
 	{Name: "relay", Summary: "flush or list pending local report relay blocks"},
 	{Name: "report", Summary: "list local reporter records"},
 	{Name: "ready-set", Summary: "classify ready and blocked work"},
-	{Name: "status", Summary: "render local delivery run status"},
 	{Name: "attach", Summary: "attach to durable detached run progress"},
 	{Name: "resume", Summary: "reconcile a local run"},
 	{Name: "state", Summary: "publish or pull durable run state"},
 	{Name: "lease", Summary: "manage the conductor lease"},
 	{Name: "recover", Summary: "recover or retry a worker attempt"},
-	{Name: "cancel", Summary: "request cancellation for a detached run"},
 	{Name: "loopreview", Summary: "run an independent read-only PR verifier"},
 	{Name: "verify-local", Summary: "run local verification gates"},
-	{Name: "dispatch-wave", Summary: "dispatch one ready issue wave"},
+	{Name: "dispatch-wave", Summary: "dispatch one ready issue wave (compatibility)"},
 	{Name: "hook", Summary: "run an embedded loopcoder conductor hook (used by Claude Code hook settings)"},
 	{Name: "ps", Summary: "list loopcoder-managed worker processes"},
 	{Name: "kill", Summary: "terminate loopcoder-managed processes (never by bare name)"},
@@ -461,6 +465,13 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 2
 	}
 
+	if command.Name == "run" {
+		return runRun(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "events" {
+		// Thin alias: events surface reuses report listing until dedicated follow lands.
+		return runReport(args[1:], stdout, stderr, deps)
+	}
 	if command.Name == "ready-set" {
 		return runReadySet(args[1:], stdout, stderr, deps)
 	}
