@@ -190,16 +190,14 @@ func (e *Executor) Run(plan Plan) (Snapshot, error) {
 			return Snapshot{}, fmt.Errorf("%w: redirects not allowed", ErrPolicy)
 		}
 		outcome, fact, diag, expl := e.Runner(st)
-		// Never accept secret-shaped facts
-		if fact != nil {
-			for k, v := range fact {
-				if looksSecret(v) || looksSecret(k) {
-					outcome = OutcomeMalformed
-					diag = "secret_in_fact"
-					fact = nil
-					expl = "fact contained secret-shaped value; discarded"
-					break
-				}
+		// Never accept secret-shaped facts (range over nil map is a no-op).
+		for k, v := range fact {
+			if looksSecret(v) || looksSecret(k) {
+				outcome = OutcomeMalformed
+				diag = "secret_in_fact"
+				fact = nil
+				expl = "fact contained secret-shaped value; discarded"
+				break
 			}
 		}
 		sr := StepResult{
