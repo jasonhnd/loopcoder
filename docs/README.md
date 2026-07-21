@@ -38,6 +38,7 @@ Every document is exactly one of these types:
 - [`reference/codex-quota-windows.md`](reference/codex-quota-windows.md): V090-041 Codex quota-window normalization.
 - [`reference/claude-observation.md`](reference/claude-observation.md): V090-042 Claude Code discovery and catalog observation.
 - [`reference/claude-invocation.md`](reference/claude-invocation.md): V090-104 Claude Code invocation consolidation.
+- [`reference/claude-quota-windows.md`](reference/claude-quota-windows.md): V090-043 Claude Code quota-window normalization.
 - [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
 - [`reference/v09-home-layout.md`](reference/v09-home-layout.md): global `$LOOPCODER_HOME` layout and owner-only creation.
 - [`reference/project-authority-store.md`](reference/project-authority-store.md): project.db domain tables and immutable events.
