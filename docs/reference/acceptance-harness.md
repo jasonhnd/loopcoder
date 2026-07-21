@@ -1,6 +1,6 @@
 # v0.9 Acceptance Fixture Harness (V090-003)
 
-Package: [`internal/acceptharness`](../../internal/acceptharness)
+Package: [`internal/acceptharness`](../../internal/acceptharness)  
 Issue: [#1095](https://github.com/jasonhnd/loopcoder/issues/1095)
 
 ## Purpose

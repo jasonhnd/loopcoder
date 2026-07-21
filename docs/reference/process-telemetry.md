@@ -1,6 +1,6 @@
 # Process Telemetry (V090-015)
 
-Package: [`internal/proctelemetry`](../../internal/proctelemetry)
+Package: [`internal/proctelemetry`](../../internal/proctelemetry)  
 Issue: [#1107](https://github.com/jasonhnd/loopcoder/issues/1107)
 
 ## Contract for V090-016

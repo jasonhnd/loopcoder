@@ -1,6 +1,6 @@
 # Bounded Output Capture (V090-014)
 
-Package: [`internal/outputcap`](../../internal/outputcap)
+Package: [`internal/outputcap`](../../internal/outputcap)  
 Issue: [#1106](https://github.com/jasonhnd/loopcoder/issues/1106)
 
 ## Behavior

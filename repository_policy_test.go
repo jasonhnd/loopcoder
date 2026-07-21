@@ -1292,6 +1292,44 @@ func TestStabilizationGatePolicy(t *testing.T) {
 	if !strings.Contains(text, "doctor") || !strings.Contains(text, "report") {
 		t.Fatal("integration-canary must run doctor and report JSON")
 	}
+	for _, needle := range []string{
+		`project_id`,
+		`repo_path`,
+		`exit_code`,
+		`loopcoder.report_query.v1`,
+		`observability`,
+		`status --porcelain`,
+	} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("integration-canary must assert %q", needle)
+		}
+	}
+
+	// assert-pre-prod-green must bind both jobs to one provenance-valid Actions run.
+	assertPath := filepath.Join(root, "scripts", "assert-pre-prod-green.sh")
+	assertRaw, err := os.ReadFile(assertPath)
+	if err != nil {
+		t.Fatalf("missing assert-pre-prod-green.sh: %v", err)
+	}
+	assertText := string(assertRaw)
+	for _, needle := range []string{
+		"actions/runs/",
+		"pre-prod-integration.yml",
+		"head_sha",
+		"head_branch",
+		"check_suite_id",
+		"details_url",
+		"newest",
+	} {
+		if !strings.Contains(assertText, needle) {
+			t.Fatalf("assert-pre-prod-green.sh must enforce provenance field %q", needle)
+		}
+	}
+	assertTest := filepath.Join(root, "scripts", "assert-pre-prod-green_test.sh")
+	if _, err := os.Stat(assertTest); err != nil {
+		t.Fatal("missing offline assert-pre-prod-green_test.sh")
+	}
+
 	if _, err := os.Stat(filepath.Join(root, "CODEOWNERS")); err != nil {
 		t.Fatal("missing CODEOWNERS for control plane")
 	}

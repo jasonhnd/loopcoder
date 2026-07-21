@@ -1,6 +1,6 @@
 # v0.9 Global Home Layout (V090-005)
 
-Package: `internal/home` (`V09Layout`)
+Package: `internal/home` (`V09Layout`)  
 Issue: #1097
 
 ## Topology

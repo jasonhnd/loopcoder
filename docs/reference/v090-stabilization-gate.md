@@ -75,14 +75,23 @@ Workflow `.github/workflows/pre-prod-integration.yml` runs **only on push to
 
 It does **not** re-run `go test ./...`, full race, or PR security suites.
 
-`bash scripts/assert-pre-prod-green.sh --sha <full>` requires, for each check:
+`bash scripts/assert-pre-prod-green.sh --sha <full>` is fail-closed. For each
+candidate check it extracts the Actions run ID from `details_url`, queries
+`repos/{owner}/{repo}/actions/runs/<run_id>`, and requires **all** of:
 
-- non-empty GitHub Actions app identity;
-- evidence the run is from `.github/workflows/pre-prod-integration.yml` /
-  push / `pre-prod` / exact head SHA;
-- newest completed **success** only.
+- workflow `path` is `.github/workflows/pre-prod-integration.yml`;
+- `event` is `push`;
+- `head_branch` is `pre-prod`;
+- `head_sha` exactly equals the requested full SHA;
+- GitHub Actions app identity on the check-run is non-empty;
+- `check_suite_id` matches the workflow run when present on the check-run.
 
-Same-name jobs from other workflows are rejected.
+It selects the **newest** provenance-valid workflow run for that SHA.
+`integration-verify` and `integration-canary` must both be completed and
+successful in that **same** run (never combined across runs or attempts).
+Missing fields, malformed URLs, API failures, pending/cancelled runs, and
+ambiguous results fail closed. Offline fixtures live in
+`scripts/assert-pre-prod-green_test.sh`.
 
 Future non-documentation PRs fail when their exact pre-prod base SHA lacks
 these checks, except the one-time bootstrap identity below.

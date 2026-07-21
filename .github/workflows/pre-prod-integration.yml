@@ -82,6 +82,8 @@ jobs:
           set -euo pipefail
           START="$(date +%s)"
           REPO_ROOT="$(pwd)"
+          # Canonical absolute path (matches doctor --repo resolution via filepath.Abs).
+          CANONICAL_REPO="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "${REPO_ROOT}")"
           # Snapshot worktree (tracked + untracked names only).
           BEFORE="$(git -C "${REPO_ROOT}" status --porcelain)"
 
@@ -91,13 +93,33 @@ jobs:
           export LOOPCODER_HOME="${HOME_ISO}"
           # Isolated home: register this repo, then doctor/report JSON.
           /tmp/loopcoder-canary projects register --repo "${REPO_ROOT}" --format json >"${HOME_ISO}/register.json"
-          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("project",{}).get("project_id"), d' "${HOME_ISO}/register.json"
+          python3 -c '
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          pid = (d.get("project") or {}).get("project_id")
+          assert isinstance(pid, str) and pid.strip(), d
+          ' "${HOME_ISO}/register.json"
 
           /tmp/loopcoder-canary doctor --repo "${REPO_ROOT}" --format json >"${HOME_ISO}/doctor.json"
-          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert "repo_path" in d or "exit_code" in d or isinstance(d, dict), d' "${HOME_ISO}/doctor.json"
+          python3 -c '
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          want = sys.argv[2]
+          assert d.get("repo_path") == want, (d.get("repo_path"), want)
+          assert d.get("exit_code") == 0, d.get("exit_code")
+          checks = d.get("checks")
+          assert isinstance(checks, list) and len(checks) > 0, checks
+          ' "${HOME_ISO}/doctor.json" "${CANONICAL_REPO}"
 
           /tmp/loopcoder-canary report --repo "${REPO_ROOT}" --format json >"${HOME_ISO}/report.json"
-          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert isinstance(d, dict), d' "${HOME_ISO}/report.json"
+          python3 -c '
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          assert d.get("schema_version") == "loopcoder.report_query.v1", d.get("schema_version")
+          assert isinstance(d.get("reports"), list), d.get("reports")
+          assert isinstance(d.get("records"), list), d.get("records")
+          assert isinstance(d.get("observability"), dict), d.get("observability")
+          ' "${HOME_ISO}/report.json"
 
           AFTER="$(git -C "${REPO_ROOT}" status --porcelain)"
           if [ "${BEFORE}" != "${AFTER}" ]; then
