@@ -41,7 +41,7 @@ const (
 	foundationMigrationID   = "r1.3-store-open-schema-foundation"
 	foundationMigrationName = "store open/schema foundation"
 
-	defaultBusyTimeout = 5 * time.Second
+	defaultBusyTimeout = DefaultBusyTimeout
 )
 
 // Options controls compact-store opening.
@@ -60,6 +60,15 @@ type Options struct {
 	// AuthorityRole is an optional diagnostic label (for example "machine" or
 	// "project"). It does not change schema by itself; FormatIdentity does.
 	AuthorityRole string
+
+	// QuarantineDir is where integrity/schema failures are moved. Empty uses
+	// <parent>/quarantine. Quarantine never auto-recreates a replacement DB
+	// in the same Open call.
+	QuarantineDir string
+
+	// SkipQuarantine disables automatic quarantine on open integrity failure
+	// (tests that assert the raw error). Default false.
+	SkipQuarantine bool
 }
 
 // Metadata is the singleton store identity and schema state.
@@ -80,6 +89,7 @@ type Store struct {
 	now            func() time.Time
 	formatIdentity string
 	authorityRole  string
+	openReport     OpenReport
 
 	closeMu sync.Mutex
 	closed  bool
@@ -110,6 +120,12 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	}
 	authorityRole := strings.TrimSpace(opts.AuthorityRole)
 
+	recovered := readUncleanMarker(path)
+	busyTimeout := opts.BusyTimeout
+	if busyTimeout <= 0 {
+		busyTimeout = defaultBusyTimeout
+	}
+
 	var store *Store
 	err := withOwnerOnlyUmask(func() error {
 		if err := ensurePermissionsForOpen(path); err != nil {
@@ -119,21 +135,29 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		if err != nil {
 			return fmt.Errorf("open store %s: %w", path, err)
 		}
-		db.SetMaxOpenConns(1)
+		// Single-writer policy: never grow a connection pool.
+		db.SetMaxOpenConns(MaxOpenConns)
+		db.SetMaxIdleConns(MaxIdleConns)
+		db.SetConnMaxLifetime(0)
 		opened := &Store{
 			path:           path,
 			db:             db,
 			formatIdentity: formatIdentity,
 			authorityRole:  authorityRole,
 			now:            normalizeNow(opts.Now),
+			openReport: OpenReport{
+				Recovered:    recovered,
+				BusyTimeout:  busyTimeout,
+				MaxOpenConns: MaxOpenConns,
+			},
 		}
-		if err := opened.configure(ctx, opts.BusyTimeout); err != nil {
+		if err := opened.configure(ctx, busyTimeout); err != nil {
 			_ = db.Close()
-			return err
+			return maybeQuarantine(path, opts, err)
 		}
 		if err := opened.bootstrapOrValidate(ctx); err != nil {
 			_ = db.Close()
-			return err
+			return maybeQuarantine(path, opts, err)
 		}
 		if err := hardenSQLiteSidecars(path); err != nil {
 			_ = db.Close()
@@ -141,7 +165,15 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		}
 		if err := opened.CheckIntegrity(ctx); err != nil {
 			_ = db.Close()
-			return err
+			return maybeQuarantine(path, opts, err)
+		}
+		var journal string
+		if err := db.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&journal); err == nil {
+			opened.openReport.JournalMode = toLowerASCII(journal)
+		}
+		if err := writeOpenMarker(path, opened.now()); err != nil {
+			_ = db.Close()
+			return fmt.Errorf("open store: %w", err)
 		}
 		store = opened
 		return nil
@@ -152,8 +184,46 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	return store, nil
 }
 
+// maybeQuarantine moves a failed store aside for integrity/version/authority
+// failures. It never creates a replacement database in the same call.
+func maybeQuarantine(path string, opts Options, cause error) error {
+	if opts.SkipQuarantine || cause == nil {
+		return cause
+	}
+	if !shouldQuarantine(cause) {
+		return cause
+	}
+	// Close any leftover handles before rename.
+	res, qerr := QuarantineDatabase(path, opts.QuarantineDir, time.Now().UTC())
+	if qerr != nil {
+		return fmt.Errorf("%w: %v (quarantine failed: %v)", ErrQuarantined, cause, qerr)
+	}
+	return fmt.Errorf("%w: %v; moved to %s", ErrQuarantined, cause, RedactPath(res.QuarantinePath))
+}
+
+func shouldQuarantine(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Quarantine only corruption / true schema-version failures.
+	// Format-identity (wrong role) must not move the file — operator can reopen
+	// with the correct role without recovery.
+	if isCorrupt(err) || errors.Is(err, ErrCorrupt) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "unsupported store schema version") {
+		return true
+	}
+	if errors.Is(err, ErrIncompatibleVersion) && !strings.Contains(msg, "format identity") {
+		return true
+	}
+	return false
+}
+
 // Close releases the store handle. It is idempotent and safe to call more than
 // once; subsequent calls return nil without re-closing the database.
+// Clean close clears the unclean-open marker and attempts a bounded WAL checkpoint.
 func (s *Store) Close() error {
 	if s == nil {
 		return nil
@@ -165,10 +235,18 @@ func (s *Store) Close() error {
 	}
 	s.closed = true
 	if s.db == nil {
+		_ = clearOpenMarker(s.path)
 		return nil
 	}
+	// Independent cleanup so a cancelled ambient context cannot block close.
+	ctx, cancel := context.WithTimeout(context.Background(), CloseCleanupTimeout)
+	defer cancel()
+	_, _ = s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`)
 	err := s.db.Close()
 	s.db = nil
+	if clearErr := clearOpenMarker(s.path); clearErr != nil && err == nil {
+		err = clearErr
+	}
 	return err
 }
 
@@ -262,9 +340,17 @@ func (s *Store) configure(ctx context.Context, busyTimeout time.Duration) error 
 	if busyTimeout <= 0 {
 		busyTimeout = defaultBusyTimeout
 	}
+	// journal_mode must run alone and returns the mode name.
+	var mode string
+	if err := s.db.QueryRowContext(ctx, `PRAGMA journal_mode = WAL`).Scan(&mode); err != nil {
+		return fmt.Errorf("open store %s: enable wal: %w", s.path, err)
+	}
+	s.openReport.JournalMode = toLowerASCII(mode)
 	for _, statement := range []string{
 		`PRAGMA foreign_keys = ON`,
+		`PRAGMA synchronous = NORMAL`,
 		fmt.Sprintf(`PRAGMA busy_timeout = %d`, busyTimeout.Milliseconds()),
+		fmt.Sprintf(`PRAGMA wal_autocheckpoint = %d`, DefaultWALAutocheckpoint),
 	} {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("open store %s: configure sqlite: %w", s.path, err)
@@ -364,6 +450,7 @@ func (s *Store) validateCurrentSchema(ctx context.Context, version int) error {
 		return fmt.Errorf("open store: %w", err)
 	}
 	if meta.FormatIdentity != s.formatIdentity {
+		// Wrong role / identity: fail closed without quarantine (file remains).
 		return fmt.Errorf("open store: unsupported store format identity %q; want %q", meta.FormatIdentity, s.formatIdentity)
 	}
 	if meta.SchemaVersion != version {
@@ -412,7 +499,7 @@ func checkIntegrity(ctx context.Context, path string, db *sql.DB) error {
 	}
 
 	if err := sqliteIntegrityCheck(ctx, db); err != nil {
-		return fmt.Errorf("store integrity: %w", err)
+		return fmt.Errorf("%w: store integrity: %v", ErrCorrupt, err)
 	}
 	if err := checkRequiredFoundationTables(ctx, db); err != nil {
 		return fmt.Errorf("store integrity: %w", err)
@@ -458,7 +545,7 @@ func sqliteIntegrityCheck(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	if result != "ok" {
-		return fmt.Errorf("integrity_check failed: %s", result)
+		return fmt.Errorf("%w: integrity_check failed: %s", ErrCorrupt, result)
 	}
 	return nil
 }
@@ -635,9 +722,9 @@ func parseTimestamp(value string) (time.Time, error) {
 }
 
 func unsupportedNewVersionError(version int) error {
-	return fmt.Errorf("unsupported store schema version %d; this binary supports up to schema version %d", version, CurrentSchemaVersion)
+	return fmt.Errorf("%w: unsupported store schema version %d; this binary supports up to schema version %d", ErrIncompatibleVersion, version, CurrentSchemaVersion)
 }
 
 func unsupportedOldVersionError(version int) error {
-	return fmt.Errorf("unsupported store schema version %d; compatibility floor is %d", version, CompatibilityFloor)
+	return fmt.Errorf("%w: unsupported store schema version %d; compatibility floor is %d", ErrIncompatibleVersion, version, CompatibilityFloor)
 }
