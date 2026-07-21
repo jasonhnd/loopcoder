@@ -35,7 +35,7 @@ func CapabilityOwners() []EnforcementOwner {
 		{CapProcessControl, "internal/supervisedexec", "existing"},
 		{CapNativeDelegate, "denied unless attempt pin allows", "gap"},
 		{CapUIAction, "UI protocol ack verification (P2)", "gap"},
-		{CapConfigFreeze, "V090-085 effective-policy snapshot", "planned"},
+		{CapConfigFreeze, "internal/effectivepolicy", "existing"},
 		{CapMachineState, "internal/store + machine schema issues", "planned"},
 		{CapProjectState, "internal/store + project schema issues", "planned"},
 	}
