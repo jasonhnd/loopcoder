@@ -35,6 +35,13 @@ new v0.9 writers.
 | `internal/storage.OpenReadOnly` | Used by `OpenLegacyReadOnly` |
 | Repo-local `.loopcoder` fallbacks | Forbidden on v0.9 path (enforced in V090-005 layout) |
 
+## Resilience (V090-011)
+
+Shared foundation settings (WAL, single-conn pool, busy timeout, unclean-open
+markers, quarantine, backup) are documented in
+[`store-resilience.md`](store-resilience.md). Machine and project roles use the
+same operational limits; they differ only by path and format identity.
+
 ## Tests
 
 ```bash
