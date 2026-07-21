@@ -1247,6 +1247,10 @@ func TestStabilizationGatePolicy(t *testing.T) {
 	if !workflowJobContains(ci.Jobs["verify"], "scripts/check-implementation-authorization.sh") {
 		t.Fatal("verify job must run implementation authorization check")
 	}
+	// Offline provenance fixtures must execute in PR verify (file presence alone is not enough).
+	if !workflowJobContains(ci.Jobs["verify"], "scripts/assert-pre-prod-green_test.sh") {
+		t.Fatal("verify job must execute scripts/assert-pre-prod-green_test.sh")
+	}
 
 	// Integrated pre-prod SHA runs bounded distinct checks only (not full PR suite).
 	integPath := filepath.Join(root, ".github", "workflows", "pre-prod-integration.yml")
@@ -1258,6 +1262,9 @@ func TestStabilizationGatePolicy(t *testing.T) {
 		if _, ok := integ.Jobs[name]; !ok {
 			t.Fatalf("pre-prod-integration.yml missing required job %q", name)
 		}
+	}
+	if !workflowJobContains(integ.Jobs["integration-verify"], "scripts/assert-pre-prod-green_test.sh") {
+		t.Fatal("integration-verify must execute scripts/assert-pre-prod-green_test.sh")
 	}
 	raw, err := os.ReadFile(integPath)
 	if err != nil {
@@ -1328,6 +1335,23 @@ func TestStabilizationGatePolicy(t *testing.T) {
 	assertTest := filepath.Join(root, "scripts", "assert-pre-prod-green_test.sh")
 	if _, err := os.Stat(assertTest); err != nil {
 		t.Fatal("missing offline assert-pre-prod-green_test.sh")
+	}
+	assertTestRaw, err := os.ReadFile(assertTest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertTestText := string(assertTestRaw)
+	for _, needle := range []string{
+		"paginated_two_pages",
+		"paginated_malformed_page2",
+		"wrap_checks",
+	} {
+		if !strings.Contains(assertTestText, needle) {
+			t.Fatalf("assert-pre-prod-green_test.sh must cover pagination case %q", needle)
+		}
+	}
+	if !strings.Contains(assertText, "idx += end") {
+		t.Fatal("assert-pre-prod-green.sh parse_json_stream must advance with idx += end")
 	}
 
 	if _, err := os.Stat(filepath.Join(root, "CODEOWNERS")); err != nil {

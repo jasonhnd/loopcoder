@@ -67,6 +67,11 @@ jobs:
               bash scripts/check-implementation-authorization.sh
           fi
 
+      - name: assert-pre-prod-green offline provenance fixtures
+        run: |
+          set -euo pipefail
+          bash scripts/assert-pre-prod-green_test.sh
+
       - name: CI check mapping check
         run: go test . -run 'TestV080WorkflowPolicy|TestStabilizationGatePolicy' -count=1
 

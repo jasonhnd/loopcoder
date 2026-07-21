@@ -29,6 +29,11 @@ fail=0
 assert_exit() {
   local label="$1" expect="$2"
   shift 2
+  local want_stdout=""
+  if [[ "${1:-}" == "--stdout-contains" ]]; then
+    want_stdout="${2:-}"
+    shift 2
+  fi
   local out="${tmp_root}/${label}.out" err="${tmp_root}/${label}.err"
   set +e
   env PATH="${bin}:${PATH}" NO_COLOR=1 CLICOLOR=0 GH_FORCE_TTY=0 \
@@ -41,6 +46,12 @@ assert_exit() {
     cat "$out" >&2 || true
     echo "--- stderr ---" >&2
     cat "$err" >&2 || true
+    fail=$((fail + 1))
+    return 0
+  fi
+  if [[ -n "$want_stdout" ]] && ! grep -Fq -- "$want_stdout" "$out"; then
+    echo "FAIL $label: stdout missing: $want_stdout" >&2
+    cat "$out" >&2 || true
     fail=$((fail + 1))
     return 0
   fi
@@ -319,6 +330,39 @@ write_check_runs "$(wrap_checks \
   "$(make_check integration-canary "$RUN_NEW" "$SUITE_NEW" completed success)" \
 )"
 assert_exit success_again 0 --sha "$SHA" --quiet
+
+# ---------- 8) paginated check-runs: two concatenated JSON documents ----------
+# Page 1 = older successful same-run evidence; page 2 = newer successful same-run.
+# Proves parse_json_stream terminates, reads both pages, and picks the newest run.
+write_run "$RUN_OLD" "$(make_workflow_run "$RUN_OLD" "$GOOD_PATH" push pre-prod "$SHA" completed success "$SUITE_OLD" "2026-07-21T10:00:00Z")"
+write_run "$RUN_NEW" "$(make_workflow_run "$RUN_NEW" "$GOOD_PATH" push pre-prod "$SHA" completed success "$SUITE_NEW" "2026-07-21T17:00:00Z")"
+{
+  wrap_checks \
+    "$(make_check integration-verify "$RUN_OLD" "$SUITE_OLD" completed success)" \
+    "$(make_check integration-canary "$RUN_OLD" "$SUITE_OLD" completed success)"
+  wrap_checks \
+    "$(make_check integration-verify "$RUN_NEW" "$SUITE_NEW" completed success)" \
+    "$(make_check integration-canary "$RUN_NEW" "$SUITE_NEW" completed success)"
+} >"${fix}/check_runs.json"
+assert_exit paginated_two_pages 0 --stdout-contains "run_id=${RUN_NEW}" --sha "$SHA" --quiet
+# Newest must win; older run id must not be selected.
+if grep -Fq "run_id=${RUN_OLD}" "${tmp_root}/paginated_two_pages.out"; then
+  echo "FAIL paginated_two_pages: selected older run" >&2
+  cat "${tmp_root}/paginated_two_pages.out" >&2
+  fail=$((fail + 1))
+else
+  echo "ok paginated_two_pages_newest_only"
+  pass=$((pass + 1))
+fi
+
+# ---------- 9) paginated stream: valid first page, malformed second page ----------
+{
+  wrap_checks \
+    "$(make_check integration-verify "$RUN_NEW" "$SUITE_NEW" completed success)" \
+    "$(make_check integration-canary "$RUN_NEW" "$SUITE_NEW" completed success)"
+  printf '{not-json-second-page\n'
+} >"${fix}/check_runs.json"
+assert_exit paginated_malformed_page2 1 --sha "$SHA" --quiet
 
 echo "assert-pre-prod-green_test: pass=${pass} fail=${fail}"
 if [[ "$fail" -ne 0 ]]; then

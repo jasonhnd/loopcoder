@@ -54,6 +54,7 @@ jobs:
           go test . -count=1 -timeout=2m -run 'TestStabilizationGatePolicy|TestV080WorkflowPolicy'
           go test ./internal/evidence -count=1 -timeout=2m -run 'TestDocsOnly|TestPolicy|TestUnlinked|TestMultiple|TestNonPlanned|TestBodyOnly|TestPlannedWith|TestClosed|TestAuthLabel|TestLatest|TestBootstrap|TestBaseSHA'
           IMPLEMENTATION_AUTH_OFFLINE=1 bash scripts/check-implementation-authorization.sh
+          bash scripts/assert-pre-prod-green_test.sh
 
   integration-canary:
     name: integration-canary

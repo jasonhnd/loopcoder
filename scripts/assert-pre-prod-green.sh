@@ -144,7 +144,8 @@ def parse_json_stream(raw):
             obj, end = dec.raw_decode(text[idx:])
         except json.JSONDecodeError as exc:
             fail("malformed_api_json: %s" % exc)
-        idx = end
+        # end is relative to text[idx:]; advance absolute cursor (paginate stream).
+        idx += end
         objects.append(obj)
     return objects
 
