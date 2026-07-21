@@ -2,14 +2,15 @@
 
 > **v0.9.0 planning rule:** this file is not compiler input. Do not run
 > `loopcoder compile`, do not activate slices, and do not use LoopCoder to
-> develop LoopCoder. GitHub issues are created manually from the reviewed issue
-> catalog only after explicit owner approval.
+> develop LoopCoder. GitHub issues are published manually from the reviewed
+> issue catalog only after explicit owner approval.
 
 ## 0.9.0 - Production-usable local development orchestrator
 
-Status: **READY FOR ORDINARY DEVELOPMENT**. Issue publication, assignment,
-provider/model selection, merge, and release still require explicit owner
-authorization; this text alone performs none of those actions.
+Status: **PUBLISHED FOR ORDINARY DEVELOPMENT**. Issue assignment,
+provider/model selection, implementation, merge, and release still require
+explicit owner authorization; catalog publication alone performs none of those
+actions.
 
 v0.9.0 is one public release developed through ordinary branches and PRs. The
 current v0.8.1 release is a predecessor, compatibility source, and migration
@@ -40,7 +41,7 @@ versions, prereleases, packages, or permission to move forward automatically.
 | P5 - Bounded workflows | Dependency graph, atomic claim/close, deterministic waves, ordered integration, and contained native/cross-provider children. | 11 | Bounded workflow canary proves one writer, resource containment, cancellation, and ordered integration. |
 | P6 - Operations and release | Multi-repo/private/cross-Mac use, machine rebuild, retention, migration, bounded legacy removal, diagnostics, docs, package, and exact-artifact qualification. | 22 | One `darwin/arm64` v0.9.0 artifact passes install, migration, consumer, and publication gates. |
 
-There are **109 draft development issues**. Each changes one primary behavior,
+There are **109 published development issues**. Each changes one primary behavior,
 has at most five acceptance criteria, targets one PR, and is sized for roughly
 one half to two ordinary developer days. Details and GitHub-ready issue bodies
 are maintained in:
@@ -48,6 +49,7 @@ are maintained in:
 - [`docs/roadmaps/v0.9.0/README.md`](docs/roadmaps/v0.9.0/README.md)
 - [`docs/roadmaps/v0.9.0/v0.8-disposition.md`](docs/roadmaps/v0.9.0/v0.8-disposition.md)
 - [`docs/roadmaps/v0.9.0/issue-index.md`](docs/roadmaps/v0.9.0/issue-index.md)
+- [`docs/roadmaps/v0.9.0/published-issues.md`](docs/roadmaps/v0.9.0/published-issues.md)
 - [`docs/roadmaps/v0.9.0/issues/`](docs/roadmaps/v0.9.0/issues/)
 
 The accepted architecture contracts remain:

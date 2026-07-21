@@ -1,13 +1,14 @@
 # v0.9.0 Issue Publication Contract
 
-Status: **READY FOR CATALOG PUBLICATION AND ORDINARY DEVELOPMENT**; assignment
-and implementation remain owner-controlled.
+Status: **PUBLISHED FOR ORDINARY DEVELOPMENT**; assignment and implementation
+remain owner-controlled.
 
-The seven phase files in this directory contain 109 proposed GitHub issue bodies.
-The owner may approve publishing the complete catalog as planned milestone
-entries. Publication alone never authorizes assignment, implementation, compile,
-dispatch, verification, merge, or closure. Those actions require separate owner
-approval for a dependency-ready issue.
+The seven phase files in this directory contain the canonical sources for 109
+published GitHub issue bodies. Their stable ID-to-issue mapping is recorded in
+[`../published-issues.md`](../published-issues.md). Publication alone never
+authorizes assignment, implementation, compile, dispatch, verification, merge,
+or closure. Those actions require separate owner approval for a dependency-ready
+issue.
 
 ## Ordinary Development Only
 

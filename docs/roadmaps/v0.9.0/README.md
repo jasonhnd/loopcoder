@@ -1,16 +1,20 @@
 # LoopCoder v0.9.0 Ordinary-Development Roadmap
 
-Status: **READY FOR ORDINARY DEVELOPMENT**; owner authorization is still
-required to publish or assign each issue.
+Status: **PUBLISHED FOR ORDINARY DEVELOPMENT**; owner authorization is still
+required to assign or implement each issue.
 
 This document is the authoritative execution plan for v0.9.0. It supersedes the
 earlier self-bootstrap Gate A-H execution model while retaining the accepted
 product, storage, domain, and operational contracts.
 
-Nothing in this document authorizes automatic issue publication, provider
-dispatch, merge, release, or self-development. GitHub issues are created
-manually from the reviewed drafts in this directory after explicit owner
-approval.
+Nothing in this document authorizes provider dispatch, implementation, merge,
+release, or self-development. The reviewed GitHub catalog was published manually
+after explicit owner approval. Publication did not assign work or authorize an
+implementation route.
+
+The live catalog is the [`v0.9.0` milestone](https://github.com/jasonhnd/loopcoder/milestone/4).
+The stable ID-to-issue map is recorded in
+[`published-issues.md`](published-issues.md).
 
 ## Decision Summary
 

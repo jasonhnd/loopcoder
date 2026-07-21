@@ -1,7 +1,8 @@
 # LoopCoder v0.9.0 Issue Index
 
-Status: **READY FOR CATALOG PUBLICATION AND ORDINARY DEVELOPMENT**; assignment
-and implementation remain owner-controlled.
+Status: **PUBLISHED FOR ORDINARY DEVELOPMENT**; assignment and implementation
+remain owner-controlled. See [`published-issues.md`](published-issues.md) for the
+stable ID-to-GitHub issue map.
 
 This index is the merge-order map for the ordinary-development v0.9.0 program.
 It is not input to `loopcoder compile`, and no row authorizes issue publication,
