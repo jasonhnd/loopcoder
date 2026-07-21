@@ -88,7 +88,19 @@ Pre-push is the only automatic local gate. It must:
   release smoke; and
 - never start a long-running local daemon or watcher.
 
-Install the hook once per clone:
+Install the repository hook path once per clone (preferred — overrides any
+global full-repository pre-push hook):
+
+```bash
+git config core.hooksPath hooks
+git config --get core.hooksPath   # must print: hooks
+```
+
+With `core.hooksPath=hooks`, Git executes `hooks/pre-push`, which only runs the
+local-focused sentinel. Do **not** rely on a global hooks directory that runs
+`go test ./...`.
+
+Legacy per-clone install (only if you cannot set `core.hooksPath`):
 
 ```bash
 ln -sf ../../hooks/pre-push .git/hooks/pre-push
@@ -101,13 +113,24 @@ Run the same checks without installing a hook:
 bash scripts/pre-push-sentinel.sh
 ```
 
+### Stabilization additions
+
+- Implementation PRs that close or implement `status:planned` issues without
+  explicit authorization fail the `verify` job
+  (`scripts/check-implementation-authorization.sh`).
+- Every push to `pre-prod` re-runs `verify` / `test` / `race` / `security` via
+  `.github/workflows/pre-prod-integration.yml` (`evidence_tier=merge-sha`).
+- Before the next feature item: `bash scripts/assert-pre-prod-green.sh`.
+- See [`v090-stabilization-gate.md`](v090-stabilization-gate.md).
+
 ### What developers run locally
 
 | Situation | Local command | Wait for remotely |
 | --- | --- | --- |
-| Before push | `bash scripts/pre-push-sentinel.sh` | Nothing yet |
-| After opening a PR | Optional focused package tests only when debugging | Required PR jobs `verify`, `test`, `race`, `security` |
+| Before push | `bash scripts/pre-push-sentinel.sh` (via `core.hooksPath=hooks`) | Nothing yet |
+| After opening a PR | Optional focused package tests only when debugging | Required PR jobs `verify`, `test`, `race`, `security` plus authorization |
 | Before merge | Do not re-run repository-wide suites locally | Green required PR checks on the exact head SHA |
+| After merge to `pre-prod` | Do not start the next feature yet | Green `pre-prod-integration` jobs on the exact merge SHA (`assert-pre-prod-green.sh`) |
 | Before release | Do not run full race or packaging locally as a substitute | Release workflow evidence for the tag SHA and archive digest |
 
 If remote CI is red or unavailable, keep the PR unmergeable. Do **not** move

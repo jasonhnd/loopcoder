@@ -160,3 +160,16 @@ For the ordinary-development pre-push gate:
 ```sh
 bash scripts/pre-push-sentinel.sh
 ```
+
+## Git `core.hooksPath` (v0.9.0 stabilization)
+
+For ordinary development clones, point Git at this directory so the repository
+sentinel runs instead of any global full-repository pre-push hook:
+
+```bash
+git config core.hooksPath hooks
+git config --get core.hooksPath   # must print: hooks
+```
+
+`pre-push` in this directory only executes `scripts/pre-push-sentinel.sh`
+(local-focused, under 60s). It never runs `go test ./...`.

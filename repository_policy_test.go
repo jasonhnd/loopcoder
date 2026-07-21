@@ -1233,3 +1233,74 @@ func releasePolicyFixtureJob(name string) workflowJobPolicy {
 		},
 	}
 }
+
+func TestStabilizationGatePolicy(t *testing.T) {
+	root := repositoryPolicyRoot(t)
+
+	// PR CI must keep the four required contexts and the authorization step.
+	ci := loadWorkflowPolicy(t, filepath.Join(root, ".github", "workflows", "ci.yml"))
+	for _, name := range requiredV080Contexts {
+		if _, ok := ci.Jobs[name]; !ok {
+			t.Fatalf("ci.yml missing required job %q", name)
+		}
+	}
+	if !workflowJobContains(ci.Jobs["verify"], "scripts/check-implementation-authorization.sh") {
+		t.Fatal("verify job must run implementation authorization check")
+	}
+
+	// Integrated pre-prod SHA must re-run the same four check names.
+	integPath := filepath.Join(root, ".github", "workflows", "pre-prod-integration.yml")
+	if _, err := os.Stat(integPath); err != nil {
+		t.Fatalf("missing pre-prod integration workflow: %v", err)
+	}
+	integ := loadWorkflowPolicy(t, integPath)
+	for _, name := range requiredV080Contexts {
+		if _, ok := integ.Jobs[name]; !ok {
+			t.Fatalf("pre-prod-integration.yml missing required job %q", name)
+		}
+	}
+	// Trigger on pre-prod pushes.
+	raw, err := os.ReadFile(integPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, "pre-prod") {
+		t.Fatal("pre-prod-integration workflow must target pre-prod")
+	}
+	if !strings.Contains(text, "evidence_tier=merge-sha") {
+		t.Fatal("pre-prod integration must record merge-sha evidence tier")
+	}
+
+	// Local sentinel and hooks must exist (no full go test ./...).
+	sentinel := filepath.Join(root, "scripts", "pre-push-sentinel.sh")
+	data, err := os.ReadFile(sentinel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(data)
+	if strings.Contains(s, "go test ./...") {
+		t.Fatal("pre-push sentinel must not run go test ./...")
+	}
+	if !strings.Contains(s, "60") {
+		t.Fatal("pre-push sentinel must document 60s budget")
+	}
+	hook := filepath.Join(root, "hooks", "pre-push")
+	h, err := os.ReadFile(hook)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(h), "pre-push-sentinel.sh") {
+		t.Fatal("hooks/pre-push must delegate to pre-push-sentinel.sh")
+	}
+
+	// Branch protection documentation must exist (settings are owner-applied).
+	bp := filepath.Join(root, "docs", "reference", "pre-prod-branch-protection.md")
+	if _, err := os.Stat(bp); err != nil {
+		t.Fatalf("missing branch protection doc: %v", err)
+	}
+	gate := filepath.Join(root, "docs", "reference", "v090-stabilization-gate.md")
+	if _, err := os.Stat(gate); err != nil {
+		t.Fatalf("missing stabilization gate doc: %v", err)
+	}
+}

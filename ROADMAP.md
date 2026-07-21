@@ -12,6 +12,32 @@ provider/model selection, implementation, merge, and release still require
 explicit owner authorization; catalog publication alone performs none of those
 actions.
 
+### Stabilization Gate (active — before further feature development)
+
+**Feature development is paused** after the owner freeze at
+`pre-prod@1a6fd6bd6a87232b23db2f6fa06de299604cf57e` until this gate’s controls
+are merged and the integrated `pre-prod` SHA is green.
+
+Do **not** start `#1108` (V090-016) or any later catalog item until:
+
+1. the Stabilization Control Gate PR is owner-approved and merged;
+2. `bash scripts/assert-pre-prod-green.sh` passes for `origin/pre-prod`; and
+3. the next issue carries explicit implementation authorization (not merely
+   `status:planned` catalog publication).
+
+Control surfaces:
+
+- [`docs/reference/v090-stabilization-gate.md`](docs/reference/v090-stabilization-gate.md)
+- [`docs/reference/pre-prod-branch-protection.md`](docs/reference/pre-prod-branch-protection.md)
+- [`docs/reference/evidence-tiers.md`](docs/reference/evidence-tiers.md)
+- GitHub issue `#1092` (evidence tiers + stabilization specification)
+
+Local hook requirement for every clone:
+
+```bash
+git config core.hooksPath hooks
+```
+
 v0.9.0 is one public release developed through ordinary branches and PRs. The
 current v0.8.1 release is a predecessor, compatibility source, and migration
 fixture; it is not the v0.9 development controller. Self-bootstrap, roadmap
