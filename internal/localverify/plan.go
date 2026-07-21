@@ -159,10 +159,7 @@ func BuildPlan(changed []string) (Plan, error) {
 			if dir == "" {
 				pkg = "."
 			}
-			// normalize package path
-			if strings.HasSuffix(pkg, "/") {
-				pkg = strings.TrimSuffix(pkg, "/")
-			}
+			pkg = strings.TrimSuffix(pkg, "/")
 			if pkg == "./" {
 				pkg = "."
 			}
