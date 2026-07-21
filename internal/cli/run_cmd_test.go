@@ -15,7 +15,7 @@ func TestRunDryRunAndAcceptedIdentity(t *testing.T) {
 	code := runRun([]string{
 		"--repo", "jasonhnd/loopcoder",
 		"--issue", "1124",
-		"--provider", "codex",
+		"--provider", "fixture",
 		"--model", "m",
 		"--dry-run",
 		"--format", "json",
@@ -30,7 +30,7 @@ func TestRunDryRunAndAcceptedIdentity(t *testing.T) {
 	if acc.Status != "dry_run" || acc.RunID == "" || !strings.HasPrefix(acc.RunID, "run_") {
 		t.Fatalf("%+v", acc)
 	}
-	if acc.Request.Provider != "codex" || acc.Request.Issue != "1124" {
+	if acc.Request.Provider != "fixture" || acc.Request.Issue != "1124" {
 		t.Fatalf("%+v", acc.Request)
 	}
 }
@@ -46,7 +46,7 @@ func TestRunRejectsMissingRouteAndAutoRoute(t *testing.T) {
 	if !strings.Contains(stderr.String(), "automatic routing") {
 		t.Fatalf("stderr=%s", stderr.String())
 	}
-	code = runRun([]string{"--repo", "r", "--issue", "1", "--provider", "codex"}, &stdout, &stderr, deps)
+	code = runRun([]string{"--repo", "r", "--issue", "1", "--provider", "fixture"}, &stdout, &stderr, deps)
 	if code != exitRunUsage {
 		t.Fatalf("missing model code=%d", code)
 	}
@@ -55,7 +55,7 @@ func TestRunRejectsMissingRouteAndAutoRoute(t *testing.T) {
 func TestRunHumanJSONLSameSchema(t *testing.T) {
 	deps := DefaultDeps()
 	deps.Now = func() time.Time { return time.Date(2026, 7, 22, 20, 1, 0, 0, time.UTC) }
-	args := []string{"--repo", "o/r", "--issue", "9", "--provider", "p", "--model", "m"}
+	args := []string{"--repo", "o/r", "--issue", "9", "--provider", "fixture", "--model", "m"}
 	var hOut, jOut bytes.Buffer
 	if runRun(append(args, "--format", "human"), &hOut, ioDiscard{}, deps) != 0 {
 		t.Fatal(hOut.String())
