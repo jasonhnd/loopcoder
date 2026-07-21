@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Git pre-push hook for ordinary LoopCoder development.
+# Delegates to the local-focused evidence sentinel (V090-002 / #1092).
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -z "${ROOT}" ]]; then
+  echo "pre-push: unable to resolve repository root" >&2
+  exit 1
+fi
+
+exec bash "${ROOT}/scripts/pre-push-sentinel.sh"
