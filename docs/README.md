@@ -46,6 +46,7 @@ Every document is exactly one of these types:
 - [`reference/antigravity-invocation.md`](reference/antigravity-invocation.md): V090-107 Antigravity invocation consolidation.
 - [`reference/antigravity-quota-windows.md`](reference/antigravity-quota-windows.md): V090-108 Antigravity quota-window adapter.
 - [`reference/grok-observation.md`](reference/grok-observation.md): V090-046 Grok discovery and catalog consolidation.
+- [`reference/grok-invocation.md`](reference/grok-invocation.md): V090-109 Grok invocation consolidation.
 - [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
 - [`reference/v09-home-layout.md`](reference/v09-home-layout.md): global `$LOOPCODER_HOME` layout and owner-only creation.
 - [`reference/project-authority-store.md`](reference/project-authority-store.md): project.db domain tables and immutable events.
