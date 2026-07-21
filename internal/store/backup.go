@@ -47,16 +47,15 @@ func (s *Store) Backup(ctx context.Context, destPath string) (BackupManifest, er
 		return BackupManifest{}, fmt.Errorf("backup: create parent: %w", err)
 	}
 
-	// Checkpoint WAL so VACUUM INTO sees committed pages.
+	// Checkpoint WAL so the main database file is consistent, then copy the
+	// file. Avoid SQL path interpolation (gosec G202); path is a local
+	// filesystem destination controlled by the caller.
 	if _, err := db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
 		return BackupManifest{}, fmt.Errorf("backup: wal checkpoint: %w", err)
 	}
-
-	// Escape single quotes for SQLite string literal.
-	escaped := strings.ReplaceAll(destPath, "'", "''")
-	if _, err := db.ExecContext(ctx, "VACUUM INTO '"+escaped+"'"); err != nil {
+	if err := copyFile(src, destPath); err != nil {
 		_ = os.Remove(destPath)
-		return BackupManifest{}, fmt.Errorf("backup: vacuum into: %w", err)
+		return BackupManifest{}, fmt.Errorf("backup: copy: %w", err)
 	}
 	if err := os.Chmod(destPath, 0o600); err != nil {
 		return BackupManifest{}, fmt.Errorf("backup: chmod: %w", err)
