@@ -33,6 +33,7 @@ Every document is exactly one of these types:
 - [`reference/provider-descriptor-spi.md`](reference/provider-descriptor-spi.md): V090-037 provider descriptor registry and conformance SPI.
 - [`reference/observation-source-plans.md`](reference/observation-source-plans.md): V090-038 ordered observation-source plans and snapshots.
 - [`reference/observation-refresh-cooldown.md`](reference/observation-refresh-cooldown.md): V090-039 adaptive refresh, health, and cooldown.
+- [`reference/codex-observation.md`](reference/codex-observation.md): V090-040 Codex discovery and model-catalog observation.
 - [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
 - [`reference/v09-home-layout.md`](reference/v09-home-layout.md): global `$LOOPCODER_HOME` layout and owner-only creation.
 - [`reference/project-authority-store.md`](reference/project-authority-store.md): project.db domain tables and immutable events.
