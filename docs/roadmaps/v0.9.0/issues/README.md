@@ -142,6 +142,23 @@ proven. Two consecutive intervals without concrete evidence require stopping or
 detaching and returning control. A generic "still working" line is not concrete
 evidence.
 
+## GitHub Catalog Labels
+
+Every published catalog issue receives this bounded label set:
+
+- `v0.9.0`;
+- `ordinary-development`;
+- exactly one of `status:planned` or `status:ready`;
+- exactly one phase label from `phase:P0` through `phase:P6`; and
+- one or more coarse work-kind labels: `kind:code`, `kind:docs`, `kind:test`,
+  or `kind:release`, as declared by the canonical issue index.
+
+`status:ready` means every named dependency is accepted and the owner has chosen
+the issue as an available next unit. It does not assign a developer or authorize
+implementation. The finer suggested labels retained in each draft are search and
+triage hints; catalog publication does not create an unbounded repository label
+vocabulary from them.
+
 ## PR And Merge Rules
 
 - One issue normally produces one PR and one primary behavior.
