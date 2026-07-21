@@ -364,6 +364,16 @@ fi
 } >"${fix}/check_runs.json"
 assert_exit paginated_malformed_page2 1 --sha "$SHA" --quiet
 
+# ---------- 10) sibling canary failure must not flip --require integration-verify ----------
+write_run "$RUN_NEW" "$(make_workflow_run "$RUN_NEW" "$GOOD_PATH" push pre-prod "$SHA" completed failure "$SUITE_NEW" "2026-07-21T18:00:00Z")"
+write_check_runs "$(wrap_checks \
+  "$(make_check integration-verify "$RUN_NEW" "$SUITE_NEW" completed success)" \
+  "$(make_check integration-canary "$RUN_NEW" "$SUITE_NEW" completed failure)" \
+)"
+assert_exit require_verify_sibling_fail 0 --sha "$SHA" --require integration-verify --quiet
+assert_exit require_canary_sibling_fail 1 --sha "$SHA" --require integration-canary --quiet
+assert_exit both_jobs_workflow_fail 1 --sha "$SHA" --quiet
+
 echo "assert-pre-prod-green_test: pass=${pass} fail=${fail}"
 if [[ "$fail" -ne 0 ]]; then
   exit 1

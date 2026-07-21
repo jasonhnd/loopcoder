@@ -79,6 +79,12 @@ jobs:
 
       - name: Provider-free integration canary (hard wall clock 5m)
         timeout-minutes: 5
+        env:
+          # doctor hard-requires `gh auth status`; without a token the canary
+          # exits 1 under set -e before JSON asserts can report the cause.
+          GH_TOKEN: ${{ github.token }}
+          GH_FORCE_TTY: "0"
+          NO_COLOR: "1"
         run: |
           set -euo pipefail
           START="$(date +%s)"
@@ -89,6 +95,11 @@ jobs:
           BEFORE="$(git -C "${REPO_ROOT}" status --porcelain)"
 
           go build -o /tmp/loopcoder-canary ./cmd/loopcoder
+          test -x /tmp/loopcoder-canary
+
+          # Prove gh is authenticated in this job (same hard check doctor runs).
+          command -v gh >/dev/null
+          gh auth status
 
           HOME_ISO="$(mktemp -d)"
           export LOOPCODER_HOME="${HOME_ISO}"
@@ -99,28 +110,51 @@ jobs:
           d = json.load(open(sys.argv[1]))
           pid = (d.get("project") or {}).get("project_id")
           assert isinstance(pid, str) and pid.strip(), d
+          print("canary_register_ok project_id=%s" % pid)
           ' "${HOME_ISO}/register.json"
 
-          /tmp/loopcoder-canary doctor --repo "${REPO_ROOT}" --format json >"${HOME_ISO}/doctor.json"
+          # Capture doctor CLI status separately: JSON is still written on hard fails.
+          set +e
+          /tmp/loopcoder-canary doctor --repo "${REPO_ROOT}" --format json >"${HOME_ISO}/doctor.json" 2>"${HOME_ISO}/doctor.err"
+          DOC_CLI=$?
+          set -e
           python3 -c '
           import json, sys
-          d = json.load(open(sys.argv[1]))
-          want = sys.argv[2]
-          assert d.get("repo_path") == want, (d.get("repo_path"), want)
-          assert d.get("exit_code") == 0, d.get("exit_code")
+          path, want, cli = sys.argv[1], sys.argv[2], int(sys.argv[3])
+          d = json.load(open(path))
+          if d.get("repo_path") != want:
+            raise SystemExit("doctor.repo_path mismatch got=%r want=%r" % (d.get("repo_path"), want))
+          if d.get("exit_code") != 0:
+            fails = [c for c in (d.get("checks") or []) if c.get("status") == "fail"]
+            for c in fails[:12]:
+              print("doctor_fail name=%s hard=%s msg=%s" % (c.get("name"), c.get("hard"), (c.get("message") or "")[:200]), file=sys.stderr)
+            raise SystemExit("doctor.exit_code=%s cli=%s" % (d.get("exit_code"), cli))
           checks = d.get("checks")
-          assert isinstance(checks, list) and len(checks) > 0, checks
-          ' "${HOME_ISO}/doctor.json" "${CANONICAL_REPO}"
+          if not isinstance(checks, list) or len(checks) == 0:
+            raise SystemExit("doctor.checks empty")
+          print("canary_doctor_ok checks=%d exit_code=0 cli=%d" % (len(checks), cli))
+          ' "${HOME_ISO}/doctor.json" "${CANONICAL_REPO}" "${DOC_CLI}"
 
-          /tmp/loopcoder-canary report --repo "${REPO_ROOT}" --format json >"${HOME_ISO}/report.json"
+          set +e
+          /tmp/loopcoder-canary report --repo "${REPO_ROOT}" --format json >"${HOME_ISO}/report.json" 2>"${HOME_ISO}/report.err"
+          REP_CLI=$?
+          set -e
           python3 -c '
           import json, sys
-          d = json.load(open(sys.argv[1]))
-          assert d.get("schema_version") == "loopcoder.report_query.v1", d.get("schema_version")
-          assert isinstance(d.get("reports"), list), d.get("reports")
-          assert isinstance(d.get("records"), list), d.get("records")
-          assert isinstance(d.get("observability"), dict), d.get("observability")
-          ' "${HOME_ISO}/report.json"
+          path, cli = sys.argv[1], int(sys.argv[2])
+          d = json.load(open(path))
+          if d.get("schema_version") != "loopcoder.report_query.v1":
+            raise SystemExit("report.schema_version=%r" % (d.get("schema_version"),))
+          if not isinstance(d.get("reports"), list):
+            raise SystemExit("report.reports not list")
+          if not isinstance(d.get("records"), list):
+            raise SystemExit("report.records not list")
+          if not isinstance(d.get("observability"), dict):
+            raise SystemExit("report.observability not object")
+          if cli != 0:
+            raise SystemExit("report cli exit=%d" % cli)
+          print("canary_report_ok schema=%s" % d.get("schema_version"))
+          ' "${HOME_ISO}/report.json" "${REP_CLI}"
 
           AFTER="$(git -C "${REPO_ROOT}" status --porcelain)"
           if [ "${BEFORE}" != "${AFTER}" ]; then

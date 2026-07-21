@@ -334,7 +334,9 @@ chosen = by_run[newest_run_id]
 wr = chosen["run"]
 jobs = chosen["jobs"]
 
-# Workflow-level status must be completed+success (fail closed otherwise).
+# Workflow-level status must be completed. Full dual-job green also requires
+# workflow conclusion success. Single --require job mode only inspects that
+# job on the newest run (a sibling failure must not flip a green job red).
 wr_status = (wr.get("status") or "").lower()
 wr_conclusion = (wr.get("conclusion") or "").lower() if wr.get("conclusion") is not None else ""
 if wr_status != "completed":
@@ -342,7 +344,8 @@ if wr_status != "completed":
         "newest_run_pending run_id=%s status=%s" % (newest_run_id, wr_status),
         "rejected_candidates: " + "; ".join(rejected[:20]) if rejected else "",
     )
-if wr_conclusion != "success":
+require_full = set(required) >= set(discovery_names)
+if require_full and wr_conclusion != "success":
     fail(
         "newest_run_not_success run_id=%s conclusion=%s" % (newest_run_id, wr_conclusion or "empty"),
         "rejected_candidates: " + "; ".join(rejected[:20]) if rejected else "",
