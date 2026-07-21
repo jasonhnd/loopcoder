@@ -167,6 +167,21 @@ func TestBaseSHARequiresBothIntegrationChecks(t *testing.T) {
 	if !EvaluateBaseSHAGate("abc", true, true, empty).Allowed {
 		t.Fatal("both green")
 	}
+
+	// One-time canary remediation base: verify OK required; canary may be red.
+	rem := EvaluateBaseSHAGate(CanaryRemediationBaseSHA, true, false, empty)
+	if !rem.Allowed {
+		t.Fatalf("canary remediation base must allow with verify green: %#v", rem)
+	}
+	if !hasReasonStr(rem.Reasons, "canary_remediation_base_734bc26") {
+		t.Fatalf("expected remediation reason, got %v", rem.Reasons)
+	}
+	if EvaluateBaseSHAGate(CanaryRemediationBaseSHA, false, false, empty).Allowed {
+		t.Fatal("canary remediation must still require integration-verify")
+	}
+	if EvaluateBaseSHAGate("ffffffffffffffffffffffffffffffffffffffff", true, false, empty).Allowed {
+		t.Fatal("unrelated base must not inherit canary remediation")
+	}
 }
 
 func hasReason(d AuthorizationDecision, sub string) bool {
