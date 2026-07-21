@@ -40,6 +40,7 @@ Every document is exactly one of these types:
 - [`reference/claude-invocation.md`](reference/claude-invocation.md): V090-104 Claude Code invocation consolidation.
 - [`reference/claude-quota-windows.md`](reference/claude-quota-windows.md): V090-043 Claude Code quota-window normalization.
 - [`reference/gemini-observation.md`](reference/gemini-observation.md): V090-044 Gemini CLI discovery and catalog observation.
+- [`reference/gemini-invocation.md`](reference/gemini-invocation.md): V090-105 Gemini CLI invocation consolidation.
 - [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
 - [`reference/v09-home-layout.md`](reference/v09-home-layout.md): global `$LOOPCODER_HOME` layout and owner-only creation.
 - [`reference/project-authority-store.md`](reference/project-authority-store.md): project.db domain tables and immutable events.
