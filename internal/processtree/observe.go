@@ -33,8 +33,18 @@ type Tracker struct {
 	MaxNodes int
 	// Observer defaults to DarwinPS on empty.
 	Observer Observer
+	// Alive reports whether a PID is currently alive. Defaults to process.Alive.
+	// Tests inject fakes so host PIDs cannot poison fixtures.
+	Alive func(pid int) bool
 	// Clock for ObservedAt; defaults to time.Now.
 	Now func() time.Time
+}
+
+func (t *Tracker) alive(pid int) bool {
+	if t.Alive != nil {
+		return t.Alive(pid)
+	}
+	return process.Alive(pid)
 }
 
 // RecordLaunch stores durable root identity. Prefer process.Snapshot fields.
@@ -103,11 +113,11 @@ func (t *Tracker) Observe() Assessment {
 	}
 
 	root, rootOK := byPID[t.Evidence.RootPID]
-	rootAlive := process.Alive(t.Evidence.RootPID)
+	rootAlive := t.alive(t.Evidence.RootPID)
 
 	// PID reuse: alive but birth identity differs.
-	if rootAlive && rootOK {
-		if t.Evidence.ProcessBirthIdentity != "" &&
+	if rootAlive {
+		if rootOK && t.Evidence.ProcessBirthIdentity != "" &&
 			strings.TrimSpace(root.LStart) != "" &&
 			root.LStart != t.Evidence.ProcessBirthIdentity {
 			return Assessment{
@@ -117,8 +127,8 @@ func (t *Tracker) Observe() Assessment {
 				Snapshot:          snap,
 			}
 		}
-		// Also verify via process package when available.
-		if t.Evidence.ProcessBirthIdentity != "" {
+		// OS birth check only with real Alive (avoid host noise under fakes).
+		if t.Alive == nil && t.Evidence.ProcessBirthIdentity != "" {
 			curBirth := processBirth(t.Evidence.RootPID)
 			if curBirth != "" && curBirth != t.Evidence.ProcessBirthIdentity {
 				return Assessment{
@@ -141,9 +151,7 @@ func (t *Tracker) Observe() Assessment {
 		queue = append(queue, t.Evidence.RootPID)
 	} else {
 		// Wrapper gone: adopt live descendants still claiming this root/PGID.
-		for _, c := range children[t.Evidence.RootPID] {
-			queue = append(queue, c)
-		}
+		queue = append(queue, children[t.Evidence.RootPID]...)
 		if t.Evidence.PGID > 0 {
 			for pid, p := range byPID {
 				if p.PGID == t.Evidence.PGID && pid != t.Evidence.RootPID {
@@ -203,7 +211,7 @@ func (t *Tracker) Observe() Assessment {
 			n.ProcessBirthIdentity = p.LStart
 			n.Comm = redactComm(p.Comm)
 			n.Zombie = isZombie(p.State)
-		} else if process.Alive(pid) {
+		} else if t.alive(pid) {
 			// Unlisted but alive — partial observation.
 			n.Comm = "?"
 		}
@@ -223,36 +231,17 @@ func (t *Tracker) Observe() Assessment {
 	snap.Nodes = nodes
 
 	liveOwned := 0
-	zombieOnly := true
-	for _, n := range nodes {
-		if !n.Owned {
-			continue
-		}
-		if n.Zombie {
-			continue
-		}
-		if process.Alive(n.PID) || byPIDHas(byPID, n.PID) {
-			// If in table and not zombie, count as live for tree purposes.
-			if !n.Zombie {
-				liveOwned++
-				zombieOnly = false
-			}
-		}
-	}
-	// Recount live owned carefully.
-	liveOwned = 0
 	for _, n := range nodes {
 		if !n.Owned || n.Zombie {
 			continue
 		}
-		if process.Alive(n.PID) {
+		if t.alive(n.PID) {
 			liveOwned++
-		} else if _, ok := byPID[n.PID]; ok && !n.Zombie {
-			// Present in table without Z — treat as live.
+		} else if _, ok := byPID[n.PID]; ok {
+			// Present in observer table without Z — treat as live for fixtures.
 			liveOwned++
 		}
 	}
-	_ = zombieOnly
 
 	reasons := []string{}
 	attention := false
@@ -332,11 +321,6 @@ func AssessPIDReuse(ev LaunchEvidence, currentBirth string, alive bool) error {
 		return ErrPIDReuse
 	}
 	return nil
-}
-
-func byPIDHas(m map[int]RawProc, pid int) bool {
-	_, ok := m[pid]
-	return ok
 }
 
 func isZombie(state string) bool {

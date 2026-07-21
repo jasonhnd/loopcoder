@@ -51,12 +51,13 @@ func TestPIDReuseRejected(t *testing.T) {
 
 	tr := &Tracker{
 		Evidence: LaunchEvidence{
-			RootPID: os.Getpid(), PGID: 0,
+			RootPID: 4242, PGID: 0,
 			ProcessBirthIdentity: "THIS_IS_NOT_REAL_BIRTH_IDENTITY",
 			RecordedAt:           time.Now().UTC(),
 		},
+		Alive: func(pid int) bool { return pid == 4242 },
 		Observer: fakeObs{procs: []RawProc{{
-			PID: os.Getpid(), PPID: 1, PGID: 1,
+			PID: 4242, PPID: 1, PGID: 1,
 			LStart: "WRONG_BIRTH", Comm: "test", State: "S",
 		}}},
 	}
@@ -81,15 +82,13 @@ func TestWrapperExitDescendantsAliveNotTerminal(t *testing.T) {
 			ProcessBirthIdentity: "start",
 			RecordedAt:           time.Now().UTC(),
 		},
+		Alive: func(pid int) bool { return pid == 101 || pid == 102 },
 		Observer: fakeObs{procs: []RawProc{
 			// root absent (exited)
 			{PID: 101, PPID: 100, PGID: 100, LStart: "c", Comm: "child", State: "S"},
 			{PID: 102, PPID: 101, PGID: 100, LStart: "g", Comm: "grand", State: "S"},
 		}},
-		// process.Alive for 101/102 will be false for fake PIDs — inject via
-		// zombie=false and presence: our logic uses Alive OR in table.
 	}
-	// Fix Observe: for fake PIDs not alive, we count in-table non-zombie as live.
 	a := tr.Observe()
 	if a.Terminal {
 		t.Fatalf("wrapper exit with descendants must not be terminal: %#v", a)
@@ -143,6 +142,7 @@ func TestEscapedDescendantAttention(t *testing.T) {
 func TestTreeExited(t *testing.T) {
 	tr := &Tracker{
 		Evidence: LaunchEvidence{RootPID: 300, PGID: 300, ProcessBirthIdentity: "x", RecordedAt: time.Now().UTC()},
+		Alive:    func(int) bool { return false },
 		Observer: fakeObs{procs: nil},
 	}
 	a := tr.Observe()
@@ -243,11 +243,11 @@ func TestZombieReasonToken(t *testing.T) {
 	// Simulated zombie root with no live kids → exited
 	tr := &Tracker{
 		Evidence: LaunchEvidence{RootPID: 400, PGID: 400, ProcessBirthIdentity: "z", RecordedAt: time.Now().UTC()},
+		Alive:    func(int) bool { return false },
 		Observer: fakeObs{procs: []RawProc{
 			{PID: 400, PPID: 1, PGID: 400, LStart: "z", Comm: "zomb", State: "Z"},
 		}},
 	}
-	// Root not alive as PID 400 — tree exited path.
 	a := tr.Observe()
 	if a.Liveness != LivenessExited {
 		t.Fatalf("%#v", a)
