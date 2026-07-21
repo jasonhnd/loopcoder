@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -9,6 +10,8 @@ import (
 	"io"
 	"strings"
 	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/preflight"
 )
 
 // RunRequest is the normalized loopcoder run command input (V090-025 / #1124).
@@ -31,12 +34,15 @@ type RunRequest struct {
 
 // RunAccepted is printed before long work with a stable run identity.
 type RunAccepted struct {
-	Schema    string     `json:"schema"`
-	RunID     string     `json:"run_id"`
-	Request   RunRequest `json:"request"`
-	Status    string     `json:"status"` // accepted|dry_run|rejected
-	Message   string     `json:"message,omitempty"`
-	CreatedAt time.Time  `json:"created_at"`
+	Schema            string     `json:"schema"`
+	RunID             string     `json:"run_id"`
+	Request           RunRequest `json:"request"`
+	Status            string     `json:"status"` // accepted|dry_run|rejected
+	Message           string     `json:"message,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+	PreflightDigest   string     `json:"preflight_digest,omitempty"`
+	PreflightAllow    *bool      `json:"preflight_allow_launch,omitempty"`
+	PreflightDecision string     `json:"preflight_decision,omitempty"`
 }
 
 const schemaRunAccepted = "loopcoder.run.accepted.v1"
@@ -119,14 +125,38 @@ func runRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		Schema: schemaRunAccepted, RunID: runID, Request: req,
 		CreatedAt: now().UTC(),
 	}
+
+	// V090-026: preflight evidence gate (read-only unless ensure later ports set it).
+	// dry-run still evaluates probes but never EnsureLayout / never launches.
+	pfIn := preflight.Input{
+		Repo: req.Repo, Provider: req.Provider, Model: req.Model,
+		EnsureLayout: false,
+	}
+	snap, pfErr := preflight.Evaluate(context.Background(), pfIn, preflight.DefaultDeps())
+	if pfErr != nil {
+		return emitRunRejected(stdout, stderr, req, "preflight error: "+pfErr.Error(), exitRunPrecondition, deps)
+	}
+	accepted.PreflightDigest = snap.Digest
+	allow := snap.AllowLaunch
+	accepted.PreflightAllow = &allow
+	accepted.PreflightDecision = string(snap.Decision)
+
 	if req.DryRun {
 		accepted.Status = "dry_run"
-		accepted.Message = "normalized inputs; no mutation, no provider, no worktree, no GitHub"
+		accepted.Message = "normalized inputs + preflight snapshot; no mutation, no provider, no worktree, no GitHub"
 		return emitRunAccepted(stdout, accepted)
 	}
-	// Contract shell only: record accepted identity; later issues attach execution ports.
+	if !snap.AllowLaunch {
+		accepted.Status = "rejected"
+		accepted.Message = "preflight blocked launch: " + string(snap.Decision)
+		accepted.RunID = "" // no run identity when gate fails
+		_ = emitRunAccepted(stdout, accepted)
+		fmt.Fprintf(stderr, "run: preflight blocked decision=%s digest=%s\n", snap.Decision, snap.Digest)
+		return exitRunPrecondition
+	}
+	// Contract shell only: record accepted identity with preflight evidence; later issues attach ports.
 	accepted.Status = "accepted"
-	accepted.Message = "run recorded; execution ports not yet attached (V090-025 shell)"
+	accepted.Message = "run recorded with preflight evidence; execution ports not yet attached"
 	return emitRunAccepted(stdout, accepted)
 }
 
