@@ -102,3 +102,8 @@ under 60s). It never runs `go test ./...`.
 - Implementing `#1108` or product features
 - LoopCoder self-bootstrap / compile / dispatch / tick
 - Silent GitHub admin or branch-protection API changes
+
+
+## Closing keyword note
+
+PR bodies must use a plain `Closes #N` line so GitHub populates `closingIssuesReferences`.
