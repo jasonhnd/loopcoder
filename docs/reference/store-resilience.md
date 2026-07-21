@@ -61,7 +61,7 @@ closed without moving the file.
 
 | API | Role |
 | --- | --- |
-| `Store.Backup(ctx, destPath)` | Online `VACUUM INTO` after WAL checkpoint; 0600 dest |
+| `Store.Backup(ctx, destPath)` | Online WAL truncate + owner-only file copy; 0600 dest |
 | `VerifyBackupOpen` | Pre-open SHA-256 + metadata/store_id check |
 
 Restore is “open the backup path as a separate store”; never overwrite a live
