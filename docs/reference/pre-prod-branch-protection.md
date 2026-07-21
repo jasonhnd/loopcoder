@@ -11,10 +11,16 @@ same account authors and must approve, the workflow **deadlocks**.
 
 Therefore:
 
-1. **Development agents must use a separate GitHub bot/machine identity** with
-   write access to open PRs but **no admin and no bypass** of branch protection.
-2. **`@jasonhnd` remains owner/reviewer**.
-3. Only after that identity split may protection require **one owner approval**.
+1. **Development agents must not be able to apply authorization labels** on the
+   upstream repository. Prefer either:
+   - a **fork identity** without upstream triage/write; or
+   - a **fine-grained GitHub App/token without Issues label-write**.
+   Ordinary write/triage on the upstream repo can apply labels and is therefore
+   insufficient as a trust boundary for `implementation-authorized`.
+2. Agents may open PRs with write access but **no admin and no bypass** of
+   branch protection.
+3. **`@jasonhnd` remains owner/reviewer**.
+4. Only after that identity split may protection require **one owner approval**.
 
 CODEOWNERS for the authorization control plane is owned by `@jasonhnd` so that,
 after identity separation, the bot cannot merge control-plane changes without

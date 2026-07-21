@@ -1280,6 +1280,18 @@ func TestStabilizationGatePolicy(t *testing.T) {
 	if strings.Contains(text, "ci-full-race.sh") {
 		t.Fatal("pre-prod integration must not run full race suite")
 	}
+	if strings.Contains(text, "workflow_dispatch") {
+		t.Fatal("pre-prod integration must not expose workflow_dispatch")
+	}
+	if !strings.Contains(text, "LOOPCODER_HOME") {
+		t.Fatal("integration-canary must use isolated LOOPCODER_HOME")
+	}
+	if !strings.Contains(text, "projects register") {
+		t.Fatal("integration-canary must register the repository")
+	}
+	if !strings.Contains(text, "doctor") || !strings.Contains(text, "report") {
+		t.Fatal("integration-canary must run doctor and report JSON")
+	}
 	if _, err := os.Stat(filepath.Join(root, "CODEOWNERS")); err != nil {
 		t.Fatal("missing CODEOWNERS for control plane")
 	}

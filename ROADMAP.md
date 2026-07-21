@@ -25,15 +25,18 @@ Do **not** start `#1108` (V090-016) or any later catalog item until:
 2. the exact `pre-prod` tip SHA has green **distinct** checks
    `integration-verify` and `integration-canary` (PR `verify`/`test`/`race`/
    `security` remain PR-authoritative and are not fully re-run post-merge);
-3. the next issue carries the owner-applied label `implementation-authorized`
-   and the PR has **exactly one** GitHub `closingIssuesReferences` entry; and
-4. development agents use a **separate non-admin** GitHub identity so owner
-   review is not a single-account deadlock (see branch-protection doc).
+3. the next issue is **OPEN**, carries owner-applied `implementation-authorized`
+   (latest label-apply actor = repository owner), and the PR has **exactly one**
+   issue pointer via `closingIssuesReferences` or, on non-default bases, a
+   single structured PR label `closes:<N>` also applied by the owner; and
+4. development agents use a **fork without upstream triage/write** or a
+   fine-grained token **without Issues label-write**, so they cannot self-apply
+   authorization labels (see branch-protection doc).
 
 Body text, `status:ready`, and catalog publication alone never authorize
 implementation. This CI policy is **not** tamper-proof: PR CI runs PR-branch
-code; CODEOWNERS + non-admin agents + protection are required for real review
-enforcement.
+code; CODEOWNERS + identity separation + protection are required for real
+review enforcement.
 
 Control surfaces:
 

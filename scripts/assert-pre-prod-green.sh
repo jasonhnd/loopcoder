@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# Assert that an exact pre-prod (or other) SHA has green integration checks.
-# Distinct check names: integration-verify, integration-canary.
-# Selects the newest completed check run per name; validates github-actions app.
+# Assert an exact SHA has green integration checks from pre-prod-integration only.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -16,7 +14,7 @@ while [[ $# -gt 0 ]]; do
     --quiet) QUIET=1; shift ;;
     --require) REQUIRE_ONLY="${2:-}"; shift 2 ;;
     -h|--help)
-      echo "Usage: $0 [--sha <full-or-prefix>] [--require integration-verify|integration-canary] [--quiet]"
+      echo "Usage: $0 --sha <full-sha> [--require integration-verify|integration-canary] [--quiet]"
       exit 0
       ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -32,10 +30,12 @@ if [[ -z "${SHA}" ]]; then
   git fetch origin pre-prod --quiet
   SHA="$(git rev-parse origin/pre-prod)"
 fi
-
-# Expand short SHA if needed.
 if [[ ${#SHA} -lt 40 ]]; then
   SHA="$(git rev-parse "${SHA}" 2>/dev/null || echo "${SHA}")"
+fi
+if [[ ${#SHA} -lt 40 ]]; then
+  echo "assert-pre-prod-green: need full commit SHA, got ${SHA}" >&2
+  exit 2
 fi
 
 [[ ${QUIET} -eq 1 ]] || {
@@ -49,23 +49,28 @@ if [[ -n "${REQUIRE_ONLY}" ]]; then
   REQUIRED=("${REQUIRE_ONLY}")
 fi
 
-# Fetch check runs for this commit; pick newest completed per name.
-# Validate app/slug is github-actions (or Actions).
+export NO_COLOR=1 CLICOLOR=0 GH_FORCE_TTY=0
 python3 - "${SHA}" "${REQUIRED[@]}" <<'PY'
-import json, subprocess, sys
+import json, subprocess, sys, os
 from datetime import datetime
 
 sha = sys.argv[1]
 required = sys.argv[2:]
+env = dict(os.environ)
+env["NO_COLOR"] = "1"
+env["CLICOLOR"] = "0"
+env["GH_FORCE_TTY"] = "0"
 
 raw = subprocess.check_output([
     "gh", "api",
     f"repos/{{owner}}/{{repo}}/commits/{sha}/check-runs",
     "--paginate",
     "-H", "Accept: application/vnd.github+json",
-], text=True)
+], text=True, env=env)
+if not raw.strip():
+    print("assert-pre-prod-green: empty check-runs response", file=sys.stderr)
+    sys.exit(1)
 
-# Paginated API may return concatenated JSON objects; parse robustly.
 runs = []
 dec = json.JSONDecoder()
 idx = 0
@@ -92,34 +97,84 @@ def parse_ts(r):
                 pass
     return datetime.min
 
-# Group by name, keep newest.
-by_name = {}
+def is_github_actions(r):
+    app = r.get("app") or {}
+    slug = (app.get("slug") or "").lower().strip()
+    name = (app.get("name") or "").lower().strip()
+    if not slug and not name:
+        return False  # empty identity rejected
+    if slug == "github-actions":
+        return True
+    if "github" in name and "action" in name.replace(" ", ""):
+        return True
+    return False
+
+def workflow_path(r):
+    # Prefer check_suite / workflow name fields when present
+    suite = r.get("check_suite") or {}
+    # Some payloads include details_url like .../actions/runs/ID/job/ID
+    # HTML URL sometimes embeds workflow
+    # GitHub REST check-run includes:
+    #   check_suite.app, name
+    # Workflow path often in: r.get("html_url") linking to actions
+    # Use external_id / name only as last resort
+    # REST: GET check-run does not always include workflow path; use check_suite.id then API
+    return (r.get("workflow_path") or
+            (r.get("check_suite") or {}).get("workflow_path") or
+            "")
+
+# Keep candidates that match identity constraints, then pick newest success per name.
+candidates = {name: [] for name in required}
+rejected = []
 for r in runs:
     name = r.get("name") or ""
-    if name not in by_name or parse_ts(r) > parse_ts(by_name[name]):
-        by_name[name] = r
+    if name not in candidates:
+        continue
+    if not is_github_actions(r):
+        rejected.append("%s:empty_or_non_actions_app" % name)
+        continue
+    # Fetch workflow path via check suite / run if needed
+    path = workflow_path(r)
+    details = r.get("details_url") or r.get("html_url") or ""
+    # Require pre-prod-integration workflow markers in details or explicit path
+    if path and path != ".github/workflows/pre-prod-integration.yml":
+        rejected.append("%s:workflow_path=%s" % (name, path))
+        continue
+    if not path:
+        # details_url for GHA jobs usually contains /actions/runs/
+        if "/actions/runs/" not in details:
+            rejected.append("%s:missing_actions_run_identity" % name)
+            continue
+        # Further constrain: check-suite head_branch when present
+        suite = r.get("check_suite") or {}
+        head_branch = (suite.get("head_branch") or r.get("head_branch") or "")
+        # head_sha must match
+        head_sha = (suite.get("head_sha") or r.get("head_sha") or "")
+        if head_sha and not (head_sha == sha or sha.startswith(head_sha) or head_sha.startswith(sha)):
+            rejected.append("%s:head_sha_mismatch" % name)
+            continue
+        if head_branch and head_branch != "pre-prod":
+            rejected.append("%s:head_branch=%s" % (name, head_branch))
+            continue
+    candidates[name].append(r)
 
-missing, failed, pending, bad_app = [], [], [], []
+missing, failed, pending, bad = [], [], [], []
 for name in required:
-    r = by_name.get(name)
-    if r is None:
+    lst = candidates.get(name) or []
+    if not lst:
         missing.append(name)
         continue
-    app = ((r.get("app") or {}).get("slug") or (r.get("app") or {}).get("name") or "").lower()
-    # Accept GitHub Actions app identities only.
-    if app and app not in ("github-actions", "github actions"):
-        # Some payloads use name "GitHub Actions"
-        if "github" not in app or "action" not in app.replace(" ", ""):
-            bad_app.append(f"{name}:app={app}")
-            continue
+    # Newest by completed_at
+    lst.sort(key=parse_ts, reverse=True)
+    r = lst[0]
     st = (r.get("status") or "").lower()
     conc = (r.get("conclusion") or "").lower()
     if st != "completed":
         pending.append(name)
     elif conc != "success":
-        failed.append(f"{name}:{conc or st}")
+        failed.append("%s:%s" % (name, conc or st))
 
-if missing or failed or pending or bad_app:
+if missing or failed or pending:
     print("assert-pre-prod-green: NOT GREEN", file=sys.stderr)
     if missing:
         print("missing:", ", ".join(missing), file=sys.stderr)
@@ -127,9 +182,9 @@ if missing or failed or pending or bad_app:
         print("pending:", ", ".join(pending), file=sys.stderr)
     if failed:
         print("failed:", ", ".join(failed), file=sys.stderr)
-    if bad_app:
-        print("bad_app:", ", ".join(bad_app), file=sys.stderr)
-    print("Required distinct checks: integration-verify, integration-canary", file=sys.stderr)
+    if rejected:
+        print("rejected_candidates:", "; ".join(rejected[:20]), file=sys.stderr)
+    print("Required: integration-verify + integration-canary from .github/workflows/pre-prod-integration.yml on push/pre-prod", file=sys.stderr)
     sys.exit(1)
 print("assert-pre-prod-green: ok", sha, "checks=", ",".join(required))
 PY

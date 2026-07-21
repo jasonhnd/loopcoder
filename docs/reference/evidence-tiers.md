@@ -115,15 +115,16 @@ bash scripts/pre-push-sentinel.sh
 
 ### Stabilization additions
 
-- Non-documentation PRs must have exactly one GitHub
-  `closingIssuesReferences` entry whose issue is labeled
-  `implementation-authorized` (body text never authorizes). Enforced in PR
-  `verify` via `scripts/check-implementation-authorization.sh`.
-- Every push to `pre-prod` runs **bounded** jobs `integration-verify` and
+- Non-documentation PRs need exactly one issue pointer:
+  `closingIssuesReferences`, or on non-default bases a single owner-applied
+  `closes:<N>` PR label. The issue must be OPEN, currently carry
+  `implementation-authorized`, and that label’s latest apply actor must be the
+  repository owner. Body text never authorizes.
+- Every **push** to `pre-prod` runs **bounded** jobs `integration-verify` and
   `integration-canary` only (not a full re-suite of PR test/race/security).
 - Future implementation PRs fail closed when their exact pre-prod base SHA
-  lacks those integration checks (one-time bootstrap exception for closing
-  `#1092` only).
+  lacks those integration checks (one-time bootstrap only for PR `#1218` with
+  all frozen identity fields).
 - See [`v090-stabilization-gate.md`](v090-stabilization-gate.md).
 
 ### What developers run locally

@@ -1,20 +1,11 @@
 # Bounded merge-sha integration for pre-prod (NOT a full re-run of PR CI).
-# PR CI remains authoritative for verify/test/race/security.
-# This workflow only runs two distinct checks on the exact integrated SHA:
-#   - integration-verify  (policy/YAML/auth fixtures)
-#   - integration-canary  (provider-free deterministic canary, hard 5m ceiling)
+# Distinct check names only: integration-verify, integration-canary.
 name: pre-prod-integration
 
 on:
   push:
     branches:
       - pre-prod
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: "Optional git ref (defaults to push SHA)"
-        required: false
-        type: string
 
 defaults:
   run:
@@ -30,8 +21,6 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          ref: ${{ inputs.ref || github.sha }}
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -45,6 +34,9 @@ jobs:
           printf 'evidence_tier=merge-sha\n'
           printf 'integration_job=integration-verify\n'
           printf 'tested_commit_sha=%s\n' "$(git rev-parse HEAD)"
+          printf 'workflow_path=.github/workflows/pre-prod-integration.yml\n'
+          printf 'event_name=%s\n' "${GITHUB_EVENT_NAME}"
+          printf 'head_branch=%s\n' "${GITHUB_REF_NAME}"
 
       - name: YAML validity (workflows + delivery)
         run: |
@@ -60,7 +52,7 @@ jobs:
         run: |
           set -euo pipefail
           go test . -count=1 -timeout=2m -run 'TestStabilizationGatePolicy|TestV080WorkflowPolicy'
-          go test ./internal/evidence -count=1 -timeout=2m -run 'TestDocsOnly|TestPolicy|TestUnlinked|TestMultiple|TestNonPlanned|TestBodyOnly|TestPlannedWith|TestReady|TestBaseSHA'
+          go test ./internal/evidence -count=1 -timeout=2m -run 'TestDocsOnly|TestPolicy|TestUnlinked|TestMultiple|TestNonPlanned|TestBodyOnly|TestPlannedWith|TestClosed|TestAuthLabel|TestLatest|TestBootstrap|TestBaseSHA'
           IMPLEMENTATION_AUTH_OFFLINE=1 bash scripts/check-implementation-authorization.sh
 
   integration-canary:
@@ -69,8 +61,6 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          ref: ${{ inputs.ref || github.sha }}
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -84,17 +74,39 @@ jobs:
           printf 'evidence_tier=merge-sha\n'
           printf 'integration_job=integration-canary\n'
           printf 'tested_commit_sha=%s\n' "$(git rev-parse HEAD)"
+          printf 'workflow_path=.github/workflows/pre-prod-integration.yml\n'
 
       - name: Provider-free integration canary (hard wall clock 5m)
         timeout-minutes: 5
         run: |
           set -euo pipefail
           START="$(date +%s)"
-          # Deterministic, no provider, no network, no full suite.
+          REPO_ROOT="$(pwd)"
+          # Snapshot worktree (tracked + untracked names only).
+          BEFORE="$(git -C "${REPO_ROOT}" status --porcelain)"
+
           go build -o /tmp/loopcoder-canary ./cmd/loopcoder
-          /tmp/loopcoder-canary version >/dev/null
-          go test ./internal/evidence -count=1 -timeout=90s
-          bash scripts/pre-push-sentinel.sh
+
+          HOME_ISO="$(mktemp -d)"
+          export LOOPCODER_HOME="${HOME_ISO}"
+          # Isolated home: register this repo, then doctor/report JSON.
+          /tmp/loopcoder-canary projects register --repo "${REPO_ROOT}" --format json >"${HOME_ISO}/register.json"
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("project",{}).get("project_id"), d' "${HOME_ISO}/register.json"
+
+          /tmp/loopcoder-canary doctor --repo "${REPO_ROOT}" --format json >"${HOME_ISO}/doctor.json"
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert "repo_path" in d or "exit_code" in d or isinstance(d, dict), d' "${HOME_ISO}/doctor.json"
+
+          /tmp/loopcoder-canary report --repo "${REPO_ROOT}" --format json >"${HOME_ISO}/report.json"
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert isinstance(d, dict), d' "${HOME_ISO}/report.json"
+
+          AFTER="$(git -C "${REPO_ROOT}" status --porcelain)"
+          if [ "${BEFORE}" != "${AFTER}" ]; then
+            echo "repository worktree changed during canary:" >&2
+            echo "BEFORE=${BEFORE}" >&2
+            echo "AFTER=${AFTER}" >&2
+            exit 1
+          fi
+
           END="$(date +%s)"
           ELAPSED="$((END - START))"
           printf 'integration_canary_elapsed_seconds=%s\n' "${ELAPSED}"

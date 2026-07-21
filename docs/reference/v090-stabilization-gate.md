@@ -18,10 +18,13 @@ authorization checker. A PR can attempt to weaken its own gate. Therefore:
 
 - This is **not** tamper-proof enforcement.
 - Real enforcement requires **CODEOWNERS** review of the control plane,
-  a **separate non-admin agent identity**, and branch protection that agents
-  cannot bypass.
-- Until the agent uses a bot account without admin/bypass rights, treat
-  authorization as **best-effort CI policy** plus human review.
+  a **separate agent identity**, and branch protection the agent cannot bypass.
+- Bots with ordinary write/triage can often **apply labels**. Target agents must
+  use either:
+  - a **fork identity** without upstream triage/write; or
+  - a **fine-grained GitHub App/token without Issues label-write**.
+- Until that separation exists, treat authorization as **best-effort CI policy**
+  plus human review.
 
 See also: [`pre-prod-branch-protection.md`](pre-prod-branch-protection.md).
 
@@ -30,62 +33,73 @@ See also: [`pre-prod-branch-protection.md`](pre-prod-branch-protection.md).
 For every PR that is **not pure documentation** (including Go, workflows,
 hooks, scripts, configuration, and policy code):
 
-1. GitHub must report **exactly one** `closingIssuesReferences` entry.
-2. That issue must carry the owner-applied label **`implementation-authorized`**.
-3. The following **do not** authorize implementation:
-   - `status:ready`
-   - absence of `status:planned`
-   - any issue/PR body text (including former `Implementation authorization: granted`)
-4. A `status:planned` issue may proceed **only if** it also has
-   `implementation-authorized`.
-5. Pure documentation-only path changes remain exempt (no closing issue required).
+1. Resolve **exactly one** issue pointer:
+   - preferred: GitHub GraphQL `closingIssuesReferences`;
+   - if empty and the PR base is **not** the repository default branch: exactly
+     one structured PR label `closes:<number>` (for example `closes:1092`).
+2. That issue is an **untrusted pointer** until verified:
+   - issue state is **OPEN**;
+   - issue currently carries label **`implementation-authorized`**;
+   - GitHub label events show the **latest apply** of that label was by the
+     repository owner (`jasonhnd`);
+   - if `closes:<N>` is used, its latest apply actor on the PR must also be the
+     owner.
+3. The following **never** authorize: `status:ready`, absence of
+   `status:planned`, free-text body phrases.
+4. Pure documentation-only path changes remain exempt.
 
-Issue links are taken only from GitHub **`closingIssuesReferences`** (GraphQL),
-not from a local regex parser over PR bodies.
+Free-text body parsing is not used for authorization.
 
 ## Required CI on pull requests
 
-Authoritative product quality gates remain the PR jobs named:
+Authoritative product quality gates remain the PR jobs:
 
-- `verify`
+- `verify` (includes authorization)
 - `test`
 - `race`
 - `security`
 
-`verify` also runs implementation-authorization evaluation.
+Outside `IMPLEMENTATION_AUTH_OFFLINE=1` (fixture tests only), missing `gh`,
+repository, PR context, API data, issue state, or label-event evidence fails
+closed (nonzero exit). There is **no** skip env override for production checks.
 
-## Integrated pre-prod SHA (bounded, not a full re-suite)
+## Integrated pre-prod SHA (bounded)
 
-Workflow `.github/workflows/pre-prod-integration.yml` runs on every `pre-prod`
-push with **two distinct** check names only:
+Workflow `.github/workflows/pre-prod-integration.yml` runs **only on push to
+`pre-prod`** (no `workflow_dispatch`) with two distinct check names:
 
 | Check | Purpose | Ceiling |
 | --- | --- | --- |
-| `integration-verify` | YAML validity, stabilization policy tests, authorization fixtures | 5 minutes |
-| `integration-canary` | Provider-free build + evidence tests + pre-push sentinel | 5 minutes wall clock |
+| `integration-verify` | YAML + policy + authorization fixtures | 5 minutes |
+| `integration-canary` | Isolated `LOOPCODER_HOME`, register, doctor/report JSON, worktree unchanged | 5 minutes wall clock |
 
-It does **not** re-run `go test ./...`, the full race suite, or PR security
-suites. Those remain PR-authoritative.
+It does **not** re-run `go test ./...`, full race, or PR security suites.
 
-Before starting the next non-documentation feature item, the **exact** pre-prod
-base SHA must show green `integration-verify` and `integration-canary`
-(newest check run per name, GitHub Actions app). Helper:
+`bash scripts/assert-pre-prod-green.sh --sha <full>` requires, for each check:
 
-```bash
-bash scripts/assert-pre-prod-green.sh --sha <full-sha>
-```
+- non-empty GitHub Actions app identity;
+- evidence the run is from `.github/workflows/pre-prod-integration.yml` /
+  push / `pre-prod` / exact head SHA;
+- newest completed **success** only.
 
-This helper is a **developer convenience and CI input**, not a
-repository-enforced merge hold by itself. Enforcement of “base SHA green”
-for future implementation PRs is evaluated inside the authorization check
-on those PRs.
+Same-name jobs from other workflows are rejected.
 
-### One-time bootstrap exception
+Future non-documentation PRs fail when their exact pre-prod base SHA lacks
+these checks, except the one-time bootstrap identity below.
 
-The stabilization PR that **closes only #1092** may land against a pre-prod
-base SHA that has not yet produced integration checks (bootstrap). That
-exception is code-gated to closing issue number `1092` only and must not be
-reused for `#1108` or other catalog items.
+### One-time bootstrap exception (all fields required)
+
+Only when **all** match:
+
+| Field | Value |
+| --- | --- |
+| PR number | `1218` |
+| Head branch | `ordinary/v090-stabilization-gate` |
+| Base branch | `pre-prod` |
+| Base SHA | `1a6fd6bd6a87232b23db2f6fa06de299604cf57e` |
+| Closing issue | `1092` |
+
+Any mismatched field disables the exception.
 
 ## Local hooks
 
@@ -94,27 +108,8 @@ git config core.hooksPath hooks
 git config --get core.hooksPath   # must print: hooks
 ```
 
-`hooks/pre-push` runs only `scripts/pre-push-sentinel.sh` (local-focused,
-under 60s). It never runs `go test ./...`.
-
 ## Out of scope
 
 - Implementing `#1108` or product features
 - LoopCoder self-bootstrap / compile / dispatch / tick
 - Silent GitHub admin or branch-protection API changes
-
-
-## Closing keyword note
-
-PR bodies must use a plain `Closes #N` line so GitHub populates `closingIssuesReferences`.
-
-## Closing issue resolution on non-default bases
-
-GitHub populates GraphQL `closingIssuesReferences` from keywords primarily for
-PRs targeting the **default branch**. Ordinary development targets `pre-prod`,
-so keywords alone often yield an empty `closingIssuesReferences` list.
-
-For non-default bases, when that list is empty, the checker accepts **exactly
-one** structured PR label of the form `closes:<number>` (for example
-`closes:1092`), then loads that issue via the GitHub API. Free-text body
-phrases still never authorize implementation.

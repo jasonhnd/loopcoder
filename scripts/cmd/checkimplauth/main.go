@@ -15,23 +15,27 @@ import (
 
 func main() {
 	filesPath := flag.String("files", "", "newline-separated changed paths")
-	closingPath := flag.String("closing-issues", "", "JSON array of closingIssuesReferences")
-	baseSHA := flag.String("base-sha", "", "exact pre-prod base SHA for integration gate")
+	closingPath := flag.String("closing-issues", "", "JSON array of closing issues with owner evidence")
+	baseSHA := flag.String("base-sha", "", "exact pre-prod base SHA")
 	verifyOK := flag.String("base-verify-ok", "false", "base SHA passed integration-verify")
 	canaryOK := flag.String("base-canary-ok", "false", "base SHA passed integration-canary")
-	bootstrap1092 := flag.String("bootstrap-1092", "false", "one-time exception for stabilization PR closing #1092 only")
+	prNumber := flag.Int("pr-number", 0, "pull request number")
+	headBranch := flag.String("head-branch", "", "PR head branch")
+	baseBranch := flag.String("base-branch", "", "PR base branch")
 	flag.Parse()
 
+	if *filesPath == "" || *closingPath == "" {
+		fatal(fmt.Errorf("files and closing-issues are required"))
+	}
+
 	paths := readLines(*filesPath)
+	raw, err := os.ReadFile(*closingPath)
+	if err != nil {
+		fatal(err)
+	}
 	var closing []evidence.ClosingIssue
-	if *closingPath != "" {
-		raw, err := os.ReadFile(*closingPath)
-		if err != nil {
-			fatal(err)
-		}
-		if err := json.Unmarshal(raw, &closing); err != nil {
-			fatal(fmt.Errorf("closing-issues json: %w", err))
-		}
+	if err := json.Unmarshal(raw, &closing); err != nil {
+		fatal(fmt.Errorf("closing-issues json: %w", err))
 	}
 
 	fmt.Printf("documentation_only=%v\n", evidence.IsDocumentationOnly(paths))
@@ -47,12 +51,21 @@ func main() {
 	}
 	if !d.Allowed {
 		fmt.Fprintln(os.Stderr, "implementation-authorization: REJECTED")
-		fmt.Fprintln(os.Stderr, "Require exactly one closingIssuesReference with label implementation-authorized.")
 		os.Exit(1)
 	}
 
 	if evidence.IsImplementationChange(paths) {
-		boot := parseBool(*bootstrap1092) && len(closing) == 1 && closing[0].Number == 1092
+		issueN := 0
+		if len(closing) == 1 {
+			issueN = closing[0].Number
+		}
+		boot := evidence.BootstrapContext{
+			PRNumber:    *prNumber,
+			HeadBranch:  *headBranch,
+			BaseBranch:  *baseBranch,
+			BaseSHA:     *baseSHA,
+			IssueNumber: issueN,
+		}
 		g := evidence.EvaluateBaseSHAGate(*baseSHA, parseBool(*verifyOK), parseBool(*canaryOK), boot)
 		fmt.Printf("base_sha_allowed=%v\n", g.Allowed)
 		for _, r := range g.Reasons {
@@ -71,9 +84,6 @@ func parseBool(s string) bool {
 }
 
 func readLines(path string) []string {
-	if path == "" {
-		return nil
-	}
 	f, err := os.Open(path)
 	if err != nil {
 		fatal(err)
