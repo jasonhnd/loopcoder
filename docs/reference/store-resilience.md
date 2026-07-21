@@ -1,6 +1,6 @@
 # Compact Store Resilience (V090-011)
 
-Package: [`internal/store`](../../internal/store)  
+Package: [`internal/store`](../../internal/store)
 Issue: [#1103](https://github.com/jasonhnd/loopcoder/issues/1103)
 
 Applies to both machine (`loopcoder.machine.v1`) and project

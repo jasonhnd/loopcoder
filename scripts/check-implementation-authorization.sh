@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Fail-closed implementation authorization for ordinary-development PRs.
-# Uses GitHub closingIssuesReferences (GraphQL), not a local issue regex.
+#
+# Closing issue sources (in order):
+# 1) GitHub GraphQL closingIssuesReferences (preferred; works when GitHub links).
+# 2) If empty and PR base != default branch: exactly one structured PR label
+#    closes:<digits> (owner-applied). GitHub does not populate
+#    closingIssuesReferences from keywords for non-default base branches.
+# Body free-text is never used for authorization.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -39,29 +45,49 @@ if [[ -z "${PR_NUMBER}" || -z "${REPO}" ]]; then
 fi
 
 echo "implementation-authorization: PR #${PR_NUMBER} repo=${REPO}"
+export REPO
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "${TMP}"' EXIT
 
 gh pr view "${PR_NUMBER}" --repo "${REPO}" --json files -q '.files[].path' >"${TMP}/files.txt"
+gh pr view "${PR_NUMBER}" --repo "${REPO}" --json labels -q '.labels[].name' >"${TMP}/pr_labels.txt"
 
 OWNER="${REPO%%/*}"
 NAME="${REPO#*/}"
-gh api graphql -f query='
+cat >"${TMP}/query.graphql" <<'GQL'
 query($owner:String!, $name:String!, $number:Int!) {
   repository(owner:$owner, name:$name) {
+    defaultBranchRef { name }
     pullRequest(number:$number) {
+      baseRefName
       baseRefOid
       closingIssuesReferences(first: 20) {
         nodes { number title body labels(first: 50) { nodes { name } } }
       }
     }
   }
-}' -f owner="${OWNER}" -f name="${NAME}" -F number="${PR_NUMBER}" >"${TMP}/pr.json"
+}
+GQL
+# Force non-TTY JSON (gh may inject ANSI color codes when stdout is redirected poorly).
+NO_COLOR=1 CLICOLOR=0 GH_FORCE_TTY=0 gh api graphql \
+  -F "query=@${TMP}/query.graphql" \
+  -f owner="${OWNER}" \
+  -f name="${NAME}" \
+  -F number="${PR_NUMBER}" \
+  --jq '.' \
+  >"${TMP}/pr.json"
 
-python3 - "${TMP}/pr.json" "${TMP}/closing.json" "${TMP}/base_sha.txt" <<'PY'
-import json, sys
-pr = json.load(open(sys.argv[1]))["data"]["repository"]["pullRequest"]
+
+python3 - "${TMP}/pr.json" "${TMP}/closing.json" "${TMP}/base_sha.txt" "${TMP}/pr_labels.txt" <<'PY'
+import json, re, sys, subprocess, os
+
+repo_name = os.environ["REPO"]
+pr_wrapper = json.load(open(sys.argv[1]))
+repo = pr_wrapper["data"]["repository"]
+pr = repo["pullRequest"]
+default_branch = (repo.get("defaultBranchRef") or {}).get("name") or "main"
+base_name = pr.get("baseRefName") or ""
 nodes = (pr.get("closingIssuesReferences") or {}).get("nodes") or []
 out = []
 for n in nodes:
@@ -72,8 +98,43 @@ for n in nodes:
         "body": n.get("body") or "",
         "labels": labels,
     })
+source = "closingIssuesReferences"
+
+if not out and base_name and base_name != default_branch:
+    labels = [ln.strip() for ln in open(sys.argv[4]) if ln.strip()]
+    closes = []
+    for lab in labels:
+        m = re.fullmatch(r"closes:(\d+)", lab, flags=re.I)
+        if m:
+            closes.append(int(m.group(1)))
+    if len(closes) == 1:
+        num = closes[0]
+        env = dict(os.environ)
+        env["NO_COLOR"] = "1"
+        env["CLICOLOR"] = "0"
+        env["GH_FORCE_TTY"] = "0"
+        raw = subprocess.check_output(
+            ["gh", "issue", "view", str(num), "--repo", repo_name, "--json", "number,title,body,labels"],
+            text=True,
+            env=env,
+        )
+        iss = json.loads(raw)
+        out = [{
+            "number": iss["number"],
+            "title": iss.get("title") or "",
+            "body": iss.get("body") or "",
+            "labels": [x["name"] for x in (iss.get("labels") or [])],
+        }]
+        source = "pr_label_closes"
+    elif len(closes) > 1:
+        out = [{"number": n, "title": "", "body": "", "labels": []} for n in closes]
+        source = "pr_label_closes_multiple"
+
 json.dump(out, open(sys.argv[2], "w"))
 open(sys.argv[3], "w").write(pr.get("baseRefOid") or "")
+print("base_branch=%s" % base_name)
+print("default_branch=%s" % default_branch)
+print("closing_source=%s" % source)
 print("closing_issue_count=%d" % len(out))
 for item in out:
     print("closing_issue=%d labels=%s" % (item["number"], ",".join(item["labels"])))
@@ -97,9 +158,9 @@ echo "base_integration_canary_ok=${CANARY_OK}"
 
 BOOTSTRAP=false
 if python3 - "${TMP}/closing.json" <<'PY'
-import json,sys
-issues=json.load(open(sys.argv[1]))
-sys.exit(0 if len(issues)==1 and issues[0]["number"]==1092 else 1)
+import json, sys
+issues = json.load(open(sys.argv[1]))
+sys.exit(0 if len(issues) == 1 and issues[0]["number"] == 1092 else 1)
 PY
 then
   BOOTSTRAP=true

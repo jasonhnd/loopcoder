@@ -1,6 +1,6 @@
 # Process Tree Identity and Liveness (V090-013)
 
-Package: [`internal/processtree`](../../internal/processtree)  
+Package: [`internal/processtree`](../../internal/processtree)
 Issue: [#1105](https://github.com/jasonhnd/loopcoder/issues/1105)
 
 ## Model

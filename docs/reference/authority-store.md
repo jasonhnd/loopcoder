@@ -1,6 +1,6 @@
 # v0.9 Authority Store Topology (V090-004)
 
-Package: [`internal/authoritystore`](../../internal/authoritystore)  
+Package: [`internal/authoritystore`](../../internal/authoritystore)
 Issue: [#1096](https://github.com/jasonhnd/loopcoder/issues/1096)
 
 ## Entry points

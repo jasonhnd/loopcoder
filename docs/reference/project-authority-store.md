@@ -1,6 +1,6 @@
 # v0.9 Project Authority Schema (V090-008 / V090-009 / V090-010)
 
-Package: [`internal/projectschema`](../../internal/projectschema)  
+Package: [`internal/projectschema`](../../internal/projectschema)
 Issues: [#1100](https://github.com/jasonhnd/loopcoder/issues/1100),
 [#1101](https://github.com/jasonhnd/loopcoder/issues/1101),
 [#1102](https://github.com/jasonhnd/loopcoder/issues/1102)
