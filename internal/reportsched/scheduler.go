@@ -226,12 +226,7 @@ func (s *Scheduler) Tick(attemptID string) (Receipt, bool, error) {
 	st.Seq++
 	st.LastReceiptAt = now
 	st.NextDue = now.Add(s.interval)
-	// No concrete progress since last interval window?
-	if st.LastConcreteProgress.Before(st.LastReceiptAt.Add(-s.interval + time.Millisecond)) {
-		// Last progress older than roughly one interval before this receipt.
-		// Count streak when last progress is before previous due window.
-	}
-	// Simpler: if last concrete progress is before previous NextDue-interval (i.e. no progress in this window)
+	// Count no-progress when last concrete progress is outside this interval window.
 	windowStart := now.Add(-s.interval)
 	if !st.LastConcreteProgress.After(windowStart) {
 		st.NoProgressStreak++
