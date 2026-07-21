@@ -1233,3 +1233,160 @@ func releasePolicyFixtureJob(name string) workflowJobPolicy {
 		},
 	}
 }
+
+func TestStabilizationGatePolicy(t *testing.T) {
+	root := repositoryPolicyRoot(t)
+
+	// PR CI must keep the four required contexts and the authorization step.
+	ci := loadWorkflowPolicy(t, filepath.Join(root, ".github", "workflows", "ci.yml"))
+	for _, name := range requiredV080Contexts {
+		if _, ok := ci.Jobs[name]; !ok {
+			t.Fatalf("ci.yml missing required job %q", name)
+		}
+	}
+	if !workflowJobContains(ci.Jobs["verify"], "scripts/check-implementation-authorization.sh") {
+		t.Fatal("verify job must run implementation authorization check")
+	}
+	// Offline provenance fixtures must execute in PR verify (file presence alone is not enough).
+	if !workflowJobContains(ci.Jobs["verify"], "scripts/assert-pre-prod-green_test.sh") {
+		t.Fatal("verify job must execute scripts/assert-pre-prod-green_test.sh")
+	}
+
+	// Integrated pre-prod SHA runs bounded distinct checks only (not full PR suite).
+	integPath := filepath.Join(root, ".github", "workflows", "pre-prod-integration.yml")
+	if _, err := os.Stat(integPath); err != nil {
+		t.Fatalf("missing pre-prod integration workflow: %v", err)
+	}
+	integ := loadWorkflowPolicy(t, integPath)
+	for _, name := range []string{"integration-verify", "integration-canary"} {
+		if _, ok := integ.Jobs[name]; !ok {
+			t.Fatalf("pre-prod-integration.yml missing required job %q", name)
+		}
+	}
+	if !workflowJobContains(integ.Jobs["integration-verify"], "scripts/assert-pre-prod-green_test.sh") {
+		t.Fatal("integration-verify must execute scripts/assert-pre-prod-green_test.sh")
+	}
+	raw, err := os.ReadFile(integPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, "pre-prod") {
+		t.Fatal("pre-prod-integration workflow must target pre-prod")
+	}
+	if !strings.Contains(text, "evidence_tier=merge-sha") {
+		t.Fatal("pre-prod integration must record merge-sha evidence tier")
+	}
+	if !strings.Contains(text, "name: integration-verify") || !strings.Contains(text, "name: integration-canary") {
+		t.Fatal("integration jobs must use distinct check names")
+	}
+	// Must not re-run full unit suite or full race as primary integration.
+	if strings.Contains(text, "go test ./...") {
+		t.Fatal("pre-prod integration must not run go test ./...")
+	}
+	if strings.Contains(text, "ci-full-race.sh") {
+		t.Fatal("pre-prod integration must not run full race suite")
+	}
+	if strings.Contains(text, "workflow_dispatch") {
+		t.Fatal("pre-prod integration must not expose workflow_dispatch")
+	}
+	if !strings.Contains(text, "LOOPCODER_HOME") {
+		t.Fatal("integration-canary must use isolated LOOPCODER_HOME")
+	}
+	if !strings.Contains(text, "projects register") {
+		t.Fatal("integration-canary must register the repository")
+	}
+	if !strings.Contains(text, "doctor") || !strings.Contains(text, "report") {
+		t.Fatal("integration-canary must run doctor and report JSON")
+	}
+	for _, needle := range []string{
+		`project_id`,
+		`repo_path`,
+		`exit_code`,
+		`loopcoder.report_query.v1`,
+		`observability`,
+		`status --porcelain`,
+	} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("integration-canary must assert %q", needle)
+		}
+	}
+
+	// assert-pre-prod-green must bind both jobs to one provenance-valid Actions run.
+	assertPath := filepath.Join(root, "scripts", "assert-pre-prod-green.sh")
+	assertRaw, err := os.ReadFile(assertPath)
+	if err != nil {
+		t.Fatalf("missing assert-pre-prod-green.sh: %v", err)
+	}
+	assertText := string(assertRaw)
+	for _, needle := range []string{
+		"actions/runs/",
+		"pre-prod-integration.yml",
+		"head_sha",
+		"head_branch",
+		"check_suite_id",
+		"details_url",
+		"newest",
+	} {
+		if !strings.Contains(assertText, needle) {
+			t.Fatalf("assert-pre-prod-green.sh must enforce provenance field %q", needle)
+		}
+	}
+	assertTest := filepath.Join(root, "scripts", "assert-pre-prod-green_test.sh")
+	if _, err := os.Stat(assertTest); err != nil {
+		t.Fatal("missing offline assert-pre-prod-green_test.sh")
+	}
+	assertTestRaw, err := os.ReadFile(assertTest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertTestText := string(assertTestRaw)
+	for _, needle := range []string{
+		"paginated_two_pages",
+		"paginated_malformed_page2",
+		"wrap_checks",
+	} {
+		if !strings.Contains(assertTestText, needle) {
+			t.Fatalf("assert-pre-prod-green_test.sh must cover pagination case %q", needle)
+		}
+	}
+	if !strings.Contains(assertText, "idx += end") {
+		t.Fatal("assert-pre-prod-green.sh parse_json_stream must advance with idx += end")
+	}
+
+	if _, err := os.Stat(filepath.Join(root, "CODEOWNERS")); err != nil {
+		t.Fatal("missing CODEOWNERS for control plane")
+	}
+
+	// Local sentinel and hooks must exist (no full go test ./...).
+	sentinel := filepath.Join(root, "scripts", "pre-push-sentinel.sh")
+	data, err := os.ReadFile(sentinel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(data)
+	if strings.Contains(s, "go test ./...") {
+		t.Fatal("pre-push sentinel must not run go test ./...")
+	}
+	if !strings.Contains(s, "60") {
+		t.Fatal("pre-push sentinel must document 60s budget")
+	}
+	hook := filepath.Join(root, "hooks", "pre-push")
+	h, err := os.ReadFile(hook)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(h), "pre-push-sentinel.sh") {
+		t.Fatal("hooks/pre-push must delegate to pre-push-sentinel.sh")
+	}
+
+	// Branch protection documentation must exist (settings are owner-applied).
+	bp := filepath.Join(root, "docs", "reference", "pre-prod-branch-protection.md")
+	if _, err := os.Stat(bp); err != nil {
+		t.Fatalf("missing branch protection doc: %v", err)
+	}
+	gate := filepath.Join(root, "docs", "reference", "v090-stabilization-gate.md")
+	if _, err := os.Stat(gate); err != nil {
+		t.Fatalf("missing stabilization gate doc: %v", err)
+	}
+}
