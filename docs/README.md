@@ -29,6 +29,7 @@ Every document is exactly one of these types:
 - [`reference/effective-policy.md`](reference/effective-policy.md): v0.9 effective-policy precedence, freeze, provenance, and digest.
 - [`reference/acceptance-harness.md`](reference/acceptance-harness.md): v0.9 deterministic acceptance fixtures and evidence manifests.
 - [`reference/direct-path-canaries.md`](reference/direct-path-canaries.md): V090-036 docs/Go visible direct-path canaries and evidence contract.
+- [`reference/silent-worker-multi-ui-canary.md`](reference/silent-worker-multi-ui-canary.md): V090-024 twelve-minute silent multi-UI visibility canary.
 - [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
 - [`reference/v09-home-layout.md`](reference/v09-home-layout.md): global `$LOOPCODER_HOME` layout and owner-only creation.
 - [`reference/project-authority-store.md`](reference/project-authority-store.md): project.db domain tables and immutable events.
