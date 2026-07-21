@@ -230,6 +230,19 @@ func (s *Store) CheckIntegrity(ctx context.Context) error {
 	return checkIntegrity(ctx, path, db)
 }
 
+// WithDB runs fn with the live database handle. The callback must not close the
+// handle; Close owns lifetime. Used by authority schema packages.
+func (s *Store) WithDB(fn func(*sql.DB) error) error {
+	if fn == nil {
+		return errors.New("store: WithDB callback is required")
+	}
+	db, _, err := s.openHandle()
+	if err != nil {
+		return err
+	}
+	return fn(db)
+}
+
 // openHandle returns the live database handle and path, or an error if the
 // store is nil or already closed. The returned *sql.DB must not be closed by
 // callers; Close owns handle lifetime.
