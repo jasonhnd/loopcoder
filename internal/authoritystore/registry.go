@@ -37,9 +37,3 @@ func (r *openRegistry) release(path string) {
 	delete(r.byPath, path)
 }
 
-// resetOpenRegistryForTest clears the process registry (tests only).
-func resetOpenRegistryForTest() {
-	globalOpen.mu.Lock()
-	defer globalOpen.mu.Unlock()
-	globalOpen.byPath = map[string]Role{}
-}
