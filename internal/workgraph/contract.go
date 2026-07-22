@@ -125,7 +125,7 @@ type Limits struct {
 
 // DefaultLimits returns conservative defaults.
 func DefaultLimits() Limits {
-	return Limits{Schema: SchemaLimits, MaxItems: 32, MaxDepth: 8, MaxParallel: 4, MaxAutomaticReplan: 1}
+	return Limits{Schema: SchemaLimits, MaxItems: 32, MaxDepth: 8, MaxParallel: 2, MaxAutomaticReplan: 1}
 }
 
 // Graph is the versioned workflow definition.
