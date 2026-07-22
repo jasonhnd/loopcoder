@@ -1,6 +1,7 @@
 package releaseslo_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ func greenObs() []releaseslo.MetricObservation {
 		releaseslo.MetricDeliveryReplay, releaseslo.MetricResources, releaseslo.MetricRedaction,
 		releaseslo.MetricMigration, releaseslo.MetricArtifact,
 		releaseslo.MetricUsefulCapacityRouting, releaseslo.MetricWorkgraphDecompose, releaseslo.MetricCapacityAccounting,
+		releaseslo.MetricMultiDepthRouting, releaseslo.MetricUnavailableRouteExclude,
 	}
 	var obs []releaseslo.MetricObservation
 	for _, id := range ids {
@@ -48,6 +50,30 @@ func TestMissingMetricNotPass(t *testing.T) {
 	sc := releaseslo.Compile(releaseslo.Candidate{SHA: "a", ArchiveDigest: "b"}, obs, releaseslo.DefaultThresholds(), nil, fixed())
 	if sc.GO {
 		t.Fatal("missing must not GO")
+	}
+}
+
+func TestMultiDepthAndUnavailableRequiredNotRunFailClosed(t *testing.T) {
+	// Drop the two new #1343 core metrics → scorecard must not GO (mechanical false green forbidden).
+	var obs []releaseslo.MetricObservation
+	for _, o := range greenObs() {
+		if o.ID == releaseslo.MetricMultiDepthRouting || o.ID == releaseslo.MetricUnavailableRouteExclude {
+			continue
+		}
+		obs = append(obs, o)
+	}
+	sc := releaseslo.Compile(releaseslo.Candidate{SHA: "a", ArchiveDigest: "b"}, obs, releaseslo.DefaultThresholds(), nil, fixed())
+	if sc.GO {
+		t.Fatal("missing multi_depth/unavailable metrics must not scorecard_go")
+	}
+	found := false
+	for _, r := range sc.Reasons {
+		if strings.Contains(r, "multi_depth_routing=not_run") || strings.Contains(r, "unavailable_route_exclude=not_run") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("reasons=%v", sc.Reasons)
 	}
 }
 

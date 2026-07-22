@@ -11,7 +11,7 @@ import (
 const SchemaScorecard = "loopcoder.releaseslo.scorecard.v1"
 
 // CalcVersion of the scorecard algorithm.
-const CalcVersion = "v090-103.0"
+const CalcVersion = "v090-1343.1"
 
 // MetricID is one scored dimension.
 type MetricID string
@@ -34,6 +34,9 @@ const (
 	MetricUsefulCapacityRouting MetricID = "useful_capacity_routing"
 	MetricWorkgraphDecompose    MetricID = "workgraph_decomposition"
 	MetricCapacityAccounting    MetricID = "capacity_accounting"
+	// Core #1343 assertions — mechanical scorecard_go must not ignore these.
+	MetricMultiDepthRouting       MetricID = "multi_depth_routing"
+	MetricUnavailableRouteExclude MetricID = "unavailable_route_exclude"
 )
 
 // Verdict for one metric.
@@ -164,6 +167,7 @@ func Compile(cand Candidate, obs []MetricObservation, th Thresholds, waivers []W
 		MetricStopJoin, MetricProcessLeaks, MetricRepoLocalState, MetricRouteSubstitution,
 		MetricDeliveryReplay, MetricResources, MetricRedaction, MetricMigration, MetricArtifact,
 		MetricUsefulCapacityRouting, MetricWorkgraphDecompose, MetricCapacityAccounting,
+		MetricMultiDepthRouting, MetricUnavailableRouteExclude,
 	}
 
 	allPass := true
@@ -217,7 +221,8 @@ func scoreOne(id MetricID, o MetricObservation, has bool, th Thresholds, w Waive
 	switch id {
 	case MetricStopJoin, MetricRepoLocalState, MetricRouteSubstitution, MetricDeliveryReplay,
 		MetricResources, MetricRedaction, MetricMigration, MetricArtifact,
-		MetricUsefulCapacityRouting, MetricWorkgraphDecompose, MetricCapacityAccounting:
+		MetricUsefulCapacityRouting, MetricWorkgraphDecompose, MetricCapacityAccounting,
+		MetricMultiDepthRouting, MetricUnavailableRouteExclude:
 		mr.Threshold = "ok=true"
 		if o.BoolOK != nil && *o.BoolOK {
 			mr.Verdict = VerdictPass

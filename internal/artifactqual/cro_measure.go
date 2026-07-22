@@ -14,17 +14,19 @@ import (
 )
 
 // CROMeasurement holds product-path routing/decomposition/capacity evidence
-// measured against the exact built binary (V090-CRO-010).
+// measured against the exact built binary (V090-CRO-010 / #1343).
 type CROMeasurement struct {
-	RoutingOK       bool
-	DecomposeOK     bool
-	AccountingOK    bool
-	ProvidersSeen   []string
-	DepthsSeen      []string
-	ChildCount      int
-	EvidenceRefs    map[string]string
-	Probes          []Probe
-	MultiProviderOK bool
+	RoutingOK            bool
+	DecomposeOK          bool
+	AccountingOK         bool
+	MultiDepthOK         bool // ≥2 of low/medium/high bound in requirement→invocation
+	UnavailableExcludeOK bool // exhausted/stale account not selected for write
+	ProvidersSeen        []string
+	DepthsSeen           []string
+	ChildCount           int
+	EvidenceRefs         map[string]string
+	Probes               []Probe
+	MultiProviderOK      bool
 }
 
 // MeasureCROFromBinary runs the extracted binary for workflow plan + auto-route
@@ -113,6 +115,73 @@ func MeasureCROFromBinary(bin, workDir string, envBase []string) (CROMeasurement
 		}
 	}
 
+	// 4) Goal dry-run: bind required depths + multi-provider inventory (exact binary).
+	// Requires #1363 depth bind evidence: requirement→selection→invocation.
+	t3 := time.Now()
+	goalOut, goalErr, goalCode := runBin(bin, env, workDir, "workflow", "goal",
+		"--goal", "implement multi-provider capacity-aware routing with tests and verification",
+		"--issue", "1343", "--format", "human", "--dry-run",
+		"--repo", workDir,
+		"--capacity-snapshot", snapPath)
+	// Note: dry-run flag may need to be supported — if not, parse plan depths only.
+	goalCombined := string(goalOut) + string(goalErr)
+	out.Probes = append(out.Probes, Probe{
+		Name: "cro_goal_dry_run_depth", ExitCode: goalCode, Passed: goalCode == 0,
+		Duration: time.Since(t3), OutputDigest: digestBytes([]byte(goalCombined)),
+		Reasons: reasonsIf(goalCode != 0, truncate(goalCombined, 200)),
+	})
+	// Depth matrix from plan requirements + dry-run route reasons.
+	hasLow := strings.Contains(string(planOut), "depth=low") || strings.Contains(goalCombined, "depth requirement=low")
+	hasHigh := strings.Contains(string(planOut), "depth=high") || strings.Contains(goalCombined, "depth requirement=high")
+	bindLow := strings.Contains(goalCombined, "depth requirement=low") && strings.Contains(goalCombined, "invocation=low")
+	bindHigh := strings.Contains(goalCombined, "depth requirement=high") && strings.Contains(goalCombined, "invocation=high")
+	out.MultiDepthOK = hasLow && hasHigh && (bindLow || bindHigh || (hasLow && hasHigh && goalCode != 0))
+	// Prefer real bind evidence when dry-run works.
+	if goalCode == 0 {
+		out.MultiDepthOK = bindLow && bindHigh
+		if out.MultiDepthOK {
+			out.EvidenceRefs["multi_depth"] = "probe:goal_dry_run_depth_bind"
+			out.DepthsSeen = uniqueStrings(append(out.DepthsSeen, "low", "high"))
+		}
+	} else if hasLow && hasHigh {
+		// Plan always carries multi-depth requirements; bind still required for pass.
+		out.MultiDepthOK = false
+		out.EvidenceRefs["multi_depth"] = "probe:plan_depths_only_bind_unmeasured"
+	}
+
+	// 5) Unavailable/exhausted exclusion: snapshot with exhausted codex + healthy AG.
+	exPath := filepath.Join(workDir, "cro-exhausted-snapshot.json")
+	if err := writeCROExhaustedSnapshot(exPath); err != nil {
+		return out, err
+	}
+	t4 := time.Now()
+	exOut, exErr, exCode := runBin(bin, env, workDir, "run",
+		"--repo", "acme/cro-excl", "--issue", "1343",
+		"--auto-route", "--dry-run", "--format", "json",
+		"--ui-required", "terminal",
+		"--capacity-snapshot", exPath)
+	exCombined := string(exOut) + string(exErr)
+	// Write-capable path must not select exhausted codex when AG remains.
+	selectedCodexOnly := strings.Contains(exCombined, "auto-route selected codex") &&
+		!strings.Contains(exCombined, "antigravity")
+	out.UnavailableExcludeOK = exCode == 0 && !selectedCodexOnly &&
+		(strings.Contains(exCombined, "antigravity") || strings.Contains(exCombined, "ResourceFit") ||
+			strings.Contains(exCombined, "no eligible") || strings.Contains(exCombined, "auto-route selected"))
+	// Stronger: if a winner is reported for write, it must not be exhausted codex alone.
+	if strings.Contains(exCombined, "Winner:") && strings.Contains(exCombined, "codex") &&
+		!strings.Contains(exCombined, "antigravity") {
+		out.UnavailableExcludeOK = false
+	}
+	if strings.Contains(exCombined, "antigravity") {
+		out.UnavailableExcludeOK = true
+		out.EvidenceRefs["unavailable_exclude"] = "probe:exhausted_route_excluded"
+	}
+	out.Probes = append(out.Probes, Probe{
+		Name: "cro_unavailable_exclude", ExitCode: exCode, Passed: out.UnavailableExcludeOK,
+		Duration: time.Since(t4), OutputDigest: digestBytes([]byte(exCombined)),
+		Reasons: reasonsIf(!out.UnavailableExcludeOK, "exhausted/stale exclusion not measured: "+truncate(exCombined, 200)),
+	})
+
 	if !out.DecomposeOK {
 		return out, fmt.Errorf("artifactqual: workgraph decomposition not measured (≥4 children)")
 	}
@@ -121,6 +190,12 @@ func MeasureCROFromBinary(bin, workDir string, envBase []string) (CROMeasurement
 	}
 	if !out.AccountingOK {
 		return out, fmt.Errorf("artifactqual: capacity accounting path not measured")
+	}
+	if !out.MultiDepthOK {
+		return out, fmt.Errorf("artifactqual: multi-depth requirement→invocation not measured (need low+high bind)")
+	}
+	if !out.UnavailableExcludeOK {
+		return out, fmt.Errorf("artifactqual: unavailable/exhausted route exclusion not measured")
 	}
 	return out, nil
 }

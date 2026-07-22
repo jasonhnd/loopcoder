@@ -6,8 +6,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"strings"
+	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/autoroute"
+	"github.com/jasonhnd/loopcoder/internal/capacitysnapshot"
 	"github.com/jasonhnd/loopcoder/internal/goalrun"
 )
 
@@ -24,6 +28,8 @@ func runWorkflowGoal(args []string, stdout, stderr io.Writer, deps Deps) int {
 		model    = fs.String("model", "", "optional child model pin (empty=auto-route per child)")
 		repo     = fs.String("repo", ".", "repository path for capacity inventory discover")
 		format   = fs.String("format", "json", "json|human")
+		dryRun   = fs.Bool("dry-run", false, "route+capacity preview only; no child execution")
+		capSnap  = fs.String("capacity-snapshot", "", "optional capacitysnapshot JSON path (offline measure / qualify)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -37,11 +43,31 @@ func runWorkflowGoal(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if projectID == "" || projectID == "local-project" {
 		projectID = goalrun.UniqueProjectID(resolvedRepo, deps.Now)
 	}
-	res, err := goalrun.Execute(context.Background(), goalrun.Request{
+	var dry *bool
+	if *dryRun {
+		t := true
+		dry = &t
+	}
+	req := goalrun.Request{
 		ProjectID: projectID, Goal: *goal, Issue: *issue, Actor: *actor,
 		Provider: *provider, Model: *model, RepoPath: resolvedRepo,
-		ReportOut: stderr, Now: deps.Now,
-	})
+		DryRun: dry, ReportOut: stderr, Now: deps.Now,
+	}
+	if p := strings.TrimSpace(*capSnap); p != "" {
+		req.LoadInventory = func(ctx context.Context, repo string, at time.Time) (autoroute.Inventory, capacitysnapshot.Snapshot, error) {
+			raw, rerr := os.ReadFile(p)
+			if rerr != nil {
+				return autoroute.Inventory{}, capacitysnapshot.Snapshot{}, rerr
+			}
+			var snap capacitysnapshot.Snapshot
+			if jerr := json.Unmarshal(raw, &snap); jerr != nil {
+				return autoroute.Inventory{}, capacitysnapshot.Snapshot{}, jerr
+			}
+			inv, ierr := capacitysnapshot.ToRouteInventory(snap, at)
+			return inv, snap, ierr
+		}
+	}
+	res, err := goalrun.Execute(context.Background(), req)
 	if err != nil && res.GraphID == "" {
 		fmt.Fprintf(stderr, "workflow goal: %v\n", err)
 		return 4
