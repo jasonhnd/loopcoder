@@ -37,6 +37,9 @@ type ChildExecInput struct {
 	Intent     string
 	Route      ChildRoute
 	RepoPath   string
+	// BaseRef is the git ref to materialize the child worktree from (goal branch
+	// HEAD after prior integrations). Empty → HEAD of RepoPath.
+	BaseRef string
 	// ReadOnly forces read-only provider mode (research children).
 	ReadOnly bool
 	Timeout  time.Duration
@@ -85,6 +88,9 @@ type FakeChildExecutor struct {
 	// Calls records provider-exec invocations per work item (exactly-once tests).
 	// When non-nil, each Execute increments Calls[WorkItemID].
 	Calls map[string]int
+	// ProductFiles optional per-work-item relative paths to write as product
+	// content (for integrate tests). Default: notes/<id>.md + optional test.
+	ProductFiles map[string][]string
 	// HomeDir overrides layout root (tests).
 	HomeDir string
 	Now     func() time.Time
@@ -106,7 +112,7 @@ func (f FakeChildExecutor) Execute(ctx context.Context, in ChildExecInput) (Chil
 	if now == nil {
 		now = time.Now
 	}
-	wt, err := allocateChildWorktree(f.HomeDir, in.ProjectID, in.GraphID, in.WorkItemID, in.AttemptID, in.RepoPath)
+	wt, err := allocateChildWorktree(f.HomeDir, in.ProjectID, in.GraphID, in.WorkItemID, in.AttemptID, in.RepoPath, in.BaseRef)
 	if err != nil {
 		return ChildExecResult{
 			Terminal: workgraph.TermFailed, FailureClass: "worktree", Message: err.Error(),
@@ -122,6 +128,9 @@ func (f FakeChildExecutor) Execute(ctx context.Context, in ChildExecInput) (Chil
 			ActualSource: "unknown",
 		}, err
 	}
+	// Product files for goal-branch integration (not meta-only).
+	prod := writeFakeProductFiles(wt, in, f.ProductFiles)
+	files = append(files, prod...)
 	if f.FailIDs != nil && f.FailIDs[in.WorkItemID] {
 		return ChildExecResult{
 			Terminal: workgraph.TermFailed, OutputEvidence: digest, WorktreePath: wt,
@@ -193,7 +202,7 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	}
 	in.Route.Provider, in.Route.Model, in.Route.Depth = prov, model, depth
 
-	wt, err := allocateChildWorktree(p.HomeDir, in.ProjectID, in.GraphID, in.WorkItemID, in.AttemptID, in.RepoPath)
+	wt, err := allocateChildWorktree(p.HomeDir, in.ProjectID, in.GraphID, in.WorkItemID, in.AttemptID, in.RepoPath, in.BaseRef)
 	if err != nil {
 		return ChildExecResult{
 			Terminal: workgraph.TermFailed, FailureClass: "worktree", Message: err.Error(),
@@ -510,7 +519,7 @@ func attachUsage(out ChildExecResult, res agent.Result) ChildExecResult {
 	return out
 }
 
-func allocateChildWorktree(homeDir, projectID, graphID, workItemID, attemptID, repoPath string) (string, error) {
+func allocateChildWorktree(homeDir, projectID, graphID, workItemID, attemptID, repoPath, baseRef string) (string, error) {
 	projectID = strings.TrimSpace(projectID)
 	if projectID == "" {
 		projectID = "local-project"
@@ -541,11 +550,13 @@ func allocateChildWorktree(homeDir, projectID, graphID, workItemID, attemptID, r
 	root := filepath.Join(pdir, "runs", "wf_"+runKey, "worktree")
 	// Isolated provider workspace: prefer a real git worktree/clone of the
 	// parent repo so AG/Codex project context is the child path only.
-	if err := materializeIsolatedGitWorkspace(root, repoPath); err != nil {
+	// baseRef is the shared goal branch after prior integrations (or HEAD).
+	if err := materializeIsolatedGitWorkspace(root, repoPath, baseRef); err != nil {
 		return "", err
 	}
 	_ = os.Chmod(root, 0o700)
-	marker := fmt.Sprintf("graph=%s\nwork_item=%s\nattempt=%s\nrepo=%s\n", graphID, workItemID, attemptID, strings.TrimSpace(repoPath))
+	marker := fmt.Sprintf("graph=%s\nwork_item=%s\nattempt=%s\nrepo=%s\nbase=%s\n",
+		graphID, workItemID, attemptID, strings.TrimSpace(repoPath), strings.TrimSpace(baseRef))
 	if err := os.WriteFile(filepath.Join(root, ".loopcoder-owned-worktree"), []byte(marker), 0o600); err != nil {
 		return "", err
 	}
@@ -553,9 +564,9 @@ func allocateChildWorktree(homeDir, projectID, graphID, workItemID, attemptID, r
 }
 
 // materializeIsolatedGitWorkspace creates an exclusive git checkout at dest
-// from repoPath (git worktree when possible, else clone, else empty git init).
-// The provider must treat dest as its sole project context.
-func materializeIsolatedGitWorkspace(dest, repoPath string) error {
+// from repoPath@baseRef (git worktree when possible, else clone, else empty git init).
+// baseRef empty → HEAD. The provider must treat dest as its sole project context.
+func materializeIsolatedGitWorkspace(dest, repoPath, baseRef string) error {
 	if err := os.RemoveAll(dest); err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -563,20 +574,29 @@ func materializeIsolatedGitWorkspace(dest, repoPath string) error {
 		return err
 	}
 	repoPath = strings.TrimSpace(repoPath)
+	baseRef = strings.TrimSpace(baseRef)
+	if baseRef == "" {
+		baseRef = "HEAD"
+	}
 	if repoPath != "" {
 		if abs, aerr := filepath.Abs(repoPath); aerr == nil {
 			repoPath = abs
 		}
 		if st, err := os.Stat(filepath.Join(repoPath, ".git")); err == nil && (st.IsDir() || st.Mode().IsRegular()) {
-			// Prefer linked worktree (cheap, independent index/worktree).
-			cmd := exec.Command("git", "-C", repoPath, "worktree", "add", "--detach", dest, "HEAD")
+			// Prefer linked worktree at goal-branch / baseRef so prior integrations are visible.
+			cmd := exec.Command("git", "-C", repoPath, "worktree", "add", "--detach", dest, baseRef)
 			if out, err := cmd.CombinedOutput(); err == nil {
 				return nil
 			} else {
-				// Fall back to local clone if worktree fails (e.g. bare/invalid).
+				// Fall back to local clone + checkout baseRef.
 				_ = out
 				cmd2 := exec.Command("git", "clone", "--local", "--no-hardlinks", repoPath, dest)
 				if out2, err2 := cmd2.CombinedOutput(); err2 == nil {
+					co := exec.Command("git", "-C", dest, "checkout", baseRef)
+					if _, err3 := co.CombinedOutput(); err3 != nil {
+						// keep clone HEAD if baseRef missing
+						_ = err3
+					}
 					return nil
 				} else {
 					_ = out2
@@ -592,6 +612,55 @@ func materializeIsolatedGitWorkspace(dest, repoPath string) error {
 	init.Dir = dest
 	_, _ = init.CombinedOutput()
 	return nil
+}
+
+// writeFakeProductFiles writes integrateable product content for tests.
+func writeFakeProductFiles(wt string, in ChildExecInput, override map[string][]string) []string {
+	var paths []string
+	if override != nil {
+		if list, ok := override[in.WorkItemID]; ok {
+			paths = list
+		}
+	}
+	if len(paths) == 0 {
+		// Default product path per child — enough for integrate tests.
+		switch {
+		case strings.Contains(strings.ToLower(in.WorkItemID), "test") || strings.Contains(strings.ToLower(in.Intent), "test"):
+			paths = []string{"notes/notes_test.go", "notes/notes.go"}
+		case strings.Contains(strings.ToLower(in.WorkItemID), "implement") || strings.Contains(strings.ToLower(in.Intent), "implement"):
+			paths = []string{"notes/notes.go"}
+		case strings.Contains(strings.ToLower(in.WorkItemID), "doc"):
+			paths = []string{"docs/notes.md"}
+		default:
+			paths = []string{"notes/" + in.WorkItemID + ".md"}
+		}
+	}
+	written := make([]string, 0, len(paths))
+	for _, rel := range paths {
+		rel = filepath.Clean(rel)
+		abs := filepath.Join(wt, rel)
+		if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
+			continue
+		}
+		body := fmt.Sprintf("// product file for %s attempt=%s\npackage notes\n\n// Intent: %s\n",
+			in.WorkItemID, in.AttemptID, in.Intent)
+		if strings.HasSuffix(rel, "_test.go") {
+			body = fmt.Sprintf("package notes\n\nimport \"testing\"\n\nfunc TestNotes_%s(t *testing.T) {\n\t// generated for attempt %s\n}\n",
+				strings.ReplaceAll(in.WorkItemID, "-", "_"), in.AttemptID)
+		} else if strings.HasSuffix(rel, ".md") {
+			body = fmt.Sprintf("# %s\n\nAttempt: %s\nIntent: %s\n", in.WorkItemID, in.AttemptID, in.Intent)
+		} else if strings.HasSuffix(rel, ".go") && !strings.HasSuffix(rel, "_test.go") {
+			body = fmt.Sprintf("package notes\n\n// WorkItem %s attempt %s\nfunc Notes() string { return %q }\n",
+				in.WorkItemID, in.AttemptID, in.Intent)
+		}
+		if err := os.WriteFile(abs, []byte(body), 0o600); err != nil {
+			continue
+		}
+		// Stage in child worktree so discoverProductFiles via porcelain sees it.
+		_ = exec.Command("git", "-C", wt, "add", "--", rel).Run()
+		written = append(written, rel)
+	}
+	return written
 }
 
 func writeChildEvidence(wt string, in ChildExecInput, kind string, at time.Time) (path, digest string, files []string, err error) {

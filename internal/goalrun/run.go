@@ -59,9 +59,13 @@ type Request struct {
 	HomeDir string
 	// OpenPR when true opens a real branch/commit/push/PR on RepoPath after
 	// human_gate (never auto-merges). Product path for real_pr_human_gate.
+	// PR head is the shared goal branch that already holds integrated product
+	// commits (not a receipt-only branch).
 	OpenPR bool
 	// PRBaseRef default main.
 	PRBaseRef string
+	// GoalBranch optional shared integrate branch (default loopcoder/goal-<runID>).
+	GoalBranch string
 	// IndependentVerifier provider/company for PR gate evidence.
 	IndependentVerifier string
 	// VerifierEvidence durable independent review ref (digest/path).
@@ -556,6 +560,10 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		exec = workflowrun.ProductionChildExecutor{HomeDir: req.HomeDir, Now: nowFn}
 	}
 	svc := workflowrun.Service{Now: nowFn, Executor: exec, HomeDir: req.HomeDir}
+	goalBranch := strings.TrimSpace(req.GoalBranch)
+	if goalBranch == "" {
+		goalBranch = "loopcoder/goal-" + runID
+	}
 	wres, werr := svc.Execute(ctx, workflowrun.Request{
 		ProjectID:      projectID,
 		RunID:          runID,
@@ -565,6 +573,8 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		Model:          firstNonEmpty(wfModel, "auto"),
 		ChildRoutes:    childRoutes,
 		RepoPath:       req.RepoPath,
+		BaseRef:        firstNonEmpty(req.PRBaseRef, "main"),
+		GoalBranch:     goalBranch,
 		PriorSucceeded: priorSucceeded,
 	})
 	out := Result{
@@ -669,6 +679,8 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		}
 		prRes, perr := prOpen(ctx, goalpr.Request{
 			RepoPath: req.RepoPath, BaseRef: firstNonEmpty(req.PRBaseRef, "main"),
+			// Head is the integrate goal branch (product commits + receipt).
+			Branch:    firstNonEmpty(wres.GoalBranch, goalBranch),
 			ProjectID: projectID, RunID: runID, GraphID: g.GraphID, PlanDigest: g.PlanDigest,
 			SourceIssue: issueN, Actor: actor, Children: wres.Children,
 			IndependentVerifier: ind, VerifierEvidence: verEv,

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -212,6 +213,9 @@ func Open(ctx context.Context, req Request) (Result, error) {
 		}
 		base = "origin/" + strings.TrimPrefix(base, "origin/")
 	}
+	// Prefer existing goal branch with product integrations (not a fresh branch
+	// from base that would drop child commits). CheckoutNewBranch reuses branch
+	// when it already exists.
 	emit("git.checkout_branch:" + branch)
 	if err := git.CheckoutNewBranch(ctx, repo, branch, base); err != nil {
 		return out, fmt.Errorf("%w: checkout branch: %v", ErrGit, err)
@@ -248,6 +252,12 @@ func Open(ctx context.Context, req Request) (Result, error) {
 	emit("git.commit")
 	if err := git.Commit(ctx, repo, msg); err != nil {
 		return out, fmt.Errorf("%w: commit: %v", ErrGit, err)
+	}
+
+	// Fail closed: PR must not be receipt-only when children produced product files.
+	// Scan working tree for product paths outside .loopcoder/.
+	if err := refuseReceiptOnlyPR(repo, req.Children); err != nil {
+		return out, err
 	}
 	head, err := git.HeadOID(ctx, repo)
 	if err != nil {
@@ -490,4 +500,53 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// refuseReceiptOnlyPR fails closed when children reported product FilesTouched
+// but the branch tree only has .loopcoder/** (no real product code/tests).
+func refuseReceiptOnlyPR(repo string, children []workflowrun.ChildOutcome) error {
+	wantProduct := false
+	for _, c := range children {
+		if !strings.EqualFold(c.Terminal, "succeeded") {
+			continue
+		}
+		for _, f := range c.FilesTouched {
+			f = filepath.ToSlash(f)
+			if f == "" || strings.HasPrefix(f, ".loopcoder/") || strings.Contains(f, ".loopcoder-owned-worktree") {
+				continue
+			}
+			if strings.HasPrefix(f, "child-output-") {
+				continue
+			}
+			wantProduct = true
+			break
+		}
+	}
+	if !wantProduct {
+		return nil
+	}
+	// Walk repo (excluding .git) for any non-meta product file.
+	found := false
+	_ = filepath.Walk(repo, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			if info != nil && info.IsDir() && (filepath.Base(path) == ".git" || filepath.Base(path) == ".loopcoder") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, _ := filepath.Rel(repo, path)
+		rel = filepath.ToSlash(rel)
+		if strings.HasPrefix(rel, ".loopcoder/") || rel == "README.md" || strings.HasPrefix(rel, ".github/") {
+			return nil
+		}
+		if strings.HasPrefix(filepath.Base(rel), "child-output-") {
+			return nil
+		}
+		found = true
+		return io.EOF // stop walk
+	})
+	if !found {
+		return fmt.Errorf("%w: PR would be receipt-only; integrate product files onto goal branch first", ErrNotReady)
+	}
+	return nil
 }

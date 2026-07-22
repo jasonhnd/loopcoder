@@ -89,11 +89,11 @@ func TestConcurrentChildWorktreesAreIsolated(t *testing.T) {
 	mustRun(t, parent, "git", "add", "README.md")
 	mustRun(t, parent, "git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "i")
 
-	wt1, err := allocateChildWorktree(home, "disp-a", "g1", "wi_implement", "att-1", parent)
+	wt1, err := allocateChildWorktree(home, "disp-a", "g1", "wi_implement", "att-1", parent, "HEAD")
 	if err != nil {
 		t.Fatal(err)
 	}
-	wt2, err := allocateChildWorktree(home, "disp-a", "g1", "wi_tests", "att-2", parent)
+	wt2, err := allocateChildWorktree(home, "disp-a", "g1", "wi_tests", "att-2", parent, "HEAD")
 	if err != nil {
 		t.Fatal(err)
 	}
