@@ -442,8 +442,15 @@ func TestExecuteOpenPRFillsRealPREvidence(t *testing.T) {
 	if len(got.Children) < 4 {
 		t.Fatalf("children passed to goalpr: %d", len(got.Children))
 	}
-	if got.IndependentVerifier != "claude" {
-		t.Fatalf("verifier %q", got.IndependentVerifier)
+	// Independent verifier is bound from the succeeded verify child (fixture in this test).
+	if got.IndependentVerifier == "" || !strings.HasPrefix(got.VerifierEvidence, "sha256:") {
+		t.Fatalf("verifier bind provider=%q evidence=%q", got.IndependentVerifier, got.VerifierEvidence)
+	}
+	if strings.Contains(strings.ToLower(got.VerifierEvidence), "pending") {
+		t.Fatal("pending-live forbidden")
+	}
+	if got.InstallMeaningfulCI == nil || !*got.InstallMeaningfulCI {
+		t.Fatal("expected InstallMeaningfulCI true for product PR")
 	}
 }
 

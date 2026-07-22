@@ -51,13 +51,19 @@ type Request struct {
 	IndependentVerifier string
 	// VerifierEvidence is durable independent review evidence (digest or path).
 	VerifierEvidence string
-	// RequiredCheckNames optional expected check names; when empty, names are
-	// taken from live PR checks observation (may be empty until CI starts).
+	// RequiredCheckNames optional expected check names; when empty and
+	// InstallMeaningfulCI is true, uses product-tests + product-build.
 	RequiredCheckNames []string
+	// InstallMeaningfulCI writes loopcoder-product.yml (real go test / product
+	// gates). Default true when opening product PRs.
+	InstallMeaningfulCI *bool
 	// WaitForChecks when true polls checks until green or timeout (tests: false).
 	WaitForChecks bool
 	// CheckWait is max wait for checks (default 0 = observe once).
 	CheckWait time.Duration
+	// FinalizeAfterOpen when true (default with WaitForChecks) queries GitHub
+	// and finalizes evidence; never hand-sets green.
+	FinalizeAfterOpen bool
 	// Injectables (tests). nil → production git/gh via exec.
 	Git  Git
 	Host Host
@@ -120,10 +126,14 @@ type Result struct {
 	RequiredChecksGreen bool     `json:"required_checks_green"`
 	IndependentVerifier string   `json:"independent_verifier,omitempty"`
 	VerifierEvidenceRef string   `json:"verifier_evidence_ref,omitempty"`
+	VerifierAttemptID   string   `json:"verifier_attempt_id,omitempty"`
+	VerifierProvider    string   `json:"verifier_provider,omitempty"`
 	CreatedByLoopCoder  bool     `json:"created_by_loopcoder"`
 	HumanMergeGate      bool     `json:"human_merge_gate"`
 	AutoMerge           bool     `json:"auto_merge"` // always false
 	ReceiptPath         string   `json:"receipt_path,omitempty"`
+	CIFiles             []string `json:"ci_files,omitempty"`
+	Finalized           bool     `json:"finalized,omitempty"`
 	Message             string   `json:"message,omitempty"`
 	Events              []string `json:"events,omitempty"`
 }
@@ -221,13 +231,51 @@ func Open(ctx context.Context, req Request) (Result, error) {
 		return out, fmt.Errorf("%w: checkout branch: %v", ErrGit, err)
 	}
 
+	// Install meaningful product CI (go test / product-build), not README/echo.
+	installCI := true
+	if req.InstallMeaningfulCI != nil {
+		installCI = *req.InstallMeaningfulCI
+	}
+	if installCI {
+		paths, cerr := InstallMeaningfulCI(repo)
+		if cerr != nil {
+			return out, fmt.Errorf("install product CI: %w", cerr)
+		}
+		out.CIFiles = paths
+		for _, p := range paths {
+			if err := git.AddPath(ctx, repo, p); err != nil {
+				return out, fmt.Errorf("%w: add ci %s: %v", ErrGit, p, err)
+			}
+		}
+		emit("ci.install:" + strings.Join(paths, ","))
+		if err := git.Commit(ctx, repo, "loopcoder: install meaningful product CI checks"); err != nil {
+			// allow empty if already present
+			if !strings.Contains(err.Error(), "nothing to commit") && !strings.Contains(err.Error(), "no changes") {
+				// still try continue if commit fails due to nothing — ignore soft
+				emit("ci.commit_note:" + err.Error())
+			}
+		}
+	}
+	if len(req.RequiredCheckNames) == 0 && installCI {
+		req.RequiredCheckNames = MeaningfulCheckNames()
+	}
+
+	// Bind independent verifier to a real verify child digest + attempt (no pending-live).
+	verProv, verAtt, verEv := bindVerifierFromChildren(req.Children, req.IndependentVerifier, req.VerifierEvidence)
+	if strings.Contains(strings.ToLower(verEv), "pending") {
+		return out, fmt.Errorf("%w: refuse pending-live verifier evidence", ErrNotReady)
+	}
+	if verEv == "" {
+		return out, fmt.Errorf("%w: verifier evidence digest required from succeeded verify child", ErrNotReady)
+	}
+
 	// Durable receipt in-repo (product file, not hand-filled canary manifest).
 	receipt := Receipt{
 		Schema: ReceiptSchema, ProjectID: req.ProjectID, RunID: req.RunID,
 		GraphID: req.GraphID, PlanDigest: req.PlanDigest, Actor: req.Actor,
 		SourceIssue: req.SourceIssue, Children: req.Children,
-		IndependentVerifier: firstNonEmpty(req.IndependentVerifier, "independent"),
-		VerifierEvidence:    req.VerifierEvidence,
+		IndependentVerifier: firstNonEmpty(verProv, req.IndependentVerifier, "independent"),
+		VerifierEvidence:    verEv,
 		HumanGate:           true, AutoMerge: false, CreatedAt: now,
 	}
 	raw, err := json.MarshalIndent(receipt, "", "  ")
@@ -287,14 +335,17 @@ func Open(ctx context.Context, req Request) (Result, error) {
 	out.Number = parsePRNumber(out.URL)
 	emit("github.pr_url:" + out.URL)
 
-	// Independent verifier evidence (from request or derived).
-	out.IndependentVerifier = firstNonEmpty(req.IndependentVerifier, "independent")
-	out.VerifierEvidenceRef = firstNonEmpty(req.VerifierEvidence, "receipt:"+rel)
+	// Independent verifier bound to same head SHA + real child attempt/output.
+	out.IndependentVerifier = firstNonEmpty(verProv, req.IndependentVerifier)
+	out.VerifierProvider = verProv
+	out.VerifierAttemptID = verAtt
+	out.VerifierEvidenceRef = verEv + "@head:" + out.HeadOID
 	if out.IndependentVerifier == "" {
 		return out, fmt.Errorf("%w: independent verifier required", ErrNotReady)
 	}
+	emit(fmt.Sprintf("verifier.bind provider=%s attempt=%s head=%s", out.VerifierProvider, out.VerifierAttemptID, out.HeadOID))
 
-	// Observe checks (product path; disposable repos may have zero until CI runs).
+	// Observe checks once (honest: usually pending right after open).
 	names := append([]string{}, req.RequiredCheckNames...)
 	allGreen := false
 	if out.Number > 0 {
@@ -304,29 +355,102 @@ func Open(ctx context.Context, req Request) (Result, error) {
 				names = n
 			}
 			allGreen = green
-			// If caller listed required names, green only when all present+green.
 			if len(req.RequiredCheckNames) > 0 {
-				allGreen = green && len(n) > 0
+				// Require observed names include required meaningful checks.
+				allGreen = green && containsAll(n, req.RequiredCheckNames)
 			}
 		}
 		emit(fmt.Sprintf("github.pr_checks count=%d green=%v", len(names), allGreen))
 	}
-	// Product honesty: if no checks configured yet, surface empty names and green=false
-	// unless caller provided names and host reported green. Canary waits for real CI.
 	if len(names) == 0 && len(req.RequiredCheckNames) > 0 {
 		names = req.RequiredCheckNames
 	}
 	out.RequiredChecks = names
+	// Never hand-set green=true without ListChecks allGreen.
 	out.RequiredChecksGreen = allGreen && len(names) > 0
 
+	// Optional finalize: poll GitHub until meaningful checks green.
+	if req.WaitForChecks || req.FinalizeAfterOpen {
+		fin, ferr := FinalizePREvidence(ctx, out, FinalizeRequest{
+			PRNumber:               out.Number,
+			HeadOID:                out.HeadOID,
+			IndependentVerifier:    out.IndependentVerifier,
+			VerifierEvidenceRef:    out.VerifierEvidenceRef,
+			VerifierAttemptID:      out.VerifierAttemptID,
+			VerifierProvider:       out.VerifierProvider,
+			RequiredMeaningfulOnly: true,
+			Wait:                   req.CheckWait,
+			Host:                   host,
+			Now:                    nowFn,
+		})
+		if ferr != nil && req.WaitForChecks {
+			out = fin
+			return out, ferr
+		}
+		if ferr == nil {
+			out = fin
+			out.Finalized = true
+			emit("finalize.ok")
+		}
+	}
+
 	out.OK = out.URL != "" && out.CreatedByLoopCoder && out.HumanMergeGate && !out.AutoMerge &&
-		out.IndependentVerifier != "" && (out.VerifierEvidenceRef != "")
+		out.IndependentVerifier != "" && out.VerifierEvidenceRef != "" &&
+		!strings.Contains(strings.ToLower(out.VerifierEvidenceRef), "pending")
+	// Canary product GO also needs checks green after finalize; open-only may be ok=true with green=false.
 	out.Message = fmt.Sprintf(
-		"PR %s opened; human merge gate; auto_merge=false; checks=%d green=%v",
-		out.URL, len(out.RequiredChecks), out.RequiredChecksGreen,
+		"PR %s opened; human merge gate; auto_merge=false; checks=%d green=%v finalized=%v head=%s",
+		out.URL, len(out.RequiredChecks), out.RequiredChecksGreen, out.Finalized, out.HeadOID,
 	)
 	emit("human_gate.await_owner_merge")
 	return out, nil
+}
+
+func bindVerifierFromChildren(children []workflowrun.ChildOutcome, pinProv, pinEv string) (provider, attemptID, evidence string) {
+	if strings.Contains(strings.ToLower(pinEv), "pending") {
+		pinEv = ""
+	}
+	for _, c := range children {
+		if !strings.EqualFold(c.Terminal, "succeeded") {
+			continue
+		}
+		id := strings.ToLower(c.WorkItemID + " " + c.RouteReason)
+		if !strings.Contains(id, "verify") && !strings.Contains(strings.ToLower(c.WorkItemID), "verify") {
+			continue
+		}
+		if strings.TrimSpace(c.OutputEvidence) == "" || !strings.HasPrefix(c.OutputEvidence, "sha256:") {
+			continue
+		}
+		return firstNonEmpty(c.Provider, pinProv), c.AttemptID, c.OutputEvidence
+	}
+	// Fallback: pin only if real sha256 (not pending).
+	if strings.HasPrefix(strings.TrimSpace(pinEv), "sha256:") {
+		return pinProv, "", pinEv
+	}
+	return pinProv, "", ""
+}
+
+func containsAll(have, need []string) bool {
+	set := map[string]bool{}
+	for _, h := range have {
+		set[strings.ToLower(h)] = true
+	}
+	for _, n := range need {
+		if !set[strings.ToLower(n)] {
+			// allow substring match for job names
+			found := false
+			for h := range set {
+				if strings.Contains(h, strings.ToLower(n)) || strings.Contains(strings.ToLower(n), h) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+	}
+	return len(need) == 0 || len(have) > 0
 }
 
 // ProductionGit uses the system git binary in the disposable repo.
