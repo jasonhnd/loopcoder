@@ -148,3 +148,104 @@ func TestStaleCrossRunRejectedByDigest(t *testing.T) {
 	}
 	_ = err
 }
+
+func TestValidateTimestampOrderFailClosed(t *testing.T) {
+	t0 := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	start := t0.Add(10 * time.Millisecond)
+	term := start.Add(5 * time.Millisecond)
+	if err := artifactqual.ValidateTimestampOrder(t0, start, term); err != nil {
+		t.Fatal(err)
+	}
+	// terminal before start
+	if err := artifactqual.ValidateTimestampOrder(t0, term, start); err == nil {
+		t.Fatal("expected fail on inverted timestamps")
+	}
+	// missing
+	if err := artifactqual.ValidateTimestampOrder(t0, time.Time{}, term); err == nil {
+		t.Fatal("expected fail on missing")
+	}
+	// stale/cross-run: start long before process
+	if err := artifactqual.ValidateTimestampOrder(t0, t0.Add(-time.Hour), t0); err == nil {
+		t.Fatal("expected fail on stale start")
+	}
+}
+
+func TestValidateRenderedAckFailClosed(t *testing.T) {
+	if err := artifactqual.ValidateRenderedAckPresence("", true, 1); err == nil {
+		t.Fatal("missing event id")
+	}
+	if err := artifactqual.ValidateRenderedAckPresence("e1", false, 1); err == nil {
+		t.Fatal("absent durable match")
+	}
+	if err := artifactqual.ValidateRenderedAckPresence("e1", true, 0); err == nil {
+		t.Fatal("zero ack ms")
+	}
+	if err := artifactqual.ValidateRenderedAckPresence("e1", true, 3); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExecutableQualificationScorecardHasNoNotRun(t *testing.T) {
+	// Rebuild-focused: only when archive script exists; asserts scorecard go=true
+	root, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(root, "go.mod")); err == nil {
+			break
+		}
+		parent := filepath.Dir(root)
+		if parent == root {
+			t.Skip("no go.mod")
+		}
+		root = parent
+	}
+	script := filepath.Join(root, "scripts", "build-release-candidate.sh")
+	if _, err := os.Stat(script); err != nil {
+		t.Skip("no build-release-candidate.sh")
+	}
+	out := t.TempDir()
+	sha, _ := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	commit := strings.TrimSpace(string(sha))
+	cmd := exec.Command("bash", script)
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(),
+		"VERSION=0.9.0-rc.latency",
+		"COMMIT_SHA="+commit,
+		"OUT_DIR="+out,
+	)
+	if b, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build archive: %v\n%s", err, b)
+	}
+	var archive string
+	ents, _ := os.ReadDir(out)
+	for _, e := range ents {
+		if strings.HasSuffix(e.Name(), ".tar.gz") {
+			archive = filepath.Join(out, e.Name())
+		}
+	}
+	sums, _ := os.ReadFile(filepath.Join(out, "SHA256SUMS"))
+	wantDigest := strings.ToLower(strings.Fields(string(sums))[0])
+	ev, err := artifactqual.Qualify(artifactqual.Input{
+		Mode:        artifactqual.ModeRelease,
+		ArchivePath: archive, ExpectedDigest: wantDigest,
+		SHA: commit, WorkDir: t.TempDir(),
+		IntegrationVerifyOK: true, IntegrationCanaryOK: true,
+		Now: time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range ev.Scorecard.Metrics {
+		if m.Verdict == "not_run" {
+			t.Fatalf("required metric still not_run: %+v", m)
+		}
+	}
+	if !ev.Scorecard.GO || ev.Scorecard.Overall != "pass" {
+		t.Fatalf("scorecard not GO: overall=%s go=%v reasons=%v", ev.Scorecard.Overall, ev.Scorecard.GO, ev.Scorecard.Reasons)
+	}
+	if !ev.Passed {
+		t.Fatalf("harness not passed: reasons=%v", ev.Reasons)
+	}
+}
