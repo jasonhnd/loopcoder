@@ -74,6 +74,13 @@ type Request struct {
 	RequiredCheckNames []string
 	// GoalPR injects goalpr opener (tests). nil → goalpr.Open production.
 	GoalPR func(ctx context.Context, req goalpr.Request) (goalpr.Result, error)
+	// CanaryEmit when set writes loopcoder.canary_evidence.v1 via EmitCanaryEvidence
+	// at goal end (exact-binary path; no hand flags).
+	CanaryEmit *CanaryEmitOptions
+	// WaitPRChecks when OpenPR waits for meaningful CI green then finalizes.
+	WaitPRChecks bool
+	// PRCheckWait max wait for checks (default 15m when WaitPRChecks).
+	PRCheckWait time.Duration
 }
 
 // ChildReport is one transparent child line for UI/JSONL.
@@ -130,6 +137,8 @@ type Result struct {
 	// RouteExcludes are measured hard/soft excludes from the live candidate set
 	// (unavailable_retry evidence; Claimed=false for pure exclude).
 	RouteExcludes []RouteExclude `json:"route_excludes,omitempty"`
+	// CanaryEvidencePath is set when CanaryEmit succeeds.
+	CanaryEvidencePath string `json:"canary_evidence_path,omitempty"`
 }
 
 // capacityHold tracks a live reservation for post-execute reconcile/release.
@@ -697,31 +706,30 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		if prOpen == nil {
 			prOpen = goalpr.Open
 		}
-		// Prefer independent verifier from verify child when not pinned.
+		// Independent verifier must be a real verify-child digest (no pending-live).
 		ind := strings.TrimSpace(req.IndependentVerifier)
 		verEv := strings.TrimSpace(req.VerifierEvidence)
-		if ind == "" || verEv == "" {
-			for _, c := range wres.Children {
-				if strings.Contains(strings.ToLower(c.WorkItemID), "verify") &&
-					strings.EqualFold(c.Terminal, "succeeded") {
-					if ind == "" {
-						ind = firstNonEmpty(c.Provider, "independent")
-					}
-					if verEv == "" {
-						verEv = c.OutputEvidence
-					}
-				}
+		if strings.Contains(strings.ToLower(verEv), "pending") {
+			verEv = ""
+		}
+		for _, c := range wres.Children {
+			if strings.Contains(strings.ToLower(c.WorkItemID), "verify") &&
+				strings.EqualFold(c.Terminal, "succeeded") &&
+				strings.HasPrefix(c.OutputEvidence, "sha256:") {
+				ind = firstNonEmpty(c.Provider, ind)
+				verEv = c.OutputEvidence
+				break
 			}
-		}
-		if ind == "" {
-			ind = "independent"
-		}
-		if verEv == "" {
-			verEv = "goalrun:" + runID
 		}
 		issueN := 0
 		if n, err := parseIssueNumber(req.Issue); err == nil {
 			issueN = n
+		}
+		inst := true
+		wait := req.WaitPRChecks
+		checkWait := req.PRCheckWait
+		if wait && checkWait <= 0 {
+			checkWait = 15 * time.Minute
 		}
 		prRes, perr := prOpen(ctx, goalpr.Request{
 			RepoPath: req.RepoPath, BaseRef: firstNonEmpty(req.PRBaseRef, "main"),
@@ -730,8 +738,12 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 			ProjectID: projectID, RunID: runID, GraphID: g.GraphID, PlanDigest: g.PlanDigest,
 			SourceIssue: issueN, Actor: actor, Children: wres.Children,
 			IndependentVerifier: ind, VerifierEvidence: verEv,
-			RequiredCheckNames: req.RequiredCheckNames,
-			Now:                nowFn,
+			RequiredCheckNames:  req.RequiredCheckNames,
+			InstallMeaningfulCI: &inst,
+			WaitForChecks:       wait,
+			CheckWait:           checkWait,
+			FinalizeAfterOpen:   wait,
+			Now:                 nowFn,
 		})
 		out.PR = &prRes
 		if perr != nil {
@@ -740,9 +752,33 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 			for _, cr := range out.Children {
 				emitChild(req.ReportOut, cr)
 			}
+			// Still try canary emit for partial evidence when configured.
+			if req.CanaryEmit != nil {
+				if _, eerr := EmitCanaryFromResult(out, *req.CanaryEmit); eerr == nil {
+					out.CanaryEvidencePath = req.CanaryEmit.OutPath
+				}
+			}
 			return out, fmt.Errorf("goalrun: open pr: %w", perr)
 		}
-		out.HumanSummary += fmt.Sprintf(" pr=%s human_gate=true auto_merge=false", prRes.URL)
+		out.HumanSummary += fmt.Sprintf(" pr=%s human_gate=true auto_merge=false checks_green=%v", prRes.URL, prRes.RequiredChecksGreen)
+	}
+
+	// Exact-binary canary evidence emission (derived from events/PR/children).
+	if req.CanaryEmit != nil {
+		opts := *req.CanaryEmit
+		if opts.HomeDir == "" {
+			opts.HomeDir = req.HomeDir
+		}
+		if _, eerr := EmitCanaryFromResult(out, opts); eerr != nil {
+			out.Message += "; canary_emit_error=" + eerr.Error()
+			// Fail closed when canary emit explicitly requested.
+			for _, cr := range out.Children {
+				emitChild(req.ReportOut, cr)
+			}
+			return out, fmt.Errorf("goalrun: canary emit: %w", eerr)
+		}
+		out.CanaryEvidencePath = opts.OutPath
+		out.HumanSummary += " canary_evidence=" + opts.OutPath
 	}
 
 	for _, cr := range out.Children {
