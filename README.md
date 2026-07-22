@@ -22,6 +22,8 @@ capability matrix:
 
 ```bash
 loopcoder doctor
+loopcoder diagnose --project-id <id> --dry-run --format json
+loopcoder capabilities --format json
 loopcoder doctor --format json   # codes/remediation aligned with capmatrix
 ```
 
