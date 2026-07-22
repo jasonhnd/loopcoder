@@ -215,6 +215,27 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 				}
 				attemptGen[id] = prev + 1
 			}
+			// Merge mid-run partial (forced kill before goal-checkpoint rewrite).
+			if part, perr := workflowrun.LoadPartialPrior(req.HomeDir, projectID, runID); perr == nil {
+				if priorSucceeded == nil {
+					priorSucceeded = map[string]workflowrun.ChildOutcome{}
+				}
+				for id, c := range part.PriorSucceeded {
+					if _, ok := priorSucceeded[id]; !ok {
+						priorSucceeded[id] = c
+					}
+				}
+				for id, att := range part.Aborted {
+					if _, ok := attemptGen[id]; !ok {
+						attemptGen[id] = 1
+					}
+					_ = att
+				}
+				if len(part.PriorSucceeded) > 0 {
+					resumed = true
+				}
+			}
+
 			for id, g0 := range cp.AttemptGeneration {
 				if _, ok := attemptGen[id]; !ok {
 					attemptGen[id] = g0
