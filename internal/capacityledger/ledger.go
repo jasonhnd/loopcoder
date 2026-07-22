@@ -293,6 +293,8 @@ func (l *Ledger) Reconcile(projectID, runID, attemptID string, actualFraction fl
 }
 
 // Release frees a reservation without usage (fail/cancel). Idempotent.
+// Does not invent Actual. Call ObserveAfter afterward to attach a fresh
+// remaining fraction when token actual is unknown.
 func (l *Ledger) Release(projectID, runID, attemptID, reason string) (Entry, error) {
 	key := idemKey(projectID, runID, attemptID)
 	l.mu.Lock()
@@ -318,6 +320,44 @@ func (l *Ledger) Release(projectID, runID, attemptID, reason string) (Entry, err
 		return *e, err
 	}
 	return *e, nil
+}
+
+// ObserveAfter records a post-run remaining fraction from a fresh capacity
+// observation without inventing actual usage. Actual may stay nil (unknown).
+// After must never be left n/a when a real observation is available.
+func (l *Ledger) ObserveAfter(projectID, runID, attemptID string, afterFraction float64, source, freshness string) (Entry, error) {
+	key := idemKey(projectID, runID, attemptID)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	e, ok := l.byKey[key]
+	if !ok || e == nil {
+		return Entry{}, fmt.Errorf("%w: no reservation for attempt", ErrInvalid)
+	}
+	a := clamp01(afterFraction)
+	e.After = &a
+	if src := strings.TrimSpace(source); src != "" {
+		e.RouteReason = appendNote(e.RouteReason, "after_source="+src)
+	}
+	if fr := strings.TrimSpace(freshness); fr != "" {
+		e.Freshness = fr
+		e.RouteReason = appendNote(e.RouteReason, "after_freshness="+fr)
+	}
+	e.UpdatedAt = l.now().UTC()
+	if err := l.saveLocked(); err != nil {
+		return *e, err
+	}
+	return *e, nil
+}
+
+func appendNote(base, add string) string {
+	add = strings.TrimSpace(add)
+	if add == "" {
+		return base
+	}
+	if strings.TrimSpace(base) == "" {
+		return add
+	}
+	return base + "; " + add
 }
 
 // Get returns the entry for an attempt if present.
