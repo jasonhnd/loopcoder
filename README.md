@@ -13,26 +13,31 @@
 
 </div>
 
-## v0.9 ordinary development quickstart
+## v0.9 candidate quickstart (pre-prod; not the public release)
 
-For **v0.9.0** on Darwin arm64, start here (full detail:
-[`docs/reference/v0.9.0-quickstart.md`](docs/reference/v0.9.0-quickstart.md),
-capability matrix:
-[`docs/reference/v0.9.0-capability-matrix.md`](docs/reference/v0.9.0-capability-matrix.md)):
+**Public install remains v0.8.1** until an owner GO publishes v0.9.0. The v0.9
+candidate lives on `pre-prod` and is documented in:
+
+- [`docs/reference/v0.9.0-quickstart.md`](docs/reference/v0.9.0-quickstart.md)
+- [`docs/reference/v0.9.0-capability-matrix.md`](docs/reference/v0.9.0-capability-matrix.md)
+  (must match `loopcoder capabilities --format json`)
 
 ```bash
-loopcoder doctor
-loopcoder diagnose --project-id <id> --dry-run --format json
+# Against a candidate binary / exact RC archive — not assumed on public PATH
+loopcoder doctor --format json
 loopcoder capabilities --format json
-loopcoder qualify --archive dist/x.tar.gz --digest <sha256>
-loopcoder doctor --format json   # codes/remediation aligned with capmatrix
+loopcoder run --repo <path> --issue <n> --provider <p> --model <m> --dry-run --format json
+loopcoder workflow run --fixture one --format json
+loopcoder migrate export-v08 --fixture --export-dir /tmp/v08-export
+loopcoder diagnose --project-id <id> --dry-run --format json
+loopcoder qualify --archive dist/loopcoder_*.tar.gz --digest <sha256>
 ```
 
 Ordinary development uses isolated worktrees/PRs and a **human merge gate**. Do
 **not** run `loopcoder compile`, `dispatch`, or `tick` against this repository
-(self-bootstrap is unsupported). Prefer explicit direct run / bounded workflow,
-global/project stores (no production `<repo>/.loopcoder` runtime writes), and
-terminal GitHub rehydration for cross-Mac handoff.
+(self-bootstrap is unsupported). Prefer explicit direct run / auto-route,
+bounded workflow, global/project stores (no production `<repo>/.loopcoder`
+runtime writes), and terminal GitHub rehydration for cross-Mac handoff.
 
 ## What it is
 
