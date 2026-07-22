@@ -159,6 +159,10 @@ loopcoder migrate storage --apply --format json
 loopcoder skill install --repo .
 loopcoder projects register --repo .
 loopcoder migrate local-state --repo . --dry-run
+loopcoder migrate export-v08 --export-dir /tmp/v08-export --fixture
+loopcoder migrate import-v09 --export-dir /tmp/v08-export
+loopcoder export-v08 --export-dir /tmp/v08-export --fixture
+loopcoder import-v09 --export-dir /tmp/v08-export
 loopcoder doctor --repo .
 ```
 

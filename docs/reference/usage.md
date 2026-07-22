@@ -116,6 +116,10 @@ legacy repo-local import before applying it:
 loopcoder projects register --repo .
 loopcoder projects show --repo .
 loopcoder migrate local-state --repo . --dry-run
+loopcoder migrate export-v08 --export-dir /tmp/v08-export --fixture
+loopcoder migrate import-v09 --export-dir /tmp/v08-export
+loopcoder export-v08 --export-dir /tmp/v08-export --fixture
+loopcoder import-v09 --export-dir /tmp/v08-export
 ```
 
 `loopcoder projects register --repo .` writes or refreshes this checkout's row
