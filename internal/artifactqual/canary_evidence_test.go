@@ -38,16 +38,19 @@ func TestValidateCanaryEvidenceRequiresRealRuntime(t *testing.T) {
 		UnavailableRetry: &artifactqual.CanaryUnavailableRetry{
 			ExcludedProvider: "codex-exhausted", ExcludedReason: "exhausted",
 			NoDuplicateClaim: true, NoDuplicateFiles: true, NoDoubleCapacity: true,
+			EvidenceRef: "events:hard_exclude:codex-exhausted",
 		},
 		Restart: &artifactqual.CanaryRestart{
 			Interrupted: true, ResumedFromDurable: true, ExactlyOnce: true,
 			ChildCountUseful: 4, ProcessCeilingOK: true, WorktreeCeilingOK: true,
 			NoLeakedProcesses: true, NoRepoLocalRuntime: true,
+			EvidenceRef: "/tmp/run/workflow-events.jsonl#sha256:deadbeef",
 		},
 		PR: &artifactqual.CanaryPR{
 			URL: "https://github.com/jasonhnd/loopcoder/pull/9999", Number: 9999,
 			RequiredChecks: []string{"verify", "test"}, RequiredChecksGreen: true,
-			IndependentVerifier: "loopreview", CreatedByLoopCoder: true,
+			IndependentVerifier: "loopreview", VerifierEvidenceRef: "sha256:verifdeadbeef",
+			CreatedByLoopCoder: true,
 		},
 	}
 	v := artifactqual.ValidateCanaryEvidence(ev, digest, sha, now)
