@@ -322,10 +322,29 @@ func (l *Ledger) Release(projectID, runID, attemptID, reason string) (Entry, err
 	return *e, nil
 }
 
+// ObserveAfterOpts binds the post-run observation to the same account/window
+// as the reservation. Cross-window after is rejected (fail closed).
+type ObserveAfterOpts struct {
+	// AccountRef and WindowKind must match the reservation when non-empty.
+	AccountRef string
+	WindowKind string
+	// ResetObserved true when the observation includes a quota reset since reserve
+	// (allows after > before). Without this, after rising is fail-closed.
+	ResetObserved bool
+	// ResetEvidence short source tag when ResetObserved (required if after > before).
+	ResetEvidence string
+}
+
 // ObserveAfter records a post-run remaining fraction from a fresh capacity
 // observation without inventing actual usage. Actual may stay nil (unknown).
-// After must never be left n/a when a real observation is available.
+// After must never be left n/a when a real same-window observation is available.
+// After rising above Before without reset evidence is rejected (fail closed).
 func (l *Ledger) ObserveAfter(projectID, runID, attemptID string, afterFraction float64, source, freshness string) (Entry, error) {
+	return l.ObserveAfterBound(projectID, runID, attemptID, afterFraction, source, freshness, ObserveAfterOpts{})
+}
+
+// ObserveAfterBound is ObserveAfter with explicit account/window/reset binding.
+func (l *Ledger) ObserveAfterBound(projectID, runID, attemptID string, afterFraction float64, source, freshness string, opts ObserveAfterOpts) (Entry, error) {
 	key := idemKey(projectID, runID, attemptID)
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -333,7 +352,26 @@ func (l *Ledger) ObserveAfter(projectID, runID, attemptID string, afterFraction 
 	if !ok || e == nil {
 		return Entry{}, fmt.Errorf("%w: no reservation for attempt", ErrInvalid)
 	}
+	// Same account + window binding (when caller provides identity).
+	if acc := strings.TrimSpace(opts.AccountRef); acc != "" {
+		if !strings.EqualFold(redact(acc), e.AccountRef) && !strings.EqualFold(acc, e.AccountRef) {
+			return Entry{}, fmt.Errorf("%w: after account %q != reserved %q", ErrInvalid, acc, e.AccountRef)
+		}
+	}
+	if wk := strings.TrimSpace(opts.WindowKind); wk != "" {
+		if !strings.EqualFold(wk, e.WindowKind) {
+			return Entry{}, fmt.Errorf("%w: after window %q != reserved %q", ErrInvalid, wk, e.WindowKind)
+		}
+	}
 	a := clamp01(afterFraction)
+	// Fail closed: after cannot rise without reset evidence (cross-window drift).
+	if a > e.Before+0.001 {
+		if !opts.ResetObserved || strings.TrimSpace(opts.ResetEvidence) == "" {
+			return Entry{}, fmt.Errorf("%w: after %.3f > before %.3f without reset evidence (provider window=%s account=%s)",
+				ErrInvalid, a, e.Before, e.WindowKind, e.AccountRef)
+		}
+		e.RouteReason = appendNote(e.RouteReason, "after_reset="+opts.ResetEvidence)
+	}
 	e.After = &a
 	if src := strings.TrimSpace(source); src != "" {
 		e.RouteReason = appendNote(e.RouteReason, "after_source="+src)
@@ -342,6 +380,7 @@ func (l *Ledger) ObserveAfter(projectID, runID, attemptID string, afterFraction 
 		e.Freshness = fr
 		e.RouteReason = appendNote(e.RouteReason, "after_freshness="+fr)
 	}
+	e.RouteReason = appendNote(e.RouteReason, "after_window="+e.WindowKind)
 	e.UpdatedAt = l.now().UTC()
 	if err := l.saveLocked(); err != nil {
 		return *e, err

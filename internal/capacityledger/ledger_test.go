@@ -115,15 +115,16 @@ func TestObserveAfterWithoutInventingActual(t *testing.T) {
 	if _, err := l.Release("p", "run-obs", "att-obs", "executed_usage_unknown"); err != nil {
 		t.Fatal(err)
 	}
-	e, err := l.ObserveAfter("p", "run-obs", "att-obs", 0.88, "codexbar", "fresh")
+	// after must be <= before unless reset evidence is supplied
+	e, err := l.ObserveAfter("p", "run-obs", "att-obs", 0.75, "codexbar", "fresh")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if e.Actual != nil {
 		t.Fatalf("must not invent actual: %+v", e)
 	}
-	if e.After == nil || *e.After != 0.88 {
-		t.Fatalf("after=%v want 0.88", e.After)
+	if e.After == nil || *e.After != 0.75 {
+		t.Fatalf("after=%v want 0.75", e.After)
 	}
 	if e.Freshness != "fresh" {
 		t.Fatalf("freshness=%q", e.Freshness)
@@ -221,4 +222,62 @@ func indexOf(s, n string) int {
 		}
 	}
 	return -1
+}
+
+func TestObserveAfterRejectsRiseWithoutReset(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cap.json")
+	l, err := capacityledger.OpenPath(path, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := testSnap() // before remaining ~0.80
+	e, err := l.Reserve(capacityledger.ReserveInput{
+		ProjectID: "p", RunID: "r", AttemptID: "a1",
+		Provider: "codex", Model: "gpt-5.5", Snapshot: &snap,
+		DemandFraction: 0.05, DemandConfidence: quotapolicy.EvidenceExact,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// after 0.98 > before without reset → fail closed
+	_, err = l.ObserveAfterBound("p", "r", "a1", 0.98, "cli", "fresh", capacityledger.ObserveAfterOpts{
+		AccountRef: e.AccountRef, WindowKind: e.WindowKind,
+	})
+	if err == nil {
+		t.Fatal("want reject rise without reset")
+	}
+	// with reset evidence OK
+	e2, err := l.ObserveAfterBound("p", "r", "a1", 0.98, "cli", "fresh", capacityledger.ObserveAfterOpts{
+		AccountRef: e.AccountRef, WindowKind: e.WindowKind,
+		ResetObserved: true, ResetEvidence: "window_reset_observed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e2.After == nil || *e2.After != 0.98 {
+		t.Fatalf("%+v", e2)
+	}
+}
+
+func TestObserveAfterRejectsWindowMismatch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cap2.json")
+	l, err := capacityledger.OpenPath(path, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := testSnap()
+	e, err := l.Reserve(capacityledger.ReserveInput{
+		ProjectID: "p", RunID: "r", AttemptID: "a2",
+		Provider: "codex", Model: "gpt-5.5", Snapshot: &snap,
+		DemandFraction: 0.05, DemandConfidence: quotapolicy.EvidenceExact,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = l.ObserveAfterBound("p", "r", "a2", 0.75, "cli", "fresh", capacityledger.ObserveAfterOpts{
+		AccountRef: e.AccountRef, WindowKind: "daily", // wrong window
+	})
+	if err == nil {
+		t.Fatal("want window mismatch")
+	}
 }
