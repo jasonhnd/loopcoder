@@ -61,6 +61,7 @@ Every document is exactly one of these types:
 - [`reference/work-graph-storage.md`](reference/work-graph-storage.md): V090-057 Work item and dependency schema (storage v32).
 - [`reference/work-graph-ready.md`](reference/work-graph-ready.md): V090-058 graph validation and deterministic ready set.
 - [`reference/work-claim.md`](reference/work-claim.md): V090-059 atomic work claim and guarded close.
+- [`reference/workflow-definition.md`](reference/workflow-definition.md): V090-060 explicit workflow definition and materialization.
 - [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
 - [`reference/v09-home-layout.md`](reference/v09-home-layout.md): global `$LOOPCODER_HOME` layout and owner-only creation.
 - [`reference/project-authority-store.md`](reference/project-authority-store.md): project.db domain tables and immutable events.
