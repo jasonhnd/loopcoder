@@ -146,7 +146,7 @@ func (m *RefreshManager) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	now := normalizeNow(req.Now)().UTC()
 	policy := normalizeRefreshPolicy(req.Policy)
 	trigger := normalizeRefreshTrigger(req.Trigger)
-	providers, inactiveProviders := selectActiveRefreshProviders(req.Config, req.Providers)
+	providers, inactiveProviders := selectActiveRefreshProviders(req.Config, req.Providers, req.NetworkGrants)
 	cached, err := Load(ctx, m.Store)
 	if err != nil {
 		return RefreshResult{}, err
@@ -244,7 +244,7 @@ func (m *RefreshManager) Status(ctx context.Context, req RefreshRequest) (QuotaR
 	if err != nil {
 		return QuotaRefreshStatus{}, err
 	}
-	providers, inactiveProviders := selectActiveRefreshProviders(req.Config, req.Providers)
+	providers, inactiveProviders := selectActiveRefreshProviders(req.Config, req.Providers, req.NetworkGrants)
 	status := m.statusFromReport(report, providers, normalizeRefreshPolicy(req.Policy), now)
 	status.Providers = append(status.Providers, inactiveProviderQuotaStatuses(inactiveProviders, now)...)
 	sort.Slice(status.Providers, func(i, j int) bool { return status.Providers[i].AdapterID < status.Providers[j].AdapterID })
@@ -380,7 +380,7 @@ func (m *RefreshManager) runSharedRefresh(req RefreshRequest, cached Report, pro
 	if err != nil {
 		return RefreshResult{}, err
 	}
-	activeProviders, inactiveProviders := selectActiveRefreshProviders(req.Config, req.Providers)
+	activeProviders, inactiveProviders := selectActiveRefreshProviders(req.Config, req.Providers, req.NetworkGrants)
 	status := m.statusFromReport(report, activeProviders, policy, normalizeNow(req.Now)().UTC())
 	status.Providers = append(status.Providers, inactiveProviderQuotaStatuses(inactiveProviders, now)...)
 	sort.Slice(status.Providers, func(i, j int) bool { return status.Providers[i].AdapterID < status.Providers[j].AdapterID })
@@ -496,17 +496,30 @@ func (m *RefreshManager) isActive(provider string) bool {
 	return m.active[provider] > 0
 }
 
-func selectActiveRefreshProviders(cfg config.Config, requested []string) ([]string, []string) {
+func selectActiveRefreshProviders(cfg config.Config, requested []string, grants []NetworkGrant) ([]string, []string) {
 	configured := configuredProviderNames(cfg)
+	// Grants expand the active set so --grant-quota-telemetry all can refresh
+	// codex+claude+grok even when delivery only configures worker/verifier.
 	active := map[string]bool{}
 	for _, provider := range configured {
-		provider = strings.TrimSpace(provider)
 		if provider != "" {
 			active[provider] = true
 		}
 	}
+	for _, g := range grants {
+		p := strings.TrimSpace(g.ProviderID)
+		if p != "" && refreshableProvider(cfg, p) {
+			active[p] = true
+		}
+	}
 	if len(requested) == 0 {
-		return configured, nil
+		// No explicit list: refresh configured + granted adapters.
+		out := make([]string, 0, len(active))
+		for p := range active {
+			out = append(out, p)
+		}
+		sort.Strings(out)
+		return out, nil
 	}
 	seen := map[string]bool{}
 	out := make([]string, 0, len(requested))

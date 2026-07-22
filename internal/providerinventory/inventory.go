@@ -2941,6 +2941,26 @@ func configuredProviderNames(cfg config.Config) []string {
 	return out
 }
 
+// refreshableProvider reports whether an adapter may be refreshed when
+// explicitly requested (e.g. --grant-quota-telemetry all). Includes delivery
+// worker/verifier plus static registry providers so multi-company capacity
+// can be persisted without elevating every Status listing.
+func refreshableProvider(cfg config.Config, provider string) bool {
+	provider = strings.TrimSpace(provider)
+	if provider == "" {
+		return false
+	}
+	for _, p := range configuredProviderNames(cfg) {
+		if p == provider {
+			return true
+		}
+	}
+	if _, ok := models.LookupProvider(provider); ok {
+		return true
+	}
+	return false
+}
+
 func filterAdapterDeclarations(adapters []AdapterDeclaration, active []string) []AdapterDeclaration {
 	if len(active) == 0 {
 		return adapters
