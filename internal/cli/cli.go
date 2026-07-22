@@ -2039,11 +2039,31 @@ func runProviders(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 2
 	}
 	now := deps.Now()
+	// When quota/auth grants are present, request refresh for those adapters so
+	// multi-provider durable capacity is collected (not only worker/verifier).
+	var refreshProviders []string
+	for _, g := range networkGrants {
+		id := strings.TrimSpace(g.ProviderID)
+		if id == "" {
+			continue
+		}
+		dup := false
+		for _, p := range refreshProviders {
+			if p == id {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			refreshProviders = append(refreshProviders, id)
+		}
+	}
 	if deps.ProviderQuotaRefresh != nil {
 		result, err := deps.ProviderQuotaRefresh(context.Background(), providerinventory.RefreshRequest{
 			RepoPath:      resolvedRepo,
 			Config:        cfg,
 			NetworkGrants: networkGrants,
+			Providers:     refreshProviders,
 			Trigger:       providerinventory.RefreshTriggerExplicit,
 			Now:           func() time.Time { return now },
 		})
@@ -2211,7 +2231,9 @@ func defaultRuntimeHostName() string {
 	return "generic-local"
 }
 
-// parseQuotaTelemetryGrants builds explicit network grants for quota telemetry.
+// parseQuotaTelemetryGrants builds explicit network grants for quota telemetry
+// and co-grants auth/catalog inventory so multi-provider unattended readiness
+// can be observed after refresh (auth + models + quota, not quota alone).
 // Accepts comma-separated adapter ids, or "all" for the common official adapters.
 func parseQuotaTelemetryGrants(raw string) ([]providerinventory.NetworkGrant, error) {
 	raw = strings.TrimSpace(raw)
@@ -2233,13 +2255,21 @@ func parseQuotaTelemetryGrants(raw string) ([]providerinventory.NetworkGrant, er
 	if len(adapters) == 0 {
 		return nil, fmt.Errorf("invalid --grant-quota-telemetry %q; want adapter ids or \"all\"", raw)
 	}
-	grants := make([]providerinventory.NetworkGrant, 0, len(adapters))
+	purposes := []providerinventory.NetworkPurpose{
+		providerinventory.NetworkPurposeQuotaTelemetry,
+		providerinventory.NetworkPurposeAuthReadiness,
+		providerinventory.NetworkPurposeModelCatalog,
+		providerinventory.NetworkPurposeAuthCatalogInventory,
+	}
+	grants := make([]providerinventory.NetworkGrant, 0, len(adapters)*len(purposes))
 	for _, adapterID := range adapters {
-		grants = append(grants, providerinventory.NetworkGrant{
-			ProviderID: adapterID,
-			Purpose:    providerinventory.NetworkPurposeQuotaTelemetry,
-			Scope:      providerinventory.NetworkScopeMachineInventory,
-		})
+		for _, purpose := range purposes {
+			grants = append(grants, providerinventory.NetworkGrant{
+				ProviderID: adapterID,
+				Purpose:    purpose,
+				Scope:      providerinventory.NetworkScopeMachineInventory,
+			})
+		}
 	}
 	return grants, nil
 }

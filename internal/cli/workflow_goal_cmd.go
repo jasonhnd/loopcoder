@@ -20,16 +20,22 @@ func runWorkflowGoal(args []string, stdout, stderr io.Writer, deps Deps) int {
 		issue    = fs.String("issue", "", "issue id")
 		project  = fs.String("project-id", "local-project", "project id")
 		actor    = fs.String("actor", "owner", "approving actor")
-		provider = fs.String("provider", "fixture", "child provider pin")
-		model    = fs.String("model", "fixture-model", "child model pin")
+		provider = fs.String("provider", "", "optional child provider pin (empty=auto-route per child)")
+		model    = fs.String("model", "", "optional child model pin (empty=auto-route per child)")
+		repo     = fs.String("repo", ".", "repository path for capacity inventory discover")
 		format   = fs.String("format", "json", "json|human")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	resolvedRepo := strings.TrimSpace(*repo)
+	if resolvedRepo == "" {
+		resolvedRepo = "."
+	}
 	res, err := goalrun.Execute(context.Background(), goalrun.Request{
 		ProjectID: *project, Goal: *goal, Issue: *issue, Actor: *actor,
-		Provider: *provider, Model: *model, ReportOut: stderr, Now: deps.Now,
+		Provider: *provider, Model: *model, RepoPath: resolvedRepo,
+		ReportOut: stderr, Now: deps.Now,
 	})
 	if err != nil && res.GraphID == "" {
 		fmt.Fprintf(stderr, "workflow goal: %v\n", err)
