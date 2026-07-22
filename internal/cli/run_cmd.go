@@ -121,15 +121,17 @@ func runRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		now = time.Now
 	}
 
-	// P4 / V090-RB04: resolve route before run identity freeze.
+	// P4 / V090-RB04 / V090-CRO-002: resolve route before run identity freeze.
 	// Explicit provider+model pin is never overridden. Omitted both (or
 	// --auto-route) evaluates inventory evidence via autoroute/routedecision.
+	// Production does not inject a silent fake matrix; deps.AutoRouteInventory
+	// must be a real snapshot (CRO-003+) or auto-route fails closed.
 	wantAuto := req.AutoRoute || (req.Provider == "" && req.Model == "")
 	routeRes, routeErr := autoroute.Resolve(autoroute.Input{
 		AutoRoute: wantAuto, Provider: req.Provider, Model: req.Model,
 		Effort: req.Effort, Permission: req.Permission,
 		ProjectID: slugProjectFromRepo(req.Repo), DecisionKey: "run-route|" + req.Repo + "|" + req.Issue,
-		Now: now().UTC(),
+		Now: now().UTC(), Inventory: deps.AutoRouteInventory,
 	})
 	if routeErr != nil || (routeRes.Outcome != autoroute.OutcomeExplicitPin && routeRes.Outcome != autoroute.OutcomeSelected) {
 		msg := routeRes.Message

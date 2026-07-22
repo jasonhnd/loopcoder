@@ -38,9 +38,13 @@ type Input struct {
 	// DecisionKey should be stable per run attempt for idempotency.
 	DecisionKey string
 	// TaskClass defaults to ClassTera (ordinary code) when empty.
+	// Production run must pass a classified TaskClass (CRO-006); default remains
+	// for pin-only paths and transitional callers.
 	TaskClass capclass.Class
 	Now       time.Time
-	// Inventory optional; nil uses DefaultInventory (official fake adapters).
+	// Inventory is required for auto-route. Nil inventory fails closed — production
+	// must never silently fall back to a fake/static matrix (V090-CRO-002 / #1335).
+	// Tests inject FakeInventory() explicitly when they need selectable candidates.
 	Inventory *Inventory
 }
 
@@ -124,11 +128,20 @@ func Resolve(in Input) (Result, error) {
 	// Auto-route with both empty, or --auto-route (with or without pin — pin becomes hard eligibility pin).
 	inv := in.Inventory
 	if inv == nil {
-		def := DefaultInventory(now)
-		inv = &def
+		return Result{
+			Outcome: OutcomeNoRoute,
+			Message: "no real inventory snapshot: auto-route requires provider/account/model/quota evidence (refusing DefaultInventory/fake matrix)",
+		}, fmt.Errorf("%w: missing real inventory", ErrNoRoute)
 	}
 	if strings.TrimSpace(inv.EvidenceDigest) == "" {
 		inv.EvidenceDigest = "inventory-" + shortHash(fmt.Sprintf("%d", len(inv.Candidates)))
+	}
+	// Refuse the historical fake evidence digest even if someone re-supplies it.
+	if inv.EvidenceDigest == fakeInventoryEvidenceDigest {
+		return Result{
+			Outcome: OutcomeNoRoute,
+			Message: "refusing fake inventory evidence digest for production auto-route",
+		}, fmt.Errorf("%w: fake inventory digest", ErrNoRoute)
 	}
 
 	elig := eligibility.Snapshot{
@@ -189,8 +202,19 @@ func Resolve(in Input) (Result, error) {
 	}
 }
 
-// DefaultInventory returns the official fake-adapter matrix used in routecanary.
-func DefaultInventory(now time.Time) Inventory {
+// fakeInventoryEvidenceDigest is the historical digest of the official fake
+// matrix. Resolve refuses this digest so production cannot smuggle fakes.
+const fakeInventoryEvidenceDigest = "default-official-fake-v1"
+
+// FakeInventory builds an explicit test-only candidate matrix.
+//
+// It must never be called from production run/resolve paths. Callers that need
+// selectable inventory in unit tests pass the result as Input.Inventory.
+// Production auto-route must supply a real capacity/inventory snapshot (CRO-003+).
+//
+// Deprecated name DefaultInventory remains as a thin alias for one release of
+// test migration; new tests must call FakeInventory.
+func FakeInventory(now time.Time) Inventory {
 	_ = now
 	type pm struct {
 		p, m string
@@ -213,8 +237,11 @@ func DefaultInventory(now time.Time) Inventory {
 		cands = append(cands, healthy(r.p, r.m, r.cl))
 		softs = append(softs, soft(r.p, r.m, r.rem, r.ttr))
 	}
+	// Use a distinct test digest so Resolve does not refuse it when tests inject
+	// FakeInventory explicitly. The historical default-official-fake-v1 digest
+	// remains banned in Resolve.
 	return Inventory{
-		EvidenceDigest: "default-official-fake-v1",
+		EvidenceDigest: "test-fake-inventory-v1",
 		Candidates:     cands,
 		Soft:           softs,
 		Machine: eligibility.MachineAdmission{
@@ -222,6 +249,12 @@ func DefaultInventory(now time.Time) Inventory {
 		},
 		Mode: quotamode.DefaultModeConfig(quotamode.ModeBalanced),
 	}
+}
+
+// DefaultInventory is a deprecated alias of FakeInventory for test migration.
+// Production Resolve never calls this function.
+func DefaultInventory(now time.Time) Inventory {
+	return FakeInventory(now)
 }
 
 func healthy(p, m string, cl capclass.Class) eligibility.Candidate {

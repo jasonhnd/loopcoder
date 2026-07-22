@@ -20,6 +20,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/audit"
+	"github.com/jasonhnd/loopcoder/internal/autoroute"
 	"github.com/jasonhnd/loopcoder/internal/budget"
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
@@ -82,6 +83,11 @@ type Deps struct {
 	NewPromoteWriter func(repoPath string) orchestration.PromotionWriter
 	ProcessAlive     func(pid int) bool
 	Now              func() time.Time
+	// AutoRouteInventory is an optional auto-route inventory snapshot.
+	// Production leaves this nil so auto-route fails closed until a real
+	// capacity snapshot is wired (V090-CRO-002/003/004). Tests may inject
+	// autoroute.FakeInventory explicitly; never use the historical silent default.
+	AutoRouteInventory *autoroute.Inventory
 	// WaitClock optionally overrides the provider-free wait clock for tests.
 	WaitClock                waitstate.Clock
 	RuntimeGOOS              string

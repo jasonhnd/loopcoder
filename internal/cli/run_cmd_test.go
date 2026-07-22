@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/autoroute"
 )
 
 func TestRunDryRunAndAcceptedIdentity(t *testing.T) {
@@ -37,7 +39,7 @@ func TestRunDryRunAndAcceptedIdentity(t *testing.T) {
 	}
 }
 
-func TestRunAutoRouteSelectsAndPartialPinFails(t *testing.T) {
+func TestRunAutoRouteWithoutInventoryFailsClosed(t *testing.T) {
 	home := t.TempDir()
 	if err := os.Chmod(home, 0o700); err != nil {
 		t.Fatal(err)
@@ -45,8 +47,41 @@ func TestRunAutoRouteSelectsAndPartialPinFails(t *testing.T) {
 	t.Setenv("LOOPCODER_HOME", home)
 	deps := DefaultDeps()
 	deps.Now = func() time.Time { return time.Date(2026, 7, 22, 22, 0, 0, 0, time.UTC) }
+	// Production deps leave AutoRouteInventory nil → fail closed (no fake matrix).
 	var stdout, stderr bytes.Buffer
-	// --auto-route must work (P4 enabled)
+	code := runRun([]string{
+		"--repo", "acme/demo", "--issue", "1", "--auto-route", "--format", "json", "--dry-run",
+	}, &stdout, &stderr, deps)
+	if code == 0 {
+		t.Fatalf("auto-route without inventory must fail closed; stdout=%s stderr=%s", stdout.String(), stderr.String())
+	}
+	if code != exitRunPrecondition && code != exitRunUsage {
+		t.Fatalf("code=%d want precondition/usage stderr=%s", code, stderr.String())
+	}
+	joined := stdout.String() + stderr.String()
+	if !strings.Contains(joined, "inventory") && !strings.Contains(joined, "no real inventory") && !strings.Contains(joined, "no eligible route") && !strings.Contains(joined, "missing real inventory") {
+		t.Fatalf("expected inventory fail-closed message: %q", joined)
+	}
+	// partial pin still usage error
+	stdout.Reset()
+	stderr.Reset()
+	code = runRun([]string{"--repo", "r", "--issue", "1", "--provider", "fixture"}, &stdout, &stderr, deps)
+	if code != exitRunUsage && code != exitRunPrecondition {
+		t.Fatalf("missing model code=%d stderr=%s", code, stderr.String())
+	}
+}
+
+func TestRunAutoRouteWithInjectedInventorySelects(t *testing.T) {
+	home := t.TempDir()
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LOOPCODER_HOME", home)
+	deps := DefaultDeps()
+	deps.Now = func() time.Time { return time.Date(2026, 7, 22, 22, 0, 0, 0, time.UTC) }
+	inv := autoroute.FakeInventory(deps.Now())
+	deps.AutoRouteInventory = &inv
+	var stdout, stderr bytes.Buffer
 	code := runRun([]string{
 		"--repo", "acme/demo", "--issue", "1", "--auto-route", "--format", "json",
 	}, &stdout, &stderr, deps)
@@ -60,25 +95,12 @@ func TestRunAutoRouteSelectsAndPartialPinFails(t *testing.T) {
 	if acc.Request.Provider == "" || acc.Request.Model == "" {
 		t.Fatalf("auto-route did not fill route: %+v", acc.Request)
 	}
-	if acc.Status != "human_gate" && acc.Status != "dry_run" {
-		// full path should reach human_gate
-		if acc.Status != "human_gate" {
-			t.Fatalf("status=%s msg=%s", acc.Status, acc.Message)
-		}
-	}
 	if !strings.Contains(stderr.String(), "auto-route selected") {
 		t.Fatalf("expected auto-route log on stderr: %q", stderr.String())
 	}
-	// partial pin still usage error
-	stdout.Reset()
-	stderr.Reset()
-	code = runRun([]string{"--repo", "r", "--issue", "1", "--provider", "fixture"}, &stdout, &stderr, deps)
-	if code != exitRunUsage && code != exitRunPrecondition {
-		t.Fatalf("missing model code=%d stderr=%s", code, stderr.String())
-	}
 }
 
-func TestRunOmittedRouteUsesAutoPolicy(t *testing.T) {
+func TestRunOmittedRouteWithoutInventoryFailsClosed(t *testing.T) {
 	home := t.TempDir()
 	if err := os.Chmod(home, 0o700); err != nil {
 		t.Fatal(err)
@@ -87,22 +109,25 @@ func TestRunOmittedRouteUsesAutoPolicy(t *testing.T) {
 	deps := DefaultDeps()
 	deps.Now = func() time.Time { return time.Date(2026, 7, 22, 22, 5, 0, 0, time.UTC) }
 	var stdout, stderr bytes.Buffer
-	// omit provider+model without --auto-route flag: still auto policy
+	// omit provider+model without inventory: auto policy fails closed (honest)
 	code := runRun([]string{
 		"--repo", "acme/demo", "--issue", "2", "--format", "json", "--dry-run",
 	}, &stdout, &stderr, deps)
-	if code != 0 {
-		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	if code == 0 {
+		t.Fatalf("omitted route without inventory must fail closed; out=%s err=%s", stdout.String(), stderr.String())
 	}
-	var acc RunAccepted
-	if err := json.Unmarshal(stdout.Bytes(), &acc); err != nil {
+}
+
+func TestRunCmdSourceDoesNotCallDefaultInventory(t *testing.T) {
+	src, err := os.ReadFile("run_cmd.go")
+	if err != nil {
+		src, err = os.ReadFile(filepath.Join("internal", "cli", "run_cmd.go"))
+	}
+	if err != nil {
 		t.Fatal(err)
 	}
-	if acc.Status != "dry_run" {
-		t.Fatalf("%+v", acc)
-	}
-	if acc.Request.Provider == "" || acc.Request.Model == "" {
-		t.Fatalf("omitted route not filled: %+v", acc.Request)
+	if strings.Contains(string(src), "DefaultInventory") || strings.Contains(string(src), "FakeInventory") {
+		t.Fatal("run_cmd must not call DefaultInventory/FakeInventory; only pass deps.AutoRouteInventory")
 	}
 }
 
