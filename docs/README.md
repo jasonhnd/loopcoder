@@ -88,6 +88,7 @@ Every document is exactly one of these types:
 - [`reference/v0.9.0-quickstart.md`](reference/v0.9.0-quickstart.md): V090-080 v0.9.0 install/doctor/ordinary-dev quickstart.
 - [`reference/support-bundle.md`](reference/support-bundle.md): V090-101 redacted diagnostic support bundle and no-telemetry default.
 - [`reference/darwin-arm64-packaging.md`](reference/darwin-arm64-packaging.md): V090-081 Darwin arm64 packaging, signing, and update metadata.
+- [`reference/install-migration-smoke.md`](reference/install-migration-smoke.md): V090-082 exact-artifact install, migration, and cleanup smoke.
 - [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
 - [`reference/v09-home-layout.md`](reference/v09-home-layout.md): global `$LOOPCODER_HOME` layout and owner-only creation.
 - [`reference/project-authority-store.md`](reference/project-authority-store.md): project.db domain tables and immutable events.
