@@ -161,7 +161,9 @@ var commands = []Command{
 	{Name: "trigger", Summary: "run automation triggers for tick (compatibility)"},
 	{Name: "promote", Summary: "promote pre-prod to main"},
 	{Name: "upgrade", Summary: "self-update from GitHub Releases"},
-	{Name: "migrate", Summary: "plan storage upgrades or import legacy repo-local state"},
+	{Name: "migrate", Summary: "plan storage upgrades, v0.8 export, and v0.9 import"},
+	{Name: "export-v08", Summary: "compatibility alias for migrate export-v08 (read-only v0.8 export)"},
+	{Name: "import-v09", Summary: "compatibility alias for migrate import-v09 (dry-run default)"},
 	{Name: "skill", Summary: "install bundled playbook skill files"},
 	{Name: "dispatch", Summary: "dispatch one issue worker (compatibility)"},
 	{Name: "nested", Summary: "submit and execute a nested child plan (compatibility)"},
@@ -543,6 +545,12 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "migrate" {
 		return runMigrate(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "export-v08" {
+		return runMigrateExportV08(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "import-v09" {
+		return runMigrateImportV09(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "skill" {
 		return runSkill(args[1:], stdout, stderr, deps)
@@ -1579,6 +1587,10 @@ func runMigrate(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return runMigrateLocalState(args[1:], stdout, stderr, deps)
 	case "storage":
 		return runMigrateStorage(args[1:], stdout, stderr, deps)
+	case "export-v08":
+		return runMigrateExportV08(args[1:], stdout, stderr, deps)
+	case "import-v09":
+		return runMigrateImportV09(args[1:], stdout, stderr, deps)
 	default:
 		fmt.Fprintf(stderr, "migrate: unknown subcommand %q\n\n", args[0])
 		printMigrateHelp(stderr)
@@ -1590,18 +1602,27 @@ func printMigrateHelp(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  loopcoder migrate local-state --repo <path> [--dry-run] [--format text|json]")
 	fmt.Fprintln(w, "  loopcoder migrate storage [--database <path>] [--apply] [--format text|json]")
+	fmt.Fprintln(w, "  loopcoder migrate export-v08 --export-dir <path> [--source-dir <path>|--fixture] [--format text|json]")
+	fmt.Fprintln(w, "  loopcoder migrate import-v09 --export-dir <path> [--apply] [--format text|json]")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Plan or apply machine-local storage changes.")
+	fmt.Fprintln(w, "Plan or apply machine-local storage changes and v0.8→v0.9 migration.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Subcommands:")
 	fmt.Fprintln(w, "  local-state   import v0.6.x repo-local run, relay, recovery, and report records")
 	fmt.Fprintln(w, "  storage       plan or apply the v0.7-to-v0.8 SQLite schema migration")
+	fmt.Fprintln(w, "  export-v08    read-only v0.8 export to a neutral bundle (outside customer repo)")
+	fmt.Fprintln(w, "  import-v09    dry-run or apply v0.9 import from an export-v08 bundle")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Compatibility aliases: loopcoder export-v08 / loopcoder import-v09")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
 	fmt.Fprintln(w, "  --repo        repository path for local-state (default \".\")")
 	fmt.Fprintln(w, "  --dry-run     scan without writing machine-local storage")
 	fmt.Fprintln(w, "  --database    SQLite path for storage (default LOOPCODER_HOME/data/loopcoder.db)")
-	fmt.Fprintln(w, "  --apply       apply the storage plan; omitted means read-only planning")
+	fmt.Fprintln(w, "  --apply       apply the storage/import plan; omitted means dry-run/planning")
+	fmt.Fprintln(w, "  --export-dir  destination (export) or source (import) for v0.8 bundles")
+	fmt.Fprintln(w, "  --source-dir  directory of v0.8 JSON sources for export-v08")
+	fmt.Fprintln(w, "  --fixture     use built-in representative v0.8 sources for export-v08")
 	fmt.Fprintln(w, "  --format      output format: text or json (default \"text\")")
 	fmt.Fprintln(w, "  --help        show command help")
 }
