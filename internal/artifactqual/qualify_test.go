@@ -185,8 +185,9 @@ func TestValidateRenderedAckFailClosed(t *testing.T) {
 	}
 }
 
-func TestExecutableQualificationScorecardHasNoNotRun(t *testing.T) {
-	// Rebuild-focused: only when archive script exists; asserts scorecard go=true
+func TestExecutableQualificationWithoutCanaryFailsClosed(t *testing.T) {
+	// Without --canary-evidence, real_runtime required metrics must be not_run
+	// and scorecard_go=false. Dry-run structural probes alone are insufficient.
 	root, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -232,20 +233,30 @@ func TestExecutableQualificationScorecardHasNoNotRun(t *testing.T) {
 		ArchivePath: archive, ExpectedDigest: wantDigest,
 		SHA: commit, WorkDir: t.TempDir(),
 		IntegrationVerifyOK: true, IntegrationCanaryOK: true,
+		// intentionally NO CanaryEvidencePath
 		Now: time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	notRun := 0
 	for _, m := range ev.Scorecard.Metrics {
-		if m.Verdict == "not_run" {
-			t.Fatalf("required metric still not_run: %+v", m)
+		switch m.ID {
+		case "multi_depth_routing", "unavailable_route_exclude", "multi_provider_execution",
+			"capacity_after_runtime", "forced_restart_ceilings", "real_pr_human_gate":
+			if m.Verdict != "not_run" {
+				t.Fatalf("real_runtime %s verdict=%s want not_run", m.ID, m.Verdict)
+			}
+			notRun++
 		}
 	}
-	if !ev.Scorecard.GO || ev.Scorecard.Overall != "pass" {
-		t.Fatalf("scorecard not GO: overall=%s go=%v reasons=%v", ev.Scorecard.Overall, ev.Scorecard.GO, ev.Scorecard.Reasons)
+	if notRun < 6 {
+		t.Fatalf("want 6 real_runtime not_run, got %d", notRun)
 	}
-	if !ev.Passed {
-		t.Fatalf("harness not passed: reasons=%v", ev.Reasons)
+	if ev.Scorecard.GO {
+		t.Fatal("scorecard_go must be false without real canary evidence")
+	}
+	if ev.Passed {
+		t.Fatal("harness must not pass without real canary evidence")
 	}
 }

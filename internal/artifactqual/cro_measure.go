@@ -13,20 +13,25 @@ import (
 	"time"
 )
 
-// CROMeasurement holds product-path routing/decomposition/capacity evidence
-// measured against the exact built binary (V090-CRO-010 / #1343).
+// CROMeasurement holds structural (dry-run / plan / snapshot) prechecks only.
+// Real multi-provider execution, depth invocation, capacity after, unavailable
+// retry, restart, and PR gates require CanaryEvidence — never dry-run.
 type CROMeasurement struct {
-	RoutingOK            bool
-	DecomposeOK          bool
-	AccountingOK         bool
-	MultiDepthOK         bool // ≥2 of low/medium/high bound in requirement→invocation
-	UnavailableExcludeOK bool // exhausted/stale account not selected for write
-	ProvidersSeen        []string
-	DepthsSeen           []string
-	ChildCount           int
-	EvidenceRefs         map[string]string
-	Probes               []Probe
-	MultiProviderOK      bool
+	RoutingOK    bool // structural auto-route path
+	DecomposeOK  bool // structural plan ≥4 children
+	AccountingOK bool // structural capacity policy path
+	// StructuralDepthPlanOK: plan emits depth=low and depth=high requirements.
+	// NOT real runtime depth binding.
+	StructuralDepthPlanOK bool
+	// StructuralExcludeOK: injected snapshot routing does not select exhausted.
+	// NOT real unavailable retry / no-dup execution evidence.
+	StructuralExcludeOK bool
+	ProvidersSeen       []string
+	DepthsSeen          []string
+	ChildCount          int
+	EvidenceRefs        map[string]string
+	Probes              []Probe
+	MultiProviderOK     bool // catalog/status presence only (structural)
 }
 
 // MeasureCROFromBinary runs the extracted binary for workflow plan + auto-route
@@ -115,41 +120,32 @@ func MeasureCROFromBinary(bin, workDir string, envBase []string) (CROMeasurement
 		}
 	}
 
-	// 4) Goal dry-run: bind required depths + multi-provider inventory (exact binary).
-	// Requires #1363 depth bind evidence: requirement→selection→invocation.
+	// 4) Structural only: plan carries multi-depth requirements (low+high).
+	// Dry-run route preview may show requirement→selection text, but that is
+	// NOT real provider execution and MUST NOT set real_runtime multi_depth.
+	hasLow := strings.Contains(string(planOut), "depth=low")
+	hasHigh := strings.Contains(string(planOut), "depth=high")
+	out.StructuralDepthPlanOK = hasLow && hasHigh
+	if out.StructuralDepthPlanOK {
+		out.DepthsSeen = uniqueStrings(append(out.DepthsSeen, "low", "high"))
+		out.EvidenceRefs["structural_depth_plan"] = "probe:workflow_plan_depth_requirements"
+	}
 	t3 := time.Now()
 	goalOut, goalErr, goalCode := runBin(bin, env, workDir, "workflow", "goal",
 		"--goal", "implement multi-provider capacity-aware routing with tests and verification",
 		"--issue", "1343", "--format", "human", "--dry-run",
 		"--repo", workDir,
 		"--capacity-snapshot", snapPath)
-	// Note: dry-run flag may need to be supported — if not, parse plan depths only.
 	goalCombined := string(goalOut) + string(goalErr)
+	// Structural probe only — never claim real multi-depth runtime.
 	out.Probes = append(out.Probes, Probe{
-		Name: "cro_goal_dry_run_depth", ExitCode: goalCode, Passed: goalCode == 0,
+		Name: "structural_goal_dry_run", ExitCode: goalCode, Passed: goalCode == 0 || goalCode == 1,
 		Duration: time.Since(t3), OutputDigest: digestBytes([]byte(goalCombined)),
-		Reasons: reasonsIf(goalCode != 0, truncate(goalCombined, 200)),
+		Reasons: []string{"structural_only: dry-run cannot satisfy real_runtime multi_depth/capacity_after/PR metrics"},
 	})
-	// Depth matrix from plan requirements + dry-run route reasons.
-	hasLow := strings.Contains(string(planOut), "depth=low") || strings.Contains(goalCombined, "depth requirement=low")
-	hasHigh := strings.Contains(string(planOut), "depth=high") || strings.Contains(goalCombined, "depth requirement=high")
-	bindLow := strings.Contains(goalCombined, "depth requirement=low") && strings.Contains(goalCombined, "invocation=low")
-	bindHigh := strings.Contains(goalCombined, "depth requirement=high") && strings.Contains(goalCombined, "invocation=high")
-	out.MultiDepthOK = hasLow && hasHigh && (bindLow || bindHigh || (hasLow && hasHigh && goalCode != 0))
-	// Prefer real bind evidence when dry-run works.
-	if goalCode == 0 {
-		out.MultiDepthOK = bindLow && bindHigh
-		if out.MultiDepthOK {
-			out.EvidenceRefs["multi_depth"] = "probe:goal_dry_run_depth_bind"
-			out.DepthsSeen = uniqueStrings(append(out.DepthsSeen, "low", "high"))
-		}
-	} else if hasLow && hasHigh {
-		// Plan always carries multi-depth requirements; bind still required for pass.
-		out.MultiDepthOK = false
-		out.EvidenceRefs["multi_depth"] = "probe:plan_depths_only_bind_unmeasured"
-	}
 
-	// 5) Unavailable/exhausted exclusion: snapshot with exhausted codex + healthy AG.
+	// 5) Structural only: injected exhausted snapshot routing (deterministic).
+	// NOT real unavailable retry / no-dup claim evidence.
 	exPath := filepath.Join(workDir, "cro-exhausted-snapshot.json")
 	if err := writeCROExhaustedSnapshot(exPath); err != nil {
 		return out, err
@@ -161,41 +157,29 @@ func MeasureCROFromBinary(bin, workDir string, envBase []string) (CROMeasurement
 		"--ui-required", "terminal",
 		"--capacity-snapshot", exPath)
 	exCombined := string(exOut) + string(exErr)
-	// Write-capable path must not select exhausted codex when AG remains.
 	selectedCodexOnly := strings.Contains(exCombined, "auto-route selected codex") &&
 		!strings.Contains(exCombined, "antigravity")
-	out.UnavailableExcludeOK = exCode == 0 && !selectedCodexOnly &&
-		(strings.Contains(exCombined, "antigravity") || strings.Contains(exCombined, "ResourceFit") ||
-			strings.Contains(exCombined, "no eligible") || strings.Contains(exCombined, "auto-route selected"))
-	// Stronger: if a winner is reported for write, it must not be exhausted codex alone.
-	if strings.Contains(exCombined, "Winner:") && strings.Contains(exCombined, "codex") &&
-		!strings.Contains(exCombined, "antigravity") {
-		out.UnavailableExcludeOK = false
-	}
+	out.StructuralExcludeOK = exCode == 0 && !selectedCodexOnly
 	if strings.Contains(exCombined, "antigravity") {
-		out.UnavailableExcludeOK = true
-		out.EvidenceRefs["unavailable_exclude"] = "probe:exhausted_route_excluded"
+		out.StructuralExcludeOK = true
+		out.EvidenceRefs["structural_exclude"] = "probe:structural_exhausted_route_inventory"
 	}
 	out.Probes = append(out.Probes, Probe{
-		Name: "cro_unavailable_exclude", ExitCode: exCode, Passed: out.UnavailableExcludeOK,
+		Name: "structural_unavailable_inventory", ExitCode: exCode, Passed: out.StructuralExcludeOK,
 		Duration: time.Since(t4), OutputDigest: digestBytes([]byte(exCombined)),
-		Reasons: reasonsIf(!out.UnavailableExcludeOK, "exhausted/stale exclusion not measured: "+truncate(exCombined, 200)),
+		Reasons: []string{"structural_only: snapshot dry-run cannot satisfy real_runtime unavailable_retry metrics"},
 	})
 
+	// Structural failures are soft for measure return (recorded as probes).
+	// real_runtime required metrics come only from CanaryEvidence.
 	if !out.DecomposeOK {
-		return out, fmt.Errorf("artifactqual: workgraph decomposition not measured (≥4 children)")
+		return out, fmt.Errorf("artifactqual: structural workgraph decomposition not measured (≥4 children)")
 	}
 	if !out.RoutingOK {
-		return out, fmt.Errorf("artifactqual: useful-capacity routing path not measured")
+		return out, fmt.Errorf("artifactqual: structural useful-capacity routing path not measured")
 	}
 	if !out.AccountingOK {
-		return out, fmt.Errorf("artifactqual: capacity accounting path not measured")
-	}
-	if !out.MultiDepthOK {
-		return out, fmt.Errorf("artifactqual: multi-depth requirement→invocation not measured (need low+high bind)")
-	}
-	if !out.UnavailableExcludeOK {
-		return out, fmt.Errorf("artifactqual: unavailable/exhausted route exclusion not measured")
+		return out, fmt.Errorf("artifactqual: structural capacity accounting path not measured")
 	}
 	return out, nil
 }

@@ -18,8 +18,10 @@ func greenObs() []releaseslo.MetricObservation {
 		releaseslo.MetricStopJoin, releaseslo.MetricRepoLocalState, releaseslo.MetricRouteSubstitution,
 		releaseslo.MetricDeliveryReplay, releaseslo.MetricResources, releaseslo.MetricRedaction,
 		releaseslo.MetricMigration, releaseslo.MetricArtifact,
-		releaseslo.MetricUsefulCapacityRouting, releaseslo.MetricWorkgraphDecompose, releaseslo.MetricCapacityAccounting,
+		// real_runtime required
 		releaseslo.MetricMultiDepthRouting, releaseslo.MetricUnavailableRouteExclude,
+		releaseslo.MetricMultiProviderExecution, releaseslo.MetricCapacityAfterRuntime,
+		releaseslo.MetricForcedRestartCeilings, releaseslo.MetricRealPRHumanGate,
 	}
 	var obs []releaseslo.MetricObservation
 	for _, id := range ids {
@@ -53,22 +55,41 @@ func TestMissingMetricNotPass(t *testing.T) {
 	}
 }
 
-func TestMultiDepthAndUnavailableRequiredNotRunFailClosed(t *testing.T) {
-	// Drop the two new #1343 core metrics → scorecard must not GO (mechanical false green forbidden).
-	var obs []releaseslo.MetricObservation
-	for _, o := range greenObs() {
-		if o.ID == releaseslo.MetricMultiDepthRouting || o.ID == releaseslo.MetricUnavailableRouteExclude {
-			continue
-		}
-		obs = append(obs, o)
+func TestRealRuntimeNotRunFailClosedWithoutCanary(t *testing.T) {
+	// Structural-only observations: no real_runtime metrics → GO false.
+	ok := releaseslo.Bool(true)
+	obs := []releaseslo.MetricObservation{
+		{ID: releaseslo.MetricStopJoin, BoolOK: ok, EvidenceRef: "e"},
+		{ID: releaseslo.MetricRepoLocalState, BoolOK: ok, EvidenceRef: "e"},
+		{ID: releaseslo.MetricRouteSubstitution, BoolOK: ok, EvidenceRef: "e"},
+		{ID: releaseslo.MetricDeliveryReplay, BoolOK: ok, EvidenceRef: "e"},
+		{ID: releaseslo.MetricResources, BoolOK: ok, EvidenceRef: "e"},
+		{ID: releaseslo.MetricRedaction, BoolOK: ok, EvidenceRef: "e"},
+		{ID: releaseslo.MetricMigration, BoolOK: ok, EvidenceRef: "e"},
+		{ID: releaseslo.MetricArtifact, BoolOK: ok, EvidenceRef: "e"},
+		{ID: releaseslo.MetricStartReportLatency, ObservedMs: 1000, EvidenceRef: "e"},
+		{ID: releaseslo.MetricReportInterval, ObservedMs: 2000, EvidenceRef: "e"},
+		{ID: releaseslo.MetricRenderedAck, ObservedMs: 500, EvidenceRef: "e"},
+		{ID: releaseslo.MetricStatusFreshness, ObservedMs: 800, EvidenceRef: "e"},
+		{ID: releaseslo.MetricProcessLeaks, ObservedCount: 0, EvidenceRef: "e"},
+		// structural only (not required)
+		{ID: releaseslo.MetricStructuralDepthPlan, BoolOK: ok, EvidenceRef: "structural"},
+		{ID: releaseslo.MetricUsefulCapacityRouting, BoolOK: ok, EvidenceRef: "structural"},
+		// real_runtime explicitly not_run
+		{ID: releaseslo.MetricMultiDepthRouting, NotRun: true},
+		{ID: releaseslo.MetricUnavailableRouteExclude, NotRun: true},
+		{ID: releaseslo.MetricMultiProviderExecution, NotRun: true},
+		{ID: releaseslo.MetricCapacityAfterRuntime, NotRun: true},
+		{ID: releaseslo.MetricForcedRestartCeilings, NotRun: true},
+		{ID: releaseslo.MetricRealPRHumanGate, NotRun: true},
 	}
 	sc := releaseslo.Compile(releaseslo.Candidate{SHA: "a", ArchiveDigest: "b"}, obs, releaseslo.DefaultThresholds(), nil, fixed())
 	if sc.GO {
-		t.Fatal("missing multi_depth/unavailable metrics must not scorecard_go")
+		t.Fatal("dry-run/structural-only must not scorecard_go")
 	}
 	found := false
 	for _, r := range sc.Reasons {
-		if strings.Contains(r, "multi_depth_routing=not_run") || strings.Contains(r, "unavailable_route_exclude=not_run") {
+		if strings.Contains(r, "multi_depth_routing=not_run") || strings.Contains(r, "real_pr_human_gate=not_run") {
 			found = true
 		}
 	}
@@ -92,7 +113,6 @@ func TestStaleAndNotRun(t *testing.T) {
 
 func TestWaiverApproved(t *testing.T) {
 	obs := greenObs()
-	// force fail process leaks
 	for i := range obs {
 		if obs[i].ID == releaseslo.MetricProcessLeaks {
 			obs[i].ObservedCount = 2
