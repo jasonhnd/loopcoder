@@ -42,10 +42,18 @@ func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 		var rem *float64
 		var ttr *time.Duration
 		confSoft := quotapolicy.EvidenceUnknown
+		hasFreshWindow := false
+		hasStaleWindow := false
+		hasAnyWindow := false
 		for _, w := range a.Windows {
+			hasAnyWindow = true
+			if w.Freshness == FreshnessStale || w.Freshness == FreshnessExpired {
+				hasStaleWindow = true
+			}
 			if w.Freshness != FreshnessFresh {
 				continue
 			}
+			hasFreshWindow = true
 			if f := RemainingFraction(w); f != nil {
 				rem = f
 				switch w.Confidence {
@@ -64,6 +72,10 @@ func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 				break
 			}
 		}
+		staleOnly := hasStaleWindow && !hasFreshWindow
+		// Stale/expired-only windows: hard-exclude via stale health evidence (no silent use).
+		// Exhausted remaining (0): hard-exclude via ResourceFit false (no invent capacity).
+		// Cooldown already hard-excluded via CooldownActive.
 		roOK, writeOK := providerPermissionSupportFixed(a.Provider)
 		for _, m := range a.Models {
 			if !m.PresentInCatalog || m.ModelID == "" {
@@ -87,6 +99,21 @@ func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 			if a.CooldownActive {
 				cooldownFact = factBool(true, "cd-"+a.Provider)
 			}
+			healthyFact := factBool(a.Healthy, "health-"+a.Provider)
+			if staleOnly && rem == nil {
+				healthyFact = eligibility.Fact{
+					State: eligibility.FactTrue, EvidenceID: "health-stale-" + a.Provider,
+					Freshness: eligibility.FreshStale,
+				}
+			}
+			resFit := factBool(true, "res-"+a.Provider)
+			if rem != nil && *rem <= 0 {
+				resFit = factBool(false, "res-exhausted-"+a.Provider)
+			}
+			if hasAnyWindow && rem == nil && !staleOnly {
+				// Window present but no usable remaining → unfit (not invented full).
+				resFit = factBool(false, "res-unknown-remaining-"+a.Provider)
+			}
 			for _, effort := range depths {
 				base := eligibility.Candidate{
 					Provider: a.Provider, Model: m.ModelID, Effort: effort,
@@ -95,9 +122,9 @@ func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 					Authenticated:  factBool(a.Authenticated, "auth-"+a.Provider),
 					ModelPresent:   factBool(true, "model-"+a.Provider+"-"+m.ModelID),
 					EffortOK:       factBool(true, "effort-"+a.Provider+"-"+effort),
-					Healthy:        factBool(a.Healthy, "health-"+a.Provider),
+					Healthy:        healthyFact,
 					CooldownActive: cooldownFact,
-					ResourceFit:    factBool(true, "res-"+a.Provider),
+					ResourceFit:    resFit,
 					QuotaRemaining: quotaRemainingUnits(rem),
 				}
 				// Emit permission-specific candidates. PermissionOK is a hard gate.
