@@ -879,40 +879,78 @@ func applyChildOutcomes(children []ChildReport, wres workflowrun.Result, ledger 
 		// Always try fresh post-run remaining → after (source-tagged).
 		// Required by #1343: after must not be n/a when observation exists.
 		if children[i].CapacityAfter == nil {
-			if rem, src, fr := remainingForProvider(postSnap, children[i].Provider); rem != nil {
-				if entry, err := ledger.ObserveAfter(h.projectID, h.runID, h.attemptID, *rem, src, fr); err == nil {
+			// Bind after to the same account+window as the reservation (fail closed).
+			var reserved *capacityledger.Entry
+			if e, ok := ledger.Get(h.projectID, h.runID, h.attemptID); ok {
+				reserved = &e
+			}
+			acc, win := "", ""
+			if reserved != nil {
+				acc, win = reserved.AccountRef, reserved.WindowKind
+			}
+			if rem, src, fr, resetEv, okMatch := remainingForProviderWindow(postSnap, children[i].Provider, acc, win); rem != nil && okMatch {
+				opts := capacityledger.ObserveAfterOpts{AccountRef: acc, WindowKind: win}
+				if resetEv != "" {
+					opts.ResetObserved = true
+					opts.ResetEvidence = resetEv
+				}
+				if entry, err := ledger.ObserveAfterBound(h.projectID, h.runID, h.attemptID, *rem, src, fr, opts); err == nil {
 					children[i].CapacityAfter = entry.After
-					children[i].CapacityNote += "; after_source=" + src + "; after_freshness=" + fr
+					children[i].CapacityNote += "; after_source=" + src + "; after_freshness=" + fr + "; after_window=" + win
+				} else {
+					children[i].CapacityNote += "; after_rejected=" + err.Error()
 				}
 			} else {
-				children[i].CapacityNote += "; after_observation=unavailable"
+				children[i].CapacityNote += "; after_observation=unavailable_or_window_mismatch"
 			}
 		}
 	}
 	return children
 }
 
-// remainingForProvider returns the first usable remaining fraction for provider
-// from a fresh snapshot (exact/estimated). Never invents values.
-func remainingForProvider(snap *capacitysnapshot.Snapshot, provider string) (rem *float64, source, freshness string) {
+// remainingForProviderWindow prefers the same account_ref + window_kind as the
+// reservation. ok=false when no matching window is available.
+// resetEvidence is non-empty when the observation indicates a reset boundary.
+func remainingForProviderWindow(snap *capacitysnapshot.Snapshot, provider, accountRef, windowKind string) (rem *float64, source, freshness, resetEvidence string, ok bool) {
 	if snap == nil || strings.TrimSpace(provider) == "" {
-		return nil, "", ""
+		return nil, "", "", "", false
 	}
+	accountRef = strings.TrimSpace(accountRef)
+	windowKind = strings.TrimSpace(windowKind)
 	for _, a := range snap.Accounts {
 		if !strings.EqualFold(a.Provider, provider) {
 			continue
 		}
+		if accountRef != "" {
+			// AccountRef on entry may be redacted; match suffix or equal fold.
+			ar := strings.TrimSpace(a.AccountRef)
+			if ar != "" && !strings.EqualFold(ar, accountRef) &&
+				!strings.HasSuffix(accountRef, ar) && !strings.HasSuffix(ar, accountRef) &&
+				!strings.Contains(accountRef, ar) {
+				continue
+			}
+		}
 		for _, w := range a.Windows {
+			if windowKind != "" && !strings.EqualFold(string(w.Kind), windowKind) {
+				continue
+			}
 			if f := capacitysnapshot.RemainingFraction(w); f != nil {
 				src := strings.TrimSpace(w.Source)
 				if src == "" {
 					src = "capacity_snapshot"
 				}
-				return f, src, string(w.Freshness)
+				// Reset evidence: snapshot window reset_at in the past relative to capture
+				// is not sufficient alone; only tag when source explicitly mentions reset.
+				resetEv := ""
+				blob := strings.ToLower(src + " " + string(w.Freshness))
+				if strings.Contains(blob, "reset") {
+					resetEv = src
+				}
+				return f, src, string(w.Freshness), resetEv, true
 			}
 		}
 	}
-	return nil, "", ""
+	return nil, "", "", "", false
 }
 
 func collectUsage(children []ChildReport) (providers, models, depths []string) {
