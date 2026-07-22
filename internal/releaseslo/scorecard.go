@@ -11,7 +11,7 @@ import (
 const SchemaScorecard = "loopcoder.releaseslo.scorecard.v1"
 
 // CalcVersion of the scorecard algorithm.
-const CalcVersion = "v090-102.1"
+const CalcVersion = "v090-103.0"
 
 // MetricID is one scored dimension.
 type MetricID string
@@ -30,6 +30,10 @@ const (
 	MetricRedaction          MetricID = "redaction"
 	MetricMigration          MetricID = "migration"
 	MetricArtifact           MetricID = "artifact"
+	// CRO product metrics (V090-CRO-010 / #1343) — required, fail closed if not_run.
+	MetricUsefulCapacityRouting MetricID = "useful_capacity_routing"
+	MetricWorkgraphDecompose    MetricID = "workgraph_decomposition"
+	MetricCapacityAccounting    MetricID = "capacity_accounting"
 )
 
 // Verdict for one metric.
@@ -159,6 +163,7 @@ func Compile(cand Candidate, obs []MetricObservation, th Thresholds, waivers []W
 		MetricStartReportLatency, MetricReportInterval, MetricRenderedAck, MetricStatusFreshness,
 		MetricStopJoin, MetricProcessLeaks, MetricRepoLocalState, MetricRouteSubstitution,
 		MetricDeliveryReplay, MetricResources, MetricRedaction, MetricMigration, MetricArtifact,
+		MetricUsefulCapacityRouting, MetricWorkgraphDecompose, MetricCapacityAccounting,
 	}
 
 	allPass := true
@@ -211,7 +216,8 @@ func scoreOne(id MetricID, o MetricObservation, has bool, th Thresholds, w Waive
 	// Boolean metrics
 	switch id {
 	case MetricStopJoin, MetricRepoLocalState, MetricRouteSubstitution, MetricDeliveryReplay,
-		MetricResources, MetricRedaction, MetricMigration, MetricArtifact:
+		MetricResources, MetricRedaction, MetricMigration, MetricArtifact,
+		MetricUsefulCapacityRouting, MetricWorkgraphDecompose, MetricCapacityAccounting:
 		mr.Threshold = "ok=true"
 		if o.BoolOK != nil && *o.BoolOK {
 			mr.Verdict = VerdictPass

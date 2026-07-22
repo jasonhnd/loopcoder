@@ -74,19 +74,20 @@ func runRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
-		repo       = fs.String("repo", "", "repository path or owner/name")
-		issue      = fs.String("issue", "", "issue number or URL")
-		provider   = fs.String("provider", "", "explicit provider pin (omit both provider+model for auto-route)")
-		model      = fs.String("model", "", "explicit model pin")
-		effort     = fs.String("effort", "", "explicit effort")
-		permission = fs.String("permission", "default", "explicit permission profile")
-		base       = fs.String("base", "pre-prod", "base branch")
-		requiredUI = fs.String("ui-required", "terminal", "comma-separated required UI clients")
-		optionalUI = fs.String("ui-optional", "", "comma-separated optional UI clients")
-		detach     = fs.Bool("detach", false, "explicit per-run detach (default foreground)")
-		dryRun     = fs.Bool("dry-run", false, "normalize and report without mutation")
-		format     = fs.String("format", "human", "human|json|jsonl")
-		autoRoute  = fs.Bool("auto-route", false, "enable automatic route selection from inventory evidence")
+		repo        = fs.String("repo", "", "repository path or owner/name")
+		issue       = fs.String("issue", "", "issue number or URL")
+		provider    = fs.String("provider", "", "explicit provider pin (omit both provider+model for auto-route)")
+		model       = fs.String("model", "", "explicit model pin")
+		effort      = fs.String("effort", "", "explicit effort")
+		permission  = fs.String("permission", "default", "explicit permission profile")
+		base        = fs.String("base", "pre-prod", "base branch")
+		requiredUI  = fs.String("ui-required", "terminal", "comma-separated required UI clients")
+		optionalUI  = fs.String("ui-optional", "", "comma-separated optional UI clients")
+		detach      = fs.Bool("detach", false, "explicit per-run detach (default foreground)")
+		dryRun      = fs.Bool("dry-run", false, "normalize and report without mutation")
+		format      = fs.String("format", "human", "human|json|jsonl")
+		autoRoute   = fs.Bool("auto-route", false, "enable automatic route selection from inventory evidence")
+		capSnapPath = fs.String("capacity-snapshot", "", "optional path to capacitysnapshot JSON (release measure / offline qualify)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return exitRunUsage
@@ -99,6 +100,26 @@ func runRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		RequiredUI: splitCSV(*requiredUI), OptionalUI: splitCSV(*optionalUI),
 		Detach: *detach, DryRun: *dryRun, Format: strings.ToLower(strings.TrimSpace(*format)),
 		AutoRoute: *autoRoute,
+	}
+	// Load optional capacity snapshot for offline exact-artifact measure (not a silent fake matrix).
+	if p := strings.TrimSpace(*capSnapPath); p != "" {
+		raw, rerr := os.ReadFile(p)
+		if rerr != nil {
+			fmt.Fprintf(stderr, "run: capacity-snapshot read: %v\n", rerr)
+			return exitRunUsage
+		}
+		var snap capacitysnapshot.Snapshot
+		if jerr := json.Unmarshal(raw, &snap); jerr != nil {
+			fmt.Fprintf(stderr, "run: capacity-snapshot json: %v\n", jerr)
+			return exitRunUsage
+		}
+		deps.LastCapacitySnapshot = &snap
+		if inv, ierr := capacitysnapshot.ToRouteInventory(snap, time.Now().UTC()); ierr == nil {
+			deps.AutoRouteInventory = &inv
+		} else {
+			fmt.Fprintf(stderr, "run: capacity-snapshot not routeable: %v\n", ierr)
+			return exitRunPrecondition
+		}
 	}
 	if req.Format == "" {
 		req.Format = "human"

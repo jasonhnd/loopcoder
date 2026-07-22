@@ -17,6 +17,7 @@ func greenObs() []releaseslo.MetricObservation {
 		releaseslo.MetricStopJoin, releaseslo.MetricRepoLocalState, releaseslo.MetricRouteSubstitution,
 		releaseslo.MetricDeliveryReplay, releaseslo.MetricResources, releaseslo.MetricRedaction,
 		releaseslo.MetricMigration, releaseslo.MetricArtifact,
+		releaseslo.MetricUsefulCapacityRouting, releaseslo.MetricWorkgraphDecompose, releaseslo.MetricCapacityAccounting,
 	}
 	var obs []releaseslo.MetricObservation
 	for _, id := range ids {
