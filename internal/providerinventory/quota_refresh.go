@@ -683,11 +683,27 @@ func normalizeRefreshPolicy(policy RefreshPolicy) RefreshPolicy {
 	if policy.ApproachingResetWithin <= 0 {
 		policy.ApproachingResetWithin = 2 * time.Minute
 	}
+	// ProviderTimeout must cover the slowest official quota probe. Claude's
+	// rendered-usage PTY is claudeQuotaTimeout (45s); leave headroom for
+	// process setup. A 20s default previously killed Claude mid-probe and
+	// left multi-provider auto-route with only codex usable windows.
+	// Only apply defaults when unset (≤0); explicit short timeouts in tests
+	// must remain fail-closed and must not be silently raised.
 	if policy.ProviderTimeout <= 0 {
-		policy.ProviderTimeout = 20 * time.Second
+		policy.ProviderTimeout = claudeQuotaTimeout + 15*time.Second
+		if policy.ProviderTimeout < 90*time.Second {
+			policy.ProviderTimeout = 90 * time.Second
+		}
 	}
+	// Global wall clock for the whole refresh wave. With MaxParallelism=2 and
+	// several adapters, keep room for one slow Claude probe without
+	// ErrQuotaRefreshDeadlineExceeded wiping other providers' results.
 	if policy.GlobalDeadline <= 0 {
-		policy.GlobalDeadline = 45 * time.Second
+		policy.GlobalDeadline = 3 * time.Minute
+		minGlobal := policy.ProviderTimeout + 30*time.Second
+		if policy.GlobalDeadline < minGlobal {
+			policy.GlobalDeadline = minGlobal
+		}
 	}
 	if policy.MaxParallelism <= 0 {
 		policy.MaxParallelism = 2

@@ -15,10 +15,13 @@ import (
 
 const (
 	claudeQuotaSourceSchema = "claude.rendered_usage_status.v1"
-	claudeQuotaTimeout      = 45 * time.Second
-	claudeQuotaOutputBytes  = 64 * 1024
-	claudeQuotaColumns      = 100
-	claudeQuotaRows         = 30
+	// Interactive /usage needs headroom after cold start + auth seed.
+	claudeQuotaTimeout     = 90 * time.Second
+	claudeQuotaOutputBytes = 64 * 1024
+	claudeQuotaColumns     = 100
+	claudeQuotaRows        = 30
+	// Delay before slash commands so the TUI can finish bootstrapping.
+	claudeQuotaInputDelay = 3 * time.Second
 )
 
 var (
@@ -204,9 +207,13 @@ func claudeQuotaSource(now time.Time) QuotaTelemetrySource {
 }
 
 func claudeQuotaSourceArgv() []string {
+	// Keep tool denylist aligned with current Claude Code tool names only.
+	// Obsolete names (MultiEdit, LS, …) emit startup warnings and slow the
+	// interactive surface that hosts /usage.
 	return []string{
 		"claude",
-		"--disallowedTools", "Bash,Edit,MultiEdit,Write,Read,Glob,Grep,LS,Task,WebFetch,WebSearch,NotebookRead,NotebookEdit",
+		"--bare",
+		"--disallowedTools", "Bash,Edit,Write,Read,Glob,Grep,Task,WebFetch,WebSearch,NotebookEdit",
 		"--mcp-config", "loopcoder-empty-mcp.json",
 		"--strict-mcp-config",
 	}
@@ -252,6 +259,14 @@ func prepareClaudeQuotaSandbox(executable string, deps Deps) (string, []string, 
 			return "", nil, nil, func() {}, err
 		}
 	}
+	// Seed allowlisted Claude auth/config files into the private HOME so
+	// interactive /usage can complete. Without this, the PTY hangs on login
+	// because credentials live under ~/.claude and env secrets are denied.
+	// File contents never enter probe records (output is redacted separately).
+	if err := seedClaudeQuotaAuthHome(filepath.Join(root, "home"), deps); err != nil {
+		cleanup()
+		return "", nil, nil, func() {}, err
+	}
 	mcpPath := filepath.Join(root, "loopcoder-empty-mcp.json")
 	if err := deps.WriteFile(mcpPath, []byte(`{"mcpServers":{}}`+"\n"), 0o600); err != nil {
 		cleanup()
@@ -266,6 +281,60 @@ func prepareClaudeQuotaSandbox(executable string, deps Deps) (string, []string, 
 	}
 	env := claudeQuotaEnvironment(deps.Getenv, root)
 	return root, argv, env, cleanup, nil
+}
+
+// seedClaudeQuotaAuthHome copies a minimal allowlist of Claude Code local auth
+// artifacts into the sandbox home. Missing sources are OK (probe will fail
+// closed as before). No credential env vars are introduced.
+func seedClaudeQuotaAuthHome(sandboxHome string, deps Deps) error {
+	if sandboxHome == "" {
+		return errors.New("claude quota sandbox home empty")
+	}
+	realHome := ""
+	if deps.UserHomeDir != nil {
+		if h, err := deps.UserHomeDir(); err == nil {
+			realHome = strings.TrimSpace(h)
+		}
+	}
+	if realHome == "" && deps.Getenv != nil {
+		realHome = strings.TrimSpace(deps.Getenv("HOME"))
+	}
+	if realHome == "" {
+		return nil
+	}
+	srcRoot := filepath.Join(realHome, ".claude")
+	dstRoot := filepath.Join(sandboxHome, ".claude")
+	if err := os.MkdirAll(dstRoot, 0o700); err != nil {
+		return err
+	}
+	// Allowlist only — never copy plugins, agents, memory, or logs.
+	allow := []string{
+		".credentials.json",
+		"settings.json",
+	}
+	for _, name := range allow {
+		src := filepath.Join(srcRoot, name)
+		info, err := os.Lstat(src)
+		if err != nil {
+			continue // optional
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		// Bound size so we never copy huge unexpected files.
+		if info.Size() <= 0 || info.Size() > 256*1024 {
+			continue
+		}
+		raw, err := os.ReadFile(src)
+		if err != nil {
+			continue
+		}
+		dst := filepath.Join(dstRoot, name)
+		if err := os.WriteFile(dst, raw, 0o600); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func claudeQuotaEnvKeys() []string {
