@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -38,14 +40,25 @@ type Request struct {
 	Model    string
 	// ChildRoutes optional per-work-item routes (goalrun auto-route winners).
 	ChildRoutes map[string]ChildRoute
-	// RepoPath optional base repo for child worktrees.
+	// RepoPath optional base repo for child worktrees and goal-branch integration.
 	RepoPath string
+	// BaseRef is the starting point for the shared goal branch (default main).
+	BaseRef string
+	// GoalBranch is the shared branch all succeeded children integrate into.
+	// Empty → loopcoder/goal-<runID>. Required for product PR (not receipt-only).
+	GoalBranch string
+	// SkipIntegrate disables product-branch integration (tests without a git repo).
+	// Production with RepoPath set always integrates on success.
+	SkipIntegrate bool
 	// MaxWaves hard cap (default 32).
 	MaxWaves int
 	// PriorSucceeded seeds already-terminal succeeded children from a prior
 	// interrupted run. Same attempt_id is reused; executor is NOT re-invoked
 	// (exactly-once provider call / file / capacity).
 	PriorSucceeded map[string]ChildOutcome
+	// Integrator injects branch integration (tests). nil → GitBranchIntegrator
+	// when RepoPath is set and SkipIntegrate is false.
+	Integrator BranchIntegrator
 }
 
 // ChildOutcome is per-child terminal + capacity-relevant evidence for reports.
@@ -66,6 +79,8 @@ type ChildOutcome struct {
 	ActualCapacity *float64 `json:"actual_capacity,omitempty"`
 	ActualSource   string   `json:"actual_source,omitempty"`
 	FilesTouched   []string `json:"files_touched,omitempty"`
+	// IntegrateCommitSHA is the goal-branch commit that absorbed this child (if any).
+	IntegrateCommitSHA string `json:"integrate_commit_sha,omitempty"`
 }
 
 // Result is durable parent evidence.
@@ -88,6 +103,10 @@ type Result struct {
 	// Ceilings are best-effort peaks observed during this process (restart evidence).
 	WorktreePeak int `json:"worktree_peak,omitempty"`
 	ProcessPeak  int `json:"process_peak,omitempty"`
+	// GoalBranch is the shared product branch (child integrations land here).
+	GoalBranch string `json:"goal_branch,omitempty"`
+	// IntegrateCommits are exactly-once product commits onto GoalBranch.
+	IntegrateCommits []IntegrateCommit `json:"integrate_commits,omitempty"`
 }
 
 // Service runs bounded workflows.
@@ -124,6 +143,31 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 	projectID := strings.TrimSpace(req.ProjectID)
 	if projectID == "" {
 		projectID = "local-project"
+	}
+	// Shared goal branch: all product integrations land here; later children
+	// materialize from this branch so they see prior integrated state.
+	goalBranch := strings.TrimSpace(req.GoalBranch)
+	if goalBranch == "" {
+		goalBranch = "loopcoder/goal-" + sanitizeBranch(runID)
+	}
+	out.GoalBranch = goalBranch
+	baseRef := strings.TrimSpace(req.BaseRef)
+	if baseRef == "" {
+		baseRef = "main"
+	}
+	var integrator BranchIntegrator
+	// Product integration requires a real git repository path. Fake/missing
+	// paths (unit tests that only set RepoPath for inventory) skip integrate.
+	doIntegrate := !req.SkipIntegrate && isGitRepo(req.RepoPath)
+	if doIntegrate {
+		integrator = req.Integrator
+		if integrator == nil {
+			integrator = GitBranchIntegrator{Now: now}
+		}
+		if _, err := integrator.EnsureGoalBranch(ctx, req.RepoPath, baseRef, goalBranch); err != nil {
+			return fail(out, StatusBlocked, "ensure goal branch: "+err.Error())
+		}
+		emit("goal_branch.ready:" + goalBranch)
 	}
 	actor := strings.TrimSpace(req.Actor)
 	if actor == "" {
@@ -247,6 +291,8 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 				}
 				ev[id] = workgraph.TermSucceeded
 				out.Children = append(out.Children, prior)
+				// Prior succeeded already integrated; do not re-exec or re-commit.
+				integrated = append(integrated, id)
 				emit(fmt.Sprintf("child.reuse:%s attempt=%s evidence=%s", id, prior.AttemptID, short(prior.OutputEvidence)))
 				if prior.WorktreePath != "" {
 					out.WorktreePeak++
@@ -282,6 +328,8 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 				ProjectID: projectID, GraphID: g.GraphID, WorkItemID: id,
 				ClaimID: res.Claim.ClaimID, AttemptID: attemptID,
 				Intent: it.Intent, Route: route, RepoPath: req.RepoPath,
+				// Materialize child from goal branch so prior integrations are visible.
+				BaseRef:  firstNonEmpty(goalBranch, baseRef),
 				ReadOnly: readOnly,
 			}
 			childOut, cerr := exec.Execute(ctx, childIn)
@@ -346,6 +394,41 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 				return fail(out, StatusBlocked, "close "+id+": "+closeErr.Error())
 			}
 			ev[id] = closeTerm
+
+			// Product integration: succeeded children commit onto shared goal branch
+			// exactly-once so subsequent ready children see prior state.
+			if closeTerm == workgraph.TermSucceeded && doIntegrate && integrator != nil {
+				ic, ierr := integrator.IntegrateChild(ctx, IntegrateRequest{
+					RepoPath: req.RepoPath, GoalBranch: goalBranch,
+					WorkItemID: id, AttemptID: attemptID,
+					ChildWorktree: childOut.WorktreePath,
+					ProductFiles:  childOut.FilesTouched,
+					Intent:        it.Intent,
+				})
+				if ierr != nil {
+					// Fail closed: required success without product integrate is blocked.
+					outcome.Terminal = string(workgraph.TermFailed)
+					outcome.FailureClass = "integrate_failed"
+					outcome.Message = ierr.Error()
+					ev[id] = workgraph.TermFailed
+					out.Children = append(out.Children, outcome)
+					emit(fmt.Sprintf("integrate.fail:%s err=%s", id, ierr.Error()))
+					if it.Status == workgraph.ItemRequired {
+						return fail(out, StatusBlocked, "integrate "+id+": "+ierr.Error())
+					}
+					continue
+				}
+				outcome.IntegrateCommitSHA = ic.CommitSHA
+				outcome.FilesTouched = firstNonEmptySlice(ic.Files, outcome.FilesTouched)
+				out.IntegrateCommits = append(out.IntegrateCommits, ic)
+				integrated = append(integrated, id)
+				if ic.Skipped {
+					emit(fmt.Sprintf("integrate.skip:%s attempt=%s commit=%s", id, attemptID, short(ic.CommitSHA)))
+				} else {
+					emit(fmt.Sprintf("integrate.ok:%s attempt=%s commit=%s files=%d", id, attemptID, short(ic.CommitSHA), len(ic.Files)))
+				}
+			}
+
 			out.Children = append(out.Children, outcome)
 			emit(fmt.Sprintf("child.terminal:%s term=%s evidence=%s", id, closeTerm, short(closeEvidence)))
 
@@ -363,12 +446,14 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 		}
 	}
 
-	// --- integration order ---
-	order := workgraph.IntegrationOrder(g)
-	for _, id := range order {
-		if term, ok := ev[id]; ok && term == workgraph.TermSucceeded {
-			integrated = append(integrated, id)
-			emit("integrate:" + id)
+	// When integrate is skipped (no repo), keep legacy in-order integrated list.
+	if !doIntegrate {
+		order := workgraph.IntegrationOrder(g)
+		for _, id := range order {
+			if term, ok := ev[id]; ok && term == workgraph.TermSucceeded {
+				integrated = append(integrated, id)
+				emit("integrate:" + id)
+			}
 		}
 	}
 	out.Integrated = integrated
@@ -473,6 +558,43 @@ func fail(out Result, status, msg string) (Result, error) {
 	out.Message = msg
 	out.Error = msg
 	return out, fmt.Errorf("workflowrun: %s", msg)
+}
+
+func isGitRepo(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	st, err := os.Stat(filepath.Join(path, ".git"))
+	return err == nil && (st.IsDir() || st.Mode().IsRegular())
+}
+
+func firstNonEmptySlice(a, b []string) []string {
+	if len(a) > 0 {
+		return a
+	}
+	return b
+}
+
+func sanitizeBranch(s string) string {
+	s = strings.TrimSpace(s)
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	out := b.String()
+	if out == "" {
+		return "run"
+	}
+	if len(out) > 80 {
+		return out[:80]
+	}
+	return out
 }
 
 func short(s string) string {
