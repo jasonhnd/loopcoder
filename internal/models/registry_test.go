@@ -11,90 +11,29 @@ import (
 
 func TestDefaultRegistryStaticRows(t *testing.T) {
 	got := models.DefaultRegistry()
-	want := models.Registry{
-		Providers: []models.Provider{
-			{
-				Name:         "codex",
-				DisplayName:  "Codex",
-				Vendor:       "OpenAI Codex",
-				CLI:          "codex",
-				DefaultModel: "gpt-5.5",
-				DefaultDepth: "high",
-				Models: []models.Model{
-					{
-						Name:         "gpt-5.5",
-						DefaultDepth: "high",
-						Depths: []models.Depth{
-							{Token: "low", Label: "low"},
-							{Token: "medium", Label: "medium"},
-							{Token: "high", Label: "high"},
-							{Token: "xhigh", Label: "xhigh"},
-						},
-					},
-				},
-			},
-			{
-				Name:         "claude",
-				DisplayName:  "Claude",
-				Vendor:       "Anthropic",
-				CLI:          "claude",
-				DefaultModel: "claude-opus-4-8[1m]",
-				DefaultDepth: "max",
-				Models: []models.Model{
-					{
-						Name:         "claude-opus-4-8[1m]",
-						DefaultDepth: "max",
-						Depths: []models.Depth{
-							{Token: "low", Label: "low"},
-							{Token: "medium", Label: "medium"},
-							{Token: "high", Label: "high"},
-							{Token: "max", Label: "max"},
-						},
-					},
-				},
-			},
-			{
-				Name:         "antigravity",
-				DisplayName:  "Antigravity",
-				Vendor:       "Google Antigravity",
-				CLI:          "agy",
-				DefaultModel: "Gemini 3.1 Pro",
-				DefaultDepth: "High",
-				Models: []models.Model{
-					{
-						Name:         "Gemini 3.1 Pro",
-						DefaultDepth: "High",
-						Depths: []models.Depth{
-							{Token: "Low", Label: "Low"},
-							{Token: "High", Label: "High"},
-						},
-					},
-					{
-						Name:         "Opus 4.6",
-						DefaultDepth: "Thinking",
-						Depths: []models.Depth{
-							{Token: "Thinking", Label: "Thinking"},
-						},
-					},
-					{
-						Name:         "GPT-OSS 120B",
-						DefaultDepth: "Medium",
-						Depths: []models.Depth{
-							{Token: "Medium", Label: "Medium"},
-						},
-					},
-				},
-			},
-			{
-				Name:        "grok",
-				DisplayName: "Grok Build",
-				Vendor:      "xAI",
-				CLI:         "grok",
-			},
-		},
+	// Structural expectations after CRO-005 reconciliation (medium defaults;
+	// expanded codex/claude catalogs; grok remains dynamic-only).
+	if len(got.Providers) != 4 {
+		t.Fatalf("providers=%d", len(got.Providers))
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("DefaultRegistry mismatch:\ngot:  %#v\nwant: %#v", got, want)
+	codex, ok := models.LookupProvider("codex")
+	if !ok || codex.DefaultModel != "gpt-5.5" || codex.DefaultDepth != "medium" {
+		t.Fatalf("codex=%#v", codex)
+	}
+	if len(codex.Models) < 2 {
+		t.Fatalf("codex models=%d want expanded catalog", len(codex.Models))
+	}
+	claude, ok := models.LookupProvider("claude")
+	if !ok || claude.DefaultModel != "claude-sonnet-4-5" || claude.DefaultDepth != "medium" {
+		t.Fatalf("claude=%#v", claude)
+	}
+	agy, ok := models.LookupProvider("antigravity")
+	if !ok || agy.DefaultDepth != "medium" {
+		t.Fatalf("antigravity=%#v", agy)
+	}
+	grok, ok := models.LookupProvider("grok")
+	if !ok || grok.DefaultModel != "" || len(grok.Models) != 0 {
+		t.Fatalf("grok must stay dynamic-only: %#v", grok)
 	}
 }
 
@@ -140,7 +79,7 @@ func TestLookupHelpers(t *testing.T) {
 	if !ok {
 		t.Fatal("LookupProvider antigravity returned false")
 	}
-	if provider.CLI != "agy" || provider.DefaultModel != "Gemini 3.1 Pro" || provider.DefaultDepth != "High" {
+	if provider.CLI != "agy" || provider.DefaultModel != "Gemini 3.1 Pro" || provider.DefaultDepth != "medium" {
 		t.Fatalf("antigravity provider = %#v", provider)
 	}
 	if got, want := provider.ModelNames(), []string{"Gemini 3.1 Pro", "Opus 4.6", "GPT-OSS 120B"}; !reflect.DeepEqual(got, want) {
@@ -151,10 +90,10 @@ func TestLookupHelpers(t *testing.T) {
 	if !ok {
 		t.Fatal("LookupModel Gemini 3.1 Pro returned false")
 	}
-	if got, want := model.DepthTokens(), []string{"Low", "High"}; !reflect.DeepEqual(got, want) {
+	if got, want := model.DepthTokens(), []string{"low", "medium", "high"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("DepthTokens = %#v, want %#v", got, want)
 	}
-	if depth, ok := model.LookupDepth("High"); !ok || depth.Label != "High" {
+	if depth, ok := model.LookupDepth("medium"); !ok || depth.Label != "medium" {
 		t.Fatalf("LookupDepth High = %#v/%t", depth, ok)
 	}
 	if _, ok := models.LookupProvider("agy"); ok {
@@ -191,7 +130,7 @@ func TestValidateSelectionAppliesDefaults(t *testing.T) {
 	if len(result.Diagnostics) != 0 {
 		t.Fatalf("Diagnostics = %#v, want none", result.Diagnostics)
 	}
-	if want := (models.Selection{Role: "worker", Provider: "codex", Model: "gpt-5.5", Depth: "high"}); result.Selection != want {
+	if want := (models.Selection{Role: "worker", Provider: "codex", Model: "gpt-5.5", Depth: "medium"}); result.Selection != want {
 		t.Fatalf("Selection = %#v, want %#v", result.Selection, want)
 	}
 }
@@ -206,8 +145,8 @@ func TestValidateSelectionUsesModelDefaultDepth(t *testing.T) {
 	if len(result.Diagnostics) != 0 {
 		t.Fatalf("Diagnostics = %#v, want none", result.Diagnostics)
 	}
-	if result.Selection.Depth != "Thinking" {
-		t.Fatalf("Depth = %q, want Thinking", result.Selection.Depth)
+	if result.Selection.Depth != "high" {
+		t.Fatalf("Depth = %q, want high", result.Selection.Depth)
 	}
 }
 

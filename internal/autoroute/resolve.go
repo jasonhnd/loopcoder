@@ -177,7 +177,8 @@ func Resolve(in Input) (Result, error) {
 		res.Outcome = OutcomeSelected
 		res.Provider = d.Winner.Provider
 		res.Model = d.Winner.Model
-		res.Effort = firstNonEmpty(d.Winner.Effort, effort, "high")
+		// Default remaining empty effort to medium — never force high (CRO-005).
+		res.Effort = firstNonEmpty(d.Winner.Effort, effort, "medium")
 		res.Permission = firstNonEmpty(d.Winner.Permission, perm)
 		res.Message = fmt.Sprintf("auto-route selected %s/%s digest=%s", res.Provider, res.Model, shortHash(d.Digest))
 		return res, nil
@@ -259,7 +260,7 @@ func DefaultInventory(now time.Time) Inventory {
 
 func healthy(p, m string, cl capclass.Class) eligibility.Candidate {
 	return eligibility.Candidate{
-		Provider: p, Model: m, Effort: "high", Permission: "bounded_write", ModelClass: cl,
+		Provider: p, Model: m, Effort: "medium", Permission: "bounded_write", ModelClass: cl,
 		Installed: okFact(p + "-i"), Authenticated: okFact(p + "-a"), ModelPresent: okFact(p + "-m"),
 		PermissionOK: okFact(p + "-p"), EffortOK: okFact(p + "-e"), Healthy: okFact(p + "-h"),
 		CooldownActive: falseFact(p + "-cd"), ResourceFit: okFact(p + "-r"), QuotaRemaining: 9999,

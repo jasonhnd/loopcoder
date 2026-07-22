@@ -39,12 +39,12 @@ func TestBuildAntigravityArgs(t *testing.T) {
 				WorktreePath: "wt",
 				Prompt:       "do the work",
 				Model:        "Gemini 3.1 Pro",
-				Effort:       "High",
+				Effort:       "medium",
 			},
 			want: []string{
 				"-p", "do the work",
 				"--add-dir", "wt",
-				"--model", "Gemini 3.1 Pro (High)",
+				"--model", "Gemini 3.1 Pro (medium)",
 			},
 		},
 		{
@@ -69,7 +69,7 @@ func TestBuildAntigravityArgs(t *testing.T) {
 			want: []string{
 				"-p", "do the work",
 				"--add-dir", "wt",
-				"--model", "Gemini 3.1 Pro (High)",
+				"--model", "Gemini 3.1 Pro (medium)",
 			},
 		},
 		{
@@ -82,7 +82,7 @@ func TestBuildAntigravityArgs(t *testing.T) {
 			want: []string{
 				"-p", "do the work",
 				"--add-dir", "wt",
-				"--model", "Opus 4.6 (Thinking)",
+				"--model", "Opus 4.6 (high)",
 			},
 		},
 	}
@@ -111,7 +111,7 @@ func TestAntigravityRunnerClosesStdinPinsWorktreeAndCapturesPlainText(t *testing
 		if cmd.Stdin != nil {
 			t.Fatalf("Stdin = %#v, want nil closed stdin", cmd.Stdin)
 		}
-		wantArgs := []string{"agy", "-p", prompt, "--add-dir", worktree, "--model", "Gemini 3.1 Pro (High)"}
+		wantArgs := []string{"agy", "-p", prompt, "--add-dir", worktree, "--model", "Gemini 3.1 Pro (medium)"}
 		if !reflect.DeepEqual(cmd.Args, wantArgs) {
 			t.Fatalf("Args = %#v, want %#v", cmd.Args, wantArgs)
 		}
@@ -126,12 +126,12 @@ func TestAntigravityRunnerClosesStdinPinsWorktreeAndCapturesPlainText(t *testing
 		Prompt:       prompt,
 		LogPath:      logPath,
 		Model:        "Gemini 3.1 Pro",
-		Effort:       "High",
+		Effort:       "medium",
 	})
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
-	if result.ExitCode != 0 || result.Summary != "plain text summary" || result.Model != "Gemini 3.1 Pro (High)" || result.Effort != "High" {
+	if result.ExitCode != 0 || result.Summary != "plain text summary" || result.Model != "Gemini 3.1 Pro (medium)" || result.Effort != "medium" {
 		t.Fatalf("result = %#v", result)
 	}
 	assertNilInt64Ptr(t, result.Usage.TotalTokens)
@@ -159,7 +159,7 @@ func TestAntigravityRunnerReadOnlyFailsClosedWithoutLaunchingAgy(t *testing.T) {
 		Prompt:       "review safely",
 		LogPath:      filepath.Join(t.TempDir(), "antigravity.log"),
 		Model:        "Gemini 3.1 Pro",
-		Effort:       "High",
+		Effort:       "medium",
 		ReadOnly:     true,
 	})
 	if err == nil {
@@ -174,7 +174,7 @@ func TestAntigravityRunnerReadOnlyFailsClosedWithoutLaunchingAgy(t *testing.T) {
 			t.Fatalf("Run error = %v, want substring %q", err, want)
 		}
 	}
-	if result.ExitCode != 1 || result.Model != "Gemini 3.1 Pro (High)" || result.Effort != "High" {
+	if result.ExitCode != 1 || result.Model != "Gemini 3.1 Pro (medium)" || result.Effort != "medium" {
 		t.Fatalf("read-only result = %#v", result)
 	}
 }
