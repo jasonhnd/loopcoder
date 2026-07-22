@@ -139,17 +139,6 @@ func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 	}, nil
 }
 
-func pickDefaultDepth(depths []string) string {
-	for _, pref := range []string{"medium", "low", "high", "xhigh"} {
-		for _, d := range depths {
-			if d == pref {
-				return pref
-			}
-		}
-	}
-	return depths[0]
-}
-
 func classFromHint(h string) capclass.Class {
 	switch capclass.Class(strings.TrimSpace(h)) {
 	case capclass.ClassLuna, capclass.ClassTera, capclass.ClassSoul, capclass.ClassNeedsHuman:
