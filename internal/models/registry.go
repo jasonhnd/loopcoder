@@ -90,6 +90,8 @@ var staticRegistry = Registry{
 			DefaultDepth: "medium",
 			Models: []Model{
 				{
+					// Prefer gpt-5.5: ChatGPT-account Codex rejects gpt-5.3-codex.
+					// capacitysnapshot filters gpt-5.3-codex from unattended inventory.
 					Name:         "gpt-5.5",
 					DefaultDepth: "medium",
 					Depths: []Depth{
