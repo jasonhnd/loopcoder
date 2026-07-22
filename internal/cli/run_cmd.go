@@ -15,11 +15,14 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/autoroute"
 	"github.com/jasonhnd/loopcoder/internal/capacitysnapshot"
+	"github.com/jasonhnd/loopcoder/internal/capclass"
+	"github.com/jasonhnd/loopcoder/internal/depthpolicy"
 	"github.com/jasonhnd/loopcoder/internal/directattempt"
 	"github.com/jasonhnd/loopcoder/internal/directdelivery"
 	"github.com/jasonhnd/loopcoder/internal/directrun"
 	"github.com/jasonhnd/loopcoder/internal/preflight"
 	"github.com/jasonhnd/loopcoder/internal/runtimepath"
+	"github.com/jasonhnd/loopcoder/internal/taskroute"
 	"github.com/jasonhnd/loopcoder/internal/termui"
 )
 
@@ -122,30 +125,47 @@ func runRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		now = time.Now
 	}
 
-	// P4 / V090-RB04 / V090-CRO-002/004: resolve route before run identity freeze.
+	// P4 / V090-RB04 / V090-CRO-002/004/006: resolve route before run identity freeze.
 	// Explicit provider+model pin is never overridden. Omitted both (or
 	// --auto-route) evaluates inventory evidence via autoroute/routedecision.
 	// Production loads capacitysnapshot from provider inventory when no
 	// explicit deps.AutoRouteInventory is injected; fails closed if unusable.
+	// Task class/depth come from taskrequirements via taskroute (not silent Tera/high).
 	wantAuto := req.AutoRoute || (req.Provider == "" && req.Model == "")
+	routeProject := slugProjectFromRepo(req.Repo)
+	at := now().UTC()
+	taskClass := capclass.ClassTera
+	difficulty := depthpolicy.DifficultyStandard
+	if rr, cerr := taskroute.ClassifyRun(routeProject, req.Issue, "issue "+req.Issue, req.Permission, at); cerr == nil {
+		taskClass = rr.TaskClass
+		difficulty = rr.Difficulty
+		fmt.Fprintf(stderr, "run: task class=%s difficulty=%s risk=%s quality=%s\n",
+			taskClass, difficulty, rr.RiskTier, rr.QualityFloor)
+	} else {
+		fmt.Fprintf(stderr, "run: task classification unavailable (%v); using tera/standard\n", cerr)
+	}
 	routeInv := deps.AutoRouteInventory
 	if routeInv == nil && wantAuto {
 		loader := deps.LoadAutoRouteInventory
 		if loader == nil {
 			loader = defaultLoadAutoRouteInventory
 		}
-		loaded, loadErr := loader(context.Background(), req.Repo, now().UTC())
+		loaded, loadErr := loader(context.Background(), req.Repo, at)
 		if loadErr != nil {
 			msg := "auto-route inventory load failed: " + loadErr.Error()
 			return emitRunRejected(stdout, stderr, req, msg, exitRunPrecondition, deps)
 		}
 		routeInv = loaded
 	}
+	// Stamp candidate efforts from classified difficulty (never universal high).
+	if routeInv != nil && wantAuto && req.Effort == "" {
+		applyDifficultyEffort(routeInv, difficulty)
+	}
 	routeRes, routeErr := autoroute.Resolve(autoroute.Input{
 		AutoRoute: wantAuto, Provider: req.Provider, Model: req.Model,
 		Effort: req.Effort, Permission: req.Permission,
-		ProjectID: slugProjectFromRepo(req.Repo), DecisionKey: "run-route|" + req.Repo + "|" + req.Issue,
-		Now: now().UTC(), Inventory: routeInv,
+		ProjectID: routeProject, DecisionKey: "run-route|" + req.Repo + "|" + req.Issue,
+		Now: at, Inventory: routeInv, TaskClass: taskClass,
 	})
 	if routeErr != nil || (routeRes.Outcome != autoroute.OutcomeExplicitPin && routeRes.Outcome != autoroute.OutcomeSelected) {
 		msg := routeRes.Message
@@ -400,4 +420,22 @@ func defaultLoadAutoRouteInventory(ctx context.Context, repo string, now time.Ti
 	}
 	_ = snap
 	return &inv, nil
+}
+
+// applyDifficultyEffort rewrites candidate efforts using depthpolicy for the
+// classified difficulty band. Owner-explicit --effort is applied later by Resolve.
+func applyDifficultyEffort(inv *autoroute.Inventory, diff depthpolicy.Difficulty) {
+	if inv == nil {
+		return
+	}
+	for i := range inv.Candidates {
+		c := &inv.Candidates[i]
+		supported := []string{"low", "medium", "high", "xhigh"}
+		if c.Effort != "" {
+			supported = []string{c.Effort, "low", "medium", "high", "xhigh"}
+		}
+		if d, err := depthpolicy.Select(diff, supported, ""); err == nil && d != "" {
+			c.Effort = d
+		}
+	}
 }
