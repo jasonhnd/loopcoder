@@ -803,6 +803,15 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 					adapterQuotaAttempted = true
 					adapterQuotaCollected = quotaProbe.Outcome == OutcomeInstalled && len(snapshots) > 0
 				}
+				if adapter.AdapterID == "antigravity" && !adapterQuotaAttempted {
+					source, snapshots, quotaProbe := inspectAntigravityQuota(ctx, discovery, adapter, installation, now, deps)
+					quotaTelemetrySources = append(quotaTelemetrySources, source)
+					quotaSnapshots = append(quotaSnapshots, snapshots...)
+					probes = append(probes, quotaProbe)
+					adapterQuotaAttempted = true
+					adapterQuotaCollected = quotaProbe.Outcome == OutcomeInstalled && len(snapshots) > 0 &&
+						snapshots[0].Confidence != ConfidenceUnavailable
+				}
 				if adapter.AdapterID == "grok" {
 					nativeProbe := inspectGrokNativeFederation(ctx, discovery, adapter, candidate, installation, now, deps)
 					probes = append(probes, nativeProbe)
@@ -836,6 +845,9 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 				quotaSource, quotaSnapshot = quotaTelemetryFallbackForAdapter(adapter, now, "quota-collection-not-granted", "ErrQuotaCollectionGrantRequired")
 			}
 			if adapter.AdapterID == "claude" {
+				quotaSource, quotaSnapshot = quotaTelemetryFallbackForAdapter(adapter, now, "quota-collection-not-granted", "ErrQuotaCollectionGrantRequired")
+			}
+			if adapter.AdapterID == "antigravity" {
 				quotaSource, quotaSnapshot = quotaTelemetryFallbackForAdapter(adapter, now, "quota-collection-not-granted", "ErrQuotaCollectionGrantRequired")
 			}
 			quotaTelemetrySources = append(quotaTelemetrySources, quotaSource)
