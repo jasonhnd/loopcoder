@@ -408,7 +408,8 @@ func snapshotDirTree(root string) dirSnap {
 		}
 		base := filepath.Base(path)
 		if base == "logs" || strings.HasPrefix(base, ".") {
-			// allow .git changes only under child worktree (not here)
+			// Skip meta/dotfiles at snapshot roots (not child worktree product).
+			return nil
 		}
 		rel, rerr := filepath.Rel(root, path)
 		if rerr != nil || strings.HasPrefix(rel, "..") {
