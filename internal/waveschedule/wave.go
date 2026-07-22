@@ -101,7 +101,6 @@ type Store struct {
 	activeWave  map[string]string    // graph key → plan digest of current wave
 	candidates  []CompletionCandidate
 	worktreeOwn map[string]string // worktree → workitem
-	seq         int64
 	now         func() time.Time
 }
 
