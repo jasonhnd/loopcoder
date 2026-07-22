@@ -75,6 +75,7 @@ Every document is exactly one of these types:
 - [`reference/retention-garbage-collection.md`](reference/retention-garbage-collection.md): V090-087 event/log/runtime retention and garbage collection.
 - [`reference/v08-state-exporter.md`](reference/v08-state-exporter.md): V090-069 read-only v0.8 state exporter.
 - [`reference/v09-state-importer.md`](reference/v09-state-importer.md): V090-070 v0.9 project-state importer and migration report.
+- [`reference/compatibility-shims.md`](reference/compatibility-shims.md): V090-071 compatibility shims and old/new writer isolation.
 - [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
 - [`reference/v09-home-layout.md`](reference/v09-home-layout.md): global `$LOOPCODER_HOME` layout and owner-only creation.
 - [`reference/project-authority-store.md`](reference/project-authority-store.md): project.db domain tables and immutable events.
