@@ -12,6 +12,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/autoroute"
 	"github.com/jasonhnd/loopcoder/internal/capacityledger"
 	"github.com/jasonhnd/loopcoder/internal/capacitysnapshot"
+	"github.com/jasonhnd/loopcoder/internal/goalpr"
 	"github.com/jasonhnd/loopcoder/internal/goalrun"
 	"github.com/jasonhnd/loopcoder/internal/workflowrun"
 )
@@ -399,6 +400,55 @@ func TestDryRunPreviewReleasesWithoutExecute(t *testing.T) {
 }
 
 func ptrTime(t time.Time) *time.Time { return &t }
+
+func TestExecuteOpenPRFillsRealPREvidence(t *testing.T) {
+	home := testHome(t)
+	now := time.Date(2026, 7, 23, 7, 30, 0, 0, time.UTC)
+	var got goalpr.Request
+	res, err := goalrun.Execute(context.Background(), goalrun.Request{
+		ProjectID: "proj-pr", RunID: "run_pr_goal",
+		Goal: "implement transparent multi-child routing", Issue: "1343",
+		Actor: "owner", Owner: "worker",
+		Provider: "fixture", Model: "fixture-model",
+		HomeDir: home, RepoPath: "/tmp/disp-repo",
+		OpenPR: true, IndependentVerifier: "claude", VerifierEvidence: "sha256:v1",
+		RequiredCheckNames: []string{"verify", "test"},
+		Executor:           workflowrun.FakeChildExecutor{HomeDir: home, Now: func() time.Time { return now }},
+		Now:                func() time.Time { return now },
+		GoalPR: func(ctx context.Context, req goalpr.Request) (goalpr.Result, error) {
+			got = req
+			return goalpr.Result{
+				OK: true, Status: goalpr.StatusHumanGate,
+				URL: "https://github.com/owner/disp/pull/99", Number: 99,
+				Branch: "loopcoder/goal-run_pr_goal", BaseRef: "main",
+				RequiredChecks: req.RequiredCheckNames, RequiredChecksGreen: true,
+				IndependentVerifier: req.IndependentVerifier, VerifierEvidenceRef: req.VerifierEvidence,
+				CreatedByLoopCoder: true, HumanMergeGate: true, AutoMerge: false,
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("%v %+v", err, res)
+	}
+	if res.PR == nil || !res.PR.OK || res.PR.URL == "" {
+		t.Fatalf("missing PR evidence: %+v", res.PR)
+	}
+	if !res.PR.CreatedByLoopCoder || !res.PR.HumanMergeGate || res.PR.AutoMerge {
+		t.Fatalf("gate flags %+v", res.PR)
+	}
+	if got.ProjectID != "proj-pr" || got.RunID != "run_pr_goal" || got.SourceIssue != 1343 {
+		t.Fatalf("goalpr request %+v", got)
+	}
+	if len(got.Children) < 4 {
+		t.Fatalf("children passed to goalpr: %d", len(got.Children))
+	}
+	if got.IndependentVerifier != "claude" {
+		t.Fatalf("verifier %q", got.IndependentVerifier)
+	}
+}
+
+// ensure goalpr import used in test file
+var _ = goalpr.StatusHumanGate
 
 // TestForcedInterruptRestartFromDurableCheckpoint: interrupt mid-goal, resume
 // same project/run from checkpoint, same attempt/evidence, no second provider call

@@ -32,6 +32,10 @@ func runWorkflowGoal(args []string, stdout, stderr io.Writer, deps Deps) int {
 		format   = fs.String("format", "json", "json|human")
 		dryRun   = fs.Bool("dry-run", false, "route+capacity preview only; no child execution")
 		capSnap  = fs.String("capacity-snapshot", "", "optional capacitysnapshot JSON path (offline measure / qualify)")
+		openPR   = fs.Bool("open-pr", false, "after human_gate open real branch/commit/push/PR (never auto-merge)")
+		prBase   = fs.String("pr-base", "main", "base ref for --open-pr")
+		verifier = fs.String("independent-verifier", "", "independent verifier provider/company for PR evidence")
+		verEv    = fs.String("verifier-evidence", "", "independent verifier evidence digest/path")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -54,7 +58,9 @@ func runWorkflowGoal(args []string, stdout, stderr io.Writer, deps Deps) int {
 		ProjectID: projectID, RunID: strings.TrimSpace(*runID),
 		Goal: *goal, Issue: *issue, Actor: *actor,
 		Provider: *provider, Model: *model, RepoPath: resolvedRepo,
-		DryRun: dry, Resume: *resume, ReportOut: stderr, Now: deps.Now,
+		DryRun: dry, Resume: *resume, OpenPR: *openPR, PRBaseRef: *prBase,
+		IndependentVerifier: *verifier, VerifierEvidence: *verEv,
+		ReportOut: stderr, Now: deps.Now,
 	}
 	if *resume && strings.TrimSpace(*runID) == "" {
 		fmt.Fprintln(stderr, "workflow goal: --resume requires --run-id")
