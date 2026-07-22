@@ -37,20 +37,72 @@ func TestRunDryRunAndAcceptedIdentity(t *testing.T) {
 	}
 }
 
-func TestRunRejectsMissingRouteAndAutoRoute(t *testing.T) {
+func TestRunAutoRouteSelectsAndPartialPinFails(t *testing.T) {
+	home := t.TempDir()
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LOOPCODER_HOME", home)
 	deps := DefaultDeps()
-	deps.Now = time.Now
+	deps.Now = func() time.Time { return time.Date(2026, 7, 22, 22, 0, 0, 0, time.UTC) }
 	var stdout, stderr bytes.Buffer
-	code := runRun([]string{"--repo", "r", "--issue", "1", "--auto-route"}, &stdout, &stderr, deps)
-	if code != exitRunUnsupported {
-		t.Fatalf("code=%d", code)
+	// --auto-route must work (P4 enabled)
+	code := runRun([]string{
+		"--repo", "acme/demo", "--issue", "1", "--auto-route", "--format", "json",
+	}, &stdout, &stderr, deps)
+	if code != 0 {
+		t.Fatalf("auto-route code=%d stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "automatic routing") {
-		t.Fatalf("stderr=%s", stderr.String())
+	var acc RunAccepted
+	if err := json.Unmarshal(stdout.Bytes(), &acc); err != nil {
+		t.Fatal(err)
 	}
+	if acc.Request.Provider == "" || acc.Request.Model == "" {
+		t.Fatalf("auto-route did not fill route: %+v", acc.Request)
+	}
+	if acc.Status != "human_gate" && acc.Status != "dry_run" {
+		// full path should reach human_gate
+		if acc.Status != "human_gate" {
+			t.Fatalf("status=%s msg=%s", acc.Status, acc.Message)
+		}
+	}
+	if !strings.Contains(stderr.String(), "auto-route selected") {
+		t.Fatalf("expected auto-route log on stderr: %q", stderr.String())
+	}
+	// partial pin still usage error
+	stdout.Reset()
+	stderr.Reset()
 	code = runRun([]string{"--repo", "r", "--issue", "1", "--provider", "fixture"}, &stdout, &stderr, deps)
-	if code != exitRunUsage {
-		t.Fatalf("missing model code=%d", code)
+	if code != exitRunUsage && code != exitRunPrecondition {
+		t.Fatalf("missing model code=%d stderr=%s", code, stderr.String())
+	}
+}
+
+func TestRunOmittedRouteUsesAutoPolicy(t *testing.T) {
+	home := t.TempDir()
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LOOPCODER_HOME", home)
+	deps := DefaultDeps()
+	deps.Now = func() time.Time { return time.Date(2026, 7, 22, 22, 5, 0, 0, time.UTC) }
+	var stdout, stderr bytes.Buffer
+	// omit provider+model without --auto-route flag: still auto policy
+	code := runRun([]string{
+		"--repo", "acme/demo", "--issue", "2", "--format", "json", "--dry-run",
+	}, &stdout, &stderr, deps)
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	var acc RunAccepted
+	if err := json.Unmarshal(stdout.Bytes(), &acc); err != nil {
+		t.Fatal(err)
+	}
+	if acc.Status != "dry_run" {
+		t.Fatalf("%+v", acc)
+	}
+	if acc.Request.Provider == "" || acc.Request.Model == "" {
+		t.Fatalf("omitted route not filled: %+v", acc.Request)
 	}
 }
 
@@ -104,6 +156,12 @@ func TestRunRemovesPortsNotAttachedStub(t *testing.T) {
 	}
 	if !strings.Contains(string(src), "directdelivery.Service") {
 		t.Fatal("cmd path does not reach directdelivery.Service")
+	}
+	if !strings.Contains(string(src), "autoroute.Resolve") {
+		t.Fatal("cmd path does not reach autoroute.Resolve")
+	}
+	if strings.Contains(string(src), "unsupported until P4") {
+		t.Fatal("P4 rejection stub still present")
 	}
 }
 
