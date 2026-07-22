@@ -98,8 +98,17 @@ func TestBuildAntigravityArgs(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := BuildAntigravityArgs(tt.inv)
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Fatalf("BuildAntigravityArgs() = %#v, want %#v", got, tt.want)
+			// --add-dir is absolute for isolation; compare after normalizing.
+			want := append([]string{}, tt.want...)
+			for i := 0; i+1 < len(want); i++ {
+				if want[i] == "--add-dir" {
+					if abs, err := filepath.Abs(want[i+1]); err == nil {
+						want[i+1] = abs
+					}
+				}
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("BuildAntigravityArgs() = %#v, want %#v", got, want)
 			}
 		})
 	}

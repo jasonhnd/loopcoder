@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -28,9 +29,14 @@ func BuildAntigravityArgs(inv Invocation) []string {
 	// --new-project binds agy project affinity to the worktree session so writes
 	// do not land in a shared global project root outside the assigned worktree.
 	// Read-only invocations never reach agy (fail closed in Run before launch).
+	worktree := strings.TrimSpace(inv.WorktreePath)
+	if abs, err := filepath.Abs(worktree); err == nil && abs != "" {
+		worktree = abs
+	}
+	// Isolated child workspace is the sole project context (no parent root writes).
 	args := []string{
 		"-p", inv.Prompt,
-		"--add-dir", inv.WorktreePath,
+		"--add-dir", worktree,
 		"--dangerously-skip-permissions",
 		"--new-project",
 	}

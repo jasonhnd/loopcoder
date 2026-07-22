@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -96,7 +97,7 @@ func (f FakeChildExecutor) Execute(ctx context.Context, in ChildExecInput) (Chil
 	if now == nil {
 		now = time.Now
 	}
-	wt, err := allocateChildWorktree(f.HomeDir, in.ProjectID, in.GraphID, in.WorkItemID, in.AttemptID)
+	wt, err := allocateChildWorktree(f.HomeDir, in.ProjectID, in.GraphID, in.WorkItemID, in.AttemptID, in.RepoPath)
 	if err != nil {
 		return ChildExecResult{
 			Terminal: workgraph.TermFailed, FailureClass: "worktree", Message: err.Error(),
@@ -175,13 +176,19 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	}
 	in.Route.Provider, in.Route.Model, in.Route.Depth = prov, model, depth
 
-	wt, err := allocateChildWorktree(p.HomeDir, in.ProjectID, in.GraphID, in.WorkItemID, in.AttemptID)
+	wt, err := allocateChildWorktree(p.HomeDir, in.ProjectID, in.GraphID, in.WorkItemID, in.AttemptID, in.RepoPath)
 	if err != nil {
 		return ChildExecResult{
 			Terminal: workgraph.TermFailed, FailureClass: "worktree", Message: err.Error(),
 			Provider: prov, Model: model, Depth: depth, ActualSource: "unknown",
 		}, err
 	}
+	// Snapshot parent/disposable root + durable project root before provider runs.
+	// Root mutation during child execution is an isolation failure (fail closed).
+	parentRoot := strings.TrimSpace(in.RepoPath)
+	projectRoot := projectRootFromWorktree(wt)
+	parentSnap := snapshotDirTree(parentRoot)
+	projectSnap := snapshotDirTree(projectRoot)
 
 	// Fixture / unknown providers: durable local evidence without inventing a live process.
 	if prov == "fixture" || prov == "auto" {
@@ -297,31 +304,29 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 			ActualSource: "unknown",
 		}, fmt.Errorf("workflowrun: empty child output evidence")
 	}
-	// Write children: product files must end up in the assigned worktree.
-	// Providers may write under the durable project root (parent of runs/); that
-	// is not shared local-project pollution when project ID is disposable.
-	// Explicit integration relocates same-project escapes into the worktree.
-	// Escapes outside the project root remain hard fail-closed.
+	// Isolation fail-closed: product writes outside the assigned worktree, or any
+	// mutation of the parent/disposable root (or durable project root outside the
+	// worktree), abort success and cleanup/restore. Never relocate escapes into
+	// the worktree and claim success (#1368 regression).
 	if !in.ReadOnly {
-		if escaped := detectWorktreeEscapes(wt); len(escaped) > 0 {
-			integrated, remaining := integrateEscapesIntoWorktree(wt, escaped)
-			files = append(files, integrated...)
-			if len(remaining) > 0 {
-				msg := fmt.Sprintf("worktree isolation violation: writes outside project/worktree: %s",
-					strings.Join(remaining, ", "))
-				out := ChildExecResult{
-					Terminal: workgraph.TermFailed, OutputEvidence: digest, WorktreePath: wt,
-					ExitCode: 1, FailureClass: "isolation_violation", Message: msg,
-					Provider: prov, Model: actualModel, Depth: actualDepth, FilesTouched: append(files, remaining...),
-					ActualSource: "unknown",
-				}
-				out = attachUsage(out, res)
-				return out, fmt.Errorf("workflowrun: %s", msg)
+		escaped := detectWorktreeEscapes(wt)
+		parentMut := diffDirTree(parentSnap, snapshotDirTree(parentRoot), wt)
+		projectMut := diffDirTree(projectSnap, snapshotDirTree(projectRoot), wt)
+		if len(escaped) > 0 || len(parentMut) > 0 || len(projectMut) > 0 {
+			// Cleanup: remove escaped product files; restore parent/project roots.
+			cleanupIsolationViolation(escaped, parentMut, projectMut, parentSnap, projectSnap, parentRoot, projectRoot)
+			all := append(append([]string{}, escaped...), parentMut...)
+			all = append(all, projectMut...)
+			msg := fmt.Sprintf("worktree isolation violation (fail closed, cleaned): %s",
+				strings.Join(all, ", "))
+			out := ChildExecResult{
+				Terminal: workgraph.TermFailed, OutputEvidence: digest, WorktreePath: wt,
+				ExitCode: 1, FailureClass: "isolation_violation", Message: msg,
+				Provider: prov, Model: actualModel, Depth: actualDepth, FilesTouched: append(files, all...),
+				ActualSource: "unknown",
 			}
-			// Re-write evidence after integration so digest reflects relocated files.
-			var more []string
-			_, digest, more, _ = writeChildEvidence(wt, in, "provider_run_integrated", now().UTC())
-			files = append(files, more...)
+			out = attachUsage(out, res)
+			return out, fmt.Errorf("workflowrun: %s", msg)
 		}
 	}
 	out := ChildExecResult{
@@ -379,44 +384,82 @@ func projectRootFromWorktree(worktree string) string {
 	return filepath.Dir(runsDir)
 }
 
-// integrateEscapesIntoWorktree moves same-project root product files into the
-// assigned worktree (explicit parent integration). Returns integrated paths and
-// any remaining paths that are outside the project (hard fail).
-func integrateEscapesIntoWorktree(worktree string, escaped []string) (integrated, remaining []string) {
-	worktree = filepath.Clean(worktree)
-	projectRoot := projectRootFromWorktree(worktree)
-	for _, src := range escaped {
-		src = filepath.Clean(src)
-		if projectRoot == "" {
-			remaining = append(remaining, src)
-			continue
-		}
-		rel, err := filepath.Rel(projectRoot, src)
-		if err != nil || strings.HasPrefix(rel, "..") {
-			remaining = append(remaining, src)
-			continue
-		}
-		dst := filepath.Join(worktree, rel)
-		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-			remaining = append(remaining, src)
-			continue
-		}
-		// Prefer rename; fall back to copy+remove.
-		if err := os.Rename(src, dst); err != nil {
-			data, rerr := os.ReadFile(src)
-			if rerr != nil {
-				remaining = append(remaining, src)
-				continue
-			}
-			if werr := os.WriteFile(dst, data, 0o600); werr != nil {
-				remaining = append(remaining, src)
-				continue
-			}
-			_ = os.Remove(src)
-		}
-		integrated = append(integrated, dst)
+// dirSnap is a relative-path → content hash map for isolation snapshots.
+type dirSnap map[string]string
+
+func snapshotDirTree(root string) dirSnap {
+	out := dirSnap{}
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return out
 	}
-	return integrated, remaining
+	info, err := os.Stat(root)
+	if err != nil || !info.IsDir() {
+		return out
+	}
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		// Skip other child worktrees under runs/ so concurrent children don't
+		// look like parent mutations.
+		if strings.Contains(path, string(filepath.Separator)+"runs"+string(filepath.Separator)) {
+			return nil
+		}
+		base := filepath.Base(path)
+		if base == "logs" || strings.HasPrefix(base, ".") {
+			// Skip meta/dotfiles at snapshot roots (not child worktree product).
+			return nil
+		}
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil || strings.HasPrefix(rel, "..") {
+			return nil
+		}
+		b, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return nil
+		}
+		sum := sha256.Sum256(b)
+		out[filepath.ToSlash(rel)] = hex.EncodeToString(sum[:8])
+		return nil
+	})
+	return out
+}
+
+// diffDirTree returns new/changed paths in after not present (or different) in
+// before, excluding anything under excludeRoot (the assigned worktree).
+func diffDirTree(before, after dirSnap, excludeRoot string) []string {
+	var mut []string
+	excludeRoot = filepath.Clean(excludeRoot)
+	for rel, h := range after {
+		if before[rel] == h {
+			continue
+		}
+		// If excludeRoot is under the snap root we can't map absolute paths here;
+		// caller snapshots only parent/project roots, not the worktree tree.
+		_ = excludeRoot
+		mut = append(mut, rel)
+	}
+	return mut
+}
+
+// cleanupIsolationViolation removes escaped product files and restores parent
+// / project roots to the pre-run snapshot (delete new files; never invent).
+func cleanupIsolationViolation(escaped, parentMut, projectMut []string, parentSnap, projectSnap dirSnap, parentRoot, projectRoot string) {
+	for _, p := range escaped {
+		_ = os.RemoveAll(p)
+	}
+	// Delete newly created relative paths under parent/project roots.
+	for _, rel := range parentMut {
+		if parentSnap[rel] == "" {
+			_ = os.RemoveAll(filepath.Join(parentRoot, filepath.FromSlash(rel)))
+		}
+	}
+	for _, rel := range projectMut {
+		if projectSnap[rel] == "" {
+			_ = os.RemoveAll(filepath.Join(projectRoot, filepath.FromSlash(rel)))
+		}
+	}
 }
 
 func attachUsage(out ChildExecResult, res agent.Result) ChildExecResult {
@@ -450,7 +493,7 @@ func attachUsage(out ChildExecResult, res agent.Result) ChildExecResult {
 	return out
 }
 
-func allocateChildWorktree(homeDir, projectID, graphID, workItemID, attemptID string) (string, error) {
+func allocateChildWorktree(homeDir, projectID, graphID, workItemID, attemptID, repoPath string) (string, error) {
 	projectID = strings.TrimSpace(projectID)
 	if projectID == "" {
 		projectID = "local-project"
@@ -479,15 +522,59 @@ func allocateChildWorktree(homeDir, projectID, graphID, workItemID, attemptID st
 	}
 	runKey := short(graphID + "|" + workItemID + "|" + attemptID)
 	root := filepath.Join(pdir, "runs", "wf_"+runKey, "worktree")
-	if err := os.MkdirAll(root, 0o700); err != nil {
+	// Isolated provider workspace: prefer a real git worktree/clone of the
+	// parent repo so AG/Codex project context is the child path only.
+	if err := materializeIsolatedGitWorkspace(root, repoPath); err != nil {
 		return "", err
 	}
 	_ = os.Chmod(root, 0o700)
-	marker := fmt.Sprintf("graph=%s\nwork_item=%s\nattempt=%s\n", graphID, workItemID, attemptID)
+	marker := fmt.Sprintf("graph=%s\nwork_item=%s\nattempt=%s\nrepo=%s\n", graphID, workItemID, attemptID, strings.TrimSpace(repoPath))
 	if err := os.WriteFile(filepath.Join(root, ".loopcoder-owned-worktree"), []byte(marker), 0o600); err != nil {
 		return "", err
 	}
 	return root, nil
+}
+
+// materializeIsolatedGitWorkspace creates an exclusive git checkout at dest
+// from repoPath (git worktree when possible, else clone, else empty git init).
+// The provider must treat dest as its sole project context.
+func materializeIsolatedGitWorkspace(dest, repoPath string) error {
+	if err := os.RemoveAll(dest); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
+		return err
+	}
+	repoPath = strings.TrimSpace(repoPath)
+	if repoPath != "" {
+		if abs, aerr := filepath.Abs(repoPath); aerr == nil {
+			repoPath = abs
+		}
+		if st, err := os.Stat(filepath.Join(repoPath, ".git")); err == nil && (st.IsDir() || st.Mode().IsRegular()) {
+			// Prefer linked worktree (cheap, independent index/worktree).
+			cmd := exec.Command("git", "-C", repoPath, "worktree", "add", "--detach", dest, "HEAD")
+			if out, err := cmd.CombinedOutput(); err == nil {
+				return nil
+			} else {
+				// Fall back to local clone if worktree fails (e.g. bare/invalid).
+				_ = out
+				cmd2 := exec.Command("git", "clone", "--local", "--no-hardlinks", repoPath, dest)
+				if out2, err2 := cmd2.CombinedOutput(); err2 == nil {
+					return nil
+				} else {
+					_ = out2
+				}
+			}
+		}
+	}
+	if err := os.MkdirAll(dest, 0o700); err != nil {
+		return err
+	}
+	// Empty isolated git project so providers still have a repo identity.
+	init := exec.Command("git", "init")
+	init.Dir = dest
+	_, _ = init.CombinedOutput()
+	return nil
 }
 
 func writeChildEvidence(wt string, in ChildExecInput, kind string, at time.Time) (path, digest string, files []string, err error) {
