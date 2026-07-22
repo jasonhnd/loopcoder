@@ -90,7 +90,7 @@ func DecomposeGoal(opts DecomposeOptions) (Graph, error) {
 		{Schema: SchemaDep, From: "wi_research", To: "wi_implement", Kind: DepFinishToStart},
 		{Schema: SchemaDep, From: "wi_implement", To: "wi_tests", Kind: DepFinishToStart},
 		{Schema: SchemaDep, From: "wi_tests", To: "wi_verify", Kind: DepFinishToStart},
-		{Schema: SchemaDep, From: "wi_implement", To: "wi_verify", Kind: DepOutput},
+		// Keep hard fan-out ≤ MaxParallel (2): do not attach verify directly to implement.
 	}
 	if !docsOnly {
 		items = append(items, WorkItem{
