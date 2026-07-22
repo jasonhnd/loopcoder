@@ -22,6 +22,7 @@ func runQualify(args []string, stdout, stderr io.Writer, deps Deps) int {
 	format := fs.String("format", "text", "text|json")
 	iv := fs.Bool("integration-verify-ok", false, "remote integration-verify green for SHA")
 	ic := fs.Bool("integration-canary-ok", false, "remote integration-canary green for SHA")
+	canary := fs.String("canary-evidence", "", "exact-binary real canary evidence JSON (loopcoder.canary_evidence.v1); required for real_runtime scorecard metrics")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -46,7 +47,8 @@ func runQualify(args []string, stdout, stderr io.Writer, deps Deps) int {
 		Mode:        artifactqual.ModeRelease,
 		ArchivePath: *archive, ExpectedDigest: *digest, SHA: *sha,
 		WorkDir: wd, IntegrationVerifyOK: *iv, IntegrationCanaryOK: *ic,
-		Now: now().UTC(),
+		CanaryEvidencePath: *canary,
+		Now:                now().UTC(),
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "qualify: %v\n", err)

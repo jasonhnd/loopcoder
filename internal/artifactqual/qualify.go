@@ -54,6 +54,10 @@ type Input struct {
 	// Integration dual-green flags measured from Actions (caller-supplied from metadata only).
 	IntegrationVerifyOK bool
 	IntegrationCanaryOK bool
+	// CanaryEvidencePath is the exact-binary real canary evidence manifest
+	// (loopcoder.canary_evidence.v1). Required for real_runtime scorecard metrics.
+	// Dry-run / --capacity-snapshot structural probes must not substitute.
+	CanaryEvidencePath string
 	// AllowFixture only for unit tests; forbidden when ModeRelease.
 	AllowFixture bool
 	// FixtureEnv only when AllowFixture && ModeUnit.
@@ -73,10 +77,12 @@ type Evidence struct {
 	InstallSmoke  installsmoke.Report  `json:"install_smoke"`
 	Scorecard     releaseslo.Scorecard `json:"scorecard"`
 	Decision      rcgonogo.Record      `json:"decision"`
-	Passed        bool                 `json:"passed"`
-	Reasons       []string             `json:"reasons,omitempty"`
-	GeneratedAt   time.Time            `json:"generated_at"`
-	RejectFixture bool                 `json:"reject_fixture_constructors"`
+	// Canary is the validated real-runtime canary evidence (if provided).
+	Canary        *CanaryValidation `json:"canary_validation,omitempty"`
+	Passed        bool              `json:"passed"`
+	Reasons       []string          `json:"reasons,omitempty"`
+	GeneratedAt   time.Time         `json:"generated_at"`
+	RejectFixture bool              `json:"reject_fixture_constructors"`
 }
 
 // Record alias for rcgonogo decision JSON shape used in tests.
@@ -294,7 +300,32 @@ func Qualify(in Input) (Evidence, error) {
 		ev.Probes = append(ev.Probes, cro.Probes...)
 	}
 
-	// scorecard from measured probes — never invent green for not-run metrics
+	// Load exact-binary real canary evidence (optional path). Without it,
+	// real_runtime required metrics stay not_run → scorecard_go=false.
+	var canaryVal *CanaryValidation
+	if p := strings.TrimSpace(in.CanaryEvidencePath); p != "" {
+		cev, cerr := LoadCanaryEvidence(p)
+		if cerr != nil {
+			ev.Reasons = append(ev.Reasons, "canary_evidence_load:"+cerr.Error())
+			cv := CanaryValidation{Present: true, Valid: false, Reasons: []string{cerr.Error()}, EvidencePath: p}
+			canaryVal = &cv
+		} else {
+			cv := ValidateCanaryEvidence(cev, digest, in.SHA, now)
+			cv.EvidencePath = p
+			canaryVal = &cv
+			if !cv.Valid {
+				ev.Reasons = append(ev.Reasons, "canary_evidence_invalid")
+				ev.Reasons = append(ev.Reasons, cv.Reasons...)
+			}
+		}
+	} else {
+		cv := CanaryValidation{Present: false, Valid: false, Reasons: []string{"canary_evidence_missing"}}
+		canaryVal = &cv
+		ev.Reasons = append(ev.Reasons, "canary_evidence_missing: real_runtime metrics require --canary-evidence from exact binary live canary")
+	}
+	ev.Canary = canaryVal
+
+	// scorecard: structural probes optional; real_runtime from canary only.
 	ok := releaseslo.Bool(true)
 	bad := releaseslo.Bool(false)
 	obs := []releaseslo.MetricObservation{
@@ -323,28 +354,36 @@ func Qualify(in Input) (Evidence, error) {
 		{ID: releaseslo.MetricRouteSubstitution, BoolOK: ok, EvidenceRef: "probe:version"},
 		{ID: releaseslo.MetricDeliveryReplay, BoolOK: ok, EvidenceRef: "probe:no_rebuild"},
 		{ID: releaseslo.MetricResources, BoolOK: ok, EvidenceRef: "probe:home"},
+		// Structural / optional (dry-run, plan, snapshot) — NOT required for GO.
 		{
-			// Always observed (pass/fail) after MeasureCRO attempt — never leave not_run.
+			ID: releaseslo.MetricStructuralWorkgraphPlan, BoolOK: releaseslo.Bool(cro.DecomposeOK),
+			EvidenceRef: nonEmptyRef(cro.EvidenceRefs["decompose"], "probe:structural_workgraph_plan"),
+		},
+		{
+			ID: releaseslo.MetricStructuralRouteInventory, BoolOK: releaseslo.Bool(cro.RoutingOK && cro.AccountingOK),
+			EvidenceRef: nonEmptyRef(cro.EvidenceRefs["routing"], "probe:structural_route_inventory"),
+		},
+		{
+			ID: releaseslo.MetricStructuralDepthPlan, BoolOK: releaseslo.Bool(cro.StructuralDepthPlanOK),
+			EvidenceRef: nonEmptyRef(cro.EvidenceRefs["structural_depth_plan"], "probe:structural_depth_plan"),
+		},
+		// Legacy structural names retained as non-required observations.
+		{
 			ID: releaseslo.MetricUsefulCapacityRouting, BoolOK: releaseslo.Bool(cro.RoutingOK),
-			EvidenceRef: nonEmptyRef(cro.EvidenceRefs["routing"], "probe:useful_capacity_routing"),
+			EvidenceRef: nonEmptyRef(cro.EvidenceRefs["routing"], "probe:useful_capacity_routing_structural"),
 		},
 		{
 			ID: releaseslo.MetricWorkgraphDecompose, BoolOK: releaseslo.Bool(cro.DecomposeOK),
-			EvidenceRef: nonEmptyRef(cro.EvidenceRefs["decompose"], "probe:workgraph_decomposition"),
+			EvidenceRef: nonEmptyRef(cro.EvidenceRefs["decompose"], "probe:workgraph_decomposition_structural"),
 		},
 		{
 			ID: releaseslo.MetricCapacityAccounting, BoolOK: releaseslo.Bool(cro.AccountingOK),
-			EvidenceRef: nonEmptyRef(cro.EvidenceRefs["accounting"], "probe:capacity_accounting"),
-		},
-		{
-			ID: releaseslo.MetricMultiDepthRouting, BoolOK: releaseslo.Bool(cro.MultiDepthOK),
-			EvidenceRef: nonEmptyRef(cro.EvidenceRefs["multi_depth"], "probe:multi_depth_routing"),
-		},
-		{
-			ID: releaseslo.MetricUnavailableRouteExclude, BoolOK: releaseslo.Bool(cro.UnavailableExcludeOK),
-			EvidenceRef: nonEmptyRef(cro.EvidenceRefs["unavailable_exclude"], "probe:unavailable_route_exclude"),
+			EvidenceRef: nonEmptyRef(cro.EvidenceRefs["accounting"], "probe:capacity_accounting_structural"),
 		},
 	}
+	// real_runtime required metrics: only from validated canary evidence.
+	// Missing/invalid canary → NotRun (omit BoolOK) so scorecard_go=false.
+	obs = append(obs, realRuntimeObs(canaryVal)...)
 	if !rep.Passed {
 		obs = append(obs, releaseslo.MetricObservation{ID: releaseslo.MetricArtifact, BoolOK: bad, EvidenceRef: "installsmoke_fail"})
 	}
@@ -405,6 +444,35 @@ func nonEmptyRef(s, def string) string {
 		return def
 	}
 	return s
+}
+
+// realRuntimeObs emits required #1343 metrics only from canary evidence.
+// Without a canary file, metrics are NotRun → scorecard_go=false.
+// With a canary file, each dimension is pass/fail from validation flags
+// (never invent green; dry-run structural probes never populate these).
+func realRuntimeObs(cv *CanaryValidation) []releaseslo.MetricObservation {
+	if cv == nil || !cv.Present {
+		return []releaseslo.MetricObservation{
+			{ID: releaseslo.MetricMultiDepthRouting, NotRun: true},
+			{ID: releaseslo.MetricUnavailableRouteExclude, NotRun: true},
+			{ID: releaseslo.MetricMultiProviderExecution, NotRun: true},
+			{ID: releaseslo.MetricCapacityAfterRuntime, NotRun: true},
+			{ID: releaseslo.MetricForcedRestartCeilings, NotRun: true},
+			{ID: releaseslo.MetricRealPRHumanGate, NotRun: true},
+		}
+	}
+	ref := "canary_evidence"
+	if strings.TrimSpace(cv.EvidencePath) != "" {
+		ref = "canary_evidence:" + cv.EvidencePath
+	}
+	return []releaseslo.MetricObservation{
+		{ID: releaseslo.MetricMultiDepthRouting, BoolOK: releaseslo.Bool(cv.MultiDepthOK), EvidenceRef: ref},
+		{ID: releaseslo.MetricUnavailableRouteExclude, BoolOK: releaseslo.Bool(cv.UnavailableRetryOK), EvidenceRef: ref},
+		{ID: releaseslo.MetricMultiProviderExecution, BoolOK: releaseslo.Bool(cv.MultiProviderOK), EvidenceRef: ref},
+		{ID: releaseslo.MetricCapacityAfterRuntime, BoolOK: releaseslo.Bool(cv.CapacityAfterOK), EvidenceRef: ref},
+		{ID: releaseslo.MetricForcedRestartCeilings, BoolOK: releaseslo.Bool(cv.RestartOK), EvidenceRef: ref},
+		{ID: releaseslo.MetricRealPRHumanGate, BoolOK: releaseslo.Bool(cv.RealPROK), EvidenceRef: ref},
+	}
 }
 
 func runProbe(name string, argv []string, env []string, judge func(code int, out string) (bool, []string)) (bool, Probe) {

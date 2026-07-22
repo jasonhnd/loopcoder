@@ -11,7 +11,7 @@ import (
 const SchemaScorecard = "loopcoder.releaseslo.scorecard.v1"
 
 // CalcVersion of the scorecard algorithm.
-const CalcVersion = "v090-1343.1"
+const CalcVersion = "v090-1343.2"
 
 // MetricID is one scored dimension.
 type MetricID string
@@ -30,13 +30,23 @@ const (
 	MetricRedaction          MetricID = "redaction"
 	MetricMigration          MetricID = "migration"
 	MetricArtifact           MetricID = "artifact"
-	// CRO product metrics (V090-CRO-010 / #1343) — required, fail closed if not_run.
+	// Structural/optional CRO prechecks (dry-run / plan / snapshot). Never substitute
+	// for real_runtime required metrics below.
+	MetricStructuralWorkgraphPlan  MetricID = "structural_workgraph_plan"
+	MetricStructuralRouteInventory MetricID = "structural_route_inventory"
+	MetricStructuralDepthPlan      MetricID = "structural_depth_plan"
+	// Legacy names kept as aliases for structural probes only (not required GO).
 	MetricUsefulCapacityRouting MetricID = "useful_capacity_routing"
 	MetricWorkgraphDecompose    MetricID = "workgraph_decomposition"
 	MetricCapacityAccounting    MetricID = "capacity_accounting"
-	// Core #1343 assertions — mechanical scorecard_go must not ignore these.
-	MetricMultiDepthRouting       MetricID = "multi_depth_routing"
-	MetricUnavailableRouteExclude MetricID = "unavailable_route_exclude"
+	// real_runtime required (#1343) — pass only with exact-binary canary evidence
+	// manifest. Without real evidence: not_run → scorecard_go=false.
+	MetricMultiDepthRouting       MetricID = "multi_depth_routing"       // real execution depth bind
+	MetricUnavailableRouteExclude MetricID = "unavailable_route_exclude" // real exclude/retry no-dup
+	MetricMultiProviderExecution  MetricID = "multi_provider_execution"  // ≥2 companies real children
+	MetricCapacityAfterRuntime    MetricID = "capacity_after_runtime"    // before/reserved/actual?/after
+	MetricForcedRestartCeilings   MetricID = "forced_restart_ceilings"   // interrupt+recover+ceilings
+	MetricRealPRHumanGate         MetricID = "real_pr_human_gate"        // real PR URL/checks/verifier
 )
 
 // Verdict for one metric.
@@ -162,12 +172,16 @@ func Compile(cand Candidate, obs []MetricObservation, th Thresholds, waivers []W
 		}
 	}
 
+	// Required set: latency/safety + real_runtime #1343 metrics.
+	// Structural dry-run metrics are intentionally NOT required for GO.
 	required := []MetricID{
 		MetricStartReportLatency, MetricReportInterval, MetricRenderedAck, MetricStatusFreshness,
 		MetricStopJoin, MetricProcessLeaks, MetricRepoLocalState, MetricRouteSubstitution,
 		MetricDeliveryReplay, MetricResources, MetricRedaction, MetricMigration, MetricArtifact,
-		MetricUsefulCapacityRouting, MetricWorkgraphDecompose, MetricCapacityAccounting,
+		// real_runtime only — dry-run must leave these not_run → GO=false
 		MetricMultiDepthRouting, MetricUnavailableRouteExclude,
+		MetricMultiProviderExecution, MetricCapacityAfterRuntime,
+		MetricForcedRestartCeilings, MetricRealPRHumanGate,
 	}
 
 	allPass := true
@@ -222,7 +236,10 @@ func scoreOne(id MetricID, o MetricObservation, has bool, th Thresholds, w Waive
 	case MetricStopJoin, MetricRepoLocalState, MetricRouteSubstitution, MetricDeliveryReplay,
 		MetricResources, MetricRedaction, MetricMigration, MetricArtifact,
 		MetricUsefulCapacityRouting, MetricWorkgraphDecompose, MetricCapacityAccounting,
-		MetricMultiDepthRouting, MetricUnavailableRouteExclude:
+		MetricStructuralWorkgraphPlan, MetricStructuralRouteInventory, MetricStructuralDepthPlan,
+		MetricMultiDepthRouting, MetricUnavailableRouteExclude,
+		MetricMultiProviderExecution, MetricCapacityAfterRuntime,
+		MetricForcedRestartCeilings, MetricRealPRHumanGate:
 		mr.Threshold = "ok=true"
 		if o.BoolOK != nil && *o.BoolOK {
 			mr.Verdict = VerdictPass
