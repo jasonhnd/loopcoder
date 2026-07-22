@@ -26,6 +26,7 @@ import (
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/detachedrun"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
+	"github.com/jasonhnd/loopcoder/internal/eventstream"
 	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/hostprofile"
 	"github.com/jasonhnd/loopcoder/internal/inspect"
@@ -54,6 +55,8 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
 	"github.com/jasonhnd/loopcoder/internal/storage"
+	"github.com/jasonhnd/loopcoder/internal/termui"
+	"github.com/jasonhnd/loopcoder/internal/uibridge"
 	"github.com/jasonhnd/loopcoder/internal/upgrade"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 	"github.com/jasonhnd/loopcoder/internal/verify"
@@ -136,7 +139,7 @@ var commands = []Command{
 	// Direct-path primary surface (V090-025): lead help with these.
 	{Name: "run", Summary: "primary direct-path run (explicit provider/model; no auto-route until P4)"},
 	{Name: "status", Summary: "render local delivery run status"},
-	{Name: "events", Summary: "follow project report events (cursor-based; thin alias surface)"},
+	{Name: "events", Summary: "follow project UI report stream (cursor replay + follow + optional loopback bridge)"},
 	{Name: "cancel", Summary: "request cancellation for a detached run"},
 	{Name: "doctor", Summary: "run read-only preflight checks"},
 	{Name: "providers", Summary: "refresh bounded provider CLI installation inventory"},
@@ -469,8 +472,7 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return runRun(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "events" {
-		// Thin alias: events surface reuses report listing until dedicated follow lands.
-		return runReport(args[1:], stdout, stderr, deps)
+		return runEvents(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "ready-set" {
 		return runReadySet(args[1:], stdout, stderr, deps)
@@ -810,6 +812,21 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --poll duration        follow poll interval (default 250ms)")
 		fmt.Fprintln(w, "  --follow-for duration  optional bounded follow duration for tests/scripts")
 		fmt.Fprintln(w, "  --format string        output format: text or jsonl (default \"text\")")
+	}
+	if command.Name == "events" {
+		fmt.Fprintln(w, "  --project-id string   project id (required unless --repo resolves a registration)")
+		fmt.Fprintln(w, "  --repo string         repository path to resolve project id (default \".\")")
+		fmt.Fprintln(w, "  --run string          optional run id filter")
+		fmt.Fprintln(w, "  --after int           resume after this sequence (default 0 = from start)")
+		fmt.Fprintln(w, "  --follow              follow new reports after replay")
+		fmt.Fprintln(w, "  --format string       output format: jsonl or human (default \"jsonl\")")
+		fmt.Fprintln(w, "  --poll duration       follow poll interval (default 250ms)")
+		fmt.Fprintln(w, "  --follow-for duration optional bounded follow duration")
+		fmt.Fprintln(w, "  --client-id string    UI client id (default \"terminal\")")
+		fmt.Fprintln(w, "  --session-id string   UI session id (default auto)")
+		fmt.Fprintln(w, "  --keepalive           emit non-semantic jsonl keepalives while idle")
+		fmt.Fprintln(w, "  --bridge              start loopback HTTP/SSE UI bridge and print handshake JSON")
+		fmt.Fprintln(w, "  --bridge-for duration how long to keep the bridge open (default 30s; 0=until interrupt)")
 	}
 	if command.Name == "report" {
 		fmt.Fprintln(w, "  --repo string      repository path (default \".\")")
@@ -6866,6 +6883,145 @@ func runStatusProgressReceipts(opts statusProgressOptions, stdout, stderr io.Wri
 		fmt.Fprintf(stderr, "status: write output: %v\n", err)
 		return 1
 	}
+	return 0
+}
+
+// runEvents is the production UI report transport entry point (V090-RB01).
+// It is not an alias of runReport.
+func runEvents(args []string, stdout, stderr io.Writer, deps Deps) int {
+	fs := flag.NewFlagSet("events", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var (
+		projectID string
+		repoPath  string
+		runID     string
+		after     int64
+		follow    bool
+		format    string
+		poll      time.Duration
+		followFor time.Duration
+		clientID  string
+		sessionID string
+		keepalive bool
+		bridge    bool
+		bridgeFor time.Duration
+	)
+	fs.StringVar(&projectID, "project-id", "", "project id")
+	fs.StringVar(&repoPath, "repo", ".", "repository path used to resolve project id when --project-id is empty")
+	fs.StringVar(&runID, "run", "", "optional run id filter")
+	fs.Int64Var(&after, "after", 0, "resume after this sequence")
+	fs.BoolVar(&follow, "follow", false, "follow new reports after replay")
+	fs.StringVar(&format, "format", "jsonl", "output format: jsonl or human")
+	fs.DurationVar(&poll, "poll", eventstream.DefaultPoll, "follow poll interval")
+	fs.DurationVar(&followFor, "follow-for", 0, "optional bounded follow duration")
+	fs.StringVar(&clientID, "client-id", "terminal", "UI client id")
+	fs.StringVar(&sessionID, "session-id", "", "UI session id")
+	fs.BoolVar(&keepalive, "keepalive", false, "emit non-semantic jsonl keepalives while idle")
+	fs.BoolVar(&bridge, "bridge", false, "start loopback HTTP/SSE UI bridge and print handshake JSON")
+	fs.DurationVar(&bridgeFor, "bridge-for", 30*time.Second, "bridge lifetime (0 waits until context cancel)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format != "jsonl" && format != "human" {
+		fmt.Fprintf(stderr, "events: --format must be jsonl or human\n")
+		return 2
+	}
+	if sessionID == "" {
+		sessionID = fmt.Sprintf("sess-%d", time.Now().UnixNano())
+	}
+	now := deps.Now
+	if now == nil {
+		now = time.Now
+	}
+	ctx := context.Background()
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		resolved, err := resolveRepo(repoPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "events: resolve repo: %v\n", err)
+			return 1
+		}
+		roots, err := runtimepath.Resolve(ctx, resolved)
+		if err != nil {
+			fmt.Fprintf(stderr, "events: resolve project: %v\n", err)
+			return 1
+		}
+		if !roots.Registered || strings.TrimSpace(roots.ProjectID) == "" {
+			fmt.Fprintf(stderr, "events: --project-id required when repository is not registered\n")
+			return 1
+		}
+		projectID = roots.ProjectID
+	}
+
+	store, err := eventstream.Open(projectID, now)
+	if err != nil {
+		fmt.Fprintf(stderr, "events: open report store: %v\n", err)
+		return 1
+	}
+
+	if bridge {
+		b, hs, err := store.StartBridge(uibridge.Config{
+			ProjectID: projectID,
+			OwnerID:   clientID,
+			Now:       now,
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "events: start bridge: %v\n", err)
+			return 1
+		}
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(hs); err != nil {
+			_ = b.Close()
+			fmt.Fprintf(stderr, "events: write handshake: %v\n", err)
+			return 1
+		}
+		bridgeCtx := ctx
+		var cancel context.CancelFunc
+		if bridgeFor > 0 {
+			bridgeCtx, cancel = context.WithTimeout(ctx, bridgeFor)
+			defer cancel()
+		}
+		<-bridgeCtx.Done()
+		if err := b.Close(); err != nil {
+			fmt.Fprintf(stderr, "events: close bridge: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+
+	mode := termui.ModeJSONL
+	if format == "human" {
+		mode = termui.ModeHuman
+	}
+	followCtx := ctx
+	var cancel context.CancelFunc
+	if follow && followFor > 0 {
+		followCtx, cancel = context.WithTimeout(ctx, followFor)
+		defer cancel()
+	} else if !follow {
+		// snapshot only
+	} else {
+		// unbounded follow: still require cancel from outside; for safety use no deadline
+	}
+	res, err := store.Follow(followCtx, eventstream.FollowOptions{
+		ClientID:  clientID,
+		SessionID: sessionID,
+		After:     after,
+		RunID:     strings.TrimSpace(runID),
+		Mode:      mode,
+		Out:       stdout,
+		Poll:      poll,
+		Keepalive: keepalive && format == "jsonl",
+		Follow:    follow,
+	})
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		fmt.Fprintf(stderr, "events: follow: %v\n", err)
+		return 1
+	}
+	// success even on bounded timeout after partial render
+	_ = res
 	return 0
 }
 
