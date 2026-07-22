@@ -73,6 +73,7 @@ push access.
    loopcoder doctor --repo .
 loopcoder diagnose --project-id <id> --dry-run --format json
 loopcoder capabilities --format json
+loopcoder qualify --archive dist/x.tar.gz --digest <sha256>
    ```
 
 6. Confirm local report querying works. A fresh repository may have no reports

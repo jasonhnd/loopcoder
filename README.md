@@ -24,6 +24,7 @@ capability matrix:
 loopcoder doctor
 loopcoder diagnose --project-id <id> --dry-run --format json
 loopcoder capabilities --format json
+loopcoder qualify --archive dist/x.tar.gz --digest <sha256>
 loopcoder doctor --format json   # codes/remediation aligned with capmatrix
 ```
 
