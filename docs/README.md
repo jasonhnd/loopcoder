@@ -84,6 +84,8 @@ Every document is exactly one of these types:
 - [`reference/remove-federation-leases.md`](reference/remove-federation-leases.md): V090-077 remove nested/federation/state-branch/cross-machine leases.
 - [`reference/cli-prune.md`](reference/cli-prune.md): V090-078 prune legacy CLI commands and superseded specifications.
 - [`reference/deadcode-sweep.md`](reference/deadcode-sweep.md): V090-079 final dependency/schema/dead-code sweep after parity.
+- [`reference/v0.9.0-capability-matrix.md`](reference/v0.9.0-capability-matrix.md): V090-080 v0.9.0 capability matrix (honest evidence tiers).
+- [`reference/v0.9.0-quickstart.md`](reference/v0.9.0-quickstart.md): V090-080 v0.9.0 install/doctor/ordinary-dev quickstart.
 - [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
 - [`reference/v09-home-layout.md`](reference/v09-home-layout.md): global `$LOOPCODER_HOME` layout and owner-only creation.
 - [`reference/project-authority-store.md`](reference/project-authority-store.md): project.db domain tables and immutable events.
