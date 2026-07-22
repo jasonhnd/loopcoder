@@ -9,9 +9,27 @@
 [![Claude Code Skill](https://img.shields.io/badge/Claude%20Code-Skill-green.svg)](SKILL.md)
 [![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-black.svg)](docs/specs/0884-macos-arm64-only.md)
 
-[What it is](#what-it-is) | [The loop](#the-loop) | [Install](#install) | [Usage](#usage) | [Upgrade](#upgrade-from-070-080-to-081) | [How it works](#how-it-works) | [Design](#design)
+[What it is](#what-it-is) | [v0.9 quickstart](#v09-ordinary-development-quickstart) | [The loop](#the-loop) | [Install](#install) | [Usage](#usage) | [Upgrade](#upgrade-from-070-080-to-081) | [How it works](#how-it-works) | [Design](#design)
 
 </div>
+
+## v0.9 ordinary development quickstart
+
+For **v0.9.0** on Darwin arm64, start here (full detail:
+[`docs/reference/v0.9.0-quickstart.md`](docs/reference/v0.9.0-quickstart.md),
+capability matrix:
+[`docs/reference/v0.9.0-capability-matrix.md`](docs/reference/v0.9.0-capability-matrix.md)):
+
+```bash
+loopcoder doctor
+loopcoder doctor --format json   # codes/remediation aligned with capmatrix
+```
+
+Ordinary development uses isolated worktrees/PRs and a **human merge gate**. Do
+**not** run `loopcoder compile`, `dispatch`, or `tick` against this repository
+(self-bootstrap is unsupported). Prefer explicit direct run / bounded workflow,
+global/project stores (no production `<repo>/.loopcoder` runtime writes), and
+terminal GitHub rehydration for cross-Mac handoff.
 
 ## What it is
 
