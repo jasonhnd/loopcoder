@@ -2,6 +2,8 @@ package goalrun
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,10 +21,12 @@ import (
 // Request is one product-path goal execution.
 type Request struct {
 	ProjectID string
-	Goal      string
-	Issue     string
-	Actor     string
-	Owner     string
+	// RunID optional unique execution namespace. Empty → generated per Execute.
+	RunID string
+	Goal  string
+	Issue string
+	Actor string
+	Owner string
 	// Provider/Model: empty or "auto" → per-child bare auto-route with durable
 	// capacity rehydrate. Explicit pin (including "fixture") skips auto-route.
 	Provider string
@@ -131,8 +135,13 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		return Result{}, err
 	}
 	projectID := strings.TrimSpace(req.ProjectID)
-	if projectID == "" {
-		projectID = "local-project"
+	if projectID == "" || projectID == "local-project" {
+		// Never share the global local-project namespace across disposable canaries.
+		projectID = UniqueProjectID(req.RepoPath, nowFn)
+	}
+	runID := strings.TrimSpace(req.RunID)
+	if runID == "" {
+		runID = "run_" + shortID(fmt.Sprintf("%s|%d", projectID, now.UnixNano()))
 	}
 	if _, err := reg.Materialize(projectID, def, approval, now); err != nil {
 		return Result{}, err
@@ -193,7 +202,7 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		dryRun = *req.DryRun
 	}
 
-	runID := "goalrun_" + shortID(g.GraphID)
+	// Capacity ledger + workflow share unique runID (not graph-only / not global local-project).
 	usedProviders := map[string]bool{}
 	children := make([]ChildReport, 0, len(g.Items))
 	childRoutes := map[string]workflowrun.ChildRoute{}
@@ -440,6 +449,7 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 	svc := workflowrun.Service{Now: nowFn, Executor: exec, HomeDir: req.HomeDir}
 	wres, werr := svc.Execute(ctx, workflowrun.Request{
 		ProjectID:   projectID,
+		RunID:       runID,
 		Definition:  def,
 		Actor:       actor,
 		Provider:    firstNonEmpty(wfProv, "auto"),
@@ -707,6 +717,23 @@ func normalizeDepth(d string) string {
 	default:
 		return d
 	}
+}
+
+// UniqueProjectID builds a durable project namespace for one disposable canary/repo.
+// Never returns the shared "local-project" default used by stale multi-run pollution.
+// IDs are alphanumeric-safe for home.ValidateProjectID (no path separators).
+func UniqueProjectID(repoPath string, nowFn func() time.Time) string {
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	abs := strings.TrimSpace(repoPath)
+	if abs == "" {
+		abs = "."
+	}
+	// Hash path + nano time so two canaries on the same goal/issue never share state.
+	seed := fmt.Sprintf("%s|%d", abs, nowFn().UTC().UnixNano())
+	sum := sha256.Sum256([]byte(seed))
+	return "disp-" + hex.EncodeToString(sum[:8])
 }
 
 func isReadOnlyPerm(p string) bool {

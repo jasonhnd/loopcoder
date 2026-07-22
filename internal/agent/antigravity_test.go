@@ -45,6 +45,7 @@ func TestBuildAntigravityArgs(t *testing.T) {
 				"-p", "do the work",
 				"--add-dir", "wt",
 				"--dangerously-skip-permissions",
+				"--new-project",
 				"--model", "Gemini 3.1 Pro (medium)",
 			},
 		},
@@ -59,6 +60,7 @@ func TestBuildAntigravityArgs(t *testing.T) {
 				"-p", "do the work",
 				"--add-dir", "wt",
 				"--dangerously-skip-permissions",
+				"--new-project",
 				"--model", "Future Model",
 			},
 		},
@@ -72,6 +74,7 @@ func TestBuildAntigravityArgs(t *testing.T) {
 				"-p", "do the work",
 				"--add-dir", "wt",
 				"--dangerously-skip-permissions",
+				"--new-project",
 				"--model", "Gemini 3.1 Pro (medium)",
 			},
 		},
@@ -86,6 +89,7 @@ func TestBuildAntigravityArgs(t *testing.T) {
 				"-p", "do the work",
 				"--add-dir", "wt",
 				"--dangerously-skip-permissions",
+				"--new-project",
 				"--model", "Opus 4.6 (high)",
 			},
 		},
@@ -115,7 +119,7 @@ func TestAntigravityRunnerClosesStdinPinsWorktreeAndCapturesPlainText(t *testing
 		if cmd.Stdin != nil {
 			t.Fatalf("Stdin = %#v, want nil closed stdin", cmd.Stdin)
 		}
-		wantArgs := []string{"agy", "-p", prompt, "--add-dir", worktree, "--dangerously-skip-permissions", "--model", "Gemini 3.1 Pro (medium)"}
+		wantArgs := []string{"agy", "-p", prompt, "--add-dir", worktree, "--dangerously-skip-permissions", "--new-project", "--model", "Gemini 3.1 Pro (medium)"}
 		if !reflect.DeepEqual(cmd.Args, wantArgs) {
 			t.Fatalf("Args = %#v, want %#v", cmd.Args, wantArgs)
 		}
