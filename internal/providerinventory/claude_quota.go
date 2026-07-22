@@ -2,6 +2,7 @@ package providerinventory
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -123,10 +124,13 @@ func inspectClaudeQuota(ctx context.Context, discovery *discoveryContext, adapte
 	probe.EnvironmentKeys = environmentKeys(env)
 
 	result, runErr := deps.RunClaudePTY(ctx, ClaudePTYRequest{
-		Argv:               argv,
-		Env:                env,
-		Cwd:                root,
-		Input:              "/usage\n/exit\n",
+		Argv: argv,
+		Env:  env,
+		Cwd:  root,
+		// Enter dismisses residual prompts; then /usage and /exit.
+		// "2" selects dark theme if first-run UI still appears; then /usage.
+		// "1" accepts workspace trust if still shown; then /usage + /exit.
+		Input:              "1\n/usage\n/exit\n",
 		Timeout:            claudeQuotaTimeout,
 		StdoutLimitBytes:   claudeQuotaOutputBytes,
 		StderrLimitBytes:   StderrLimitBytes,
@@ -263,7 +267,8 @@ func prepareClaudeQuotaSandbox(executable string, deps Deps) (string, []string, 
 	// interactive /usage can complete. Without this, the PTY hangs on login
 	// because credentials live under ~/.claude and env secrets are denied.
 	// File contents never enter probe records (output is redacted separately).
-	if err := seedClaudeQuotaAuthHome(filepath.Join(root, "home"), deps); err != nil {
+	// Trust the sandbox cwd so the workspace trust dialog is skipped.
+	if err := seedClaudeQuotaAuthHome(filepath.Join(root, "home"), root, deps); err != nil {
 		cleanup()
 		return "", nil, nil, func() {}, err
 	}
@@ -286,7 +291,13 @@ func prepareClaudeQuotaSandbox(executable string, deps Deps) (string, []string, 
 // seedClaudeQuotaAuthHome copies a minimal allowlist of Claude Code local auth
 // artifacts into the sandbox home. Missing sources are OK (probe will fail
 // closed as before). No credential env vars are introduced.
-func seedClaudeQuotaAuthHome(sandboxHome string, deps Deps) error {
+//
+// Writes a redacted ~/.claude.json stub that:
+//   - hasCompletedOnboarding=true (skip theme picker)
+//   - trusts sandboxCwd (skip "Is this a project you trust?" dialog)
+//
+// cwd must match the PTY working directory or the trust dialog reappears.
+func seedClaudeQuotaAuthHome(sandboxHome, sandboxCwd string, deps Deps) error {
 	if sandboxHome == "" {
 		return errors.New("claude quota sandbox home empty")
 	}
@@ -307,32 +318,53 @@ func seedClaudeQuotaAuthHome(sandboxHome string, deps Deps) error {
 	if err := os.MkdirAll(dstRoot, 0o700); err != nil {
 		return err
 	}
-	// Allowlist only — never copy plugins, agents, memory, or logs.
-	allow := []string{
-		".credentials.json",
-		"settings.json",
+	// Credentials only — do not copy host settings.json (hooks/plugins/deny
+	// rules inject obsolete MultiEdit/LS warnings and slow TUI bootstrap).
+	credSrc := filepath.Join(srcRoot, ".credentials.json")
+	if info, err := os.Lstat(credSrc); err == nil && info.Mode().IsRegular() && info.Size() > 0 && info.Size() <= 256*1024 {
+		if raw, err := os.ReadFile(credSrc); err == nil {
+			if err := os.WriteFile(filepath.Join(dstRoot, ".credentials.json"), raw, 0o600); err != nil {
+				return err
+			}
+		}
 	}
-	for _, name := range allow {
-		src := filepath.Join(srcRoot, name)
-		info, err := os.Lstat(src)
-		if err != nil {
-			continue // optional
-		}
-		if !info.Mode().IsRegular() {
-			continue
-		}
-		// Bound size so we never copy huge unexpected files.
-		if info.Size() <= 0 || info.Size() > 256*1024 {
-			continue
-		}
-		raw, err := os.ReadFile(src)
-		if err != nil {
-			continue
-		}
-		dst := filepath.Join(dstRoot, name)
-		if err := os.WriteFile(dst, raw, 0o600); err != nil {
-			return err
-		}
+	// Minimal settings: skip prompts without host hooks/plugins.
+	minimalSettings := []byte(`{
+  "tui": "fullscreen",
+  "skipDangerousModePermissionPrompt": true,
+  "skipWorkflowUsageWarning": true
+}
+`)
+	if err := os.WriteFile(filepath.Join(dstRoot, "settings.json"), minimalSettings, 0o600); err != nil {
+		return err
+	}
+	// Global state: skip theme/onboarding + workspace trust for the probe cwd.
+	// Do not copy the full host ~/.claude.json (projects map, caches, PII).
+	cwd := strings.TrimSpace(sandboxCwd)
+	if cwd == "" {
+		cwd = sandboxHome
+	}
+	// Escape JSON string for path.
+	cwdJSON, _ := json.Marshal(cwd)
+	onboardStub := []byte(fmt.Sprintf(`{
+  "hasCompletedOnboarding": true,
+  "lastOnboardingVersion": "2.1.210",
+  "numStartups": 10,
+  "theme": "dark",
+  "optionAsMetaKeyInstalled": true,
+  "effortCalloutV2Dismissed": true,
+  "projects": {
+    %s: {
+      "hasTrustDialogAccepted": true,
+      "hasCompletedProjectOnboarding": true,
+      "projectOnboardingSeenCount": 1,
+      "allowedTools": []
+    }
+  }
+}
+`, string(cwdJSON)))
+	if err := os.WriteFile(filepath.Join(sandboxHome, ".claude.json"), onboardStub, 0o600); err != nil {
+		return err
 	}
 	return nil
 }

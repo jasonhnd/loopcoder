@@ -68,7 +68,7 @@ func TestClaudeQuotaCollectsCurrentSessionAndWeeklyWindows(t *testing.T) {
 		if req.Cwd == "" || strings.Contains(req.Cwd, "wt") {
 			t.Fatalf("claude cwd = %q, want neutral temp outside worktree", req.Cwd)
 		}
-		if req.Input != "/usage\n/exit\n" {
+		if req.Input != "1\n/usage\n/exit\n" {
 			t.Fatalf("claude input = %q", req.Input)
 		}
 		if req.Columns != claudeQuotaColumns || req.Rows != claudeQuotaRows {
