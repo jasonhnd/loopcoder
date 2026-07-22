@@ -908,16 +908,6 @@ func applyChildOutcomes(children []ChildReport, wres workflowrun.Result, ledger 
 	return children
 }
 
-// remainingForProvider returns the first usable remaining fraction for provider
-// from a fresh snapshot (exact/estimated). Never invents values.
-func remainingForProvider(snap *capacitysnapshot.Snapshot, provider string) (rem *float64, source, freshness string) {
-	rem, source, freshness, _, ok := remainingForProviderWindow(snap, provider, "", "")
-	if !ok {
-		return nil, "", ""
-	}
-	return rem, source, freshness
-}
-
 // remainingForProviderWindow prefers the same account_ref + window_kind as the
 // reservation. ok=false when no matching window is available.
 // resetEvidence is non-empty when the observation indicates a reset boundary.
