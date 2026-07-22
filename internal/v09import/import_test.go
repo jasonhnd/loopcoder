@@ -121,8 +121,8 @@ func TestFailedProjectIsolated(t *testing.T) {
 	if s.ProjectCount() != 1 {
 		t.Fatalf("want only p1 imported, got %d", s.ProjectCount())
 	}
-	if _, ok := s.Projects["p1"]; !ok {
-		// need to access - Projects is exported
+	if s.Projects["p1"] == nil {
+		t.Fatal("p1 missing after import")
 	}
 	if len(r.Report.FailedProjects) != 1 || r.Report.FailedProjects[0] != "p2" {
 		t.Fatalf("failed=%v", r.Report.FailedProjects)
@@ -179,12 +179,12 @@ func TestDigestMismatchFails(t *testing.T) {
 }
 
 func TestOmissionsFromUnsupported(t *testing.T) {
-	bundle, dig := sampleBundle(t)
+	bundle, _ := sampleBundle(t)
 	bundle.Unsupported = append(bundle.Unsupported, v08export.UnsupportedRecord{Path: "x", Reason: "corrupt"})
 	// recompute digest after mutation
 	b, _ := json.Marshal(bundle)
 	sum := sha256.Sum256(b)
-	dig = hex.EncodeToString(sum[:])
+	dig := hex.EncodeToString(sum[:])
 	s := v09import.NewStore()
 	r := s.Run(v09import.Input{Bundle: bundle, ExpectedBundleDigest: dig, DryRun: true, Now: fixed()})
 	if len(r.Report.Omissions) == 0 {
