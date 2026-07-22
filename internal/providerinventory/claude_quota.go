@@ -15,7 +15,7 @@ import (
 
 const (
 	claudeQuotaSourceSchema = "claude.rendered_usage_status.v1"
-	claudeQuotaTimeout      = 10 * time.Second
+	claudeQuotaTimeout      = 45 * time.Second
 	claudeQuotaOutputBytes  = 64 * 1024
 	claudeQuotaColumns      = 100
 	claudeQuotaRows         = 30
