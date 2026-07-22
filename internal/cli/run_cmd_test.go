@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -53,6 +55,11 @@ func TestRunRejectsMissingRouteAndAutoRoute(t *testing.T) {
 }
 
 func TestRunHumanJSONLSameSchema(t *testing.T) {
+	home := t.TempDir()
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LOOPCODER_HOME", home)
 	deps := DefaultDeps()
 	deps.Now = func() time.Time { return time.Date(2026, 7, 22, 20, 1, 0, 0, time.UTC) }
 	args := []string{"--repo", "o/r", "--issue", "9", "--provider", "fixture", "--model", "m"}
@@ -70,8 +77,56 @@ func TestRunHumanJSONLSameSchema(t *testing.T) {
 	if !strings.Contains(hOut.String(), acc.RunID) {
 		t.Fatalf("human missing run_id %s in %s", acc.RunID, hOut.String())
 	}
-	if acc.Schema != schemaRunAccepted || acc.Status != "accepted" {
+	if acc.Schema != schemaRunAccepted || acc.Status != "cleanup_terminal" {
 		t.Fatalf("%+v", acc)
+	}
+	if strings.Contains(acc.Message, "execution ports not yet attached") {
+		t.Fatal("old stub message still present")
+	}
+}
+
+func TestRunRemovesPortsNotAttachedStub(t *testing.T) {
+	src, err := os.ReadFile("run_cmd.go")
+	if err != nil {
+		src, err = os.ReadFile(filepath.Join("internal", "cli", "run_cmd.go"))
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(src), "execution ports not yet attached") {
+		t.Fatal("stub message still in source")
+	}
+	if !strings.Contains(string(src), "directrun.Service") {
+		t.Fatal("cmd path does not reach directrun.Service")
+	}
+}
+
+func TestRunBlackBoxReachesCleanupTerminal(t *testing.T) {
+	home := t.TempDir()
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LOOPCODER_HOME", home)
+	deps := DefaultDeps()
+	deps.Now = func() time.Time { return time.Date(2026, 7, 22, 21, 0, 0, 0, time.UTC) }
+	var stdout, stderr bytes.Buffer
+	code := runRun([]string{
+		"--repo", "acme/demo", "--issue", "7", "--provider", "fixture", "--model", "m",
+		"--format", "json",
+	}, &stdout, &stderr, deps)
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	var acc RunAccepted
+	if err := json.Unmarshal(stdout.Bytes(), &acc); err != nil {
+		t.Fatal(err)
+	}
+	if acc.Status != "cleanup_terminal" {
+		t.Fatalf("%+v", acc)
+	}
+	// start report should have been written to stderr report stream
+	if !strings.Contains(stderr.String(), "start") && !strings.Contains(stderr.String(), "stage=") {
+		t.Fatalf("expected start report on stderr: %q", stderr.String())
 	}
 }
 

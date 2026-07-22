@@ -8,10 +8,16 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/directattempt"
+	"github.com/jasonhnd/loopcoder/internal/directrun"
 	"github.com/jasonhnd/loopcoder/internal/preflight"
+	"github.com/jasonhnd/loopcoder/internal/runtimepath"
+	"github.com/jasonhnd/loopcoder/internal/termui"
 )
 
 // RunRequest is the normalized loopcoder run command input (V090-025 / #1124).
@@ -154,10 +160,75 @@ func runRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "run: preflight blocked decision=%s digest=%s\n", snap.Decision, snap.Digest)
 		return exitRunPrecondition
 	}
-	// Contract shell only: record accepted identity with preflight evidence; later issues attach ports.
-	accepted.Status = "accepted"
-	accepted.Message = "run recorded with preflight evidence; execution ports not yet attached"
+
+	// Production direct-run application service (V090-RB02): worker lifecycle
+	// through cleanup-terminal. No Git commit/push/PR in this command path.
+	projectID := ""
+	if resolved, err := resolveRepo(req.Repo); err == nil {
+		if roots, rerr := runtimepath.Resolve(context.Background(), resolved); rerr == nil && roots.Registered {
+			projectID = roots.ProjectID
+		}
+	}
+	reportMode := termui.ModeHuman
+	if req.Format == "jsonl" {
+		reportMode = termui.ModeJSONL
+	}
+	// Operator reports go to stderr so stdout keeps the accepted/result envelope.
+	reportOut := stderr
+	if deps.IsTerminal != nil && !deps.IsTerminal(stderr) {
+		reportOut = stderr
+	}
+	svc := directrun.Service{Deps: directrun.Deps{
+		Now: now,
+		Preflight: func(ctx context.Context, in preflight.Input) (preflight.Snapshot, error) {
+			// reuse already-evaluated snapshot for the same inputs
+			if in.Repo == req.Repo && in.Provider == req.Provider && in.Model == req.Model {
+				return snap, nil
+			}
+			return preflight.Evaluate(ctx, in, preflight.DefaultDeps())
+		},
+	}}
+	execRes, execErr := svc.Execute(context.Background(), directrun.Request{
+		Repo: req.Repo, Issue: req.Issue, Provider: req.Provider, Model: req.Model,
+		Effort: req.Effort, Permission: req.Permission, BaseBranch: req.BaseBranch,
+		RequiredUI: req.RequiredUI, OptionalUI: req.OptionalUI, Detach: req.Detach,
+		ProjectID: projectID, RunID: runID, ReportOut: reportOut, ReportMode: reportMode,
+	})
+	if execErr != nil {
+		accepted.Status = "failed"
+		accepted.Message = execRes.Error
+		if accepted.Message == "" {
+			accepted.Message = execErr.Error()
+		}
+		_ = emitRunAccepted(stdout, accepted)
+		fmt.Fprintf(stderr, "run: execution failed: %v\n", execErr)
+		return exitRunPrecondition
+	}
+	if execRes.State != directattempt.StateCleanupTerminal {
+		accepted.Status = "failed"
+		accepted.Message = execRes.Message
+		_ = emitRunAccepted(stdout, accepted)
+		fmt.Fprintf(stderr, "run: incomplete terminal state %s\n", execRes.State)
+		return exitRunPrecondition
+	}
+	accepted.Status = "cleanup_terminal"
+	accepted.Message = execRes.Message
+	accepted.RunID = execRes.RunID
+	// Persist a tiny status marker for status/events correlation (project runtime).
+	_ = writeRunMarker(execRes)
 	return emitRunAccepted(stdout, accepted)
+}
+
+func writeRunMarker(res directrun.Result) error {
+	if res.WorktreePath == "" {
+		return nil
+	}
+	// marker beside worktree for local inspection
+	dir := filepath.Dir(res.WorktreePath)
+	return os.WriteFile(filepath.Join(dir, "cleanup_terminal.json"), []byte(fmt.Sprintf(
+		`{"run_id":%q,"attempt_id":%q,"state":%q,"exit_code":%d}`+"\n",
+		res.RunID, res.AttemptID, res.State, res.ExitCode,
+	)), 0o600)
 }
 
 func emitRunRejected(stdout, stderr io.Writer, req RunRequest, msg string, code int, deps Deps) int {
