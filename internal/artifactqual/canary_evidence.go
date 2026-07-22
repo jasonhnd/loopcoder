@@ -289,7 +289,7 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 		v.CapacityAfterOK = true
 	}
 
-	// Unavailable retry
+	// Unavailable retry — require evidence_ref binding (no bare true flags).
 	if ev.UnavailableRetry == nil {
 		add("unavailable_retry_missing")
 	} else {
@@ -298,12 +298,16 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 			add("unavailable_retry_incomplete")
 		} else if !u.NoDuplicateClaim || !u.NoDuplicateFiles || !u.NoDoubleCapacity {
 			add("unavailable_retry_dup_flags_false")
+		} else if strings.TrimSpace(u.EvidenceRef) == "" {
+			add("unavailable_retry_evidence_ref_missing")
+		} else if strings.Contains(strings.ToLower(u.EvidenceRef), "pending") {
+			add("unavailable_retry_pending_evidence")
 		} else {
 			v.UnavailableRetryOK = true
 		}
 	}
 
-	// Restart / ceilings
+	// Restart / ceilings — evidence_ref must point at raw event ledger digest/path.
 	if ev.Restart == nil {
 		add("restart_evidence_missing")
 	} else {
@@ -314,12 +318,16 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 			add("restart_useful_children_lt_4")
 		} else if !r.ProcessCeilingOK || !r.WorktreeCeilingOK || !r.NoLeakedProcesses || !r.NoRepoLocalRuntime {
 			add("restart_ceilings_or_leaks_unmet")
+		} else if strings.TrimSpace(r.EvidenceRef) == "" {
+			add("restart_evidence_ref_missing")
+		} else if !strings.Contains(r.EvidenceRef, "workflow-events") && !strings.Contains(r.EvidenceRef, "event") {
+			add("restart_evidence_ref_not_event_ledger")
 		} else {
 			v.RestartOK = true
 		}
 	}
 
-	// Real PR
+	// Real PR — refuse pending-live and empty verifier digests.
 	if ev.PR == nil {
 		add("real_pr_missing")
 	} else {
@@ -332,6 +340,13 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 			add("real_pr_checks_unmet")
 		} else if strings.TrimSpace(p.IndependentVerifier) == "" && strings.TrimSpace(p.VerifierEvidenceRef) == "" {
 			add("real_pr_verifier_missing")
+		} else if strings.Contains(strings.ToLower(p.VerifierEvidenceRef), "pending") {
+			add("real_pr_verifier_pending_live")
+		} else if strings.TrimSpace(p.VerifierEvidenceRef) != "" &&
+			!strings.HasPrefix(p.VerifierEvidenceRef, "sha256:") &&
+			!strings.Contains(p.VerifierEvidenceRef, "receipt:") &&
+			!strings.Contains(p.VerifierEvidenceRef, "event") {
+			add("real_pr_verifier_ref_unbound")
 		} else {
 			v.RealPROK = true
 		}
