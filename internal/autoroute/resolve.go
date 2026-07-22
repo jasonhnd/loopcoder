@@ -144,9 +144,25 @@ func Resolve(in Input) (Result, error) {
 		}, fmt.Errorf("%w: fake inventory digest", ErrNoRoute)
 	}
 
+	// Permission-aware filter: when the request requires a specific permission
+	// mode, only candidates that advertise that Permission and pass PermissionOK
+	// compete. Antigravity is never selected for read-only research.
+	cands := inv.Candidates
+	softs := inv.Soft
+	if perm != "" && !strings.EqualFold(perm, "default") {
+		cands = filterCandidatesByPermission(cands, perm)
+		softs = filterSoftByProviders(softs, cands)
+	}
+	if len(cands) == 0 {
+		return Result{
+			Outcome: OutcomeNoRoute,
+			Message: fmt.Sprintf("no candidates support permission %q", perm),
+		}, fmt.Errorf("%w: permission %s", ErrNoRoute, perm)
+	}
+
 	elig := eligibility.Snapshot{
 		TaskRequiredClass: taskClass,
-		Candidates:        inv.Candidates,
+		Candidates:        cands,
 		Machine:           inv.Machine,
 		CapturedAt:        now,
 	}
@@ -163,7 +179,7 @@ func Resolve(in Input) (Result, error) {
 
 	req := routedecision.Request{
 		DecisionKey: key, ProjectID: projectID, EvidenceDigest: inv.EvidenceDigest,
-		TaskClass: taskClass, Eligibility: elig, SoftCandidates: inv.Soft,
+		TaskClass: taskClass, Eligibility: elig, SoftCandidates: softs,
 		Mode: mode, Now: now,
 	}
 	d, err := routedecision.Evaluate(req)
@@ -287,6 +303,58 @@ func okFact(id string) eligibility.Fact {
 
 func falseFact(id string) eligibility.Fact {
 	return eligibility.Fact{State: eligibility.FactFalse, EvidenceID: id, Freshness: eligibility.FreshFresh}
+}
+
+// filterCandidatesByPermission keeps rows that advertise the required permission
+// and pass PermissionOK. Rows with PermissionOK false are hard-excluded so
+// Antigravity never wins a read-only resolve.
+func filterCandidatesByPermission(cands []eligibility.Candidate, perm string) []eligibility.Candidate {
+	want := normalizePermission(perm)
+	if want == "" || want == "default" {
+		return cands
+	}
+	out := make([]eligibility.Candidate, 0, len(cands))
+	for _, c := range cands {
+		if normalizePermission(c.Permission) != want {
+			continue
+		}
+		// PermissionOK false → hard ineligible for this mode.
+		if c.PermissionOK.KnownFalse() {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+func filterSoftByProviders(softs []quotapolicy.Candidate, cands []eligibility.Candidate) []quotapolicy.Candidate {
+	if len(softs) == 0 || len(cands) == 0 {
+		return softs
+	}
+	ok := map[string]bool{}
+	for _, c := range cands {
+		ok[c.Provider+"|"+c.Model] = true
+		ok[c.Provider] = true
+	}
+	out := make([]quotapolicy.Candidate, 0, len(softs))
+	for _, s := range softs {
+		if ok[s.Provider+"|"+s.Model] || ok[s.Provider] {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func normalizePermission(p string) string {
+	p = strings.ToLower(strings.TrimSpace(p))
+	switch p {
+	case "readonly", "read_only", "ro":
+		return "read-only"
+	case "bounded-write", "write", "workspace-write":
+		return "bounded_write"
+	default:
+		return p
+	}
 }
 
 func shortHash(s string) string {

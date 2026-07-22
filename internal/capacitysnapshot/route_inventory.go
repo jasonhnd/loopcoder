@@ -11,10 +11,17 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/eligibility"
 	"github.com/jasonhnd/loopcoder/internal/quotamode"
 	"github.com/jasonhnd/loopcoder/internal/quotapolicy"
+	"github.com/jasonhnd/loopcoder/internal/runtimecap"
 )
 
 // ToRouteInventory maps a Snapshot to autoroute.Inventory for production Resolve.
 // Returns error when UnattendedOK is false (fail closed for auto-route).
+//
+// Permission-aware: each model emits separate candidates for read-only and
+// bounded_write. Providers that lack read-only capability (e.g. Antigravity)
+// get PermissionOK=false for read-only rows and are hard-excluded when the
+// request requires read-only. Capacity remaining is shared across permission
+// rows; it never invents windows.
 func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 	if strings.TrimSpace(s.Digest) == "" {
 		return autoroute.Inventory{}, fmt.Errorf("%w: missing digest", ErrInvalidSnapshot)
@@ -57,6 +64,7 @@ func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 				break
 			}
 		}
+		roOK, writeOK := providerPermissionSupportFixed(a.Provider)
 		for _, m := range a.Models {
 			if !m.PresentInCatalog || m.ModelID == "" {
 				continue
@@ -86,19 +94,38 @@ func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 			if a.CooldownActive {
 				cooldownFact = factBool(true, "cd-"+a.Provider)
 			}
-			cands = append(cands, eligibility.Candidate{
+			base := eligibility.Candidate{
 				Provider: a.Provider, Model: m.ModelID, Effort: effort,
-				Permission: "bounded_write", ModelClass: cl,
+				ModelClass:     cl,
 				Installed:      factBool(a.Installed, "inst-"+a.Provider),
 				Authenticated:  factBool(a.Authenticated, "auth-"+a.Provider),
 				ModelPresent:   factBool(true, "model-"+a.Provider+"-"+m.ModelID),
-				PermissionOK:   factBool(true, "perm-"+a.Provider),
 				EffortOK:       factBool(true, "effort-"+a.Provider),
 				Healthy:        factBool(a.Healthy, "health-"+a.Provider),
 				CooldownActive: cooldownFact,
 				ResourceFit:    factBool(true, "res-"+a.Provider),
 				QuotaRemaining: quotaRemainingUnits(rem),
-			})
+			}
+			// Emit permission-specific candidates. PermissionOK is a hard gate.
+			if writeOK {
+				wc := base
+				wc.Permission = "bounded_write"
+				wc.PermissionOK = factBool(true, "perm-write-"+a.Provider)
+				cands = append(cands, wc)
+			}
+			if roOK {
+				rc := base
+				rc.Permission = "read-only"
+				rc.PermissionOK = factBool(true, "perm-ro-"+a.Provider)
+				cands = append(cands, rc)
+			} else {
+				// Explicit ineligible row so reports can show denial reasons when
+				// a read-only request is attempted against this company.
+				rc := base
+				rc.Permission = "read-only"
+				rc.PermissionOK = factBool(false, "perm-ro-denied-"+a.Provider)
+				cands = append(cands, rc)
+			}
 			sc := quotapolicy.Candidate{
 				Provider: a.Provider, Model: m.ModelID,
 				ReliabilityEvidence: quotapolicy.EvidenceUnknown,
@@ -139,6 +166,27 @@ func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 		// usable capacity before reset (V090-CRO-007).
 		Mode: quotamode.DefaultModeConfig(quotamode.ModeBurnBeforeReset),
 	}, nil
+}
+
+// providerPermissionSupportFixed returns (readOnlyOK, writeOK) from the
+// authoritative runtimecap contract.
+//
+// Antigravity declares neither ReadOnly nor BoundedWrite but product write path
+// uses `agy -p` workspace write — treat as write-only.
+// Codex/Claude declare both ReadOnly and BoundedWrite.
+func providerPermissionSupportFixed(provider string) (readOnlyOK, writeOK bool) {
+	p, ok := runtimecap.LookupProvider(provider)
+	if !ok {
+		// Unknown: do not invent read-only.
+		return false, true
+	}
+	readOnlyOK = p.ReadOnly
+	writeOK = p.BoundedWrite
+	if !p.ReadOnly && !p.BoundedWrite {
+		// Write-only adapters (antigravity).
+		writeOK = true
+	}
+	return readOnlyOK, writeOK
 }
 
 func classFromHint(h string) capclass.Class {

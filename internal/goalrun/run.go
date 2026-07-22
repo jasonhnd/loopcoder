@@ -226,10 +226,12 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 			continue
 		}
 
+		// Permission from route requirement (research=read-only, implement=bounded_write).
+		perm := permissionFromRoute(it.RouteRequirement, it.Owner)
 		// Independent per-child auto-route (shared inventory; durable rehydrate).
 		routeIn := autoroute.Input{
 			AutoRoute:   true,
-			Permission:  "bounded_write",
+			Permission:  perm,
 			ProjectID:   projectID,
 			DecisionKey: "goalrun|" + g.GraphID + "|" + it.ID,
 			Inventory:   inv,
@@ -255,21 +257,40 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 
 		prov, model, effort := res.Provider, res.Model, firstNonEmpty(res.Effort, depth, "medium")
 		// Prefer alternate provider if already used and decision lists others.
+		// Candidates were already filtered to this permission by autoroute.Resolve.
 		if usedProviders[prov] && res.Decision != nil {
 			for _, cv := range res.Decision.Candidates {
 				if cv.Provider == "" || usedProviders[cv.Provider] || !cv.HardEligible || cv.SoftExcluded {
+					continue
+				}
+				// Skip write-only providers when this child requires read-only.
+				if isReadOnlyPerm(perm) && !providerSupportsReadOnly(cv.Provider) {
 					continue
 				}
 				prov, model = cv.Provider, cv.Model
 				break
 			}
 		}
+		// Guard: never accept Antigravity (or any non-RO provider) for read-only.
+		if isReadOnlyPerm(perm) && !providerSupportsReadOnly(prov) {
+			cr.Stage = "unavailable"
+			cr.Unavailable = true
+			cr.Terminal = "permission_denied"
+			cr.Provider = prov
+			cr.Model = model
+			cr.RouteReason = "provider " + prov + " does not support read-only for child " + it.ID
+			cr.CapacityNote = "permission_ineligible"
+			cr.NextAction = "retry_other_route"
+			children = append(children, cr)
+			emitChild(req.ReportOut, cr)
+			continue
+		}
 		cr.Provider = prov
 		cr.Model = model
 		cr.Depth = effort
-		cr.RouteReason = res.Message
+		cr.RouteReason = res.Message + "; permission=" + perm
 		if res.Explain != nil && res.Explain.WinnerLine != "" {
-			cr.RouteReason = res.Explain.WinnerLine
+			cr.RouteReason = res.Explain.WinnerLine + "; permission=" + perm
 		}
 
 		if ledger != nil && snap != nil {
@@ -320,6 +341,7 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		childRoutes[it.ID] = workflowrun.ChildRoute{
 			Provider: prov, Model: model, Depth: effort,
 			AccountRef: cr.AccountRef, RouteReason: cr.RouteReason,
+			// Permission is carried in route reason; executor uses ReadOnly from intent/owner.
 		}
 		children = append(children, cr)
 		emitChild(req.ReportOut, cr)
@@ -603,4 +625,53 @@ func shortID(s string) string {
 		return s
 	}
 	return s[:16]
+}
+
+// permissionFromRoute extracts permission from RouteRequirement or owner role.
+// research/verify → read-only; implement/tests → bounded_write.
+func permissionFromRoute(routeReq, owner string) string {
+	for _, part := range strings.Split(routeReq, ",") {
+		part = strings.TrimSpace(part)
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) == 2 && strings.TrimSpace(kv[0]) == "permission" {
+			return normalizePerm(kv[1])
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(owner)) {
+	case "research", "verifier":
+		return "read-only"
+	default:
+		return "bounded_write"
+	}
+}
+
+func normalizePerm(p string) string {
+	p = strings.ToLower(strings.TrimSpace(p))
+	switch p {
+	case "readonly", "read_only", "ro", "read-only":
+		return "read-only"
+	case "bounded-write", "write", "workspace-write", "bounded_write":
+		return "bounded_write"
+	default:
+		if p == "" {
+			return "bounded_write"
+		}
+		return p
+	}
+}
+
+func isReadOnlyPerm(p string) bool {
+	return normalizePerm(p) == "read-only"
+}
+
+func providerSupportsReadOnly(provider string) bool {
+	// Authoritative runtimecap contract: Antigravity is write-only.
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "antigravity":
+		return false
+	case "codex", "claude", "gemini", "fixture":
+		return true
+	default:
+		return true
+	}
 }
