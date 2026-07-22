@@ -14,9 +14,6 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 		now = time.Now().UTC()
 	}
 	// Group by adapter_id
-	type accKey struct {
-		provider string
-	}
 	type builder struct {
 		in AccountInput
 	}
