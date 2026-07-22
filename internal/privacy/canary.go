@@ -3,7 +3,6 @@ package privacy
 import (
 	"encoding/json"
 	"fmt"
-	"strings"
 )
 
 // SurfaceBundle is a pure in-memory fixture of the destinations that must stay
@@ -223,10 +222,4 @@ func redactAny(dest Destination, v any) any {
 	default:
 		return v
 	}
-}
-
-// Ensure marker labels never appear as the marker values in reports (helper for tests).
-func findingHasSecretValue(f Finding) bool {
-	s := f.String()
-	return ContainsAnyMarker(s) || strings.Contains(s, MarkerCredential)
 }
