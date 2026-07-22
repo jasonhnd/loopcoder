@@ -191,9 +191,8 @@ func scenarioInvalidCyclicZeroSideEffect(now time.Time) ScenarioResult {
 
 func scenarioWaveDeterministic(now time.Time) ScenarioResult {
 	name := "wave_deterministic"
-	g, _ := workgraph.MaterializeDirectRun("gw", "solo", "w", now)
-	// add free item via multi
-	g = workgraph.Graph{
+	_ = now
+	g := workgraph.Graph{
 		Schema: workgraph.SchemaGraph, ContractVersion: workgraph.ContractVersion,
 		GraphID: "gw", Version: 1, Source: workgraph.SourceOwnerApproved,
 		ExplicitOptIn: true, ApprovedBy: "o",
