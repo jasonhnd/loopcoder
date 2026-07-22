@@ -63,6 +63,7 @@ Every document is exactly one of these types:
 - [`reference/work-claim.md`](reference/work-claim.md): V090-059 atomic work claim and guarded close.
 - [`reference/workflow-definition.md`](reference/workflow-definition.md): V090-060 explicit workflow definition and materialization.
 - [`reference/wave-schedule.md`](reference/wave-schedule.md): V090-061 deterministic bounded-wave scheduling.
+- [`reference/integration-receipts.md`](reference/integration-receipts.md): V090-100 ordered integration receipts and conflict boundary.
 - [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
 - [`reference/v09-home-layout.md`](reference/v09-home-layout.md): global `$LOOPCODER_HOME` layout and owner-only creation.
 - [`reference/project-authority-store.md`](reference/project-authority-store.md): project.db domain tables and immutable events.
