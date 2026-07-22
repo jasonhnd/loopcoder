@@ -96,7 +96,13 @@ func TestMigrationV31MarksLegacyChildExecutionRequestsNeedsHumanGolden(t *testin
 		if _, err := tx.Exec(ctx, `DROP TABLE child_execution_requests`); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `DELETE FROM migrations WHERE version = 31`)
+		// Drop tables introduced after v30 so reopen re-applies migrations 31+.
+		for _, table := range []string{"workgraph_events", "workgraph_dependencies", "workgraph_items", "workgraph_versions"} {
+			if _, err := tx.Exec(ctx, `DROP TABLE IF EXISTS `+table); err != nil {
+				return err
+			}
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM migrations WHERE version >= 31`)
 		return err
 	}); err != nil {
 		t.Fatalf("rewind schema to v30: %v", err)
