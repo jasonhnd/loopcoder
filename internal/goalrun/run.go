@@ -15,6 +15,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/autoroute"
 	"github.com/jasonhnd/loopcoder/internal/capacityledger"
 	"github.com/jasonhnd/loopcoder/internal/capacitysnapshot"
+	"github.com/jasonhnd/loopcoder/internal/goalpr"
 	"github.com/jasonhnd/loopcoder/internal/workflowdef"
 	"github.com/jasonhnd/loopcoder/internal/workflowrun"
 	"github.com/jasonhnd/loopcoder/internal/workgraph"
@@ -56,6 +57,19 @@ type Request struct {
 	Now        func() time.Time
 	// HomeDir overrides child worktree layout (tests).
 	HomeDir string
+	// OpenPR when true opens a real branch/commit/push/PR on RepoPath after
+	// human_gate (never auto-merges). Product path for real_pr_human_gate.
+	OpenPR bool
+	// PRBaseRef default main.
+	PRBaseRef string
+	// IndependentVerifier provider/company for PR gate evidence.
+	IndependentVerifier string
+	// VerifierEvidence durable independent review ref (digest/path).
+	VerifierEvidence string
+	// RequiredCheckNames optional expected PR checks.
+	RequiredCheckNames []string
+	// GoalPR injects goalpr opener (tests). nil → goalpr.Open production.
+	GoalPR func(ctx context.Context, req goalpr.Request) (goalpr.Result, error)
 }
 
 // ChildReport is one transparent child line for UI/JSONL.
@@ -107,6 +121,8 @@ type Result struct {
 	ProcessPeak    int    `json:"process_peak,omitempty"`
 	CheckpointPath string `json:"checkpoint_path,omitempty"`
 	Resumed        bool   `json:"resumed,omitempty"`
+	// PR is real GitHub PR human-gate evidence when OpenPR requested.
+	PR *goalpr.Result `json:"pr,omitempty"`
 }
 
 // capacityHold tracks a live reservation for post-execute reconcile/release.
@@ -618,10 +634,71 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		g.GraphID, g.PlanDigest, len(g.Items), wres.Status, out.ProvidersUsed, out.ModelsUsed, out.DepthsUsed, out.MultiProviderOK,
 		out.ReuseCount, out.WorktreePeak, out.ProcessPeak, out.Resumed,
 	)
+
+	// Real PR human merge gate: LoopCoder creates branch/commit/push/PR itself.
+	if req.OpenPR && wres.Status == workflowrun.StatusHumanGate {
+		prOpen := req.GoalPR
+		if prOpen == nil {
+			prOpen = goalpr.Open
+		}
+		// Prefer independent verifier from verify child when not pinned.
+		ind := strings.TrimSpace(req.IndependentVerifier)
+		verEv := strings.TrimSpace(req.VerifierEvidence)
+		if ind == "" || verEv == "" {
+			for _, c := range wres.Children {
+				if strings.Contains(strings.ToLower(c.WorkItemID), "verify") &&
+					strings.EqualFold(c.Terminal, "succeeded") {
+					if ind == "" {
+						ind = firstNonEmpty(c.Provider, "independent")
+					}
+					if verEv == "" {
+						verEv = c.OutputEvidence
+					}
+				}
+			}
+		}
+		if ind == "" {
+			ind = "independent"
+		}
+		if verEv == "" {
+			verEv = "goalrun:" + runID
+		}
+		issueN := 0
+		if n, err := parseIssueNumber(req.Issue); err == nil {
+			issueN = n
+		}
+		prRes, perr := prOpen(ctx, goalpr.Request{
+			RepoPath: req.RepoPath, BaseRef: firstNonEmpty(req.PRBaseRef, "main"),
+			ProjectID: projectID, RunID: runID, GraphID: g.GraphID, PlanDigest: g.PlanDigest,
+			SourceIssue: issueN, Actor: actor, Children: wres.Children,
+			IndependentVerifier: ind, VerifierEvidence: verEv,
+			RequiredCheckNames: req.RequiredCheckNames,
+			Now:                nowFn,
+		})
+		out.PR = &prRes
+		if perr != nil {
+			out.Message = firstNonEmpty(out.Message, "") + "; pr_open_error=" + perr.Error()
+			out.Status = "blocked"
+			for _, cr := range out.Children {
+				emitChild(req.ReportOut, cr)
+			}
+			return out, fmt.Errorf("goalrun: open pr: %w", perr)
+		}
+		out.HumanSummary += fmt.Sprintf(" pr=%s human_gate=true auto_merge=false", prRes.URL)
+	}
+
 	for _, cr := range out.Children {
 		emitChild(req.ReportOut, cr)
 	}
 	return out, nil
+}
+
+func parseIssueNumber(s string) (int, error) {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "#")
+	var n int
+	_, err := fmt.Sscanf(s, "%d", &n)
+	return n, err
 }
 
 func saveRunCheckpoint(homeDir, projectID, runID, goal, issue, actor, graphID, planDigest string, out Result, wres workflowrun.Result, at time.Time) (string, error) {
