@@ -1,0 +1,134 @@
+# Release Candidate Draft dispatcher (main-only install for workflow_dispatch visibility).
+# Owner-authorized minimal default-branch exception for v0.9.0 qualification.
+# Builds from an exact pre-prod SHA; does NOT create a public tag or GitHub Release.
+# Product code remains on pre-prod; this file exists on main solely so Actions can dispatch it.
+name: Release Candidate Draft
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact pre-prod commit SHA to build (full 40-char preferred)
+        required: true
+        type: string
+      version:
+        description: Non-public candidate version (e.g. 0.9.0-rc.1); must not be dev
+        required: true
+        type: string
+        default: "0.9.0-rc.1"
+
+permissions:
+  contents: read
+  id-token: write
+  actions: write
+
+concurrency:
+  group: release-candidate-${{ github.event.inputs.commit_sha }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GO_VERSION: "1.26.5"
+
+jobs:
+  validate-sha:
+    name: validate protected SHA
+    runs-on: macos-15
+    outputs:
+      commit_sha: ${{ steps.pin.outputs.commit_sha }}
+      version: ${{ steps.pin.outputs.version }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          ref: pre-prod
+
+      - name: Pin and refuse dirty/unknown SHA
+        id: pin
+        env:
+          INPUT_SHA: ${{ github.event.inputs.commit_sha }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          version="$(printf '%s' "${INPUT_VERSION}" | tr -d '[:space:]')"
+          if [[ -z "${version}" || "${version}" == "dev" ]]; then
+            echo "version must not be empty or dev" >&2
+            exit 1
+          fi
+          sha="$(printf '%s' "${INPUT_SHA}" | tr -d '[:space:]')"
+          if [[ ${#sha} -lt 7 ]]; then
+            echo "commit_sha too short" >&2
+            exit 1
+          fi
+          resolved="$(git rev-parse --verify "${sha}^{commit}" 2>/dev/null || true)"
+          if [[ -z "${resolved}" ]]; then
+            echo "unknown commit sha ${sha}" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${resolved}" origin/pre-prod 2>/dev/null && \
+             ! git branch -r --contains "${resolved}" | grep -q 'origin/pre-prod'; then
+            echo "sha ${resolved} is not on origin/pre-prod" >&2
+            exit 1
+          fi
+          sha="${resolved}"
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "workspace dirty" >&2
+            exit 1
+          fi
+          echo "commit_sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          printf 'pinned_sha=%s version=%s\n' "${sha}" "${version}"
+
+  build:
+    name: build draft archive (darwin/arm64)
+    needs: validate-sha
+    runs-on: macos-15
+    # Protected environment: owner approval required; never bypass.
+    environment: release-publication
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ needs.validate-sha.outputs.commit_sha }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+          cache: true
+
+      - name: Assert darwin/arm64 Go host
+        run: |
+          set -euo pipefail
+          test "$(go env GOOS)" = "darwin"
+          test "$(go env GOARCH)" = "arm64"
+
+      - name: Build immutable draft archive (no tag, no release)
+        env:
+          VERSION: ${{ needs.validate-sha.outputs.version }}
+          COMMIT_SHA: ${{ needs.validate-sha.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          test -f scripts/build-release-candidate.sh
+          bash scripts/build-release-candidate.sh
+          test ! -f dist/.git
+          # Refuse accidental release metadata
+          if compgen -G "dist/*.rpm" >/dev/null || compgen -G "dist/*.deb" >/dev/null; then
+            echo "unexpected package format" >&2
+            exit 1
+          fi
+          test -f dist/SHA256SUMS
+          test -f dist/sbom.spdx.json
+          test -f dist/evidence/rc-manifest.json
+          jq -e '.draft_only == true and .public_release == false' dist/evidence/rc-manifest.json
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: v090-rc-darwin-arm64
+          path: |
+            dist/*
+          if-no-files-found: error
+          retention-days: 30
