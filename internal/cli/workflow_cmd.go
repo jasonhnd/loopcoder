@@ -15,7 +15,7 @@ import (
 
 func runWorkflow(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "workflow: subcommand required (run|plan)")
+		fmt.Fprintln(stderr, "workflow: subcommand required (run|plan|goal)")
 		return exitRunUsage
 	}
 	switch args[0] {
@@ -23,9 +23,12 @@ func runWorkflow(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return runWorkflowRun(args[1:], stdout, stderr, deps)
 	case "plan":
 		return runWorkflowPlan(args[1:], stdout, stderr, deps)
+	case "goal":
+		return runWorkflowGoal(args[1:], stdout, stderr, deps)
 	case "help", "-h", "--help":
 		fmt.Fprintln(stdout, "usage: loopcoder workflow run [--fixture one|chain] [--def path.json] [--project-id id] [--format json|human]")
 		fmt.Fprintln(stdout, "       loopcoder workflow plan --goal TEXT [--issue N] [--format json|human]")
+		fmt.Fprintln(stdout, "       loopcoder workflow goal --goal TEXT [--issue N] [--provider p] [--model m]")
 		return exitRunOK
 	default:
 		fmt.Fprintf(stderr, "workflow: unknown subcommand %q\n", args[0])
