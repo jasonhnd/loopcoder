@@ -127,6 +127,9 @@ type Result struct {
 	Resumed        bool   `json:"resumed,omitempty"`
 	// PR is real GitHub PR human-gate evidence when OpenPR requested.
 	PR *goalpr.Result `json:"pr,omitempty"`
+	// RouteExcludes are measured hard/soft excludes from the live candidate set
+	// (unavailable_retry evidence; Claimed=false for pure exclude).
+	RouteExcludes []RouteExclude `json:"route_excludes,omitempty"`
 }
 
 // capacityHold tracks a live reservation for post-execute reconcile/release.
@@ -286,6 +289,16 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 	childRoutes := map[string]workflowrun.ChildRoute{}
 	// Track which children hold live reservations for post-execute reconcile.
 	holds := map[string]capacityHold{}
+	var routeExcludes []RouteExclude
+	recordExclude := func(childID, provider, reason, msg string, hard, soft, claimed bool) {
+		if strings.TrimSpace(provider) == "" && strings.TrimSpace(reason) == "" {
+			return
+		}
+		routeExcludes = append(routeExcludes, RouteExclude{
+			ChildID: childID, Provider: provider, Reason: reason,
+			HardEligible: hard, SoftExcluded: soft, Claimed: claimed, Message: msg,
+		})
+	}
 
 	for idx, it := range g.Items {
 		depth := depthFromRoute(it.RouteRequirement, idx)
@@ -386,6 +399,20 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 			} else {
 				cr.RouteReason = string(res.Outcome) + ": " + res.Message
 			}
+			// Measure candidate hard-excludes from decision set (no claim).
+			if res.Decision != nil {
+				for _, cv := range res.Decision.Candidates {
+					if cv.Provider == "" {
+						continue
+					}
+					if !cv.HardEligible || cv.SoftExcluded {
+						recordExclude(it.ID, cv.Provider, ClassifyExcludeReason(cr.CapacityNote, cr.Terminal, cv.Provider),
+							cr.RouteReason, cv.HardEligible, cv.SoftExcluded, false)
+					}
+				}
+			}
+			recordExclude(it.ID, firstNonEmpty(res.Provider, "none"), ClassifyExcludeReason(cr.CapacityNote, cr.Terminal, cr.RouteReason),
+				cr.RouteReason, false, true, false)
 			cr.NextAction = "retry_or_refresh"
 			children = append(children, cr)
 			emitChild(req.ReportOut, cr)
@@ -477,6 +504,8 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 				if rerr != nil {
 					cr.RouteReason = rerr.Error()
 				}
+				// Capacity refuse before claim: exclude provider, Claimed=false.
+				recordExclude(it.ID, prov, "exhausted", cr.RouteReason, true, false, false)
 				cr.NextAction = "retry_other_route"
 				children = append(children, cr)
 				emitChild(req.ReportOut, cr)
@@ -603,6 +632,7 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 	out.ReuseCount = wres.ReuseCount
 	out.WorktreePeak = wres.WorktreePeak
 	out.ProcessPeak = wres.ProcessPeak
+	out.RouteExcludes = routeExcludes
 
 	// Reconcile capacity from real child outcomes — never fabricate actual.
 	// Then attach post-run remaining from a fresh capacity observation when possible
