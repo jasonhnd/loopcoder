@@ -160,6 +160,14 @@ func TestExecuteAutoRoutesChildrenWithCapacityAccounting(t *testing.T) {
 		if c.CapacityActual != nil && c.ActualSource == "unknown" {
 			t.Fatalf("must not invent actual when source unknown: %+v", c)
 		}
+		// #1343: after must come from post-run observation when inventory available
+		// (not n/a solely because token actual is unknown).
+		if c.CapacityAfter == nil {
+			t.Fatalf("want capacity after from post-run observation: %+v", c)
+		}
+		if !strings.Contains(c.CapacityNote, "after_source=") && !strings.Contains(c.CapacityNote, "reconciled=") {
+			t.Fatalf("want after_source or reconciled in note: %s", c.CapacityNote)
+		}
 		if c.OutputEvidence == "" {
 			t.Fatalf("missing output evidence: %+v", c)
 		}

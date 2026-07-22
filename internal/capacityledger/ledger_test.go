@@ -2,6 +2,7 @@ package capacityledger_test
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -93,6 +94,42 @@ func TestReserveReconcileIdempotent(t *testing.T) {
 	rep := e3.HumanReport()
 	if rep == "" || containsSecret(rep) {
 		t.Fatalf("report=%q", rep)
+	}
+}
+
+func TestObserveAfterWithoutInventingActual(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "capacity-ledger.json")
+	l, err := capacityledger.OpenPath(path, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := testSnap()
+	_, err = l.Reserve(capacityledger.ReserveInput{
+		ProjectID: "p", RunID: "run-obs", AttemptID: "att-obs",
+		Policy: capacityledger.PolicyBalanced, Provider: "codex", Model: "gpt-5.5",
+		Snapshot: &snap, DemandFraction: 0.05, DemandConfidence: quotapolicy.EvidenceExact,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Release("p", "run-obs", "att-obs", "executed_usage_unknown"); err != nil {
+		t.Fatal(err)
+	}
+	e, err := l.ObserveAfter("p", "run-obs", "att-obs", 0.88, "codexbar", "fresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.Actual != nil {
+		t.Fatalf("must not invent actual: %+v", e)
+	}
+	if e.After == nil || *e.After != 0.88 {
+		t.Fatalf("after=%v want 0.88", e.After)
+	}
+	if e.Freshness != "fresh" {
+		t.Fatalf("freshness=%q", e.Freshness)
+	}
+	if !strings.Contains(e.RouteReason, "after_source=codexbar") {
+		t.Fatalf("route reason missing source: %s", e.RouteReason)
 	}
 }
 

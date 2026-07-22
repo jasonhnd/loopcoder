@@ -465,7 +465,15 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 	out.MultiModelOrDepthOK = len(out.ModelsUsed) >= 2 || len(out.DepthsUsed) >= 2
 
 	// Reconcile capacity from real child outcomes — never fabricate actual.
-	out.Children = applyChildOutcomes(out.Children, wres, ledger, holds)
+	// Then attach post-run remaining from a fresh capacity observation when possible
+	// so after is never left n/a solely because token actual is unknown.
+	var postSnap *capacitysnapshot.Snapshot
+	if wantAuto && loadInv != nil {
+		if _, s, lerr := loadInv(ctx, req.RepoPath, nowFn().UTC()); lerr == nil {
+			postSnap = &s
+		}
+	}
+	out.Children = applyChildOutcomes(out.Children, wres, ledger, holds, postSnap)
 
 	if werr != nil {
 		out.Status = "blocked"
@@ -511,7 +519,7 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 
 // applyChildOutcomes merges workflow child terminal/evidence into reports and
 // reconciles capacity when actual is known; otherwise releases with honest unknown.
-func applyChildOutcomes(children []ChildReport, wres workflowrun.Result, ledger *capacityledger.Ledger, holds map[string]capacityHold) []ChildReport {
+func applyChildOutcomes(children []ChildReport, wres workflowrun.Result, ledger *capacityledger.Ledger, holds map[string]capacityHold, postSnap *capacitysnapshot.Snapshot) []ChildReport {
 	byID := map[string]workflowrun.ChildOutcome{}
 	for _, c := range wres.Children {
 		byID[c.WorkItemID] = c
@@ -594,8 +602,43 @@ func applyChildOutcomes(children []ChildReport, wres workflowrun.Result, ledger 
 			}
 			// Actual stays nil — honest unknown.
 		}
+		// Always try fresh post-run remaining → after (source-tagged).
+		// Required by #1343: after must not be n/a when observation exists.
+		if children[i].CapacityAfter == nil {
+			if rem, src, fr := remainingForProvider(postSnap, children[i].Provider); rem != nil {
+				if entry, err := ledger.ObserveAfter(h.projectID, h.runID, h.attemptID, *rem, src, fr); err == nil {
+					children[i].CapacityAfter = entry.After
+					children[i].CapacityNote += "; after_source=" + src + "; after_freshness=" + fr
+				}
+			} else {
+				children[i].CapacityNote += "; after_observation=unavailable"
+			}
+		}
 	}
 	return children
+}
+
+// remainingForProvider returns the first usable remaining fraction for provider
+// from a fresh snapshot (exact/estimated). Never invents values.
+func remainingForProvider(snap *capacitysnapshot.Snapshot, provider string) (rem *float64, source, freshness string) {
+	if snap == nil || strings.TrimSpace(provider) == "" {
+		return nil, "", ""
+	}
+	for _, a := range snap.Accounts {
+		if !strings.EqualFold(a.Provider, provider) {
+			continue
+		}
+		for _, w := range a.Windows {
+			if f := capacitysnapshot.RemainingFraction(w); f != nil {
+				src := strings.TrimSpace(w.Source)
+				if src == "" {
+					src = "capacity_snapshot"
+				}
+				return f, src, string(w.Freshness)
+			}
+		}
+	}
+	return nil, "", ""
 }
 
 func collectUsage(children []ChildReport) (providers, models, depths []string) {
