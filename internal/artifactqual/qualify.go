@@ -336,6 +336,14 @@ func Qualify(in Input) (Evidence, error) {
 			ID: releaseslo.MetricCapacityAccounting, BoolOK: releaseslo.Bool(cro.AccountingOK),
 			EvidenceRef: nonEmptyRef(cro.EvidenceRefs["accounting"], "probe:capacity_accounting"),
 		},
+		{
+			ID: releaseslo.MetricMultiDepthRouting, BoolOK: releaseslo.Bool(cro.MultiDepthOK),
+			EvidenceRef: nonEmptyRef(cro.EvidenceRefs["multi_depth"], "probe:multi_depth_routing"),
+		},
+		{
+			ID: releaseslo.MetricUnavailableRouteExclude, BoolOK: releaseslo.Bool(cro.UnavailableExcludeOK),
+			EvidenceRef: nonEmptyRef(cro.EvidenceRefs["unavailable_exclude"], "probe:unavailable_route_exclude"),
+		},
 	}
 	if !rep.Passed {
 		obs = append(obs, releaseslo.MetricObservation{ID: releaseslo.MetricArtifact, BoolOK: bad, EvidenceRef: "installsmoke_fail"})
