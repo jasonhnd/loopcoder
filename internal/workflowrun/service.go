@@ -56,9 +56,14 @@ type Request struct {
 	// interrupted run. Same attempt_id is reused; executor is NOT re-invoked
 	// (exactly-once provider call / file / capacity).
 	PriorSucceeded map[string]ChildOutcome
+	// AttemptGeneration bumps attempt IDs for aborted/in-flight children on resume
+	// (completed children stay generation 0 / prior attempt). Key = work item id.
+	AttemptGeneration map[string]int
 	// Integrator injects branch integration (tests). nil → GitBranchIntegrator
 	// when RepoPath is set and SkipIntegrate is false.
 	Integrator BranchIntegrator
+	// EventLogPath optional pre-opened path; empty → open under HomeDir/project/run.
+	EventLogPath string
 }
 
 // ChildOutcome is per-child terminal + capacity-relevant evidence for reports.
@@ -107,6 +112,12 @@ type Result struct {
 	GoalBranch string `json:"goal_branch,omitempty"`
 	// IntegrateCommits are exactly-once product commits onto GoalBranch.
 	IntegrateCommits []IntegrateCommit `json:"integrate_commits,omitempty"`
+	// EventLogPath is the append-only raw event JSONL for interrupt evidence.
+	EventLogPath string `json:"event_log_path,omitempty"`
+	// Interrupted true when a forced interrupt was recorded this process.
+	Interrupted bool `json:"interrupted,omitempty"`
+	// AbortedAttempts maps work_item_id → aborted attempt_id (must get new gen on resume).
+	AbortedAttempts map[string]string `json:"aborted_attempts,omitempty"`
 }
 
 // Service runs bounded workflows.
@@ -168,6 +179,20 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 			return fail(out, StatusBlocked, "ensure goal branch: "+err.Error())
 		}
 		emit("goal_branch.ready:" + goalBranch)
+	}
+
+	// Append-only event log (forced interrupt / exactly-once evidence source).
+	elog, _ := OpenEventLog(s.HomeDir, projectID, runID)
+	if elog != nil {
+		out.EventLogPath = elog.Path()
+		_ = elog.Append(Event{ProjectID: projectID, RunID: runID, Kind: "run.start", Message: "workflow execute"})
+	}
+	logEv := func(ev Event) {
+		if elog == nil {
+			return
+		}
+		ev.ProjectID, ev.RunID = projectID, runID
+		_ = elog.Append(ev)
 	}
 	actor := strings.TrimSpace(req.Actor)
 	if actor == "" {
@@ -294,13 +319,19 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 				// Prior succeeded already integrated; do not re-exec or re-commit.
 				integrated = append(integrated, id)
 				emit(fmt.Sprintf("child.reuse:%s attempt=%s evidence=%s", id, prior.AttemptID, short(prior.OutputEvidence)))
+				logEv(Event{Kind: "reuse", WorkItemID: id, AttemptID: prior.AttemptID, Evidence: prior.OutputEvidence})
 				if prior.WorktreePath != "" {
 					out.WorktreePeak++
 				}
 				continue
 			}
 			// Bind attempt to plan digest AND unique run ID (no cross-run reuse).
-			attemptID := "att-" + id + "-" + short(out.PlanDigest+"|"+runID)
+			// Generation bumps for aborted/in-flight children on forced-interrupt resume.
+			gen := 0
+			if req.AttemptGeneration != nil {
+				gen = req.AttemptGeneration[id]
+			}
+			attemptID := fmt.Sprintf("att-%s-%s-g%d", id, short(out.PlanDigest+"|"+runID), gen)
 			res, err := cs.Claim(workclaim.ClaimRequest{
 				ProjectID: projectID, Graph: g, Evidence: ev, WorkItemID: id,
 				AttemptID:  attemptID,
@@ -315,9 +346,12 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 			launches++
 			out.LaunchCount = launches
 			out.ProcessPeak++
+			logEv(Event{Kind: "claim", WorkItemID: id, AttemptID: attemptID, Generation: gen})
 
 			route := resolveChildRoute(req.ChildRoutes, id, defaultProvider, defaultModel)
-			emit(fmt.Sprintf("child.launch:%s route=%s/%s depth=%s", id, route.Provider, route.Model, route.Depth))
+			emit(fmt.Sprintf("child.launch:%s route=%s/%s depth=%s gen=%d", id, route.Provider, route.Model, route.Depth, gen))
+			logEv(Event{Kind: "launch", WorkItemID: id, AttemptID: attemptID, Generation: gen,
+				Message: route.Provider + "/" + route.Model})
 
 			it := itemByID[id]
 			readOnly := strings.Contains(strings.ToLower(it.RouteRequirement), "read-only") ||
@@ -333,6 +367,9 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 				ReadOnly: readOnly,
 			}
 			childOut, cerr := exec.Execute(ctx, childIn)
+			if childOut.ProcessPID > 0 {
+				logEv(Event{Kind: "pid", WorkItemID: id, AttemptID: attemptID, PID: childOut.ProcessPID})
+			}
 			if childOut.WorktreePath != "" {
 				out.WorktreePeak++
 			}
@@ -358,12 +395,20 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 					outcome.Message = "executor returned no terminal"
 				}
 			}
-			// Context cancel mid-child → cancelled terminal + release path for callers.
+			// Context cancel mid-child → cancelled terminal + forced interrupt record.
 			if ctx.Err() != nil && term != workgraph.TermSucceeded {
 				term = workgraph.TermCancelled
 				if outcome.FailureClass == "" {
-					outcome.FailureClass = "cancelled"
+					outcome.FailureClass = "forced_interrupt"
 				}
+				out.Interrupted = true
+				if out.AbortedAttempts == nil {
+					out.AbortedAttempts = map[string]string{}
+				}
+				out.AbortedAttempts[id] = attemptID
+				logEv(Event{Kind: "interrupt", WorkItemID: id, AttemptID: attemptID,
+					PID: childOut.ProcessPID, Message: "forced interrupt; attempt aborted", Terminal: string(term)})
+				emit(fmt.Sprintf("interrupt:%s attempt=%s pid=%d", id, attemptID, childOut.ProcessPID))
 			}
 			outcome.Terminal = string(term)
 
@@ -394,6 +439,8 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 				return fail(out, StatusBlocked, "close "+id+": "+closeErr.Error())
 			}
 			ev[id] = closeTerm
+			logEv(Event{Kind: "terminal", WorkItemID: id, AttemptID: attemptID,
+				Terminal: string(closeTerm), Evidence: closeEvidence, Message: outcome.FailureClass})
 
 			// Task-specific acceptance: clarification/empty/no-tests must not succeed.
 			if closeTerm == workgraph.TermSucceeded {
@@ -440,6 +487,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 				outcome.FilesTouched = firstNonEmptySlice(ic.Files, outcome.FilesTouched)
 				out.IntegrateCommits = append(out.IntegrateCommits, ic)
 				integrated = append(integrated, id)
+				logEv(Event{Kind: "integrate", WorkItemID: id, AttemptID: attemptID, CommitSHA: ic.CommitSHA})
 				if ic.Skipped {
 					emit(fmt.Sprintf("integrate.skip:%s attempt=%s commit=%s", id, attemptID, short(ic.CommitSHA)))
 				} else {

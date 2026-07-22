@@ -180,8 +180,10 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 	if runID == "" {
 		runID = "run_" + shortID(fmt.Sprintf("%s|%d", projectID, now.UnixNano()))
 	}
-	// Forced restart: load durable checkpoint for same RunID → PriorSucceeded seed.
+	// Forced restart: load durable checkpoint for same RunID → PriorSucceeded seed
+	// and attempt generation bumps for aborted/in-flight children.
 	priorSucceeded := req.PriorSucceeded
+	attemptGen := map[string]int{}
 	resumed := false
 	var loadedCP Checkpoint
 	if req.Resume || priorSucceeded == nil {
@@ -192,6 +194,19 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 			}
 			if req.Resume || len(priorSucceeded) > 0 {
 				resumed = len(priorSucceeded) > 0
+			}
+			// Bump generation for aborted attempts so resume uses a new attempt_id.
+			for id := range cp.AbortedAttempts {
+				prev := 0
+				if cp.AttemptGeneration != nil {
+					prev = cp.AttemptGeneration[id]
+				}
+				attemptGen[id] = prev + 1
+			}
+			for id, g0 := range cp.AttemptGeneration {
+				if _, ok := attemptGen[id]; !ok {
+					attemptGen[id] = g0
+				}
 			}
 			// Prefer durable graph identity when resuming same run.
 			if req.Resume && cp.GraphID != "" && cp.GraphID != g.GraphID {
@@ -565,17 +580,18 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		goalBranch = "loopcoder/goal-" + runID
 	}
 	wres, werr := svc.Execute(ctx, workflowrun.Request{
-		ProjectID:      projectID,
-		RunID:          runID,
-		Definition:     def,
-		Actor:          actor,
-		Provider:       firstNonEmpty(wfProv, "auto"),
-		Model:          firstNonEmpty(wfModel, "auto"),
-		ChildRoutes:    childRoutes,
-		RepoPath:       req.RepoPath,
-		BaseRef:        firstNonEmpty(req.PRBaseRef, "main"),
-		GoalBranch:     goalBranch,
-		PriorSucceeded: priorSucceeded,
+		ProjectID:         projectID,
+		RunID:             runID,
+		Definition:        def,
+		Actor:             actor,
+		Provider:          firstNonEmpty(wfProv, "auto"),
+		Model:             firstNonEmpty(wfModel, "auto"),
+		ChildRoutes:       childRoutes,
+		RepoPath:          req.RepoPath,
+		BaseRef:           firstNonEmpty(req.PRBaseRef, "main"),
+		GoalBranch:        goalBranch,
+		PriorSucceeded:    priorSucceeded,
+		AttemptGeneration: attemptGen,
 	})
 	out := Result{
 		GraphID: g.GraphID, PlanDigest: g.PlanDigest, RunID: runID, ProjectID: projectID,
@@ -714,6 +730,20 @@ func parseIssueNumber(s string) (int, error) {
 }
 
 func saveRunCheckpoint(homeDir, projectID, runID, goal, issue, actor, graphID, planDigest string, out Result, wres workflowrun.Result, at time.Time) (string, error) {
+	gens := map[string]int{}
+	for id := range wres.AbortedAttempts {
+		// Persist generation so next resume can bump again if re-interrupted.
+		gens[id] = 0
+		// Parse generation from aborted attempt id ...-gN
+		if att := wres.AbortedAttempts[id]; strings.Contains(att, "-g") {
+			if i := strings.LastIndex(att, "-g"); i >= 0 {
+				var n int
+				if _, err := fmt.Sscanf(att[i+2:], "%d", &n); err == nil {
+					gens[id] = n
+				}
+			}
+		}
+	}
 	cp := Checkpoint{
 		Schema: CheckpointSchema, ProjectID: projectID, RunID: runID,
 		GraphID: graphID, PlanDigest: planDigest, Goal: goal, Issue: issue, Actor: actor,
@@ -721,7 +751,8 @@ func saveRunCheckpoint(homeDir, projectID, runID, goal, issue, actor, graphID, p
 		Children: out.Children, WorkflowKids: wres.Children,
 		WorktreePeak: wres.WorktreePeak, ProcessPeak: wres.ProcessPeak,
 		ReuseCount: wres.ReuseCount, ClaimCount: wres.ClaimCount, LaunchCount: wres.LaunchCount,
-		SavedAt: at,
+		SavedAt: at, Interrupted: wres.Interrupted, AbortedAttempts: wres.AbortedAttempts,
+		AttemptGeneration: gens, EventLogPath: wres.EventLogPath,
 	}
 	return SaveCheckpoint(homeDir, cp)
 }

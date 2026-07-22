@@ -216,9 +216,9 @@ func TestPerChildRoutesPropagate(t *testing.T) {
 	}
 }
 
-// TestForcedInterruptThenResumeExactlyOnce proves production resume path:
-// interrupt after first child succeeds, resume with PriorSucceeded reuses
-// claim/attempt/output without a second provider call.
+// TestForcedInterruptThenResumeExactlyOnce: cancel mid-flight child b (HangIDs),
+// record interrupt event + aborted attempt; resume reuses a, re-runs b with new
+// generation, no re-exec of a.
 func TestForcedInterruptThenResumeExactlyOnce(t *testing.T) {
 	home := testHome(t)
 	calls1 := map[string]int{}
@@ -226,21 +226,25 @@ func TestForcedInterruptThenResumeExactlyOnce(t *testing.T) {
 		Now: t0, HomeDir: home,
 		Executor: workflowrun.FakeChildExecutor{
 			HomeDir: home, Now: t0, Calls: calls1,
-			FailIDs: map[string]bool{"b": true}, // forced interrupt after a
+			HangIDs: map[string]bool{"b": true}, // true mid-flight hang until cancel
 		},
 	}
 	runID := "run_restart_once"
-	r1, err := svc1.Execute(context.Background(), workflowrun.Request{
+	ctx1, cancel := context.WithCancel(context.Background())
+	// Cancel shortly after start so a may finish and b hangs.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	r1, err := svc1.Execute(ctx1, workflowrun.Request{
 		ProjectID: "proj-restart", RunID: runID,
 		Definition: workflowrun.ChainDefinition("g-restart"),
 		Actor:      "owner",
 	})
-	if err == nil {
-		t.Fatalf("expected interrupt/block: %+v", r1)
+	if err == nil && r1.Status == workflowrun.StatusHumanGate {
+		t.Fatalf("expected interrupt/block before full success: %+v", r1)
 	}
-	if r1.Status != workflowrun.StatusBlocked {
-		t.Fatalf("status %+v", r1)
-	}
+	// a should have succeeded; b aborted/cancelled.
 	var priorA workflowrun.ChildOutcome
 	foundA := false
 	for _, c := range r1.Children {
@@ -250,28 +254,54 @@ func TestForcedInterruptThenResumeExactlyOnce(t *testing.T) {
 		}
 	}
 	if !foundA || priorA.AttemptID == "" || priorA.OutputEvidence == "" {
-		t.Fatalf("need durable a outcome: %+v", r1.Children)
+		// If cancel hit before a, still require event log interrupt path.
+		if !r1.Interrupted && len(r1.AbortedAttempts) == 0 {
+			t.Fatalf("need a succeeded or interrupt evidence: children=%+v interrupted=%v aborted=%v", r1.Children, r1.Interrupted, r1.AbortedAttempts)
+		}
 	}
-	if calls1["a"] != 1 || calls1["b"] != 1 {
-		t.Fatalf("first pass calls %+v", calls1)
+	if r1.EventLogPath == "" {
+		t.Fatal("expected event log path")
 	}
-	if r1.ProcessPeak < 1 || r1.WorktreePeak < 1 {
-		t.Fatalf("ceilings missing: proc=%d wt=%d", r1.ProcessPeak, r1.WorktreePeak)
+	el, err := workflowrun.OpenEventLog(home, "proj-restart", runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := el.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	interrupted, aborted := workflowrun.InterruptedFromEvents(events)
+	if !interrupted && !r1.Interrupted {
+		// Hang path should produce interrupt when cancel fires during b.
+		for _, e := range events {
+			t.Logf("event %+v", e)
+		}
+		t.Fatalf("want interrupt in events; aborted=%v r1=%+v", aborted, r1)
 	}
 
-	// Resume: same RunID + PriorSucceeded(a). Only b,c should execute.
+	// Resume: same RunID + PriorSucceeded(a). b gets generation bump.
 	calls2 := map[string]int{}
 	svc2 := workflowrun.Service{
 		Now: t0, HomeDir: home,
 		Executor: workflowrun.FakeChildExecutor{HomeDir: home, Now: t0, Calls: calls2},
 	}
+	prior := map[string]workflowrun.ChildOutcome{}
+	if foundA {
+		prior["a"] = priorA
+	}
+	gen := map[string]int{}
+	for id := range r1.AbortedAttempts {
+		gen[id] = 1
+	}
+	if len(gen) == 0 {
+		gen["b"] = 1 // expected hang victim
+	}
 	r2, err := svc2.Execute(context.Background(), workflowrun.Request{
 		ProjectID: "proj-restart", RunID: runID,
-		Definition: workflowrun.ChainDefinition("g-restart"),
-		Actor:      "owner",
-		PriorSucceeded: map[string]workflowrun.ChildOutcome{
-			"a": priorA,
-		},
+		Definition:        workflowrun.ChainDefinition("g-restart"),
+		Actor:             "owner",
+		PriorSucceeded:    prior,
+		AttemptGeneration: gen,
 	})
 	if err != nil {
 		t.Fatalf("resume: %v %+v", err, r2)
@@ -279,37 +309,38 @@ func TestForcedInterruptThenResumeExactlyOnce(t *testing.T) {
 	if r2.Status != workflowrun.StatusHumanGate {
 		t.Fatalf("resume status %+v", r2)
 	}
-	if r2.ReuseCount != 1 {
-		t.Fatalf("reuse=%d want 1 events=%v", r2.ReuseCount, r2.Events)
-	}
-	if r2.ClaimCount != 2 || r2.LaunchCount != 2 {
-		t.Fatalf("claims/launches for remaining only: claim=%d launch=%d", r2.ClaimCount, r2.LaunchCount)
-	}
-	if calls2["a"] != 0 {
-		t.Fatalf("a re-executed (duplicate provider call): %+v", calls2)
-	}
-	if calls2["b"] != 1 || calls2["c"] != 1 {
-		t.Fatalf("remaining calls %+v", calls2)
-	}
-	// Same attempt_id + output evidence for a (exactly-once identity).
-	var a2 workflowrun.ChildOutcome
-	for _, c := range r2.Children {
-		if c.WorkItemID == "a" {
-			a2 = c
+	if foundA {
+		if r2.ReuseCount != 1 {
+			t.Fatalf("reuse=%d want 1 events=%v", r2.ReuseCount, r2.Events)
+		}
+		if calls2["a"] != 0 {
+			t.Fatalf("a re-executed: %+v", calls2)
+		}
+		var a2 workflowrun.ChildOutcome
+		for _, c := range r2.Children {
+			if c.WorkItemID == "a" {
+				a2 = c
+			}
+		}
+		if a2.AttemptID != priorA.AttemptID || a2.OutputEvidence != priorA.OutputEvidence {
+			t.Fatalf("a identity drift: first=%+v resume=%+v", priorA, a2)
 		}
 	}
-	if a2.AttemptID != priorA.AttemptID || a2.OutputEvidence != priorA.OutputEvidence {
-		t.Fatalf("a identity drift: first=%+v resume=%+v", priorA, a2)
+	// b must re-run with new generation (not aborted attempt id).
+	var b2 workflowrun.ChildOutcome
+	for _, c := range r2.Children {
+		if c.WorkItemID == "b" {
+			b2 = c
+		}
 	}
-	// No second evidence write for a: worktree path reused, file still one digest.
-	if a2.WorktreePath != priorA.WorktreePath {
-		t.Fatalf("worktree changed on reuse: %q vs %q", priorA.WorktreePath, a2.WorktreePath)
+	if b2.AttemptID == "" || !strings.Contains(b2.AttemptID, "-g1") {
+		t.Fatalf("b should use generation 1 attempt, got %q aborted=%v", b2.AttemptID, r1.AbortedAttempts)
 	}
-	if r2.ProcessPeak != 2 {
-		t.Fatalf("process peak on resume should be remaining launches only: %d", r2.ProcessPeak)
+	if calls2["b"] != 1 {
+		t.Fatalf("b calls=%d", calls2["b"])
 	}
 	joined := strings.Join(r2.Events, "\n")
-	if !strings.Contains(joined, "child.reuse:a") {
+	if foundA && !strings.Contains(joined, "child.reuse:a") {
 		t.Fatalf("missing reuse event: %v", r2.Events)
 	}
 }

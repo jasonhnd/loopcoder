@@ -39,6 +39,14 @@ type Checkpoint struct {
 	SavedAt      time.Time                  `json:"saved_at"`
 	// PriorSucceeded is the exact map seed for workflowrun.Request.PriorSucceeded.
 	PriorSucceeded map[string]workflowrun.ChildOutcome `json:"prior_succeeded,omitempty"`
+	// Interrupted is true only when a forced interrupt event was recorded.
+	Interrupted bool `json:"interrupted,omitempty"`
+	// AbortedAttempts: work_item_id → aborted attempt_id (must bump generation).
+	AbortedAttempts map[string]string `json:"aborted_attempts,omitempty"`
+	// AttemptGeneration for resume (aborted items get gen+1).
+	AttemptGeneration map[string]int `json:"attempt_generation,omitempty"`
+	// EventLogPath is the append-only raw event ledger for evidence derivation.
+	EventLogPath string `json:"event_log_path,omitempty"`
 }
 
 // CheckpointPath returns $HOME/projects/<project>/runs/<runID>/goal-checkpoint.json.
