@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/autoroute"
+	"github.com/jasonhnd/loopcoder/internal/capacityledger"
 	"github.com/jasonhnd/loopcoder/internal/capacitysnapshot"
 	"github.com/jasonhnd/loopcoder/internal/capclass"
 	"github.com/jasonhnd/loopcoder/internal/depthpolicy"
@@ -21,6 +22,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/directdelivery"
 	"github.com/jasonhnd/loopcoder/internal/directrun"
 	"github.com/jasonhnd/loopcoder/internal/preflight"
+	"github.com/jasonhnd/loopcoder/internal/quotapolicy"
 	"github.com/jasonhnd/loopcoder/internal/runtimepath"
 	"github.com/jasonhnd/loopcoder/internal/taskroute"
 	"github.com/jasonhnd/loopcoder/internal/termui"
@@ -46,15 +48,16 @@ type RunRequest struct {
 
 // RunAccepted is printed before long work with a stable run identity.
 type RunAccepted struct {
-	Schema            string     `json:"schema"`
-	RunID             string     `json:"run_id"`
-	Request           RunRequest `json:"request"`
-	Status            string     `json:"status"` // accepted|dry_run|rejected
-	Message           string     `json:"message,omitempty"`
-	CreatedAt         time.Time  `json:"created_at"`
-	PreflightDigest   string     `json:"preflight_digest,omitempty"`
-	PreflightAllow    *bool      `json:"preflight_allow_launch,omitempty"`
-	PreflightDecision string     `json:"preflight_decision,omitempty"`
+	Schema            string                `json:"schema"`
+	RunID             string                `json:"run_id"`
+	Request           RunRequest            `json:"request"`
+	Status            string                `json:"status"` // accepted|dry_run|rejected
+	Message           string                `json:"message,omitempty"`
+	CreatedAt         time.Time             `json:"created_at"`
+	PreflightDigest   string                `json:"preflight_digest,omitempty"`
+	PreflightAllow    *bool                 `json:"preflight_allow_launch,omitempty"`
+	PreflightDecision string                `json:"preflight_decision,omitempty"`
+	Capacity          *capacityledger.Entry `json:"capacity,omitempty"`
 }
 
 const schemaRunAccepted = "loopcoder.run.accepted.v1"
@@ -145,17 +148,26 @@ func runRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "run: task classification unavailable (%v); using tera/standard\n", cerr)
 	}
 	routeInv := deps.AutoRouteInventory
+	capSnap := deps.LastCapacitySnapshot
 	if routeInv == nil && wantAuto {
-		loader := deps.LoadAutoRouteInventory
-		if loader == nil {
-			loader = defaultLoadAutoRouteInventory
+		if deps.LoadAutoRouteInventory != nil {
+			loaded, loadErr := deps.LoadAutoRouteInventory(context.Background(), req.Repo, at)
+			if loadErr != nil {
+				msg := "auto-route inventory load failed: " + loadErr.Error()
+				return emitRunRejected(stdout, stderr, req, msg, exitRunPrecondition, deps)
+			}
+			routeInv = loaded
+		} else {
+			inv, snap, loadErr := capacitysnapshot.LoadRouteInventory(context.Background(), capacitysnapshot.LoadOptions{
+				RepoPath: req.Repo, Now: at,
+			})
+			if loadErr != nil {
+				msg := "auto-route inventory load failed: " + loadErr.Error()
+				return emitRunRejected(stdout, stderr, req, msg, exitRunPrecondition, deps)
+			}
+			routeInv = &inv
+			capSnap = &snap
 		}
-		loaded, loadErr := loader(context.Background(), req.Repo, at)
-		if loadErr != nil {
-			msg := "auto-route inventory load failed: " + loadErr.Error()
-			return emitRunRejected(stdout, stderr, req, msg, exitRunPrecondition, deps)
-		}
-		routeInv = loaded
 	}
 	// Stamp candidate efforts from classified difficulty (never universal high).
 	if routeInv != nil && wantAuto && req.Effort == "" {
@@ -193,18 +205,55 @@ func runRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if routeRes.Permission != "" {
 		req.Permission = routeRes.Permission
 	}
+	routeReason := ""
 	if routeRes.Outcome == autoroute.OutcomeSelected {
 		fmt.Fprintf(stderr, "run: auto-route selected provider=%s model=%s digest=%s\n",
 			req.Provider, req.Model, routeRes.Digest)
 		if routeRes.Explain != nil && routeRes.Explain.WinnerLine != "" {
 			fmt.Fprintf(stderr, "run: route winner: %s\n", routeRes.Explain.WinnerLine)
+			routeReason = routeRes.Explain.WinnerLine
 		}
+		if routeRes.Explain != nil && routeRes.Explain.Human != "" {
+			fmt.Fprintf(stderr, "run: route explain:\n%s\n", routeRes.Explain.Human)
+		}
+	} else if routeRes.Outcome == autoroute.OutcomeExplicitPin {
+		routeReason = "explicit owner pin"
 	}
 
 	runID := stableRunID(req, now().UTC())
 	accepted := RunAccepted{
 		Schema: schemaRunAccepted, RunID: runID, Request: req,
 		CreatedAt: now().UTC(),
+	}
+
+	// V090-CRO-007: soft capacity reserve after route selection (product path).
+	// Durable ledger prevents double-reserve on restart; unknown/stale windows refuse.
+	var capEntry *capacityledger.Entry
+	var capLedger *capacityledger.Ledger
+	if wantAuto && routeRes.Outcome == autoroute.OutcomeSelected {
+		if lg, lerr := openCapacityLedger(deps, now); lerr == nil && lg != nil {
+			capLedger = lg
+			attemptID := runID + "-attempt-1"
+			snapForReserve := capSnap
+			if snapForReserve == nil {
+				snapForReserve = snapshotFromRouteInventory(routeInv, req.Provider, req.Model, at)
+			}
+			e, rerr := lg.Reserve(capacityledger.ReserveInput{
+				ProjectID: routeProject, RunID: runID, AttemptID: attemptID,
+				Policy:   capacityledger.DefaultPolicy(),
+				Provider: req.Provider, Model: req.Model, Depth: req.Effort,
+				Snapshot: snapForReserve, RouteReason: routeReason,
+				DemandFraction: 0.05, DemandConfidence: quotapolicy.EvidenceEstimated,
+			})
+			if rerr != nil {
+				fmt.Fprintf(stderr, "run: capacity reserve refused: %v\n", rerr)
+				// Fail closed for auto-route when reserve cannot be established.
+				return emitRunRejected(stdout, stderr, req, "capacity reserve refused: "+rerr.Error(), exitRunPrecondition, deps)
+			}
+			capEntry = &e
+			accepted.Capacity = capEntry
+			fmt.Fprintf(stderr, "run: %s\n", e.HumanReport())
+		}
 	}
 
 	// V090-026: preflight evidence gate (read-only unless ensure later ports set it).
@@ -225,12 +274,22 @@ func runRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if req.DryRun {
 		accepted.Status = "dry_run"
 		accepted.Message = "normalized inputs + preflight snapshot; no mutation, no provider, no worktree, no GitHub"
+		// Dry-run keeps reserve as evidence then releases (no actual usage).
+		if capLedger != nil && capEntry != nil {
+			if re, rerr := capLedger.Release(routeProject, runID, runID+"-attempt-1", "dry_run"); rerr == nil {
+				accepted.Capacity = &re
+				fmt.Fprintf(stderr, "run: %s\n", re.HumanReport())
+			}
+		}
 		return emitRunAccepted(stdout, accepted)
 	}
 	if !snap.AllowLaunch {
 		accepted.Status = "rejected"
 		accepted.Message = "preflight blocked launch: " + string(snap.Decision)
 		accepted.RunID = "" // no run identity when gate fails
+		if capLedger != nil && capEntry != nil {
+			_, _ = capLedger.Release(routeProject, runID, runID+"-attempt-1", "preflight_blocked")
+		}
 		_ = emitRunAccepted(stdout, accepted)
 		fmt.Fprintf(stderr, "run: preflight blocked decision=%s digest=%s\n", snap.Decision, snap.Digest)
 		return exitRunPrecondition
@@ -276,6 +335,12 @@ func runRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		if accepted.Message == "" {
 			accepted.Message = execErr.Error()
 		}
+		if capLedger != nil && capEntry != nil {
+			if re, rerr := capLedger.Release(routeProject, runID, runID+"-attempt-1", "execution_failed"); rerr == nil {
+				accepted.Capacity = &re
+				fmt.Fprintf(stderr, "run: %s\n", re.HumanReport())
+			}
+		}
 		_ = emitRunAccepted(stdout, accepted)
 		fmt.Fprintf(stderr, "run: execution failed: %v\n", execErr)
 		return exitRunPrecondition
@@ -283,6 +348,11 @@ func runRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if execRes.State != directattempt.StateCleanupTerminal {
 		accepted.Status = "failed"
 		accepted.Message = execRes.Message
+		if capLedger != nil && capEntry != nil {
+			if re, rerr := capLedger.Release(routeProject, runID, runID+"-attempt-1", "incomplete_terminal"); rerr == nil {
+				accepted.Capacity = &re
+			}
+		}
 		_ = emitRunAccepted(stdout, accepted)
 		fmt.Fprintf(stderr, "run: incomplete terminal state %s\n", execRes.State)
 		return exitRunPrecondition
@@ -301,6 +371,13 @@ func runRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 			accepted.Message = dErr.Error()
 		}
 		accepted.RunID = execRes.RunID
+		// Worker ran: reconcile estimated actual rather than full release.
+		if capLedger != nil && capEntry != nil {
+			if re, rerr := capLedger.Reconcile(routeProject, runID, runID+"-attempt-1", 0.04, "worker_ran_delivery_blocked"); rerr == nil {
+				accepted.Capacity = &re
+				fmt.Fprintf(stderr, "run: %s\n", re.HumanReport())
+			}
+		}
 		_ = emitRunAccepted(stdout, accepted)
 		fmt.Fprintf(stderr, "run: delivery blocked: %v\n", dErr)
 		return exitRunPrecondition
@@ -308,6 +385,17 @@ func runRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 	accepted.Status = dRes.Status // human_gate
 	accepted.Message = dRes.Message
 	accepted.RunID = execRes.RunID
+	if capLedger != nil && capEntry != nil {
+		// Soft actual usage estimate from reserved demand (provider-authoritative tokens when available later).
+		actual := capEntry.Reserved
+		if actual <= 0 {
+			actual = 0.03
+		}
+		if re, rerr := capLedger.Reconcile(routeProject, runID, runID+"-attempt-1", actual, "local_estimate"); rerr == nil {
+			accepted.Capacity = &re
+			fmt.Fprintf(stderr, "run: %s\n", re.HumanReport())
+		}
+	}
 	if dRes.PRNumber > 0 {
 		fmt.Fprintf(stderr, "run: delivery pr=%d commit=%s status=%s auto_merge=%v\n",
 			dRes.PRNumber, dRes.CommitSHA, dRes.Status, dRes.AutoMerge)
@@ -410,18 +498,6 @@ func splitCSV(s string) []string {
 	return out
 }
 
-func defaultLoadAutoRouteInventory(ctx context.Context, repo string, now time.Time) (*autoroute.Inventory, error) {
-	inv, snap, err := capacitysnapshot.LoadRouteInventory(ctx, capacitysnapshot.LoadOptions{
-		RepoPath: repo,
-		Now:      now,
-	})
-	if err != nil {
-		return nil, err
-	}
-	_ = snap
-	return &inv, nil
-}
-
 // applyDifficultyEffort rewrites candidate efforts using depthpolicy for the
 // classified difficulty band. Owner-explicit --effort is applied later by Resolve.
 func applyDifficultyEffort(inv *autoroute.Inventory, diff depthpolicy.Difficulty) {
@@ -438,4 +514,76 @@ func applyDifficultyEffort(inv *autoroute.Inventory, diff depthpolicy.Difficulty
 			c.Effort = d
 		}
 	}
+}
+
+func openCapacityLedger(deps Deps, now func() time.Time) (*capacityledger.Ledger, error) {
+	if strings.TrimSpace(deps.CapacityLedgerPath) != "" {
+		return capacityledger.OpenPath(deps.CapacityLedgerPath, now)
+	}
+	return capacityledger.Open(now)
+}
+
+// snapshotFromRouteInventory builds a minimal capacitysnapshot from soft ranking
+// windows already attached to the inventory used for routing.
+func snapshotFromRouteInventory(inv *autoroute.Inventory, provider, model string, now time.Time) *capacitysnapshot.Snapshot {
+	if inv == nil {
+		return nil
+	}
+	var win capacitysnapshot.Window
+	found := false
+	for _, s := range inv.Soft {
+		if !strings.EqualFold(s.Provider, provider) || !strings.EqualFold(s.Model, model) {
+			continue
+		}
+		for _, w := range s.Windows {
+			if w.RemainingFraction == nil {
+				continue
+			}
+			conf := capacitysnapshot.ConfidenceEstimated
+			switch w.Evidence {
+			case quotapolicy.EvidenceExact:
+				conf = capacitysnapshot.ConfidenceExact
+			case quotapolicy.EvidenceEstimated:
+				conf = capacitysnapshot.ConfidenceEstimated
+			default:
+				continue
+			}
+			rf := *w.RemainingFraction * 100
+			win = capacitysnapshot.Window{
+				Kind: string(w.Kind), Unit: capacitysnapshot.UnitPercentage,
+				Remaining:  capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: rf, Unit: capacitysnapshot.UnitPercentage},
+				Limit:      capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: 100, Unit: capacitysnapshot.UnitPercentage},
+				Confidence: conf, Freshness: capacitysnapshot.FreshnessFresh,
+				Source: "route_inventory_soft", CapturedAt: now,
+			}
+			if w.TimeToReset != nil {
+				t := now.Add(*w.TimeToReset)
+				win.ResetAt = &t
+			}
+			found = true
+			break
+		}
+		if found {
+			break
+		}
+	}
+	if !found {
+		return nil
+	}
+	acc := capacitysnapshot.FromAccountInput(capacitysnapshot.AccountInput{
+		Provider: provider, AccountRef: "acct-" + provider,
+		Installed: true, Authenticated: true, Healthy: true,
+		HealthConfidence: capacitysnapshot.ConfidenceEstimated,
+		HealthFreshness:  capacitysnapshot.FreshnessFresh,
+		Windows:          []capacitysnapshot.Window{win},
+		Models: []capacitysnapshot.ModelSpec{{
+			ModelID: model, Present: true, SupportedDepths: []string{"low", "medium", "high"}, DefaultDepth: "medium",
+		}},
+		Source: "route_inventory", CapturedAt: now,
+	})
+	s, err := capacitysnapshot.Build([]capacitysnapshot.AccountObservation{acc}, now)
+	if err != nil {
+		return nil
+	}
+	return &s
 }
