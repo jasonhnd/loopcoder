@@ -50,6 +50,7 @@ Every document is exactly one of these types:
 - [`reference/grok-quota-windows.md`](reference/grok-quota-windows.md): V090-047 Grok quota-window adapter.
 - [`reference/codexbar-bridge.md`](reference/codexbar-bridge.md): V090-048 optional CodexBar observation bridge.
 - [`reference/future-provider-kit.md`](reference/future-provider-kit.md): V090-049 future-provider registration kit.
+- [`reference/capability-classes.md`](reference/capability-classes.md): V090-050 task risk classes and Luna/Tera/Soul capability mapping.
 - [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
 - [`reference/v09-home-layout.md`](reference/v09-home-layout.md): global `$LOOPCODER_HOME` layout and owner-only creation.
 - [`reference/project-authority-store.md`](reference/project-authority-store.md): project.db domain tables and immutable events.
