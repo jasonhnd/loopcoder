@@ -68,6 +68,7 @@ Every document is exactly one of these types:
 - [`reference/child-attempt-isolation.md`](reference/child-attempt-isolation.md): V090-063 cross-provider child-attempt isolation.
 - [`reference/workflow-lifecycle.md`](reference/workflow-lifecycle.md): V090-064 workflow cancellation, restart, and terminal compaction.
 - [`reference/bounded-workflow-canary.md`](reference/bounded-workflow-canary.md): V090-065 bounded-workflow end-to-end acceptance canary.
+- [`reference/multi-project-admission.md`](reference/multi-project-admission.md): V090-066 multi-project global admission and isolation.
 - [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
 - [`reference/v09-home-layout.md`](reference/v09-home-layout.md): global `$LOOPCODER_HOME` layout and owner-only creation.
 - [`reference/project-authority-store.md`](reference/project-authority-store.md): project.db domain tables and immutable events.
