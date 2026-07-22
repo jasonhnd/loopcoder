@@ -143,6 +143,8 @@ var commands = []Command{
 	{Name: "events", Summary: "follow project UI report stream (cursor replay + follow + optional loopback bridge)"},
 	{Name: "cancel", Summary: "request cancellation for a detached run"},
 	{Name: "doctor", Summary: "run read-only preflight checks"},
+	{Name: "diagnose", Summary: "plan or write a local redacted support bundle (no network upload)"},
+	{Name: "capabilities", Summary: "print authoritative v0.9 capability matrix (same table as doctor codes)"},
 	{Name: "providers", Summary: "refresh bounded provider CLI installation inventory"},
 	// Remaining commands (legacy / compatibility remain available).
 	{Name: "attest", Summary: "emit conductor self-report"},
@@ -521,6 +523,12 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "doctor" {
 		return runDoctor(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "diagnose" {
+		return runDiagnose(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "capabilities" {
+		return runCapabilities(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "init" {
 		return runInit(args[1:], stdout, stderr, deps)

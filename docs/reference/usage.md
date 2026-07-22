@@ -71,6 +71,8 @@ push access.
 
    ```text
    loopcoder doctor --repo .
+loopcoder diagnose --project-id <id> --dry-run --format json
+loopcoder capabilities --format json
    ```
 
 6. Confirm local report querying works. A fresh repository may have no reports
