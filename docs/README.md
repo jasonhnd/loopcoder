@@ -83,6 +83,7 @@ Every document is exactly one of these types:
 - [`reference/remove-autonomous-entrypoints.md`](reference/remove-autonomous-entrypoints.md): V090-076 remove autonomous compile/tick/trigger/promotion entry points.
 - [`reference/remove-federation-leases.md`](reference/remove-federation-leases.md): V090-077 remove nested/federation/state-branch/cross-machine leases.
 - [`reference/cli-prune.md`](reference/cli-prune.md): V090-078 prune legacy CLI commands and superseded specifications.
+- [`reference/deadcode-sweep.md`](reference/deadcode-sweep.md): V090-079 final dependency/schema/dead-code sweep after parity.
 - [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
 - [`reference/v09-home-layout.md`](reference/v09-home-layout.md): global `$LOOPCODER_HOME` layout and owner-only creation.
 - [`reference/project-authority-store.md`](reference/project-authority-store.md): project.db domain tables and immutable events.
