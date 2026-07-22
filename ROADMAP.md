@@ -107,15 +107,80 @@ direct run, hardened multi-UI runtime, provider/router, workflow, and release.
 The visible direct-run canary is the first source-build usability checkpoint;
 the longer silent-worker/multi-UI canary must pass before automatic routing.
 
+### Core resource orchestration (v0.9.0 product completion)
+
+**Status (2026-07-22):** active program after owner product-level **NO-GO** on
+[#1199](https://github.com/jasonhnd/loopcoder/issues/1199). Mechanical RC
+qualification is necessary but not sufficient for public v0.9.0.
+
+**Highest acceptance criterion (owner product objective):**
+
+> Turn unused paid AI subscription capacity into useful software work by
+> observing real provider/account quota, understanding model capability and
+> reasoning depth, decomposing goals into bounded transparent child work, and
+> routing every child to the best eligible provider/model/depth while
+> delivering visible reports and PRs.
+
+The product must use paid multi-company AI subscription capacity intelligently.
+It optimizes useful work subject to quality and safety floors. It must never
+burn tokens pointlessly or fabricate quota. Package tests, fake adapters,
+fixture workflows, and green mechanical RC scorecards are **not** proof that
+this objective works.
+
+#### Confirmed production defects (pre-prod baseline)
+
+Observed on `pre-prod@96a4395` (and still authoritative until fixed):
+
+| Defect | Location / evidence |
+| --- | --- |
+| Official fake/static inventory used when production inventory is nil | `internal/autoroute.DefaultInventory`; `Resolve` falls back when `Input.Inventory == nil` |
+| `loopcoder run` does not pass a real inventory or classified TaskClass | `internal/cli/run_cmd.go` → `autoroute.Resolve` without Inventory/TaskClass (defaults to Tera) |
+| Auto effort defaults to high | `autoroute.Resolve` winner effort `firstNonEmpty(..., "high")`; DefaultInventory candidates set `Effort: "high"` |
+| Stale model IDs across maps | `internal/models` vs `capclass.DefaultModelMap` disagree (e.g. gpt-5.5 vs gpt-5.3-codex family) |
+| Provider inventory/quota packages not authoritative for production auto-route | `providerinventory` / `*quota` exist but are not wired into `run` routing |
+| Federation/nested automatic goal decomposition unsupported | `capmatrix` `fed-nested` unsupported; no product path for automatic WorkGraph → transparent multi-provider children |
+
+#### Historical RC evidence (preserve; do not rebuild or erase)
+
+| Candidate | Run | Digest | Role |
+| --- | --- | --- | --- |
+| RC1 `0.9.0-rc.1` | 29916328295 | `76988d993241cef7a8068752123d9d49d2eb887d57b3da2d446c88e9c54e9cce` | Failed baseline (required latency metrics `not_run`) |
+| RC2 `0.9.0-rc.2` | 29917947829 | `339a58924bc438824733b8a7ee53e99faee84f6f783e41a8e44889b5c3c28798` | Mechanical pass; **product NO-GO** |
+
+The next candidate must use a **later RC number** and a **new exact pre-prod SHA**
+after this program lands. No tag / public GitHub release / Latest without a
+**separate** explicit owner public-release GO.
+
+#### Program phases and ordered release-blockers
+
+| Phase | Outcome | Issues |
+| --- | --- | --- |
+| CRO-0 Ledger | ROADMAP authority + issue map | [#1334](https://github.com/jasonhnd/loopcoder/issues/1334) |
+| CRO-1 Provider/account/model/quota truth | Remove production fake inventory; immutable capacity snapshot; wire `run` | [#1335](https://github.com/jasonhnd/loopcoder/issues/1335), [#1336](https://github.com/jasonhnd/loopcoder/issues/1336), [#1337](https://github.com/jasonhnd/loopcoder/issues/1337) |
+| CRO-2 Task intelligence + depth policy | Reconcile catalogs; classifier on run path; no universal high effort | [#1338](https://github.com/jasonhnd/loopcoder/issues/1338), [#1339](https://github.com/jasonhnd/loopcoder/issues/1339) |
+| CRO-3 Useful-capacity routing + accounting | Floors first; use-before-reset; reserve/reconcile; explain | [#1340](https://github.com/jasonhnd/loopcoder/issues/1340) |
+| CRO-4 Automatic decomposition + transparent children | WorkGraph entry; LoopCoder-owned children; ceilings (default ≤2 writers) | [#1341](https://github.com/jasonhnd/loopcoder/issues/1341), [#1342](https://github.com/jasonhnd/loopcoder/issues/1342) |
+| CRO-5 UI / operator controls | Capacity-aware reports; safe overrides; durable 5-minute state | (covered under #1342) |
+| CRO-6 Multi-provider exact-artifact qualification | New RC proves multi-company routes, depths, capacity truth, PR+human gate | [#1343](https://github.com/jasonhnd/loopcoder/issues/1343) → updates [#1199](https://github.com/jasonhnd/loopcoder/issues/1199) |
+
+Governance: one active issue/worktree/PR; JIT `implementation-authorized` only
+on the current issue; authorize the next only after prior PR is merged and the
+exact pre-prod SHA is dual-green (`integration-verify` + `integration-canary`).
+Ordinary development only — no LoopCoder self-bootstrap.
+
 ### Release acceptance
 
-v0.9.0 is releasable only when all 109 accepted issue outcomes are merged or an
+v0.9.0 is releasable only when the **core resource orchestration** product
+objective above is proven on an exact multi-provider artifact (see #1343 / #1199),
+all required catalog and CRO release-blocker outcomes are merged or an
 owner-approved scope-change record explicitly removes an outcome; every P0/P1
 defect is closed or consciously accepted; the exact release SHA passes protected
 remote checks; the exact packaged archive passes install, upgrade, migration,
-rollback-limitation, and consumer-repository smoke; UI capability claims match
-real rendered evidence; no child process remains after stop; and the release
-documentation accurately describes supported and unsupported paths.
+rollback-limitation, consumer-repository smoke, **and** multi-provider
+routing/decomposition qualification; UI capability claims match real rendered
+evidence; no child process remains after stop; and the release documentation
+accurately describes supported and unsupported paths. Mechanical scorecard
+green alone is not sufficient.
 
 Self-development of LoopCoder by LoopCoder is not part of this release gate. It
 may be considered only after v0.9.0 is already production-usable and only under a
