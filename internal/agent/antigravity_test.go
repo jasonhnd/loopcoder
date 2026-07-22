@@ -44,6 +44,7 @@ func TestBuildAntigravityArgs(t *testing.T) {
 			want: []string{
 				"-p", "do the work",
 				"--add-dir", "wt",
+				"--dangerously-skip-permissions",
 				"--model", "Gemini 3.1 Pro (medium)",
 			},
 		},
@@ -57,6 +58,7 @@ func TestBuildAntigravityArgs(t *testing.T) {
 			want: []string{
 				"-p", "do the work",
 				"--add-dir", "wt",
+				"--dangerously-skip-permissions",
 				"--model", "Future Model",
 			},
 		},
@@ -69,6 +71,7 @@ func TestBuildAntigravityArgs(t *testing.T) {
 			want: []string{
 				"-p", "do the work",
 				"--add-dir", "wt",
+				"--dangerously-skip-permissions",
 				"--model", "Gemini 3.1 Pro (medium)",
 			},
 		},
@@ -82,6 +85,7 @@ func TestBuildAntigravityArgs(t *testing.T) {
 			want: []string{
 				"-p", "do the work",
 				"--add-dir", "wt",
+				"--dangerously-skip-permissions",
 				"--model", "Opus 4.6 (high)",
 			},
 		},
@@ -111,7 +115,7 @@ func TestAntigravityRunnerClosesStdinPinsWorktreeAndCapturesPlainText(t *testing
 		if cmd.Stdin != nil {
 			t.Fatalf("Stdin = %#v, want nil closed stdin", cmd.Stdin)
 		}
-		wantArgs := []string{"agy", "-p", prompt, "--add-dir", worktree, "--model", "Gemini 3.1 Pro (medium)"}
+		wantArgs := []string{"agy", "-p", prompt, "--add-dir", worktree, "--dangerously-skip-permissions", "--model", "Gemini 3.1 Pro (medium)"}
 		if !reflect.DeepEqual(cmd.Args, wantArgs) {
 			t.Fatalf("Args = %#v, want %#v", cmd.Args, wantArgs)
 		}
@@ -144,6 +148,47 @@ func TestAntigravityRunnerClosesStdinPinsWorktreeAndCapturesPlainText(t *testing
 		if !strings.Contains(string(logBytes), want) {
 			t.Fatalf("log missing %q:\n%s", want, string(logBytes))
 		}
+	}
+}
+
+func TestAntigravityHeadlessPermissionDenied(t *testing.T) {
+	if !antigravityHeadlessPermissionDenied(
+		`jetski: no output produced — a tool required the "read_file" permission that headless mode cannot prompt for, so it was auto-denied. Alternatively, re-run with --dangerously-skip-permissions to auto-approve all tools.`,
+		"",
+	) {
+		t.Fatal("expected denial detection for jetski empty headless output")
+	}
+	if antigravityHeadlessPermissionDenied("Created NOTES.md with multi-provider notes.", "ok") {
+		t.Fatal("useful write output must not be classified as permission denial")
+	}
+}
+
+func TestAntigravityRunnerFailsClosedOnHeadlessPermissionDenial(t *testing.T) {
+	worktree := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "antigravity.log")
+	restore := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
+		msg := `jetski: no output produced — a tool required the "read_file" permission that headless mode cannot prompt for, so it was auto-denied. Alternatively, re-run with --dangerously-skip-permissions to auto-approve all tools.`
+		_, _ = io.WriteString(cmd.Stdout, msg+"\n")
+		_, _ = io.WriteString(cmd.Stderr, msg+"\n")
+		return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: 0}, nil
+	})
+	defer restore()
+
+	result, err := AntigravityRunner{}.Run(context.Background(), Invocation{
+		WorktreePath: worktree,
+		Prompt:       "write notes",
+		LogPath:      logPath,
+		Model:        "Gemini 3.1 Pro",
+		Effort:       "medium",
+	})
+	if err == nil {
+		t.Fatal("Run returned nil error, want headless permission denial")
+	}
+	if !strings.Contains(err.Error(), "headless permission denial") {
+		t.Fatalf("error = %v", err)
+	}
+	if result.ExitCode != 1 {
+		t.Fatalf("ExitCode = %d, want 1", result.ExitCode)
 	}
 }
 
