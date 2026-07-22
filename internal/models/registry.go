@@ -85,11 +85,23 @@ var staticRegistry = Registry{
 			Vendor:       "OpenAI Codex",
 			CLI:          "codex",
 			DefaultModel: "gpt-5.5",
-			DefaultDepth: "high",
+			// DefaultDepth is the catalog default for unspecified ordinary work;
+			// depthpolicy selects lower/higher from task difficulty (CRO-005).
+			DefaultDepth: "medium",
 			Models: []Model{
 				{
 					Name:         "gpt-5.5",
-					DefaultDepth: "high",
+					DefaultDepth: "medium",
+					Depths: []Depth{
+						{Token: "low", Label: "low"},
+						{Token: "medium", Label: "medium"},
+						{Token: "high", Label: "high"},
+						{Token: "xhigh", Label: "xhigh"},
+					},
+				},
+				{
+					Name:         "gpt-5.3-codex",
+					DefaultDepth: "medium",
 					Depths: []Depth{
 						{Token: "low", Label: "low"},
 						{Token: "medium", Label: "medium"},
@@ -104,17 +116,34 @@ var staticRegistry = Registry{
 			DisplayName:  "Claude",
 			Vendor:       "Anthropic",
 			CLI:          "claude",
-			DefaultModel: "claude-opus-4-8[1m]",
-			DefaultDepth: "max",
+			DefaultModel: "claude-sonnet-4-5",
+			DefaultDepth: "medium",
 			Models: []Model{
 				{
 					Name:         "claude-opus-4-8[1m]",
-					DefaultDepth: "max",
+					DefaultDepth: "high",
 					Depths: []Depth{
 						{Token: "low", Label: "low"},
 						{Token: "medium", Label: "medium"},
 						{Token: "high", Label: "high"},
 						{Token: "max", Label: "max"},
+					},
+				},
+				{
+					Name:         "claude-sonnet-4-5",
+					DefaultDepth: "medium",
+					Depths: []Depth{
+						{Token: "low", Label: "low"},
+						{Token: "medium", Label: "medium"},
+						{Token: "high", Label: "high"},
+					},
+				},
+				{
+					Name:         "claude-haiku-4-5",
+					DefaultDepth: "low",
+					Depths: []Depth{
+						{Token: "low", Label: "low"},
+						{Token: "medium", Label: "medium"},
 					},
 				},
 			},
@@ -125,28 +154,33 @@ var staticRegistry = Registry{
 			Vendor:       "Google Antigravity",
 			CLI:          "agy",
 			DefaultModel: "Gemini 3.1 Pro",
-			DefaultDepth: "High",
+			DefaultDepth: "medium",
 			Models: []Model{
 				{
 					Name:         "Gemini 3.1 Pro",
-					DefaultDepth: "High",
+					DefaultDepth: "medium",
 					Depths: []Depth{
-						{Token: "Low", Label: "Low"},
-						{Token: "High", Label: "High"},
+						{Token: "low", Label: "low"},
+						{Token: "medium", Label: "medium"},
+						{Token: "high", Label: "high"},
 					},
 				},
 				{
 					Name:         "Opus 4.6",
-					DefaultDepth: "Thinking",
+					DefaultDepth: "high",
 					Depths: []Depth{
-						{Token: "Thinking", Label: "Thinking"},
+						{Token: "medium", Label: "medium"},
+						{Token: "high", Label: "high"},
+						{Token: "xhigh", Label: "xhigh"},
 					},
 				},
 				{
 					Name:         "GPT-OSS 120B",
-					DefaultDepth: "Medium",
+					DefaultDepth: "medium",
 					Depths: []Depth{
-						{Token: "Medium", Label: "Medium"},
+						{Token: "low", Label: "low"},
+						{Token: "medium", Label: "medium"},
+						{Token: "high", Label: "high"},
 					},
 				},
 			},
@@ -156,6 +190,8 @@ var staticRegistry = Registry{
 			DisplayName: "Grok Build",
 			Vendor:      "xAI",
 			CLI:         "grok",
+			// Grok requires dynamic inventory for authoritative model/depth lists.
+			// Static catalog remains empty by design (account-observed only).
 		},
 	},
 }

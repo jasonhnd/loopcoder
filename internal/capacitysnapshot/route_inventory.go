@@ -7,6 +7,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/autoroute"
 	"github.com/jasonhnd/loopcoder/internal/capclass"
+	"github.com/jasonhnd/loopcoder/internal/depthpolicy"
 	"github.com/jasonhnd/loopcoder/internal/eligibility"
 	"github.com/jasonhnd/loopcoder/internal/quotamode"
 	"github.com/jasonhnd/loopcoder/internal/quotapolicy"
@@ -60,14 +61,26 @@ func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 			if !m.PresentInCatalog || m.ModelID == "" {
 				continue
 			}
-			effort := m.DefaultDepth
-			if effort == "" && len(m.SupportedDepths) > 0 {
-				effort = pickDefaultDepth(m.SupportedDepths)
+			// Depth from policy + model support; never universal high.
+			// Model DefaultDepth is not an owner pin — do not fail closed on it.
+			diff := depthpolicy.DifficultyStandard
+			if m.ClassHint == string(capclass.ClassSoul) {
+				diff = depthpolicy.DifficultyHard
 			}
-			if effort == "" {
+			if m.ClassHint == string(capclass.ClassLuna) {
+				diff = depthpolicy.DifficultyTiny
+			}
+			effort, derr := depthpolicy.Select(diff, m.SupportedDepths, "")
+			if derr != nil || effort == "" {
 				effort = "medium"
 			}
 			cl := classFromHint(m.ClassHint)
+			if cl == capclass.ClassTera {
+				// Prefer capclass map when model is known.
+				if mapped, ok := capclass.LookupModel(capclass.DefaultModelMap(), a.Provider, m.ModelID); ok {
+					cl = mapped
+				}
+			}
 			// CooldownActive FactTrue means on cooldown (ineligible).
 			cooldownFact := factBool(false, "cd-"+a.Provider)
 			if a.CooldownActive {
