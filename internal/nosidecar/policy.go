@@ -69,24 +69,31 @@ type Decision struct {
 	Guidance string
 }
 
-// ForbiddenRepoLocalReports whether path is under a removed/export-only pattern.
+// ForbiddenRepoLocal reports whether path is under a removed/export-only pattern.
+// Longest matching pattern wins so .loopcoder/state is not swallowed by .loopcoder.
 func ForbiddenRepoLocal(repoRoot, target string) (bool, PathRule) {
 	rel := relToRepo(repoRoot, target)
 	if rel == "" {
 		return false, PathRule{}
 	}
 	rel = filepath.ToSlash(rel)
+	var best PathRule
+	bestLen := -1
 	for _, rule := range DefaultManifest() {
 		pat := strings.TrimSuffix(rule.Pattern, "/")
 		if rel == pat || strings.HasPrefix(rel, pat+"/") {
-			if rule.Disposition == DispRemoved || rule.Disposition == DispReadOnlyExport || rule.Disposition == DispRetainDiscover {
-				return true, rule
+			if len(pat) > bestLen {
+				best = rule
+				bestLen = len(pat)
 			}
-			// policy files: not forbidden to exist, but production must not write them as runtime sidecars
-			if rule.Disposition == DispPolicyFile {
-				// allow if not creating as runtime — still block runtime writer claiming them as state
-				return false, rule
-			}
+		}
+	}
+	if bestLen >= 0 {
+		if best.Disposition == DispRemoved || best.Disposition == DispReadOnlyExport || best.Disposition == DispRetainDiscover {
+			return true, best
+		}
+		if best.Disposition == DispPolicyFile {
+			return false, best
 		}
 	}
 	// any path under .loopcoder is forbidden even if not listed
