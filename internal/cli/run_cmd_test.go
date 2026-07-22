@@ -77,11 +77,14 @@ func TestRunHumanJSONLSameSchema(t *testing.T) {
 	if !strings.Contains(hOut.String(), acc.RunID) {
 		t.Fatalf("human missing run_id %s in %s", acc.RunID, hOut.String())
 	}
-	if acc.Schema != schemaRunAccepted || acc.Status != "cleanup_terminal" {
+	if acc.Schema != schemaRunAccepted || acc.Status != "human_gate" {
 		t.Fatalf("%+v", acc)
 	}
 	if strings.Contains(acc.Message, "execution ports not yet attached") {
 		t.Fatal("old stub message still present")
+	}
+	if !strings.Contains(acc.Message, "human merge gate") && !strings.Contains(acc.Message, "pr=") {
+		t.Fatalf("expected delivery human-gate message: %+v", acc)
 	}
 }
 
@@ -98,6 +101,9 @@ func TestRunRemovesPortsNotAttachedStub(t *testing.T) {
 	}
 	if !strings.Contains(string(src), "directrun.Service") {
 		t.Fatal("cmd path does not reach directrun.Service")
+	}
+	if !strings.Contains(string(src), "directdelivery.Service") {
+		t.Fatal("cmd path does not reach directdelivery.Service")
 	}
 }
 
@@ -121,12 +127,16 @@ func TestRunBlackBoxReachesCleanupTerminal(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &acc); err != nil {
 		t.Fatal(err)
 	}
-	if acc.Status != "cleanup_terminal" {
+	if acc.Status != "human_gate" {
 		t.Fatalf("%+v", acc)
 	}
 	// start report should have been written to stderr report stream
 	if !strings.Contains(stderr.String(), "start") && !strings.Contains(stderr.String(), "stage=") {
 		t.Fatalf("expected start report on stderr: %q", stderr.String())
+	}
+	// delivery evidence on stderr
+	if !strings.Contains(stderr.String(), "delivery pr=") {
+		t.Fatalf("expected delivery pr line on stderr: %q", stderr.String())
 	}
 }
 

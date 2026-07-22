@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/directattempt"
+	"github.com/jasonhnd/loopcoder/internal/directdelivery"
 	"github.com/jasonhnd/loopcoder/internal/directrun"
 	"github.com/jasonhnd/loopcoder/internal/preflight"
 	"github.com/jasonhnd/loopcoder/internal/runtimepath"
@@ -161,8 +162,9 @@ func runRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return exitRunPrecondition
 	}
 
-	// Production direct-run application service (V090-RB02): worker lifecycle
-	// through cleanup-terminal. No Git commit/push/PR in this command path.
+	// Production direct-run (V090-RB02) then post-worker delivery (V090-RB03 / #1314):
+	// worker lifecycle through cleanup-terminal, then localverify→commit→push→PR→
+	// ciwatch→verifier, stopping at the human merge gate (no auto-merge).
 	projectID := ""
 	if resolved, err := resolveRepo(req.Repo); err == nil {
 		if roots, rerr := runtimepath.Resolve(context.Background(), resolved); rerr == nil && roots.Registered {
@@ -211,11 +213,31 @@ func runRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "run: incomplete terminal state %s\n", execRes.State)
 		return exitRunPrecondition
 	}
-	accepted.Status = "cleanup_terminal"
-	accepted.Message = execRes.Message
-	accepted.RunID = execRes.RunID
-	// Persist a tiny status marker for status/events correlation (project runtime).
+	// Persist worker marker before delivery so crashes remain inspectable.
 	_ = writeRunMarker(execRes)
+
+	deliv := directdelivery.Service{Deps: directdelivery.Deps{Now: now}}
+	dRes, dErr := deliv.Execute(context.Background(), directdelivery.Request{
+		Worker: execRes, Repo: req.Repo, Issue: req.Issue, BaseBranch: req.BaseBranch,
+	})
+	if dErr != nil {
+		accepted.Status = "delivery_blocked"
+		accepted.Message = dRes.Message
+		if accepted.Message == "" {
+			accepted.Message = dErr.Error()
+		}
+		accepted.RunID = execRes.RunID
+		_ = emitRunAccepted(stdout, accepted)
+		fmt.Fprintf(stderr, "run: delivery blocked: %v\n", dErr)
+		return exitRunPrecondition
+	}
+	accepted.Status = dRes.Status // human_gate
+	accepted.Message = dRes.Message
+	accepted.RunID = execRes.RunID
+	if dRes.PRNumber > 0 {
+		fmt.Fprintf(stderr, "run: delivery pr=%d commit=%s status=%s auto_merge=%v\n",
+			dRes.PRNumber, dRes.CommitSHA, dRes.Status, dRes.AutoMerge)
+	}
 	return emitRunAccepted(stdout, accepted)
 }
 
