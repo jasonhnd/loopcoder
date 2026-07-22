@@ -101,7 +101,8 @@ Command side effects in the first-run path:
 | `loopcoder doctor --repo .` | Read-only diagnostics in the first-run path; use `--format json` for the machine-readable form. |
 | `loopcoder report --repo .` | Read-only local report query. |
 | `loopcoder status --repo .` | Read-only local run status. |
-| `loopcoder run --repo . --issue <n> --provider <p> --model <m>` | Primary direct-path command shell (explicit provider/model; automatic routing unsupported until P4). |
+| `loopcoder run --repo . --issue <n> --provider <p> --model <m>` | Primary direct-path command (explicit pin or `--auto-route` / omitted route). |
+| `loopcoder workflow run --fixture one\|chain` | Bounded multi-item workflow execution through the direct-run lifecycle (human gate). |
 | `loopcoder events --repo .` | Report/event follow surface (thin alias until dedicated follow lands). |
 | `loopcoder attach --repo . --run <run-id>` | Read-only durable detached run progress follow. |
 | `loopcoder cancel --repo . --run <run-id>` | Requests cancellation for a LoopCoder-owned detached run. |

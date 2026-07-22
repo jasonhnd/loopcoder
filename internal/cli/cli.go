@@ -137,7 +137,8 @@ type Deps struct {
 
 var commands = []Command{
 	// Direct-path primary surface (V090-025): lead help with these.
-	{Name: "run", Summary: "primary direct-path run (explicit provider/model; no auto-route until P4)"},
+	{Name: "run", Summary: "primary direct-path run (explicit pin or auto-route; delivery to human gate)"},
+	{Name: "workflow", Summary: "bounded multi-item workflow execution through the direct-run lifecycle"},
 	{Name: "status", Summary: "render local delivery run status"},
 	{Name: "events", Summary: "follow project UI report stream (cursor replay + follow + optional loopback bridge)"},
 	{Name: "cancel", Summary: "request cancellation for a detached run"},
@@ -470,6 +471,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 
 	if command.Name == "run" {
 		return runRun(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "workflow" {
+		return runWorkflow(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "events" {
 		return runEvents(args[1:], stdout, stderr, deps)
