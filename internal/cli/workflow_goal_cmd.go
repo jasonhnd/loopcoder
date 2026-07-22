@@ -42,11 +42,28 @@ func runWorkflowGoal(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 4
 	}
 	if strings.ToLower(*format) == "human" {
-		fmt.Fprintf(stdout, "status=%s graph=%s digest=%s children=%d\n%s\n",
-			res.Status, res.GraphID, res.PlanDigest, len(res.Children), res.HumanSummary)
+		fmt.Fprintf(stdout, "status=%s graph=%s digest=%s children=%d multi_provider=%v\n%s\n",
+			res.Status, res.GraphID, res.PlanDigest, len(res.Children), res.MultiProviderOK, res.HumanSummary)
 		for _, c := range res.Children {
-			fmt.Fprintf(stdout, "- %s stage=%s route=%s provider=%s model=%s depth=%s\n",
-				c.ChildID, c.Stage, c.RouteRequirement, c.Provider, c.Model, c.Depth)
+			before, reserved, actual, after := "n/a", "n/a", "unknown", "n/a"
+			if c.CapacityBefore != nil {
+				before = fmt.Sprintf("%.3f", *c.CapacityBefore)
+			}
+			if c.CapacityReserved != nil {
+				reserved = fmt.Sprintf("%.3f", *c.CapacityReserved)
+			}
+			if c.CapacityActual != nil {
+				actual = fmt.Sprintf("%.3f", *c.CapacityActual)
+			}
+			if c.CapacityAfter != nil {
+				after = fmt.Sprintf("%.3f", *c.CapacityAfter)
+			}
+			fmt.Fprintf(stdout, "- %s stage=%s provider=%s account=%s model=%s depth=%s route=%s\n",
+				c.ChildID, c.Stage, c.Provider, c.AccountRef, c.Model, c.Depth, c.RouteReason)
+			fmt.Fprintf(stdout, "    capacity before=%s reserved=%s actual=%s after=%s state=%s source=%s\n",
+				before, reserved, actual, after, c.CapacityState, c.ActualSource)
+			fmt.Fprintf(stdout, "    attempt=%s terminal=%s evidence=%s worktree=%s next=%s\n",
+				c.AttemptID, c.Terminal, c.OutputEvidence, c.WorktreePath, c.NextAction)
 		}
 	} else {
 		enc := json.NewEncoder(stdout)
