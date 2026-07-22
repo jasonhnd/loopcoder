@@ -2210,7 +2210,12 @@ func TestScheduleNestedRunsMigratedLegacyContractBlocksWithoutExecute(t *testing
 		if _, err := tx.Exec(ctx, `DROP TABLE child_execution_requests`); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `DELETE FROM migrations WHERE version = 31`)
+		for _, table := range []string{"workgraph_events", "workgraph_dependencies", "workgraph_items", "workgraph_versions"} {
+			if _, err := tx.Exec(ctx, `DROP TABLE IF EXISTS `+table); err != nil {
+				return err
+			}
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM migrations WHERE version >= 31`)
 		return err
 	}); err != nil {
 		t.Fatalf("rewind fixture to schema v30: %v", err)
