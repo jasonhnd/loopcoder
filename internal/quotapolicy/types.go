@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"math"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/capclass"
@@ -230,10 +229,6 @@ func clamp01(v float64) float64 {
 		return 1
 	}
 	return v
-}
-
-func keyOf(c Candidate) string {
-	return strings.ToLower(strings.TrimSpace(c.Provider)) + "/" + strings.TrimSpace(c.Model)
 }
 
 func sortScores(scores []Score) {
