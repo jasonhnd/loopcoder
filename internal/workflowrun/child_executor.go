@@ -85,6 +85,9 @@ type FakeChildExecutor struct {
 	// CancelAfterIDs force TermCancelled after success write for matching ids
 	// (simulates forced interrupt mid-child). Prefer FailIDs for hard fails.
 	CancelAfterIDs map[string]bool
+	// HangIDs block until ctx is cancelled (true forced interrupt mid-flight).
+	// Sets ProcessPID to os.Getpid() for event ledger evidence.
+	HangIDs map[string]bool
 	// Calls records provider-exec invocations per work item (exactly-once tests).
 	// When non-nil, each Execute increments Calls[WorkItemID].
 	Calls map[string]int
@@ -138,6 +141,18 @@ func (f FakeChildExecutor) Execute(ctx context.Context, in ChildExecInput) (Chil
 			Provider: in.Route.Provider, Model: in.Route.Model, Depth: in.Route.Depth,
 			FilesTouched: files, ActualSource: "unknown",
 		}, nil
+	}
+	if f.HangIDs != nil && f.HangIDs[in.WorkItemID] {
+		// True mid-flight interrupt: wait for ctx cancel with a real PID recorded.
+		pid := os.Getpid()
+		<-ctx.Done()
+		return ChildExecResult{
+			Terminal: workgraph.TermCancelled, OutputEvidence: digest, WorktreePath: wt,
+			ProcessPID: pid, ExitCode: 130, FailureClass: "forced_interrupt",
+			Message:  "forced interrupt while running " + in.WorkItemID,
+			Provider: in.Route.Provider, Model: in.Route.Model, Depth: in.Route.Depth,
+			FilesTouched: files, ActualSource: "unknown",
+		}, ctx.Err()
 	}
 	if f.CancelAfterIDs != nil && f.CancelAfterIDs[in.WorkItemID] {
 		return ChildExecResult{

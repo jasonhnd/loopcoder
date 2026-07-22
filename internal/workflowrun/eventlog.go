@@ -1,0 +1,158 @@
+package workflowrun
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+)
+
+// EventSchema is the append-only raw event line schema for forced-interrupt evidence.
+const EventSchema = "loopcoder.workflow.event.v1"
+
+// Event is one append-only durable parent/child lifecycle fact.
+// Canary evidence must derive interrupt/restart metrics from these lines,
+// not from hand-written booleans.
+type Event struct {
+	Schema     string    `json:"schema"`
+	At         time.Time `json:"at"`
+	ProjectID  string    `json:"project_id"`
+	RunID      string    `json:"run_id"`
+	Kind       string    `json:"kind"` // claim|launch|pid|terminal|integrate|interrupt|reuse|accept
+	WorkItemID string    `json:"work_item_id,omitempty"`
+	AttemptID  string    `json:"attempt_id,omitempty"`
+	Terminal   string    `json:"terminal,omitempty"`
+	PID        int       `json:"pid,omitempty"`
+	CommitSHA  string    `json:"commit_sha,omitempty"`
+	Message    string    `json:"message,omitempty"`
+	Evidence   string    `json:"evidence,omitempty"`
+	Generation int       `json:"generation,omitempty"`
+}
+
+// EventLog is an append-only JSONL log under the project runs directory.
+type EventLog struct {
+	mu   sync.Mutex
+	path string
+}
+
+// OpenEventLog opens/creates the durable event log for a run under
+// $HOME/projects/<project>/runs/<runID>/workflow-events.jsonl.
+func OpenEventLog(homeDir, projectID, runID string) (*EventLog, error) {
+	projectID = strings.TrimSpace(projectID)
+	runID = strings.TrimSpace(runID)
+	if projectID == "" || runID == "" {
+		return nil, fmt.Errorf("workflowrun: event log requires project_id and run_id")
+	}
+	root := homeDir
+	if root == "" {
+		root = filepath.Join(os.TempDir(), "loopcoder-events-home")
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return nil, err
+	}
+	dir := filepath.Join(root, "projects", projectID, "runs", sanitizeBranch(runID))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	return &EventLog{path: filepath.Join(dir, "workflow-events.jsonl")}, nil
+}
+
+// Path returns the JSONL path.
+func (e *EventLog) Path() string {
+	if e == nil {
+		return ""
+	}
+	return e.path
+}
+
+// Append writes one event line (fail-closed on I/O error for interrupt evidence).
+func (e *EventLog) Append(ev Event) error {
+	if e == nil {
+		return nil
+	}
+	if strings.TrimSpace(ev.Schema) == "" {
+		ev.Schema = EventSchema
+	}
+	if ev.At.IsZero() {
+		ev.At = time.Now().UTC()
+	}
+	raw, err := json.Marshal(ev)
+	if err != nil {
+		return err
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(e.path), 0o700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(e.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Write(append(raw, '\n')); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+// ReadAll loads all events (tests / evidence builders).
+func (e *EventLog) ReadAll() ([]Event, error) {
+	if e == nil {
+		return nil, nil
+	}
+	raw, err := os.ReadFile(e.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []Event
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var ev Event
+		if json.Unmarshal([]byte(line), &ev) == nil {
+			out = append(out, ev)
+		}
+	}
+	return out, nil
+}
+
+// InterruptedFromEvents reports whether a forced interrupt was recorded and
+// which attempts were aborted mid-flight (for resume generation bumps).
+func InterruptedFromEvents(events []Event) (interrupted bool, aborted map[string]string) {
+	aborted = map[string]string{} // workItemID → attemptID
+	launched := map[string]string{}
+	terminal := map[string]bool{}
+	for _, ev := range events {
+		switch ev.Kind {
+		case "launch", "pid":
+			if ev.WorkItemID != "" && ev.AttemptID != "" {
+				launched[ev.WorkItemID] = ev.AttemptID
+			}
+		case "terminal", "reuse", "integrate":
+			if ev.WorkItemID != "" {
+				terminal[ev.WorkItemID] = true
+				delete(aborted, ev.WorkItemID)
+			}
+		case "interrupt":
+			interrupted = true
+			for id, att := range launched {
+				if !terminal[id] {
+					aborted[id] = att
+				}
+			}
+			if ev.WorkItemID != "" && ev.AttemptID != "" && !terminal[ev.WorkItemID] {
+				aborted[ev.WorkItemID] = ev.AttemptID
+			}
+		}
+	}
+	return interrupted, aborted
+}
