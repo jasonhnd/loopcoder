@@ -2,7 +2,9 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +13,8 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/autoroute"
 )
+
+var errTestNoCapacity = errors.New("test: no eligible capacity snapshot")
 
 func TestRunDryRunAndAcceptedIdentity(t *testing.T) {
 	deps := DefaultDeps()
@@ -47,7 +51,10 @@ func TestRunAutoRouteWithoutInventoryFailsClosed(t *testing.T) {
 	t.Setenv("LOOPCODER_HOME", home)
 	deps := DefaultDeps()
 	deps.Now = func() time.Time { return time.Date(2026, 7, 22, 22, 0, 0, 0, time.UTC) }
-	// Production deps leave AutoRouteInventory nil → fail closed (no fake matrix).
+	// Force load failure: no usable live snapshot (honest fail-closed).
+	deps.LoadAutoRouteInventory = func(ctx context.Context, repo string, now time.Time) (*autoroute.Inventory, error) {
+		return nil, errTestNoCapacity
+	}
 	var stdout, stderr bytes.Buffer
 	code := runRun([]string{
 		"--repo", "acme/demo", "--issue", "1", "--auto-route", "--format", "json", "--dry-run",
@@ -59,7 +66,7 @@ func TestRunAutoRouteWithoutInventoryFailsClosed(t *testing.T) {
 		t.Fatalf("code=%d want precondition/usage stderr=%s", code, stderr.String())
 	}
 	joined := stdout.String() + stderr.String()
-	if !strings.Contains(joined, "inventory") && !strings.Contains(joined, "no real inventory") && !strings.Contains(joined, "no eligible route") && !strings.Contains(joined, "missing real inventory") {
+	if !strings.Contains(joined, "inventory") && !strings.Contains(joined, "capacity") && !strings.Contains(joined, "no real inventory") && !strings.Contains(joined, "no eligible route") && !strings.Contains(joined, "missing real inventory") && !strings.Contains(joined, "auto-route inventory load failed") {
 		t.Fatalf("expected inventory fail-closed message: %q", joined)
 	}
 	// partial pin still usage error
@@ -108,13 +115,49 @@ func TestRunOmittedRouteWithoutInventoryFailsClosed(t *testing.T) {
 	t.Setenv("LOOPCODER_HOME", home)
 	deps := DefaultDeps()
 	deps.Now = func() time.Time { return time.Date(2026, 7, 22, 22, 5, 0, 0, time.UTC) }
+	deps.LoadAutoRouteInventory = func(ctx context.Context, repo string, now time.Time) (*autoroute.Inventory, error) {
+		return nil, errTestNoCapacity
+	}
 	var stdout, stderr bytes.Buffer
-	// omit provider+model without inventory: auto policy fails closed (honest)
+	// omit provider+model without usable capacity: auto policy fails closed (honest)
 	code := runRun([]string{
 		"--repo", "acme/demo", "--issue", "2", "--format", "json", "--dry-run",
 	}, &stdout, &stderr, deps)
 	if code == 0 {
 		t.Fatalf("omitted route without inventory must fail closed; out=%s err=%s", stdout.String(), stderr.String())
+	}
+}
+
+func TestRunAutoRouteLoadsViaDepsLoader(t *testing.T) {
+	home := t.TempDir()
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LOOPCODER_HOME", home)
+	deps := DefaultDeps()
+	deps.Now = func() time.Time { return time.Date(2026, 7, 22, 22, 6, 0, 0, time.UTC) }
+	inv := autoroute.FakeInventory(deps.Now())
+	called := false
+	deps.LoadAutoRouteInventory = func(ctx context.Context, repo string, now time.Time) (*autoroute.Inventory, error) {
+		called = true
+		return &inv, nil
+	}
+	var stdout, stderr bytes.Buffer
+	code := runRun([]string{
+		"--repo", "acme/demo", "--issue", "3", "--auto-route", "--format", "json", "--dry-run",
+	}, &stdout, &stderr, deps)
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	if !called {
+		t.Fatal("expected LoadAutoRouteInventory to be called")
+	}
+	var acc RunAccepted
+	if err := json.Unmarshal(stdout.Bytes(), &acc); err != nil {
+		t.Fatal(err)
+	}
+	if acc.Request.Provider == "" || acc.Request.Model == "" {
+		t.Fatalf("%+v", acc.Request)
 	}
 }
 

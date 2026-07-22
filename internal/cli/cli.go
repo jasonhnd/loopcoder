@@ -84,10 +84,13 @@ type Deps struct {
 	ProcessAlive     func(pid int) bool
 	Now              func() time.Time
 	// AutoRouteInventory is an optional auto-route inventory snapshot.
-	// Production leaves this nil so auto-route fails closed until a real
-	// capacity snapshot is wired (V090-CRO-002/003/004). Tests may inject
-	// autoroute.FakeInventory explicitly; never use the historical silent default.
+	// When nil and auto-route is requested, production loads a live
+	// capacitysnapshot via LoadAutoRouteInventory (or the default loader).
+	// Tests may inject FakeInventory explicitly; never use a silent default matrix.
 	AutoRouteInventory *autoroute.Inventory
+	// LoadAutoRouteInventory optionally overrides production capacity loading.
+	// Default discovers provider inventory → capacitysnapshot → autoroute.Inventory.
+	LoadAutoRouteInventory func(ctx context.Context, repo string, now time.Time) (*autoroute.Inventory, error)
 	// WaitClock optionally overrides the provider-free wait clock for tests.
 	WaitClock                waitstate.Clock
 	RuntimeGOOS              string
