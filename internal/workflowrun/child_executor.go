@@ -256,6 +256,9 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	res, rerr := runner.Run(runCtx, inv)
 	// Always materialize evidence files (even on failure) for audit.
 	_, digest, files, _ := writeChildEvidence(wt, in, "provider_run", now().UTC())
+	// Requested route identity is authoritative (never swap provider←model).
+	actualModel := firstNonEmpty(res.Model, model)
+	actualDepth := firstNonEmpty(res.Effort, depth)
 	if rerr != nil {
 		term := workgraph.TermFailed
 		fc := "process_failure"
@@ -269,8 +272,7 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 		out := ChildExecResult{
 			Terminal: term, OutputEvidence: digest, WorktreePath: wt,
 			ExitCode: res.ExitCode, FailureClass: fc, Message: rerr.Error(),
-			Provider: firstNonEmpty(res.Model, model), Model: firstNonEmpty(res.Model, model),
-			Depth: firstNonEmpty(res.Effort, depth), FilesTouched: files,
+			Provider: prov, Model: actualModel, Depth: actualDepth, FilesTouched: files,
 			ActualSource: "unknown",
 		}
 		out = attachUsage(out, res)
@@ -281,8 +283,7 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 			Terminal: workgraph.TermFailed, OutputEvidence: digest, WorktreePath: wt,
 			ExitCode: res.ExitCode, FailureClass: firstNonEmpty(res.FailureClass, "nonzero_exit"),
 			Message:  firstNonEmpty(res.Summary, fmt.Sprintf("exit %d", res.ExitCode)),
-			Provider: firstNonEmpty(res.Model, model), Model: firstNonEmpty(res.Model, model),
-			Depth: firstNonEmpty(res.Effort, depth), FilesTouched: files,
+			Provider: prov, Model: actualModel, Depth: actualDepth, FilesTouched: files,
 			ActualSource: "unknown",
 		}
 		out = attachUsage(out, res)
@@ -299,18 +300,7 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	out := ChildExecResult{
 		Terminal: workgraph.TermSucceeded, OutputEvidence: digest, WorktreePath: wt,
 		ExitCode: 0, Message: firstNonEmpty(res.Summary, "provider_ok"),
-		Provider: firstNonEmpty(res.Model, model), Model: firstNonEmpty(res.Model, model),
-		Depth: firstNonEmpty(res.Effort, depth), FilesTouched: files,
-	}
-	// Prefer provider identity fields for route display.
-	if strings.TrimSpace(prov) != "" {
-		out.Provider = prov
-	}
-	if strings.TrimSpace(model) != "" {
-		out.Model = model
-	}
-	if strings.TrimSpace(depth) != "" {
-		out.Depth = depth
+		Provider: prov, Model: actualModel, Depth: actualDepth, FilesTouched: files,
 	}
 	out = attachUsage(out, res)
 	return out, nil

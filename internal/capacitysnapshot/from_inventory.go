@@ -4,11 +4,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/models"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 )
 
 // FromProviderInventoryReport maps a live providerinventory.Report into AccountObservations.
-// It does not invent quota: missing remaining stays unknown.
+//
+// Capacity honesty rules (must never be weakened):
+//   - missing/unsupported quota stays unknown — never invent 0, full, or unlimited
+//   - auth-ready and live model catalog are not capacity evidence
+//   - static model seed is estimated catalog only and does not create unattended eligibility
+//   - unattended eligibility still requires a real fresh usable capacity window
 func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []AccountObservation {
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -77,6 +83,8 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 		}
 	}
 
+	// Live catalog capabilities first (preferred for final acceptance routing).
+	liveModels := map[string]bool{}
 	for _, m := range rep.ModelCapabilities {
 		b := ensure(m.AdapterID)
 		present := m.CanonicalModelID != "" &&
@@ -88,14 +96,27 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 			m.FreshnessState == providerinventory.FreshnessStale {
 			present = false
 		}
+		// Account/model capability exclusions (not a silent global delete of the
+		// static registry): ChatGPT Codex accounts reject gpt-5.3-codex.
+		// Record as not-present with provenance; do not invent a replacement window.
+		if present && strings.EqualFold(m.AdapterID, "codex") &&
+			strings.EqualFold(m.CanonicalModelID, "gpt-5.3-codex") {
+			present = false
+			b.in.Provenance = strings.TrimSpace(b.in.Provenance +
+				"; model_excluded=gpt-5.3-codex reason=chatgpt_account_incompatible")
+		}
 		depths := []string{"low", "medium", "high"}
 		b.in.Models = append(b.in.Models, ModelSpec{
 			ModelID: m.CanonicalModelID, Present: present,
 			SupportedDepths: depths, DefaultDepth: "medium",
 		})
+		if present {
+			liveModels[strings.ToLower(m.AdapterID)+"|"+strings.ToLower(m.CanonicalModelID)] = true
+		}
 	}
 
-	// Quota windows
+	// Quota windows — only real observations with known confidence/freshness.
+	// Unavailable/unsupported snapshots must not become finite/unlimited windows.
 	for _, q := range rep.QuotaSnapshots {
 		provider := strings.ToLower(strings.TrimSpace(q.AdapterID))
 		if provider == "" {
@@ -103,6 +124,20 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 			provider = strings.ToLower(strings.TrimSpace(q.ScopeKey))
 		}
 		b := ensure(provider)
+		// Explicitly refuse unavailable/not-applicable snapshots as usable capacity.
+		if q.Confidence == providerinventory.ConfidenceUnavailable ||
+			q.FreshnessState == providerinventory.FreshnessNotApplicable {
+			b.in.Provenance = strings.TrimSpace(b.in.Provenance +
+				"; quota_observation=unsupported_or_unavailable")
+			continue
+		}
+		// Require at least one of remaining/used/limit to be observed; pure empty
+		// snapshots with unknown confidence are not capacity evidence.
+		if q.RemainingValue == nil && q.UsedValue == nil && q.LimitValue == nil {
+			b.in.Provenance = strings.TrimSpace(b.in.Provenance +
+				"; quota_observation=no_numeric_fields")
+			continue
+		}
 		unit := mapUnit(q.Unit)
 		if unit == UnitUnknown {
 			unit = unitFromQuantityKind(string(q.QuantityKind))
@@ -129,17 +164,102 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 
 	out := make([]AccountObservation, 0, len(by))
 	for _, b := range by {
-		// If installed+auth but no windows, leave windows empty → not unattended
-		// unless we have usable data — honesty.
+		// Health freshness fill is not capacity.
 		if b.in.Installed && b.in.Authenticated && b.in.Healthy && b.in.HealthFreshness == FreshnessUnknown {
 			b.in.HealthFreshness = FreshnessFresh
 			if b.in.HealthConfidence == ConfidenceUnknown {
 				b.in.HealthConfidence = ConfidenceEstimated
 			}
 		}
+		// Static model seed: estimated catalog only when live catalog has zero
+		// present models. Never creates capacity windows and never bypasses the
+		// requirement for fresh live catalog on final multi-provider acceptance
+		// (callers must still require live capability rows for RC acceptance).
+		if !hasPresentModel(b.in.Models) {
+			seedStaticModelsEstimated(&b.in, liveModels)
+		}
+		// Prefer gpt-5.5 ordering among present models (capability preference).
+		if b.in.Provider == "codex" && len(b.in.Models) > 1 {
+			preferCodexDefaultModel(&b.in)
+		}
+		// CRITICAL: do NOT inject unlimited/full/zero remaining when windows empty.
+		// Missing/unsupported quota ⇒ empty windows ⇒ unattended ineligible.
 		out = append(out, FromAccountInput(b.in))
 	}
 	return out
+}
+
+func hasPresentModel(models []ModelSpec) bool {
+	for _, m := range models {
+		if m.Present && strings.TrimSpace(m.ModelID) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// preferCodexDefaultModel puts present gpt-5.5 first when available.
+func preferCodexDefaultModel(in *AccountInput) {
+	if in == nil || len(in.Models) < 2 {
+		return
+	}
+	want := "gpt-5.5"
+	idx := -1
+	for i, m := range in.Models {
+		if strings.EqualFold(m.ModelID, want) && m.Present {
+			idx = i
+			break
+		}
+	}
+	if idx <= 0 {
+		return
+	}
+	m := in.Models[idx]
+	copy(in.Models[1:idx+1], in.Models[0:idx])
+	in.Models[0] = m
+}
+
+// seedStaticModelsEstimated adds static registry models as estimated catalog
+// hints only. Does not invent capacity. Does not claim live freshness.
+func seedStaticModelsEstimated(in *AccountInput, live map[string]bool) {
+	if in == nil {
+		return
+	}
+	p, ok := models.LookupProvider(in.Provider)
+	if !ok || len(p.Models) == 0 {
+		return
+	}
+	for _, m := range p.Models {
+		key := strings.ToLower(in.Provider) + "|" + strings.ToLower(m.Name)
+		if live[key] {
+			continue
+		}
+		// Skip ChatGPT-incompatible codex model from estimated seed as well.
+		if strings.EqualFold(in.Provider, "codex") && strings.EqualFold(m.Name, "gpt-5.3-codex") {
+			in.Provenance = strings.TrimSpace(in.Provenance +
+				"; static_seed_skipped=gpt-5.3-codex reason=chatgpt_account_incompatible")
+			continue
+		}
+		depths := make([]string, 0, len(m.Depths))
+		for _, d := range m.Depths {
+			depths = append(depths, d.Token)
+		}
+		if len(depths) == 0 {
+			depths = []string{"low", "medium", "high"}
+		}
+		def := m.DefaultDepth
+		if def == "" {
+			def = p.DefaultDepth
+		}
+		if def == "" {
+			def = "medium"
+		}
+		in.Models = append(in.Models, ModelSpec{
+			ModelID: m.Name, Present: true,
+			SupportedDepths: depths, DefaultDepth: def,
+		})
+	}
+	in.Provenance = strings.TrimSpace(in.Provenance + "; models_source=static_registry_estimated")
 }
 
 func mapPIConfidence(c providerinventory.Confidence) Confidence {

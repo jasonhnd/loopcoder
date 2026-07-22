@@ -1716,9 +1716,76 @@ func parseAuthStatus(adapter AdapterDeclaration, output string, exitCode int) []
 		return parseClaudeAuthStatus(output, exitCode)
 	case "grok-models":
 		return parseGrokModelsAuthStatus(output, exitCode)
+	case "agy-models":
+		return parseAgyModelsAuthStatus(output, exitCode)
 	default:
 		return parseTextAuthStatus(adapter.AdapterID, output)
 	}
+}
+
+// parseAgyModelsAuthStatus treats a successful `agy models` listing as auth-ready
+// reachability evidence (authorization scope still unknown). Empty/error output
+// stays not-authenticated or unknown without inventing capacity.
+func parseAgyModelsAuthStatus(output string, exitCode int) []parsedAuthStatus {
+	lower := strings.ToLower(output)
+	if networkFailureText(lower) {
+		return []parsedAuthStatus{{
+			ReferenceHash: "sha256:" + hashHex("antigravity", "models-status", "network"),
+			Display:       "antigravity-profile",
+			EvidenceKind:  EvidenceStatusCommand,
+			State:         ReadinessUnknown,
+			ScopeState:    AuthorizationUnknown,
+			ScopeSummary:  "model inventory network unavailable",
+			Gaps:          []string{"catalog-network-unavailable"},
+		}}
+	}
+	// Count non-empty model id lines (agy models prints one id per line).
+	lines := 0
+	for _, line := range strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Skip help-ish noise.
+		if strings.HasPrefix(line, "Usage:") || strings.HasPrefix(line, "Available") {
+			continue
+		}
+		if strings.Contains(strings.ToLower(line), "not logged") || strings.Contains(strings.ToLower(line), "not authenticated") {
+			return []parsedAuthStatus{{
+				ReferenceHash: "sha256:" + hashHex("antigravity", "models-status", "not-auth"),
+				Display:       "antigravity-profile",
+				EvidenceKind:  EvidenceStatusCommand,
+				State:         ReadinessNotAuthenticated,
+				ScopeState:    AuthorizationNotApplicable,
+				ScopeSummary:  "provider reports not authenticated",
+				Gaps:          []string{"provider-reports-not-authenticated"},
+			}}
+		}
+		lines++
+	}
+	if exitCode == 0 && lines > 0 {
+		return []parsedAuthStatus{{
+			ReferenceHash: "sha256:" + hashHex("antigravity", "models-status", "ready", fmt.Sprintf("%d", lines)),
+			Display:       "antigravity-profile",
+			EvidenceKind:  EvidenceStatusCommand,
+			State:         ReadinessReady,
+			ScopeState:    AuthorizationUnknown,
+			ScopeSummary:  "model authorization unknown",
+			Gaps:          []string{"authorization-scope-unknown"},
+		}}
+	}
+	if exitCode != 0 {
+		return []parsedAuthStatus{{
+			ReferenceHash: "sha256:" + hashHex("antigravity", "models-status", "exit", fmt.Sprintf("%d", exitCode)),
+			Display:       "antigravity-profile",
+			EvidenceKind:  EvidenceStatusCommand,
+			State:         ReadinessUnknown,
+			ScopeState:    AuthorizationUnknown,
+			ScopeSummary:  "agy models nonzero exit",
+			Gaps:          []string{"auth-probe-nonzero-exit"},
+		}}
+	}
+	return parseTextAuthStatus("antigravity", output)
 }
 
 func parseGrokModelsAuthStatus(output string, exitCode int) []parsedAuthStatus {
