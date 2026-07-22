@@ -177,21 +177,27 @@ func TestToRouteInventoryFeedsAutoroute(t *testing.T) {
 	if res.Outcome != autoroute.OutcomeSelected {
 		t.Fatalf("%+v", res)
 	}
-	// Default depth preference is medium when available — not forced high.
-	if res.Effort == "high" && res.Provider == "codex" {
-		// codex model default is medium in fixture; winner effort may come from candidate
-	}
+	// Inventory exposes the full supported depth ladder; unsolicited resolve
+	// without Effort must not force high (CRO-005). Medium must still be present.
 	foundMediumDefault := false
+	foundHigh := false
 	for _, c := range inv.Candidates {
-		if c.Effort == "medium" {
+		if c.Model == "gpt-5.5" && c.Effort == "medium" {
 			foundMediumDefault = true
 		}
-		if c.Effort == "high" && c.Model == "gpt-5.5" {
-			t.Fatalf("gpt-5.5 should default medium from catalog, got high")
+		if c.Model == "gpt-5.5" && c.Effort == "high" {
+			foundHigh = true
 		}
 	}
 	if !foundMediumDefault {
-		t.Fatal("expected medium default depth from catalog")
+		t.Fatal("expected medium depth candidate from catalog")
+	}
+	if !foundHigh {
+		t.Fatal("expected high depth candidate so per-child high requirements can bind")
+	}
+	// Auto-route without required Effort should not silently force high.
+	if res.Effort == "high" {
+		t.Fatalf("unsolicited resolve must not force high, got %+v", res)
 	}
 }
 

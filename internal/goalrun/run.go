@@ -255,9 +255,15 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 			continue
 		}
 
-		prov, model, effort := res.Provider, res.Model, firstNonEmpty(res.Effort, depth, "medium")
+		// Required depth from route_requirement is authoritative for invocation.
+		// Never let winner inventory default (often medium) override low/high.
+		reqDepth := normalizeDepth(depth)
+		if reqDepth == "" {
+			reqDepth = "medium"
+		}
+		prov, model := res.Provider, res.Model
 		// Prefer alternate provider if already used and decision lists others.
-		// Candidates were already filtered to this permission by autoroute.Resolve.
+		// Candidates were already filtered to this permission+depth by autoroute.Resolve.
 		if usedProviders[prov] && res.Decision != nil {
 			for _, cv := range res.Decision.Candidates {
 				if cv.Provider == "" || usedProviders[cv.Provider] || !cv.HardEligible || cv.SoftExcluded {
@@ -267,6 +273,7 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 				if isReadOnlyPerm(perm) && !providerSupportsReadOnly(cv.Provider) {
 					continue
 				}
+				// CandidateView may omit Effort; required depth remains bound via reqDepth.
 				prov, model = cv.Provider, cv.Model
 				break
 			}
@@ -285,13 +292,38 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 			emitChild(req.ReportOut, cr)
 			continue
 		}
+		// Fail closed if selected route cannot bind required depth.
+		selDepth := normalizeDepth(firstNonEmpty(res.Effort, reqDepth))
+		if selDepth != reqDepth {
+			cr.Stage = "unavailable"
+			cr.Unavailable = true
+			cr.Terminal = "depth_mismatch"
+			cr.Provider = prov
+			cr.Model = model
+			cr.Depth = reqDepth
+			cr.RouteReason = fmt.Sprintf(
+				"depth requirement=%s selection=%s refused (no silent substitution)",
+				reqDepth, selDepth,
+			)
+			cr.CapacityNote = "depth_ineligible"
+			cr.NextAction = "retry_other_route"
+			children = append(children, cr)
+			emitChild(req.ReportOut, cr)
+			continue
+		}
+		// Invocation depth == required depth (bound into ChildRoute.Depth → agent Effort).
+		effort := reqDepth
 		cr.Provider = prov
 		cr.Model = model
 		cr.Depth = effort
-		cr.RouteReason = res.Message + "; permission=" + perm
+		winnerLine := res.Message
 		if res.Explain != nil && res.Explain.WinnerLine != "" {
-			cr.RouteReason = res.Explain.WinnerLine + "; permission=" + perm
+			winnerLine = res.Explain.WinnerLine
 		}
+		cr.RouteReason = fmt.Sprintf(
+			"%s; permission=%s; depth requirement=%s selection=%s invocation=%s",
+			winnerLine, perm, reqDepth, selDepth, effort,
+		)
 
 		if ledger != nil && snap != nil {
 			attemptID := it.ID
@@ -657,6 +689,23 @@ func normalizePerm(p string) string {
 			return "bounded_write"
 		}
 		return p
+	}
+}
+
+// normalizeDepth maps route depth tokens onto the canonical ladder.
+func normalizeDepth(d string) string {
+	d = strings.ToLower(strings.TrimSpace(d))
+	switch d {
+	case "low", "minimal", "light":
+		return "low"
+	case "medium", "mid", "standard", "default":
+		return "medium"
+	case "high":
+		return "high"
+	case "xhigh", "max", "deep", "thinking":
+		return "xhigh"
+	default:
+		return d
 	}
 }
 
