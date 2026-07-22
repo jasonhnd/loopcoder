@@ -79,6 +79,12 @@ type ChildExecutor interface {
 type FakeChildExecutor struct {
 	// FailIDs force TermFailed for matching work item ids.
 	FailIDs map[string]bool
+	// CancelAfterIDs force TermCancelled after success write for matching ids
+	// (simulates forced interrupt mid-child). Prefer FailIDs for hard fails.
+	CancelAfterIDs map[string]bool
+	// Calls records provider-exec invocations per work item (exactly-once tests).
+	// When non-nil, each Execute increments Calls[WorkItemID].
+	Calls map[string]int
 	// HomeDir overrides layout root (tests).
 	HomeDir string
 	Now     func() time.Time
@@ -86,6 +92,9 @@ type FakeChildExecutor struct {
 
 // Execute implements ChildExecutor for tests.
 func (f FakeChildExecutor) Execute(ctx context.Context, in ChildExecInput) (ChildExecResult, error) {
+	if f.Calls != nil {
+		f.Calls[in.WorkItemID]++
+	}
 	if err := ctx.Err(); err != nil {
 		return ChildExecResult{
 			Terminal: workgraph.TermCancelled, FailureClass: "cancelled", Message: err.Error(),
@@ -120,6 +129,14 @@ func (f FakeChildExecutor) Execute(ctx context.Context, in ChildExecInput) (Chil
 			Provider: in.Route.Provider, Model: in.Route.Model, Depth: in.Route.Depth,
 			FilesTouched: files, ActualSource: "unknown",
 		}, nil
+	}
+	if f.CancelAfterIDs != nil && f.CancelAfterIDs[in.WorkItemID] {
+		return ChildExecResult{
+			Terminal: workgraph.TermCancelled, OutputEvidence: digest, WorktreePath: wt,
+			ExitCode: 130, FailureClass: "forced_interrupt", Message: "fake interrupt " + in.WorkItemID,
+			Provider: in.Route.Provider, Model: in.Route.Model, Depth: in.Route.Depth,
+			FilesTouched: files, ActualSource: "unknown",
+		}, context.Canceled
 	}
 	_ = evPath
 	// Fake does not invent capacity actual — honest unknown.

@@ -23,6 +23,8 @@ func runWorkflowGoal(args []string, stdout, stderr io.Writer, deps Deps) int {
 		goal     = fs.String("goal", "", "goal text")
 		issue    = fs.String("issue", "", "issue id")
 		project  = fs.String("project-id", "", "project id (empty=unique disposable namespace; never share global local-project)")
+		runID    = fs.String("run-id", "", "stable run namespace for forced restart (empty=generated)")
+		resume   = fs.Bool("resume", false, "resume from durable checkpoint for --run-id (exactly-once reuse)")
 		actor    = fs.String("actor", "owner", "approving actor")
 		provider = fs.String("provider", "", "optional child provider pin (empty=auto-route per child)")
 		model    = fs.String("model", "", "optional child model pin (empty=auto-route per child)")
@@ -49,9 +51,14 @@ func runWorkflowGoal(args []string, stdout, stderr io.Writer, deps Deps) int {
 		dry = &t
 	}
 	req := goalrun.Request{
-		ProjectID: projectID, Goal: *goal, Issue: *issue, Actor: *actor,
+		ProjectID: projectID, RunID: strings.TrimSpace(*runID),
+		Goal: *goal, Issue: *issue, Actor: *actor,
 		Provider: *provider, Model: *model, RepoPath: resolvedRepo,
-		DryRun: dry, ReportOut: stderr, Now: deps.Now,
+		DryRun: dry, Resume: *resume, ReportOut: stderr, Now: deps.Now,
+	}
+	if *resume && strings.TrimSpace(*runID) == "" {
+		fmt.Fprintln(stderr, "workflow goal: --resume requires --run-id")
+		return 2
 	}
 	if p := strings.TrimSpace(*capSnap); p != "" {
 		req.LoadInventory = func(ctx context.Context, repo string, at time.Time) (autoroute.Inventory, capacitysnapshot.Snapshot, error) {
