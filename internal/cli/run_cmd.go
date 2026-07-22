@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/autoroute"
 	"github.com/jasonhnd/loopcoder/internal/directattempt"
 	"github.com/jasonhnd/loopcoder/internal/directdelivery"
 	"github.com/jasonhnd/loopcoder/internal/directrun"
@@ -68,8 +69,8 @@ func runRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var (
 		repo       = fs.String("repo", "", "repository path or owner/name")
 		issue      = fs.String("issue", "", "issue number or URL")
-		provider   = fs.String("provider", "", "explicit provider (required until P4 auto-route)")
-		model      = fs.String("model", "", "explicit model")
+		provider   = fs.String("provider", "", "explicit provider pin (omit both provider+model for auto-route)")
+		model      = fs.String("model", "", "explicit model pin")
 		effort     = fs.String("effort", "", "explicit effort")
 		permission = fs.String("permission", "default", "explicit permission profile")
 		base       = fs.String("base", "pre-prod", "base branch")
@@ -78,7 +79,7 @@ func runRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 		detach     = fs.Bool("detach", false, "explicit per-run detach (default foreground)")
 		dryRun     = fs.Bool("dry-run", false, "normalize and report without mutation")
 		format     = fs.String("format", "human", "human|json|jsonl")
-		autoRoute  = fs.Bool("auto-route", false, "request automatic routing (unsupported until P4)")
+		autoRoute  = fs.Bool("auto-route", false, "enable automatic route selection from inventory evidence")
 	)
 	if err := fs.Parse(args); err != nil {
 		return exitRunUsage
@@ -98,14 +99,6 @@ func runRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if req.Format != "human" && req.Format != "json" && req.Format != "jsonl" {
 		fmt.Fprintf(stderr, "run: invalid --format %q (want human|json|jsonl)\n", req.Format)
 		return exitRunUsage
-	}
-	if req.AutoRoute || (req.Provider == "" && req.Model == "") {
-		// Omitted automatic-route inputs are unsupported until P4.
-		msg := "automatic routing is unsupported until P4; pass explicit --provider and --model"
-		return emitRunRejected(stdout, stderr, req, msg, exitRunUnsupported, deps)
-	}
-	if req.Provider == "" || req.Model == "" {
-		return emitRunRejected(stdout, stderr, req, "missing required --provider and --model", exitRunUsage, deps)
 	}
 	if req.Repo == "" {
 		return emitRunRejected(stdout, stderr, req, "missing required --repo", exitRunUsage, deps)
@@ -127,6 +120,51 @@ func runRun(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if now == nil {
 		now = time.Now
 	}
+
+	// P4 / V090-RB04: resolve route before run identity freeze.
+	// Explicit provider+model pin is never overridden. Omitted both (or
+	// --auto-route) evaluates inventory evidence via autoroute/routedecision.
+	wantAuto := req.AutoRoute || (req.Provider == "" && req.Model == "")
+	routeRes, routeErr := autoroute.Resolve(autoroute.Input{
+		AutoRoute: wantAuto, Provider: req.Provider, Model: req.Model,
+		Effort: req.Effort, Permission: req.Permission,
+		ProjectID: slugProjectFromRepo(req.Repo), DecisionKey: "run-route|" + req.Repo + "|" + req.Issue,
+		Now: now().UTC(),
+	})
+	if routeErr != nil || (routeRes.Outcome != autoroute.OutcomeExplicitPin && routeRes.Outcome != autoroute.OutcomeSelected) {
+		msg := routeRes.Message
+		if msg == "" && routeErr != nil {
+			msg = routeErr.Error()
+		}
+		if msg == "" {
+			msg = "route resolution failed"
+		}
+		code := exitRunPrecondition
+		if routeRes.Outcome == autoroute.OutcomeInvalid {
+			code = exitRunUsage
+		}
+		// write explain to stderr when available (read-only, redacted by construction)
+		if routeRes.Explain != nil && routeRes.Explain.Human != "" {
+			fmt.Fprintf(stderr, "run: route explain:\n%s\n", routeRes.Explain.Human)
+		}
+		return emitRunRejected(stdout, stderr, req, msg, code, deps)
+	}
+	req.Provider = routeRes.Provider
+	req.Model = routeRes.Model
+	if routeRes.Effort != "" {
+		req.Effort = routeRes.Effort
+	}
+	if routeRes.Permission != "" {
+		req.Permission = routeRes.Permission
+	}
+	if routeRes.Outcome == autoroute.OutcomeSelected {
+		fmt.Fprintf(stderr, "run: auto-route selected provider=%s model=%s digest=%s\n",
+			req.Provider, req.Model, routeRes.Digest)
+		if routeRes.Explain != nil && routeRes.Explain.WinnerLine != "" {
+			fmt.Fprintf(stderr, "run: route winner: %s\n", routeRes.Explain.WinnerLine)
+		}
+	}
+
 	runID := stableRunID(req, now().UTC())
 	accepted := RunAccepted{
 		Schema: schemaRunAccepted, RunID: runID, Request: req,
@@ -296,6 +334,28 @@ func stableRunID(req RunRequest, at time.Time) string {
 	fmt.Fprintf(h, "%s|%s|%s|%s|%s|%s|%d",
 		req.Repo, req.Issue, req.Provider, req.Model, req.BaseBranch, req.Permission, at.UnixNano())
 	return "run_" + hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+func slugProjectFromRepo(repo string) string {
+	repo = strings.TrimSpace(repo)
+	repo = strings.ReplaceAll(repo, "/", "-")
+	if repo == "" {
+		return "local-project"
+	}
+	var b strings.Builder
+	for _, r := range repo {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	s := b.String()
+	if s == "" {
+		return "local-project"
+	}
+	if len(s) > 48 {
+		s = s[:48]
+	}
+	return s
 }
 
 func splitCSV(s string) []string {
