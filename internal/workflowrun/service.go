@@ -25,6 +25,9 @@ const (
 // Request executes one bounded workflow.
 type Request struct {
 	ProjectID string
+	// RunID uniquely namespaces this execution (attempts, worktrees). Empty → generated.
+	// Prevents stale/cross-run reuse of attempt IDs and durable worktree paths.
+	RunID string
 	// Definition is the frozen user graph (JSON-serializable).
 	Definition workflowdef.Definition
 	// Actor is the approving owner identity (required for materialize).
@@ -66,6 +69,7 @@ type Result struct {
 	Message        string
 	GraphID        string
 	PlanDigest     string
+	RunID          string // execution namespace (unique per parent launch)
 	GraphVersion   int
 	ClaimCount     int
 	LaunchCount    int // child launches (== claims on success path)
@@ -97,6 +101,12 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 	}
 	t0 := now().UTC()
 	out := Result{AutoMerge: false}
+	runID := strings.TrimSpace(req.RunID)
+	if runID == "" {
+		// Unique per parent launch — never reuse att-* across disposable canaries.
+		runID = "run_" + short(fmt.Sprintf("%s|%d|%s", req.ProjectID, t0.UnixNano(), req.Actor))
+	}
+	out.RunID = runID
 	emit := func(e string) { out.Events = append(out.Events, e) }
 
 	if ctx.Err() != nil {
@@ -211,7 +221,8 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 			if claimed[id] > 0 {
 				continue
 			}
-			attemptID := "att-" + id + "-" + short(out.PlanDigest)
+			// Bind attempt to plan digest AND unique run ID (no cross-run reuse).
+			attemptID := "att-" + id + "-" + short(out.PlanDigest+"|"+runID)
 			res, err := cs.Claim(workclaim.ClaimRequest{
 				ProjectID: projectID, Graph: g, Evidence: ev, WorkItemID: id,
 				AttemptID:  attemptID,

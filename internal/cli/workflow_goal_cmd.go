@@ -18,7 +18,7 @@ func runWorkflowGoal(args []string, stdout, stderr io.Writer, deps Deps) int {
 	var (
 		goal     = fs.String("goal", "", "goal text")
 		issue    = fs.String("issue", "", "issue id")
-		project  = fs.String("project-id", "local-project", "project id")
+		project  = fs.String("project-id", "", "project id (empty=unique disposable namespace; never share global local-project)")
 		actor    = fs.String("actor", "owner", "approving actor")
 		provider = fs.String("provider", "", "optional child provider pin (empty=auto-route per child)")
 		model    = fs.String("model", "", "optional child model pin (empty=auto-route per child)")
@@ -32,8 +32,13 @@ func runWorkflowGoal(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if resolvedRepo == "" {
 		resolvedRepo = "."
 	}
+	projectID := strings.TrimSpace(*project)
+	// Empty or explicit local-project → unique namespace (isolation for disposable canaries).
+	if projectID == "" || projectID == "local-project" {
+		projectID = goalrun.UniqueProjectID(resolvedRepo, deps.Now)
+	}
 	res, err := goalrun.Execute(context.Background(), goalrun.Request{
-		ProjectID: *project, Goal: *goal, Issue: *issue, Actor: *actor,
+		ProjectID: projectID, Goal: *goal, Issue: *issue, Actor: *actor,
 		Provider: *provider, Model: *model, RepoPath: resolvedRepo,
 		ReportOut: stderr, Now: deps.Now,
 	})

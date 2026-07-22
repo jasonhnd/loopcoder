@@ -186,6 +186,51 @@ func TestExecuteAutoRoutesChildrenWithCapacityAccounting(t *testing.T) {
 	}
 }
 
+func TestUniqueProjectIDNeverLocalProject(t *testing.T) {
+	now := time.Date(2026, 7, 22, 20, 0, 0, 0, time.UTC)
+	a := goalrun.UniqueProjectID("/tmp/disp-a", func() time.Time { return now })
+	b := goalrun.UniqueProjectID("/tmp/disp-a", func() time.Time { return now.Add(time.Nanosecond) })
+	if a == "" || a == "local-project" || !strings.HasPrefix(a, "disp-") {
+		t.Fatalf("a=%q", a)
+	}
+	if a == b {
+		t.Fatalf("expected distinct project ids for distinct times: %q", a)
+	}
+}
+
+func TestExecuteUsesUniqueProjectAndRunNotSharedLocal(t *testing.T) {
+	now := time.Date(2026, 7, 22, 21, 0, 0, 0, time.UTC)
+	home := testHome(t)
+	// Default ProjectID empty → UniqueProjectID, not local-project.
+	res, err := goalrun.Execute(context.Background(), goalrun.Request{
+		// ProjectID empty
+		Goal: "unique namespace canary", Issue: "1343", Actor: "owner",
+		Provider: "fixture", Model: "fixture-model",
+		HomeDir: home, RepoPath: "/tmp/disposable-repo-a",
+		Executor: workflowrun.FakeChildExecutor{HomeDir: home},
+		Now:      func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if res.Workflow.RunID == "" {
+		t.Fatal("expected unique workflow RunID")
+	}
+	// Attempts should embed unique run, not only plan digest.
+	for _, c := range res.Workflow.Children {
+		if c.AttemptID == "" {
+			continue
+		}
+		if !strings.Contains(c.AttemptID, "att-") {
+			t.Fatalf("attempt %q", c.AttemptID)
+		}
+		// Worktree under home, not bare local-project shared path when home set.
+		if c.WorktreePath != "" && strings.Contains(c.WorktreePath, "/local-project/") {
+			t.Fatalf("must not use shared local-project path: %s", c.WorktreePath)
+		}
+	}
+}
+
 func TestExecuteBindsRequiredDepthsFromRouteRequirement(t *testing.T) {
 	now := time.Date(2026, 7, 22, 23, 45, 0, 0, time.UTC)
 	home := testHome(t)

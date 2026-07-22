@@ -25,11 +25,14 @@ func BuildAntigravityArgs(inv Invocation) []string {
 	// --dangerously-skip-permissions is required for non-interactive/headless agy:
 	// without it, jetski auto-denies tool permission prompts and can exit 0 with
 	// "no output produced" while writing nothing useful into the worktree.
+	// --new-project binds agy project affinity to the worktree session so writes
+	// do not land in a shared global project root outside the assigned worktree.
 	// Read-only invocations never reach agy (fail closed in Run before launch).
 	args := []string{
 		"-p", inv.Prompt,
 		"--add-dir", inv.WorktreePath,
 		"--dangerously-skip-permissions",
+		"--new-project",
 	}
 	if selectedModel := AntigravitySelectedModel(inv.Model, inv.Effort); selectedModel != "" {
 		args = append(args, "--model", selectedModel)
