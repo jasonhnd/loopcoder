@@ -283,6 +283,17 @@ func Qualify(in Input) (Evidence, error) {
 	}
 	ev.Probes = append(ev.Probes, lat.Probes...)
 
+	// CRO product metrics from exact binary (routing / decompose / capacity).
+	cro, croErr := MeasureCROFromBinary(bin, filepath.Join(in.WorkDir, "cro"), envHome)
+	if croErr != nil {
+		ev.Probes = append(ev.Probes, Probe{
+			Name: "cro_measure", Passed: false, Reasons: []string{croErr.Error()},
+		})
+		ev.Reasons = append(ev.Reasons, "cro_measure:"+croErr.Error())
+	} else {
+		ev.Probes = append(ev.Probes, cro.Probes...)
+	}
+
 	// scorecard from measured probes — never invent green for not-run metrics
 	ok := releaseslo.Bool(true)
 	bad := releaseslo.Bool(false)
@@ -312,6 +323,19 @@ func Qualify(in Input) (Evidence, error) {
 		{ID: releaseslo.MetricRouteSubstitution, BoolOK: ok, EvidenceRef: "probe:version"},
 		{ID: releaseslo.MetricDeliveryReplay, BoolOK: ok, EvidenceRef: "probe:no_rebuild"},
 		{ID: releaseslo.MetricResources, BoolOK: ok, EvidenceRef: "probe:home"},
+		{
+			// Always observed (pass/fail) after MeasureCRO attempt — never leave not_run.
+			ID: releaseslo.MetricUsefulCapacityRouting, BoolOK: releaseslo.Bool(cro.RoutingOK),
+			EvidenceRef: nonEmptyRef(cro.EvidenceRefs["routing"], "probe:useful_capacity_routing"),
+		},
+		{
+			ID: releaseslo.MetricWorkgraphDecompose, BoolOK: releaseslo.Bool(cro.DecomposeOK),
+			EvidenceRef: nonEmptyRef(cro.EvidenceRefs["decompose"], "probe:workgraph_decomposition"),
+		},
+		{
+			ID: releaseslo.MetricCapacityAccounting, BoolOK: releaseslo.Bool(cro.AccountingOK),
+			EvidenceRef: nonEmptyRef(cro.EvidenceRefs["accounting"], "probe:capacity_accounting"),
+		},
 	}
 	if !rep.Passed {
 		obs = append(obs, releaseslo.MetricObservation{ID: releaseslo.MetricArtifact, BoolOK: bad, EvidenceRef: "installsmoke_fail"})
