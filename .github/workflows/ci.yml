@@ -81,6 +81,9 @@ jobs:
       - name: Release draft staging unit test
         run: bash scripts/stage-draft-release_test.sh
 
+      - name: Release candidate script gates
+        run: bash scripts/build-release-candidate_test.sh
+
       - name: Installer unit test
         run: bash scripts/install_test.sh
 
