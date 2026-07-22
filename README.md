@@ -9,30 +9,35 @@
 [![Claude Code Skill](https://img.shields.io/badge/Claude%20Code-Skill-green.svg)](SKILL.md)
 [![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-black.svg)](docs/specs/0884-macos-arm64-only.md)
 
-[What it is](#what-it-is) | [v0.9 quickstart](#v09-ordinary-development-quickstart) | [The loop](#the-loop) | [Install](#install) | [Usage](#usage) | [Upgrade](#upgrade-from-070-080-to-081) | [How it works](#how-it-works) | [Design](#design)
+[What it is](#what-it-is) | [v0.9 candidate quickstart](#v09-candidate-quickstart-pre-prod-not-the-public-release) | [The loop](#the-loop) | [Install](#install) | [Usage](#usage) | [Upgrade](#upgrade-from-070-080-to-081) | [How it works](#how-it-works) | [Design](#design)
 
 </div>
 
-## v0.9 ordinary development quickstart
+## v0.9 candidate quickstart (pre-prod; not the public release)
 
-For **v0.9.0** on Darwin arm64, start here (full detail:
-[`docs/reference/v0.9.0-quickstart.md`](docs/reference/v0.9.0-quickstart.md),
-capability matrix:
-[`docs/reference/v0.9.0-capability-matrix.md`](docs/reference/v0.9.0-capability-matrix.md)):
+**Public install remains v0.8.1** until an owner GO publishes v0.9.0. The v0.9
+candidate lives on `pre-prod` and is documented in:
+
+- [`docs/reference/v0.9.0-quickstart.md`](docs/reference/v0.9.0-quickstart.md)
+- [`docs/reference/v0.9.0-capability-matrix.md`](docs/reference/v0.9.0-capability-matrix.md)
+  (must match `loopcoder capabilities --format json`)
 
 ```bash
-loopcoder doctor
-loopcoder diagnose --project-id <id> --dry-run --format json
+# Against a candidate binary / exact RC archive — not assumed on public PATH
+loopcoder doctor --format json
 loopcoder capabilities --format json
-loopcoder qualify --archive dist/x.tar.gz --digest <sha256>
-loopcoder doctor --format json   # codes/remediation aligned with capmatrix
+loopcoder run --repo <path> --issue <n> --provider <p> --model <m> --dry-run --format json
+loopcoder workflow run --fixture one --format json
+loopcoder migrate export-v08 --fixture --export-dir /tmp/v08-export
+loopcoder diagnose --project-id <id> --dry-run --format json
+loopcoder qualify --archive dist/loopcoder_*.tar.gz --digest <sha256>
 ```
 
 Ordinary development uses isolated worktrees/PRs and a **human merge gate**. Do
 **not** run `loopcoder compile`, `dispatch`, or `tick` against this repository
-(self-bootstrap is unsupported). Prefer explicit direct run / bounded workflow,
-global/project stores (no production `<repo>/.loopcoder` runtime writes), and
-terminal GitHub rehydration for cross-Mac handoff.
+(self-bootstrap is unsupported). Prefer explicit direct run / auto-route,
+bounded workflow, global/project stores (no production `<repo>/.loopcoder`
+runtime writes), and terminal GitHub rehydration for cross-Mac handoff.
 
 ## What it is
 
