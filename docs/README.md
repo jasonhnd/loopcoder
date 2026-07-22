@@ -80,6 +80,7 @@ Every document is exactly one of these types:
 - [`reference/legacy-storage-retirement.md`](reference/legacy-storage-retirement.md): V090-073 retire legacy v0.8 storage mutation paths.
 - [`reference/retire-lifecycle-writers.md`](reference/retire-lifecycle-writers.md): V090-074 retire parallel progress/report/relay/outbox writers.
 - [`reference/retire-duplicate-provider-writers.md`](reference/retire-duplicate-provider-writers.md): V090-075 retire duplicate provider inventory/router writers.
+- [`reference/remove-autonomous-entrypoints.md`](reference/remove-autonomous-entrypoints.md): V090-076 remove autonomous compile/tick/trigger/promotion entry points.
 - [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
 - [`reference/v09-home-layout.md`](reference/v09-home-layout.md): global `$LOOPCODER_HOME` layout and owner-only creation.
 - [`reference/project-authority-store.md`](reference/project-authority-store.md): project.db domain tables and immutable events.
