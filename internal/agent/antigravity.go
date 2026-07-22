@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -21,14 +22,33 @@ func init() {
 }
 
 func BuildAntigravityArgs(inv Invocation) []string {
+	// --dangerously-skip-permissions is required for non-interactive/headless agy:
+	// without it, jetski auto-denies tool permission prompts and can exit 0 with
+	// "no output produced" while writing nothing useful into the worktree.
+	// Read-only invocations never reach agy (fail closed in Run before launch).
 	args := []string{
 		"-p", inv.Prompt,
 		"--add-dir", inv.WorktreePath,
+		"--dangerously-skip-permissions",
 	}
 	if selectedModel := AntigravitySelectedModel(inv.Model, inv.Effort); selectedModel != "" {
 		args = append(args, "--model", selectedModel)
 	}
 	return args
+}
+
+// antigravityHeadlessPermissionDenied reports jetski headless permission auto-denial.
+// These runs are not useful capacity consumption and must not close as succeeded.
+func antigravityHeadlessPermissionDenied(stdout, logText string) bool {
+	blob := strings.ToLower(stdout + "\n" + logText)
+	if strings.Contains(blob, "dangerously-skip-permissions") &&
+		(strings.Contains(blob, "no output produced") || strings.Contains(blob, "auto-denied") || strings.Contains(blob, "cannot prompt")) {
+		return true
+	}
+	if strings.Contains(blob, "jetski: no output produced") {
+		return true
+	}
+	return false
 }
 
 func AntigravitySelectedModel(model, effort string) string {
@@ -99,6 +119,22 @@ func (AntigravityRunner) Run(ctx context.Context, inv Invocation) (Result, error
 	supervision, runErr := runProviderCommand(ctx, cmd, inv, "antigravity")
 	endedAt := time.Now()
 	summary := strings.TrimSpace(stdout.String())
+	// Best-effort re-read log for denial phrases that may land only on stderr/log.
+	logText := ""
+	if b, rerr := os.ReadFile(inv.LogPath); rerr == nil {
+		logText = string(b)
+	}
+	if antigravityHeadlessPermissionDenied(summary, logText) {
+		msg := "antigravity headless permission denial (no useful output); require --dangerously-skip-permissions"
+		if summary == "" {
+			summary = msg
+		}
+		result := resultWithSupervision(1, summary, metadata, startedAt, endedAt, supervision, runErr, ctx)
+		if runErr != nil {
+			return result, runErr
+		}
+		return result, errors.New(msg)
+	}
 	result := resultWithSupervision(supervisedExitCode(supervision, runErr), summary, metadata, startedAt, endedAt, supervision, runErr, ctx)
 	if runErr != nil {
 		return result, runErr
