@@ -2,8 +2,6 @@ package workflowrun
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -456,14 +454,4 @@ func runGitRepo(ctx context.Context, dir string, args ...string) (string, error)
 		return "", fmt.Errorf("git %v: %w: %s", args, err, strings.TrimSpace(string(out)))
 	}
 	return strings.TrimSpace(string(out)), nil
-}
-
-// fileDigest is used by tests.
-func fileDigest(path string) string {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	sum := sha256.Sum256(raw)
-	return "sha256:" + hex.EncodeToString(sum[:])
 }
