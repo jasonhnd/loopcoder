@@ -361,13 +361,6 @@ func hasReasonPrefix(reasons []string, prefix string) bool {
 	return false
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // DigestCanaryBody hashes a stable subset for optional anti-tamper.
 func DigestCanaryBody(ev CanaryEvidence) string {
 	// Clear content digest field before hashing if present.
