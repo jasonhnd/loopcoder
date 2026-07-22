@@ -157,7 +157,8 @@ func Resolve(in Input) (Result, error) {
 
 	mode := inv.Mode
 	if mode.Mode == "" {
-		mode = quotamode.DefaultModeConfig(quotamode.ModeBalanced)
+		// Default soft policy: use-before-reset (burn_before_reset) after floors.
+		mode = quotamode.DefaultModeConfig(quotamode.ModeBurnBeforeReset)
 	}
 
 	req := routedecision.Request{

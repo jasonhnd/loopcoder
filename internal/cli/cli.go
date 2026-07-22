@@ -22,6 +22,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/audit"
 	"github.com/jasonhnd/loopcoder/internal/autoroute"
 	"github.com/jasonhnd/loopcoder/internal/budget"
+	"github.com/jasonhnd/loopcoder/internal/capacitysnapshot"
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
@@ -91,6 +92,11 @@ type Deps struct {
 	// LoadAutoRouteInventory optionally overrides production capacity loading.
 	// Default discovers provider inventory → capacitysnapshot → autoroute.Inventory.
 	LoadAutoRouteInventory func(ctx context.Context, repo string, now time.Time) (*autoroute.Inventory, error)
+	// LastCapacitySnapshot is the capacity truth used for soft reserve (CRO-007).
+	// Production loader sets this; tests may inject.
+	LastCapacitySnapshot *capacitysnapshot.Snapshot
+	// CapacityLedgerPath overrides durable ledger path (tests only).
+	CapacityLedgerPath string
 	// WaitClock optionally overrides the provider-free wait clock for tests.
 	WaitClock                waitstate.Clock
 	RuntimeGOOS              string

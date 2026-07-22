@@ -135,7 +135,9 @@ func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 		Machine: eligibility.MachineAdmission{
 			CapacityOK: factBool(true, "mach"), ConcurrentSlots: 2,
 		},
-		Mode: quotamode.DefaultModeConfig(quotamode.ModeBalanced),
+		// Owner product default: quality floors already applied; soft rank burns
+		// usable capacity before reset (V090-CRO-007).
+		Mode: quotamode.DefaultModeConfig(quotamode.ModeBurnBeforeReset),
 	}, nil
 }
 
