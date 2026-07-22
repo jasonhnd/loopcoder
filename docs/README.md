@@ -52,6 +52,7 @@ Every document is exactly one of these types:
 - [`reference/future-provider-kit.md`](reference/future-provider-kit.md): V090-049 future-provider registration kit.
 - [`reference/capability-classes.md`](reference/capability-classes.md): V090-050 task risk classes and Luna/Tera/Soul capability mapping.
 - [`reference/hard-eligibility.md`](reference/hard-eligibility.md): V090-051 hard eligibility and immutable-pin precedence.
+- [`reference/quota-policy.md`](reference/quota-policy.md): V090-052 quota burn urgency, reserve, and reliability policy.
 - [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
 - [`reference/v09-home-layout.md`](reference/v09-home-layout.md): global `$LOOPCODER_HOME` layout and owner-only creation.
 - [`reference/project-authority-store.md`](reference/project-authority-store.md): project.db domain tables and immutable events.
