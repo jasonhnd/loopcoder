@@ -71,6 +71,7 @@ Every document is exactly one of these types:
 - [`reference/multi-project-admission.md`](reference/multi-project-admission.md): V090-066 multi-project global admission and isolation.
 - [`reference/private-repository-redaction.md`](reference/private-repository-redaction.md): V090-067 private-repository redaction and consumer canary.
 - [`reference/cross-mac-rehydration.md`](reference/cross-mac-rehydration.md): V090-068 cross-Mac GitHub rehydration after terminal handoff.
+- [`reference/machine-authority-rebuild.md`](reference/machine-authority-rebuild.md): V090-086 machine-authority rebuild and reservation reconciliation.
 - [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
 - [`reference/v09-home-layout.md`](reference/v09-home-layout.md): global `$LOOPCODER_HOME` layout and owner-only creation.
 - [`reference/project-authority-store.md`](reference/project-authority-store.md): project.db domain tables and immutable events.
