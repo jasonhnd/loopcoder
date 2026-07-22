@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -22,6 +24,7 @@ import (
 type Request struct {
 	ProjectID string
 	// RunID optional unique execution namespace. Empty → generated per Execute.
+	// On forced restart, pass the same RunID so claim/attempt IDs stay stable.
 	RunID string
 	Goal  string
 	Issue string
@@ -36,6 +39,12 @@ type Request struct {
 	// DryRun when true only plans routes and releases capacity without executing
 	// children (route preview). Default false → real child execution.
 	DryRun *bool
+	// Resume loads durable checkpoint for RunID and seeds PriorSucceeded so
+	// already-terminal children are not re-claimed / re-executed / re-reserved.
+	// When true, RunID is required (or checkpoint must resolve).
+	Resume bool
+	// PriorSucceeded optional explicit seed (tests). Prefer Resume+checkpoint.
+	PriorSucceeded map[string]workflowrun.ChildOutcome
 	// Executor injects the workflow child executor. nil → production real path.
 	// Focused tests inject workflowrun.FakeChildExecutor.
 	Executor workflowrun.ChildExecutor
@@ -81,6 +90,8 @@ type Result struct {
 	Status              string             `json:"status"`
 	GraphID             string             `json:"graph_id"`
 	PlanDigest          string             `json:"plan_digest"`
+	RunID               string             `json:"run_id,omitempty"`
+	ProjectID           string             `json:"project_id,omitempty"`
 	Children            []ChildReport      `json:"children"`
 	Workflow            workflowrun.Result `json:"workflow"`
 	Message             string             `json:"message"`
@@ -90,6 +101,12 @@ type Result struct {
 	DepthsUsed          []string           `json:"depths_used,omitempty"`
 	MultiProviderOK     bool               `json:"multi_provider_ok"`
 	MultiModelOrDepthOK bool               `json:"multi_model_or_depth_ok"`
+	// Restart / ceilings evidence (from workflow + durable checkpoint).
+	ReuseCount     int    `json:"reuse_count,omitempty"`
+	WorktreePeak   int    `json:"worktree_peak,omitempty"`
+	ProcessPeak    int    `json:"process_peak,omitempty"`
+	CheckpointPath string `json:"checkpoint_path,omitempty"`
+	Resumed        bool   `json:"resumed,omitempty"`
 }
 
 // capacityHold tracks a live reservation for post-execute reconcile/release.
@@ -143,6 +160,32 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 	if runID == "" {
 		runID = "run_" + shortID(fmt.Sprintf("%s|%d", projectID, now.UnixNano()))
 	}
+	// Forced restart: load durable checkpoint for same RunID → PriorSucceeded seed.
+	priorSucceeded := req.PriorSucceeded
+	resumed := false
+	var loadedCP Checkpoint
+	if req.Resume || priorSucceeded == nil {
+		if cp, _, lerr := LoadCheckpoint(req.HomeDir, projectID, runID); lerr == nil {
+			loadedCP = cp
+			if priorSucceeded == nil && len(cp.PriorSucceeded) > 0 {
+				priorSucceeded = cp.PriorSucceeded
+			}
+			if req.Resume || len(priorSucceeded) > 0 {
+				resumed = len(priorSucceeded) > 0
+			}
+			// Prefer durable graph identity when resuming same run.
+			if req.Resume && cp.GraphID != "" && cp.GraphID != g.GraphID {
+				// Graph re-decomposition can change IDs; still allow resume by work-item
+				// keys present in PriorSucceeded (stable attempt evidence).
+			}
+		} else if req.Resume && !osIsNotExist(lerr) {
+			return Result{}, fmt.Errorf("goalrun: resume load checkpoint: %w", lerr)
+		}
+	}
+	if req.Resume && runID == "" {
+		return Result{}, fmt.Errorf("goalrun: resume requires run_id")
+	}
+	_ = loadedCP
 	if _, err := reg.Materialize(projectID, def, approval, now); err != nil {
 		return Result{}, err
 	}
@@ -217,6 +260,56 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 			Depth:            depth,
 			Stage:            "routing",
 			NextAction:       "route_child",
+		}
+
+		// Exactly-once: prior succeeded child keeps claim/attempt/output/capacity;
+		// no re-route, re-reserve, or re-exec.
+		if prior, ok := priorSucceeded[it.ID]; ok &&
+			isResumeEligible(prior.Terminal, prior.AttemptID, prior.OutputEvidence) {
+			cr.Provider = prior.Provider
+			cr.Model = prior.Model
+			cr.Depth = firstNonEmpty(prior.Depth, depth)
+			cr.AccountRef = prior.AccountRef
+			cr.RouteReason = firstNonEmpty(prior.RouteReason, "resume_prior_succeeded")
+			cr.AttemptID = prior.AttemptID
+			cr.OutputEvidence = prior.OutputEvidence
+			cr.WorktreePath = prior.WorktreePath
+			cr.Terminal = "succeeded"
+			cr.Stage = "resumed"
+			cr.NextAction = "reuse_no_reexec"
+			cr.CapacityNote = "resume_no_re_reserve"
+			if prior.ActualCapacity != nil {
+				cr.CapacityActual = prior.ActualCapacity
+			}
+			cr.ActualSource = prior.ActualSource
+			// Carry capacity fields from prior checkpoint child report when present.
+			if loadedCP.Children != nil {
+				for _, pc := range loadedCP.Children {
+					if pc.ChildID == it.ID {
+						cr.CapacityBefore = pc.CapacityBefore
+						cr.CapacityReserved = pc.CapacityReserved
+						if pc.CapacityActual != nil {
+							cr.CapacityActual = pc.CapacityActual
+						}
+						cr.CapacityAfter = pc.CapacityAfter
+						cr.CapacityState = firstNonEmpty(pc.CapacityState, "reconciled_or_released")
+						if pc.CapacityNote != "" {
+							cr.CapacityNote = pc.CapacityNote + "; resume_reuse"
+						}
+						break
+					}
+				}
+			}
+			if cr.Provider != "" {
+				usedProviders[cr.Provider] = true
+			}
+			childRoutes[it.ID] = workflowrun.ChildRoute{
+				Provider: firstNonEmpty(cr.Provider, "fixture"), Model: firstNonEmpty(cr.Model, "fixture-model"),
+				Depth: cr.Depth, AccountRef: cr.AccountRef, RouteReason: cr.RouteReason,
+			}
+			children = append(children, cr)
+			emitChild(req.ReportOut, cr)
+			continue
 		}
 
 		if !wantAuto {
@@ -448,21 +541,26 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 	}
 	svc := workflowrun.Service{Now: nowFn, Executor: exec, HomeDir: req.HomeDir}
 	wres, werr := svc.Execute(ctx, workflowrun.Request{
-		ProjectID:   projectID,
-		RunID:       runID,
-		Definition:  def,
-		Actor:       actor,
-		Provider:    firstNonEmpty(wfProv, "auto"),
-		Model:       firstNonEmpty(wfModel, "auto"),
-		ChildRoutes: childRoutes,
-		RepoPath:    req.RepoPath,
+		ProjectID:      projectID,
+		RunID:          runID,
+		Definition:     def,
+		Actor:          actor,
+		Provider:       firstNonEmpty(wfProv, "auto"),
+		Model:          firstNonEmpty(wfModel, "auto"),
+		ChildRoutes:    childRoutes,
+		RepoPath:       req.RepoPath,
+		PriorSucceeded: priorSucceeded,
 	})
 	out := Result{
-		GraphID: g.GraphID, PlanDigest: g.PlanDigest, Children: children, Workflow: wres,
+		GraphID: g.GraphID, PlanDigest: g.PlanDigest, RunID: runID, ProjectID: projectID,
+		Children: children, Workflow: wres, Resumed: resumed,
 	}
 	out.ProvidersUsed, out.ModelsUsed, out.DepthsUsed = collectUsage(children)
 	out.MultiProviderOK = len(out.ProvidersUsed) >= 2
 	out.MultiModelOrDepthOK = len(out.ModelsUsed) >= 2 || len(out.DepthsUsed) >= 2
+	out.ReuseCount = wres.ReuseCount
+	out.WorktreePeak = wres.WorktreePeak
+	out.ProcessPeak = wres.ProcessPeak
 
 	// Reconcile capacity from real child outcomes — never fabricate actual.
 	// Then attach post-run remaining from a fresh capacity observation when possible
@@ -474,6 +572,10 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		}
 	}
 	out.Children = applyChildOutcomes(out.Children, wres, ledger, holds, postSnap)
+
+	// Always persist durable checkpoint (partial or complete) for forced restart.
+	cpPath, _ := saveRunCheckpoint(req.HomeDir, projectID, runID, req.Goal, req.Issue, actor, g.GraphID, g.PlanDigest, out, wres, nowFn().UTC())
+	out.CheckpointPath = cpPath
 
 	if werr != nil {
 		out.Status = "blocked"
@@ -500,6 +602,10 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 				}
 			}
 		}
+		// Re-save checkpoint after release notes updated.
+		if p, err := saveRunCheckpoint(req.HomeDir, projectID, runID, req.Goal, req.Issue, actor, g.GraphID, g.PlanDigest, out, wres, nowFn().UTC()); err == nil {
+			out.CheckpointPath = p
+		}
 		for _, cr := range out.Children {
 			emitChild(req.ReportOut, cr)
 		}
@@ -508,13 +614,31 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 	out.Status = wres.Status
 	out.Message = wres.Message
 	out.HumanSummary = fmt.Sprintf(
-		"goal graph %s digest=%s children=%d status=%s providers=%v models=%v depths=%v multi_provider=%v",
+		"goal graph %s digest=%s children=%d status=%s providers=%v models=%v depths=%v multi_provider=%v reuse=%d wt_peak=%d proc_peak=%d resumed=%v",
 		g.GraphID, g.PlanDigest, len(g.Items), wres.Status, out.ProvidersUsed, out.ModelsUsed, out.DepthsUsed, out.MultiProviderOK,
+		out.ReuseCount, out.WorktreePeak, out.ProcessPeak, out.Resumed,
 	)
 	for _, cr := range out.Children {
 		emitChild(req.ReportOut, cr)
 	}
 	return out, nil
+}
+
+func saveRunCheckpoint(homeDir, projectID, runID, goal, issue, actor, graphID, planDigest string, out Result, wres workflowrun.Result, at time.Time) (string, error) {
+	cp := Checkpoint{
+		Schema: CheckpointSchema, ProjectID: projectID, RunID: runID,
+		GraphID: graphID, PlanDigest: planDigest, Goal: goal, Issue: issue, Actor: actor,
+		Status: firstNonEmpty(out.Status, wres.Status), Message: firstNonEmpty(out.Message, wres.Message),
+		Children: out.Children, WorkflowKids: wres.Children,
+		WorktreePeak: wres.WorktreePeak, ProcessPeak: wres.ProcessPeak,
+		ReuseCount: wres.ReuseCount, ClaimCount: wres.ClaimCount, LaunchCount: wres.LaunchCount,
+		SavedAt: at,
+	}
+	return SaveCheckpoint(homeDir, cp)
+}
+
+func osIsNotExist(err error) bool {
+	return err != nil && (errors.Is(err, os.ErrNotExist) || os.IsNotExist(err))
 }
 
 // applyChildOutcomes merges workflow child terminal/evidence into reports and

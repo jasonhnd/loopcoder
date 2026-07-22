@@ -215,3 +215,131 @@ func TestPerChildRoutesPropagate(t *testing.T) {
 		}
 	}
 }
+
+// TestForcedInterruptThenResumeExactlyOnce proves production resume path:
+// interrupt after first child succeeds, resume with PriorSucceeded reuses
+// claim/attempt/output without a second provider call.
+func TestForcedInterruptThenResumeExactlyOnce(t *testing.T) {
+	home := testHome(t)
+	calls1 := map[string]int{}
+	svc1 := workflowrun.Service{
+		Now: t0, HomeDir: home,
+		Executor: workflowrun.FakeChildExecutor{
+			HomeDir: home, Now: t0, Calls: calls1,
+			FailIDs: map[string]bool{"b": true}, // forced interrupt after a
+		},
+	}
+	runID := "run_restart_once"
+	r1, err := svc1.Execute(context.Background(), workflowrun.Request{
+		ProjectID: "proj-restart", RunID: runID,
+		Definition: workflowrun.ChainDefinition("g-restart"),
+		Actor:      "owner",
+	})
+	if err == nil {
+		t.Fatalf("expected interrupt/block: %+v", r1)
+	}
+	if r1.Status != workflowrun.StatusBlocked {
+		t.Fatalf("status %+v", r1)
+	}
+	var priorA workflowrun.ChildOutcome
+	foundA := false
+	for _, c := range r1.Children {
+		if c.WorkItemID == "a" && c.Terminal == "succeeded" {
+			priorA = c
+			foundA = true
+		}
+	}
+	if !foundA || priorA.AttemptID == "" || priorA.OutputEvidence == "" {
+		t.Fatalf("need durable a outcome: %+v", r1.Children)
+	}
+	if calls1["a"] != 1 || calls1["b"] != 1 {
+		t.Fatalf("first pass calls %+v", calls1)
+	}
+	if r1.ProcessPeak < 1 || r1.WorktreePeak < 1 {
+		t.Fatalf("ceilings missing: proc=%d wt=%d", r1.ProcessPeak, r1.WorktreePeak)
+	}
+
+	// Resume: same RunID + PriorSucceeded(a). Only b,c should execute.
+	calls2 := map[string]int{}
+	svc2 := workflowrun.Service{
+		Now: t0, HomeDir: home,
+		Executor: workflowrun.FakeChildExecutor{HomeDir: home, Now: t0, Calls: calls2},
+	}
+	r2, err := svc2.Execute(context.Background(), workflowrun.Request{
+		ProjectID: "proj-restart", RunID: runID,
+		Definition: workflowrun.ChainDefinition("g-restart"),
+		Actor:      "owner",
+		PriorSucceeded: map[string]workflowrun.ChildOutcome{
+			"a": priorA,
+		},
+	})
+	if err != nil {
+		t.Fatalf("resume: %v %+v", err, r2)
+	}
+	if r2.Status != workflowrun.StatusHumanGate {
+		t.Fatalf("resume status %+v", r2)
+	}
+	if r2.ReuseCount != 1 {
+		t.Fatalf("reuse=%d want 1 events=%v", r2.ReuseCount, r2.Events)
+	}
+	if r2.ClaimCount != 2 || r2.LaunchCount != 2 {
+		t.Fatalf("claims/launches for remaining only: claim=%d launch=%d", r2.ClaimCount, r2.LaunchCount)
+	}
+	if calls2["a"] != 0 {
+		t.Fatalf("a re-executed (duplicate provider call): %+v", calls2)
+	}
+	if calls2["b"] != 1 || calls2["c"] != 1 {
+		t.Fatalf("remaining calls %+v", calls2)
+	}
+	// Same attempt_id + output evidence for a (exactly-once identity).
+	var a2 workflowrun.ChildOutcome
+	for _, c := range r2.Children {
+		if c.WorkItemID == "a" {
+			a2 = c
+		}
+	}
+	if a2.AttemptID != priorA.AttemptID || a2.OutputEvidence != priorA.OutputEvidence {
+		t.Fatalf("a identity drift: first=%+v resume=%+v", priorA, a2)
+	}
+	// No second evidence write for a: worktree path reused, file still one digest.
+	if a2.WorktreePath != priorA.WorktreePath {
+		t.Fatalf("worktree changed on reuse: %q vs %q", priorA.WorktreePath, a2.WorktreePath)
+	}
+	if r2.ProcessPeak != 2 {
+		t.Fatalf("process peak on resume should be remaining launches only: %d", r2.ProcessPeak)
+	}
+	joined := strings.Join(r2.Events, "\n")
+	if !strings.Contains(joined, "child.reuse:a") {
+		t.Fatalf("missing reuse event: %v", r2.Events)
+	}
+}
+
+func TestPriorSucceededNegativeMissingEvidenceRefusesReuse(t *testing.T) {
+	home := testHome(t)
+	calls := map[string]int{}
+	svc := workflowrun.Service{
+		Now: t0, HomeDir: home,
+		Executor: workflowrun.FakeChildExecutor{HomeDir: home, Now: t0, Calls: calls},
+	}
+	// Empty evidence must NOT skip re-exec (fail-closed reuse gate).
+	res, err := svc.Execute(context.Background(), workflowrun.Request{
+		ProjectID: "proj", RunID: "run_neg",
+		Definition: workflowrun.OneNodeDefinition("g-neg", "docs"),
+		Actor:      "owner",
+		PriorSucceeded: map[string]workflowrun.ChildOutcome{
+			"only": {
+				WorkItemID: "only", Terminal: "succeeded", AttemptID: "att-only-x",
+				OutputEvidence: "", // missing → re-exec
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("%v %+v", err, res)
+	}
+	if res.ReuseCount != 0 {
+		t.Fatalf("must not reuse without evidence: %+v", res)
+	}
+	if calls["only"] != 1 {
+		t.Fatalf("expected re-exec calls=%+v", calls)
+	}
+}

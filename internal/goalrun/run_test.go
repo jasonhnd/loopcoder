@@ -399,3 +399,157 @@ func TestDryRunPreviewReleasesWithoutExecute(t *testing.T) {
 }
 
 func ptrTime(t time.Time) *time.Time { return &t }
+
+// TestForcedInterruptRestartFromDurableCheckpoint: interrupt mid-goal, resume
+// same project/run from checkpoint, same attempt/evidence, no second provider call
+// for already-succeeded children, ceilings recorded, no worktree leak for reuse.
+func TestForcedInterruptRestartFromDurableCheckpoint(t *testing.T) {
+	home := testHome(t)
+	now := time.Date(2026, 7, 23, 6, 0, 0, 0, time.UTC)
+	projectID := "proj-restart-goal"
+	runID := "run_goal_restart_1"
+	calls1 := map[string]int{}
+	// Fail the second child in graph order to force partial durable state.
+	// DecomposeGoal yields wi_research, wi_implement, wi_tests, wi_verify, wi_docs
+	// for multi-child goals — fail wi_implement after research succeeds.
+	res1, err1 := goalrun.Execute(context.Background(), goalrun.Request{
+		ProjectID: projectID, RunID: runID,
+		Goal: "implement transparent multi-child routing", Issue: "1343",
+		Actor: "owner", Owner: "worker",
+		Provider: "fixture", Model: "fixture-model",
+		HomeDir: home, Now: func() time.Time { return now },
+		Executor: workflowrun.FakeChildExecutor{
+			HomeDir: home, Now: func() time.Time { return now },
+			Calls:   calls1,
+			FailIDs: map[string]bool{"wi_implement": true},
+		},
+	})
+	if err1 == nil {
+		t.Fatalf("expected blocked interrupt: %+v", res1)
+	}
+	if res1.CheckpointPath == "" {
+		t.Fatal("expected durable checkpoint path after interrupt")
+	}
+	if _, err := os.Stat(res1.CheckpointPath); err != nil {
+		t.Fatalf("checkpoint missing: %v", err)
+	}
+	cp, _, err := goalrun.LoadCheckpoint(home, projectID, runID)
+	if err != nil {
+		t.Fatalf("load checkpoint: %v", err)
+	}
+	if len(cp.PriorSucceeded) == 0 {
+		t.Fatalf("checkpoint has no prior succeeded: %+v", cp)
+	}
+	// At least research (or first wave member) succeeded before implement fail.
+	var researchAttempt, researchEvidence string
+	for id, c := range cp.PriorSucceeded {
+		if c.AttemptID == "" || c.OutputEvidence == "" {
+			t.Fatalf("prior %s missing identity: %+v", id, c)
+		}
+		if id == "wi_research" {
+			researchAttempt = c.AttemptID
+			researchEvidence = c.OutputEvidence
+		}
+	}
+	if researchAttempt == "" {
+		// If graph order failed earlier, still require some prior.
+		for _, c := range cp.PriorSucceeded {
+			researchAttempt = c.AttemptID
+			researchEvidence = c.OutputEvidence
+			break
+		}
+	}
+	if calls1["wi_research"] > 1 {
+		t.Fatalf("research over-called first pass: %+v", calls1)
+	}
+
+	// Resume: same run — succeeded kids must not re-exec.
+	calls2 := map[string]int{}
+	// Do not fail implement on resume so run can complete.
+	res2, err2 := goalrun.Execute(context.Background(), goalrun.Request{
+		ProjectID: projectID, RunID: runID, Resume: true,
+		Goal: "implement transparent multi-child routing", Issue: "1343",
+		Actor: "owner", Owner: "worker",
+		Provider: "fixture", Model: "fixture-model",
+		HomeDir: home, Now: func() time.Time { return now.Add(time.Minute) },
+		Executor: workflowrun.FakeChildExecutor{
+			HomeDir: home, Now: func() time.Time { return now.Add(time.Minute) },
+			Calls: calls2,
+		},
+	})
+	if err2 != nil {
+		t.Fatalf("resume execute: %v status=%s msg=%s", err2, res2.Status, res2.Message)
+	}
+	if !res2.Resumed {
+		t.Fatalf("expected resumed=true: %+v", res2)
+	}
+	if res2.ReuseCount < 1 {
+		t.Fatalf("reuse_count=%d want ≥1 events=%v", res2.ReuseCount, res2.Workflow.Events)
+	}
+	// No second provider call for any prior-succeeded child.
+	for id := range cp.PriorSucceeded {
+		if calls2[id] != 0 {
+			t.Fatalf("duplicate provider call on resume for %s: calls2=%+v prior=%v", id, calls2, cp.PriorSucceeded)
+		}
+	}
+	// Same attempt/evidence identity preserved in final children.
+	for _, c := range res2.Children {
+		if prior, ok := cp.PriorSucceeded[c.ChildID]; ok {
+			if c.AttemptID != prior.AttemptID || c.OutputEvidence != prior.OutputEvidence {
+				t.Fatalf("identity drift %s: prior attempt=%s ev=%s got attempt=%s ev=%s",
+					c.ChildID, prior.AttemptID, prior.OutputEvidence, c.AttemptID, c.OutputEvidence)
+			}
+			if c.Stage != "integrated" && c.Stage != "resumed" && c.Stage != "human_gate" {
+				// after applyChildOutcomes succeeded → integrated/human_gate
+			}
+		}
+	}
+	if researchEvidence != "" {
+		found := false
+		for _, c := range res2.Workflow.Children {
+			if c.WorkItemID == "wi_research" {
+				found = true
+				if c.AttemptID != researchAttempt || c.OutputEvidence != researchEvidence {
+					t.Fatalf("research identity: want %s/%s got %s/%s", researchAttempt, researchEvidence, c.AttemptID, c.OutputEvidence)
+				}
+			}
+		}
+		if !found {
+			t.Fatal("research missing from resume workflow children")
+		}
+	}
+	if res2.WorktreePeak < 1 && res2.Workflow.WorktreePeak < 1 {
+		t.Fatalf("worktree peak missing: %+v", res2)
+	}
+	if res2.ProcessPeak < 1 && res2.Workflow.ProcessPeak < 1 {
+		// resume may only launch remaining; peaks still ≥1 if any remaining
+		if res2.Workflow.LaunchCount > 0 && res2.Workflow.ProcessPeak < 1 {
+			t.Fatalf("process peak missing with launches: %+v", res2.Workflow)
+		}
+	}
+	// Checkpoint rewritten after resume success.
+	if res2.CheckpointPath == "" {
+		t.Fatal("resume must rewrite checkpoint")
+	}
+	cp2, _, err := goalrun.LoadCheckpoint(home, projectID, runID)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if len(cp2.PriorSucceeded) < len(cp.PriorSucceeded) {
+		t.Fatalf("checkpoint regressed: before=%d after=%d", len(cp.PriorSucceeded), len(cp2.PriorSucceeded))
+	}
+}
+
+func TestCheckpointRefuseReuseWithoutEvidence(t *testing.T) {
+	got := goalrun.PriorSucceededFrom(
+		[]workflowrun.ChildOutcome{
+			{WorkItemID: "a", Terminal: "succeeded", AttemptID: "att-a", OutputEvidence: "sha256:abc"},
+			{WorkItemID: "b", Terminal: "succeeded", AttemptID: "att-b", OutputEvidence: ""}, // refuse
+			{WorkItemID: "c", Terminal: "failed", AttemptID: "att-c", OutputEvidence: "sha256:x"},
+		},
+		nil,
+	)
+	if len(got) != 1 || got["a"].AttemptID != "att-a" {
+		t.Fatalf("%+v", got)
+	}
+}

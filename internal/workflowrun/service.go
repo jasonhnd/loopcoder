@@ -27,6 +27,7 @@ type Request struct {
 	ProjectID string
 	// RunID uniquely namespaces this execution (attempts, worktrees). Empty → generated.
 	// Prevents stale/cross-run reuse of attempt IDs and durable worktree paths.
+	// On resume, pass the same RunID so attempt IDs stay stable (exactly-once).
 	RunID string
 	// Definition is the frozen user graph (JSON-serializable).
 	Definition workflowdef.Definition
@@ -41,6 +42,10 @@ type Request struct {
 	RepoPath string
 	// MaxWaves hard cap (default 32).
 	MaxWaves int
+	// PriorSucceeded seeds already-terminal succeeded children from a prior
+	// interrupted run. Same attempt_id is reused; executor is NOT re-invoked
+	// (exactly-once provider call / file / capacity).
+	PriorSucceeded map[string]ChildOutcome
 }
 
 // ChildOutcome is per-child terminal + capacity-relevant evidence for reports.
@@ -73,12 +78,16 @@ type Result struct {
 	GraphVersion   int
 	ClaimCount     int
 	LaunchCount    int // child launches (== claims on success path)
+	ReuseCount     int // prior-succeeded children reused without re-exec
 	Integrated     []string
 	Children       []ChildOutcome
 	Events         []string
 	DirectRunEquiv bool
 	AutoMerge      bool
 	Error          string
+	// Ceilings are best-effort peaks observed during this process (restart evidence).
+	WorktreePeak int `json:"worktree_peak,omitempty"`
+	ProcessPeak  int `json:"process_peak,omitempty"`
 }
 
 // Service runs bounded workflows.
@@ -221,6 +230,29 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 			if claimed[id] > 0 {
 				continue
 			}
+			// Exactly-once resume: prior succeeded outcome with stable attempt_id
+			// is restored without re-claim / re-exec (no second provider call,
+			// file write, or capacity deduction). ClaimCount/LaunchCount stay
+			// for real claims only; ReuseCount records durable reuses.
+			if prior, ok := req.PriorSucceeded[id]; ok &&
+				strings.EqualFold(strings.TrimSpace(prior.Terminal), string(workgraph.TermSucceeded)) &&
+				strings.TrimSpace(prior.AttemptID) != "" &&
+				strings.TrimSpace(prior.OutputEvidence) != "" {
+				// Mark claimed so claim-once map stays consistent without a second claim.
+				claimed[id] = 1
+				out.ReuseCount++
+				prior.WorkItemID = id
+				if prior.Terminal == "" {
+					prior.Terminal = string(workgraph.TermSucceeded)
+				}
+				ev[id] = workgraph.TermSucceeded
+				out.Children = append(out.Children, prior)
+				emit(fmt.Sprintf("child.reuse:%s attempt=%s evidence=%s", id, prior.AttemptID, short(prior.OutputEvidence)))
+				if prior.WorktreePath != "" {
+					out.WorktreePeak++
+				}
+				continue
+			}
 			// Bind attempt to plan digest AND unique run ID (no cross-run reuse).
 			attemptID := "att-" + id + "-" + short(out.PlanDigest+"|"+runID)
 			res, err := cs.Claim(workclaim.ClaimRequest{
@@ -229,12 +261,14 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 				ExecutorID: "workflowrun", Lease: time.Minute,
 			})
 			if err != nil || res.Code != workclaim.ResultClaimed {
+				// Already-running same attempt is treated as conflict unless prior seed.
 				return fail(out, StatusBlocked, fmt.Sprintf("claim %s: %v code=%v", id, err, res.Code))
 			}
 			claimed[id]++
 			out.ClaimCount++
 			launches++
 			out.LaunchCount = launches
+			out.ProcessPeak++
 
 			route := resolveChildRoute(req.ChildRoutes, id, defaultProvider, defaultModel)
 			emit(fmt.Sprintf("child.launch:%s route=%s/%s depth=%s", id, route.Provider, route.Model, route.Depth))
@@ -251,6 +285,9 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 				ReadOnly: readOnly,
 			}
 			childOut, cerr := exec.Execute(ctx, childIn)
+			if childOut.WorktreePath != "" {
+				out.WorktreePeak++
+			}
 			outcome := ChildOutcome{
 				WorkItemID: id, Provider: firstNonEmpty(childOut.Provider, route.Provider),
 				Model:      firstNonEmpty(childOut.Model, route.Model),
