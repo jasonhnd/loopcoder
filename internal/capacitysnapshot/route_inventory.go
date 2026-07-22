@@ -69,19 +69,12 @@ func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 			if !m.PresentInCatalog || m.ModelID == "" {
 				continue
 			}
-			// Depth from policy + model support; never universal high.
-			// Model DefaultDepth is not an owner pin — do not fail closed on it.
-			diff := depthpolicy.DifficultyStandard
-			if m.ClassHint == string(capclass.ClassSoul) {
-				diff = depthpolicy.DifficultyHard
-			}
-			if m.ClassHint == string(capclass.ClassLuna) {
-				diff = depthpolicy.DifficultyTiny
-			}
-			effort, derr := depthpolicy.Select(diff, m.SupportedDepths, "")
-			if derr != nil || effort == "" {
-				effort = "medium"
-			}
+			// Emit one candidate per supported depth so per-child required depth
+			// (route_requirement depth=low|medium|high) can filter and bind
+			// eligibility. Never invent depths the model does not support.
+			// Prefer class-hint difficulty only when no explicit child depth is set
+			// (handled at Resolve); inventory must expose the full supported ladder.
+			depths := supportedDepthsForModel(m)
 			cl := classFromHint(m.ClassHint)
 			if cl == capclass.ClassTera {
 				// Prefer capclass map when model is known.
@@ -94,37 +87,39 @@ func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 			if a.CooldownActive {
 				cooldownFact = factBool(true, "cd-"+a.Provider)
 			}
-			base := eligibility.Candidate{
-				Provider: a.Provider, Model: m.ModelID, Effort: effort,
-				ModelClass:     cl,
-				Installed:      factBool(a.Installed, "inst-"+a.Provider),
-				Authenticated:  factBool(a.Authenticated, "auth-"+a.Provider),
-				ModelPresent:   factBool(true, "model-"+a.Provider+"-"+m.ModelID),
-				EffortOK:       factBool(true, "effort-"+a.Provider),
-				Healthy:        factBool(a.Healthy, "health-"+a.Provider),
-				CooldownActive: cooldownFact,
-				ResourceFit:    factBool(true, "res-"+a.Provider),
-				QuotaRemaining: quotaRemainingUnits(rem),
-			}
-			// Emit permission-specific candidates. PermissionOK is a hard gate.
-			if writeOK {
-				wc := base
-				wc.Permission = "bounded_write"
-				wc.PermissionOK = factBool(true, "perm-write-"+a.Provider)
-				cands = append(cands, wc)
-			}
-			if roOK {
-				rc := base
-				rc.Permission = "read-only"
-				rc.PermissionOK = factBool(true, "perm-ro-"+a.Provider)
-				cands = append(cands, rc)
-			} else {
-				// Explicit ineligible row so reports can show denial reasons when
-				// a read-only request is attempted against this company.
-				rc := base
-				rc.Permission = "read-only"
-				rc.PermissionOK = factBool(false, "perm-ro-denied-"+a.Provider)
-				cands = append(cands, rc)
+			for _, effort := range depths {
+				base := eligibility.Candidate{
+					Provider: a.Provider, Model: m.ModelID, Effort: effort,
+					ModelClass:     cl,
+					Installed:      factBool(a.Installed, "inst-"+a.Provider),
+					Authenticated:  factBool(a.Authenticated, "auth-"+a.Provider),
+					ModelPresent:   factBool(true, "model-"+a.Provider+"-"+m.ModelID),
+					EffortOK:       factBool(true, "effort-"+a.Provider+"-"+effort),
+					Healthy:        factBool(a.Healthy, "health-"+a.Provider),
+					CooldownActive: cooldownFact,
+					ResourceFit:    factBool(true, "res-"+a.Provider),
+					QuotaRemaining: quotaRemainingUnits(rem),
+				}
+				// Emit permission-specific candidates. PermissionOK is a hard gate.
+				if writeOK {
+					wc := base
+					wc.Permission = "bounded_write"
+					wc.PermissionOK = factBool(true, "perm-write-"+a.Provider)
+					cands = append(cands, wc)
+				}
+				if roOK {
+					rc := base
+					rc.Permission = "read-only"
+					rc.PermissionOK = factBool(true, "perm-ro-"+a.Provider)
+					cands = append(cands, rc)
+				} else {
+					// Explicit ineligible row so reports can show denial reasons when
+					// a read-only request is attempted against this company.
+					rc := base
+					rc.Permission = "read-only"
+					rc.PermissionOK = factBool(false, "perm-ro-denied-"+a.Provider)
+					cands = append(cands, rc)
+				}
 			}
 			sc := quotapolicy.Candidate{
 				Provider: a.Provider, Model: m.ModelID,
@@ -196,6 +191,28 @@ func classFromHint(h string) capclass.Class {
 	default:
 		return capclass.ClassTera
 	}
+}
+
+// supportedDepthsForModel returns normalized unique depths the model may run.
+// Empty catalog support falls back to medium only (never invent high/low).
+func supportedDepthsForModel(m ModelEntry) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, d := range m.SupportedDepths {
+		n := depthpolicy.NormalizeDepth(d)
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	if len(out) == 0 {
+		if def := depthpolicy.NormalizeDepth(m.DefaultDepth); def != "" {
+			return []string{def}
+		}
+		return []string{"medium"}
+	}
+	return out
 }
 
 func factBool(ok bool, id string) eligibility.Fact {

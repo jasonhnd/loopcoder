@@ -159,6 +159,25 @@ func Resolve(in Input) (Result, error) {
 			Message: fmt.Sprintf("no candidates support permission %q", perm),
 		}, fmt.Errorf("%w: permission %s", ErrNoRoute, perm)
 	}
+	// Depth-aware filter: required Effort must match a candidate Effort and
+	// EffortOK. Unsupported required depth fails closed (no silent medium sub).
+	// When Effort is unset, prefer medium among inventory (CRO-005: never force high).
+	if effort == "" {
+		if mediums := filterCandidatesByEffort(cands, "medium"); len(mediums) > 0 {
+			cands = mediums
+			softs = filterSoftByProviders(softs, cands)
+			effort = "medium"
+		}
+	} else {
+		cands = filterCandidatesByEffort(cands, effort)
+		softs = filterSoftByProviders(softs, cands)
+	}
+	if effort != "" && len(cands) == 0 {
+		return Result{
+			Outcome: OutcomeNoRoute,
+			Message: fmt.Sprintf("no candidates support required depth %q", effort),
+		}, fmt.Errorf("%w: depth %s", ErrNoRoute, effort)
+	}
 
 	elig := eligibility.Snapshot{
 		TaskRequiredClass: taskClass,
@@ -194,10 +213,23 @@ func Resolve(in Input) (Result, error) {
 		res.Outcome = OutcomeSelected
 		res.Provider = d.Winner.Provider
 		res.Model = d.Winner.Model
-		// Default remaining empty effort to medium — never force high (CRO-005).
-		res.Effort = firstNonEmpty(d.Winner.Effort, effort, "medium")
+		// Required request Effort wins when set (already filtered). Otherwise
+		// winner effort, then medium — never force high without requirement (CRO-005).
+		if effort != "" {
+			res.Effort = normalizeEffort(effort)
+		} else {
+			res.Effort = firstNonEmpty(normalizeEffort(d.Winner.Effort), "medium")
+		}
+		// Fail closed if winner effort still mismatches a required depth.
+		if effort != "" && normalizeEffort(d.Winner.Effort) != "" &&
+			normalizeEffort(d.Winner.Effort) != normalizeEffort(effort) {
+			return Result{
+				Outcome: OutcomeNoRoute, Decision: &d, Explain: &explain, Digest: d.Digest,
+				Message: fmt.Sprintf("winner depth %q does not match required %q", d.Winner.Effort, effort),
+			}, fmt.Errorf("%w: depth mismatch", ErrNoRoute)
+		}
 		res.Permission = firstNonEmpty(d.Winner.Permission, perm)
-		res.Message = fmt.Sprintf("auto-route selected %s/%s digest=%s", res.Provider, res.Model, shortHash(d.Digest))
+		res.Message = fmt.Sprintf("auto-route selected %s/%s depth=%s digest=%s", res.Provider, res.Model, res.Effort, shortHash(d.Digest))
 		return res, nil
 	case routedecision.OutcomePinFail:
 		res.Outcome = OutcomePinFail
@@ -303,6 +335,43 @@ func okFact(id string) eligibility.Fact {
 
 func falseFact(id string) eligibility.Fact {
 	return eligibility.Fact{State: eligibility.FactFalse, EvidenceID: id, Freshness: eligibility.FreshFresh}
+}
+
+// filterCandidatesByEffort keeps rows whose Effort matches the required depth
+// (normalized) and pass EffortOK. Required depth is a hard eligibility gate —
+// never silently substitute medium for low/high requirements.
+func filterCandidatesByEffort(cands []eligibility.Candidate, effort string) []eligibility.Candidate {
+	want := normalizeEffort(effort)
+	if want == "" {
+		return cands
+	}
+	out := make([]eligibility.Candidate, 0, len(cands))
+	for _, c := range cands {
+		if normalizeEffort(c.Effort) != want {
+			continue
+		}
+		if c.EffortOK.KnownFalse() {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+func normalizeEffort(e string) string {
+	e = strings.ToLower(strings.TrimSpace(e))
+	switch e {
+	case "low", "minimal", "light":
+		return "low"
+	case "medium", "mid", "standard", "default":
+		return "medium"
+	case "high":
+		return "high"
+	case "xhigh", "max", "deep", "thinking":
+		return "xhigh"
+	default:
+		return e
+	}
 }
 
 // filterCandidatesByPermission keeps rows that advertise the required permission

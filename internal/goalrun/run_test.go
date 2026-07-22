@@ -186,6 +186,106 @@ func TestExecuteAutoRoutesChildrenWithCapacityAccounting(t *testing.T) {
 	}
 }
 
+func TestExecuteBindsRequiredDepthsFromRouteRequirement(t *testing.T) {
+	now := time.Date(2026, 7, 22, 23, 45, 0, 0, time.UTC)
+	home := testHome(t)
+	codex := capacitysnapshot.FromAccountInput(capacitysnapshot.AccountInput{
+		Provider: "codex", AccountRef: "acct-codex", InstallRef: "i-codex",
+		Installed: true, Authenticated: true, Healthy: true,
+		HealthConfidence: capacitysnapshot.ConfidenceExact, HealthFreshness: capacitysnapshot.FreshnessFresh,
+		Windows: []capacitysnapshot.Window{{
+			Kind: "five_hour", Unit: capacitysnapshot.UnitPercentage,
+			Used:       capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: 15, Unit: capacitysnapshot.UnitPercentage},
+			Remaining:  capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: 85, Unit: capacitysnapshot.UnitPercentage},
+			Limit:      capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: 100, Unit: capacitysnapshot.UnitPercentage},
+			Confidence: capacitysnapshot.ConfidenceExact, Freshness: capacitysnapshot.FreshnessFresh,
+			ResetAt: ptrTime(now.Add(time.Hour)), CapturedAt: now, Source: "test",
+		}},
+		Models: []capacitysnapshot.ModelSpec{{
+			ModelID: "gpt-5.5", SupportedDepths: []string{"low", "medium", "high"}, DefaultDepth: "medium", Present: true,
+		}},
+		Source: "test", CapturedAt: now,
+	})
+	ag := capacitysnapshot.FromAccountInput(capacitysnapshot.AccountInput{
+		Provider: "antigravity", AccountRef: "acct-ag", InstallRef: "i-ag",
+		Installed: true, Authenticated: true, Healthy: true,
+		HealthConfidence: capacitysnapshot.ConfidenceExact, HealthFreshness: capacitysnapshot.FreshnessFresh,
+		Windows: []capacitysnapshot.Window{{
+			Kind: "five_hour", Unit: capacitysnapshot.UnitPercentage,
+			Used:       capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: 20, Unit: capacitysnapshot.UnitPercentage},
+			Remaining:  capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: 80, Unit: capacitysnapshot.UnitPercentage},
+			Limit:      capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: 100, Unit: capacitysnapshot.UnitPercentage},
+			Confidence: capacitysnapshot.ConfidenceExact, Freshness: capacitysnapshot.FreshnessFresh,
+			ResetAt: ptrTime(now.Add(30 * time.Minute)), CapturedAt: now, Source: "test",
+		}},
+		Models: []capacitysnapshot.ModelSpec{{
+			ModelID: "GPT-OSS 120B", SupportedDepths: []string{"low", "medium", "high"}, DefaultDepth: "medium", Present: true,
+		}},
+		Source: "test", CapturedAt: now,
+	})
+	snap, err := capacitysnapshot.Build([]capacitysnapshot.AccountObservation{codex, ag}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inv, err := capacitysnapshot.ToRouteInventory(snap, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dry := true
+	ledgerPath := filepath.Join(t.TempDir(), "cap-depth.json")
+	res, err := goalrun.Execute(context.Background(), goalrun.Request{
+		ProjectID: "proj-depth", Goal: "bind required depths",
+		DryRun: &dry, Issue: "1343", Actor: "owner",
+		HomeDir: home, Now: func() time.Time { return now },
+		LoadInventory: func(ctx context.Context, repo string, at time.Time) (autoroute.Inventory, capacitysnapshot.Snapshot, error) {
+			return inv, snap, nil
+		},
+		OpenLedger: func(nowFn func() time.Time) (*capacityledger.Ledger, error) {
+			return capacityledger.OpenPath(ledgerPath, nowFn)
+		},
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	wantDepth := map[string]string{
+		"wi_research":  "low",
+		"wi_implement": "medium",
+		"wi_tests":     "medium",
+		"wi_verify":    "high",
+		"wi_docs":      "low",
+	}
+	depthsSeen := map[string]bool{}
+	for _, c := range res.Children {
+		want, ok := wantDepth[c.ChildID]
+		if !ok {
+			continue
+		}
+		if c.Unavailable {
+			t.Fatalf("child %s unavailable: %+v", c.ChildID, c)
+		}
+		if c.Depth != want {
+			t.Fatalf("child %s depth=%q want %q route=%s", c.ChildID, c.Depth, want, c.RouteReason)
+		}
+		// requirement→selection→invocation evidence in route reason
+		for _, frag := range []string{
+			"depth requirement=" + want,
+			"selection=" + want,
+			"invocation=" + want,
+		} {
+			if !strings.Contains(c.RouteReason, frag) {
+				t.Fatalf("child %s missing %q in route reason: %s", c.ChildID, frag, c.RouteReason)
+			}
+		}
+		depthsSeen[c.Depth] = true
+	}
+	if !depthsSeen["low"] || !depthsSeen["high"] {
+		t.Fatalf("expected both low and high depths used; seen=%v children=%+v", depthsSeen, res.Children)
+	}
+	if len(res.DepthsUsed) < 2 {
+		t.Fatalf("DepthsUsed=%v want ≥2", res.DepthsUsed)
+	}
+}
+
 func TestDryRunPreviewReleasesWithoutExecute(t *testing.T) {
 	now := time.Date(2026, 7, 22, 23, 30, 0, 0, time.UTC)
 	codex := capacitysnapshot.FromAccountInput(capacitysnapshot.AccountInput{
