@@ -90,6 +90,7 @@ Every document is exactly one of these types:
 - [`reference/darwin-arm64-packaging.md`](reference/darwin-arm64-packaging.md): V090-081 Darwin arm64 packaging, signing, and update metadata.
 - [`reference/install-migration-smoke.md`](reference/install-migration-smoke.md): V090-082 exact-artifact install, migration, and cleanup smoke.
 - [`reference/release-slo-scorecard.md`](reference/release-slo-scorecard.md): V090-102 release SLO scorecard and GO/NO-GO evidence compiler.
+- [`reference/rc-go-nogo.md`](reference/rc-go-nogo.md): V090-083 release-candidate consumer canary and GO/NO-GO record.
 - [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
 - [`reference/v09-home-layout.md`](reference/v09-home-layout.md): global `$LOOPCODER_HOME` layout and owner-only creation.
 - [`reference/project-authority-store.md`](reference/project-authority-store.md): project.db domain tables and immutable events.
