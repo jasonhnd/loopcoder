@@ -395,6 +395,24 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 			}
 			ev[id] = closeTerm
 
+			// Task-specific acceptance: clarification/empty/no-tests must not succeed.
+			if closeTerm == workgraph.TermSucceeded {
+				if aerr := AcceptSucceededChild(id, it.Intent, it.Owner, childOut.FilesTouched, childOut.WorktreePath, closeEvidence); aerr != nil {
+					closeTerm = workgraph.TermFailed
+					outcome.Terminal = string(closeTerm)
+					outcome.FailureClass = "acceptance_failed"
+					outcome.Message = aerr.Error()
+					ev[id] = closeTerm
+					out.Children = append(out.Children, outcome)
+					emit(fmt.Sprintf("accept.fail:%s err=%s", id, aerr.Error()))
+					if it.Status == workgraph.ItemRequired {
+						return fail(out, StatusBlocked, "accept "+id+": "+aerr.Error())
+					}
+					continue
+				}
+				emit(fmt.Sprintf("accept.ok:%s role=%s", id, ClassifyTaskRole(id, it.Intent, it.Owner)))
+			}
+
 			// Product integration: succeeded children commit onto shared goal branch
 			// exactly-once so subsequent ready children see prior state.
 			if closeTerm == workgraph.TermSucceeded && doIntegrate && integrator != nil {

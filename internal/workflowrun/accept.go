@@ -1,0 +1,250 @@
+package workflowrun
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// TaskRole classifies a child for task-specific acceptance.
+type TaskRole string
+
+const (
+	RoleResearch  TaskRole = "research"
+	RoleImplement TaskRole = "implement"
+	RoleTests     TaskRole = "tests"
+	RoleVerify    TaskRole = "verify"
+	RoleDocs      TaskRole = "docs"
+	RoleGeneric   TaskRole = "generic"
+)
+
+// ClassifyTaskRole maps work-item id/intent/owner to an acceptance role.
+func ClassifyTaskRole(workItemID, intent, owner string) TaskRole {
+	id := strings.ToLower(workItemID + " " + intent + " " + owner)
+	switch {
+	case strings.Contains(id, "wi_tests") || strings.Contains(id, "test"):
+		return RoleTests
+	case strings.Contains(id, "wi_verify") || strings.Contains(id, "verif") || strings.Contains(id, "adversarial"):
+		return RoleVerify
+	case strings.Contains(id, "wi_implement") || strings.Contains(id, "implement") || strings.Contains(id, "deliver the change"):
+		return RoleImplement
+	case strings.Contains(id, "wi_research") || strings.Contains(id, "research") || strings.Contains(id, "survey"):
+		return RoleResearch
+	case strings.Contains(id, "wi_docs") || strings.Contains(id, "docs"):
+		return RoleDocs
+	default:
+		return RoleGeneric
+	}
+}
+
+// AcceptSucceededChild enforces task-specific acceptance after a child claims
+// success. Clarification-only text, empty worktrees, and missing tests/product
+// fail closed (must not count as succeeded).
+func AcceptSucceededChild(workItemID, intent, owner string, files []string, worktree, evidence string) error {
+	role := ClassifyTaskRole(workItemID, intent, owner)
+	product := filterProductFiles(files)
+	if looksLikeClarification(evidence, worktree, product) {
+		return fmt.Errorf("workflowrun: acceptance refused for %s: clarification/empty work is not success", workItemID)
+	}
+	switch role {
+	case RoleTests:
+		if !hasTestProduct(product, worktree) {
+			return fmt.Errorf("workflowrun: tests child %s must add/adjust real test files (*_test.go or tests/); got %v", workItemID, product)
+		}
+	case RoleImplement:
+		if !hasSourceProduct(product) {
+			return fmt.Errorf("workflowrun: implement child %s must produce product source (not meta/clarification only); got %v", workItemID, product)
+		}
+	case RoleVerify:
+		if !hasVerifierVerdict(product, worktree, evidence) {
+			return fmt.Errorf("workflowrun: verify child %s must produce independent verdict with digest over integrated head; clarification refused", workItemID)
+		}
+	case RoleResearch:
+		if len(product) == 0 && !hasAnyFindings(worktree) {
+			return fmt.Errorf("workflowrun: research child %s produced no findings product", workItemID)
+		}
+	case RoleDocs:
+		if !hasDocsProduct(product) && len(product) == 0 {
+			return fmt.Errorf("workflowrun: docs child %s produced no docs product", workItemID)
+		}
+	default:
+		if len(product) == 0 {
+			return fmt.Errorf("workflowrun: child %s success requires product files", workItemID)
+		}
+	}
+	return nil
+}
+
+func looksLikeClarification(evidence, worktree string, product []string) bool {
+	blobs := []string{strings.ToLower(evidence)}
+	// Scan small product/md files for clarification language.
+	for _, rel := range product {
+		if !strings.HasSuffix(rel, ".md") && !strings.HasSuffix(rel, ".txt") {
+			continue
+		}
+		if worktree == "" {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(worktree, rel))
+		if err != nil || len(raw) > 32<<10 {
+			continue
+		}
+		blobs = append(blobs, strings.ToLower(string(raw)))
+	}
+	// Also check child-output stub.
+	if worktree != "" {
+		entries, _ := os.ReadDir(worktree)
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if strings.HasPrefix(name, "child-output-") || strings.HasSuffix(name, ".md") {
+				raw, err := os.ReadFile(filepath.Join(worktree, name))
+				if err == nil && len(raw) < 32<<10 {
+					blobs = append(blobs, strings.ToLower(string(raw)))
+				}
+			}
+		}
+	}
+	phrases := []string{
+		"please clarify", "need clarification", "need more information",
+		"cannot find implementation", "no implementation", "no test suite",
+		"repository contains no", "nothing to review", "awaiting clarification",
+		"what should i", "please provide more", "unclear requirements",
+		"no code changes", "no files changed",
+	}
+	for _, b := range blobs {
+		if b == "" {
+			continue
+		}
+		// If text is only clarification with no concrete deliverable markers.
+		for _, p := range phrases {
+			if strings.Contains(b, p) {
+				// Allow if product also has real tests/source.
+				if hasTestProduct(product, worktree) || hasSourceProduct(product) {
+					continue
+				}
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasTestProduct(product []string, worktree string) bool {
+	for _, f := range product {
+		base := filepath.Base(f)
+		if strings.HasSuffix(base, "_test.go") || strings.HasSuffix(base, "_test.py") ||
+			strings.HasSuffix(base, ".test.ts") || strings.HasSuffix(base, ".spec.ts") ||
+			strings.Contains(f, "/tests/") || strings.HasPrefix(f, "tests/") ||
+			strings.Contains(f, "/testdata/") {
+			return true
+		}
+	}
+	if worktree == "" {
+		return false
+	}
+	found := false
+	_ = filepath.Walk(worktree, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			if info != nil && info.IsDir() && (filepath.Base(path) == ".git" || filepath.Base(path) == ".loopcoder") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		base := filepath.Base(path)
+		if strings.HasSuffix(base, "_test.go") || strings.HasSuffix(base, "_test.py") {
+			found = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
+}
+
+func hasSourceProduct(product []string) bool {
+	for _, f := range product {
+		base := filepath.Base(f)
+		if strings.HasPrefix(base, "child-output-") {
+			continue
+		}
+		if strings.HasSuffix(base, "_test.go") {
+			continue
+		}
+		switch {
+		case strings.HasSuffix(base, ".go"), strings.HasSuffix(base, ".py"),
+			strings.HasSuffix(base, ".ts"), strings.HasSuffix(base, ".tsx"),
+			strings.HasSuffix(base, ".js"), strings.HasSuffix(base, ".rs"),
+			strings.HasSuffix(base, ".java"), strings.HasSuffix(base, ".c"),
+			strings.HasSuffix(base, ".h"), strings.HasSuffix(base, ".cpp"):
+			return true
+		}
+	}
+	return false
+}
+
+func hasDocsProduct(product []string) bool {
+	for _, f := range product {
+		if strings.HasSuffix(f, ".md") && !strings.HasPrefix(filepath.Base(f), "child-output-") {
+			return true
+		}
+		if strings.HasPrefix(f, "docs/") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAnyFindings(worktree string) bool {
+	if worktree == "" {
+		return false
+	}
+	// findings.md or child-output with substantial body
+	for _, name := range []string{"findings.md", "FINDINGS.md"} {
+		if st, err := os.Stat(filepath.Join(worktree, name)); err == nil && st.Size() > 40 {
+			return true
+		}
+	}
+	return false
+}
+
+func hasVerifierVerdict(product []string, worktree, evidence string) bool {
+	// Must have non-empty evidence digest and not be clarification.
+	if strings.TrimSpace(evidence) == "" || !strings.HasPrefix(evidence, "sha256:") {
+		return false
+	}
+	if looksLikeClarification(evidence, worktree, product) {
+		return false
+	}
+	// Prefer an explicit verification artifact when present.
+	for _, f := range product {
+		base := strings.ToLower(filepath.Base(f))
+		if strings.Contains(base, "verif") || strings.Contains(base, "verdict") || strings.Contains(base, "review") {
+			return true
+		}
+	}
+	// child-output with adversarial review content + digest is acceptable when
+	// integrated head was available (caller ensures materialize from goal branch).
+	if worktree != "" {
+		entries, _ := os.ReadDir(worktree)
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "child-output-") {
+				raw, err := os.ReadFile(filepath.Join(worktree, e.Name()))
+				if err != nil {
+					continue
+				}
+				low := strings.ToLower(string(raw))
+				if strings.Contains(low, "no implementation") || strings.Contains(low, "nothing to review") {
+					return false
+				}
+				if len(raw) > 80 {
+					return true
+				}
+			}
+		}
+	}
+	// Evidence digest alone is insufficient without review artifact for verify role.
+	return false
+}
