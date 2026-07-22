@@ -297,19 +297,31 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 			ActualSource: "unknown",
 		}, fmt.Errorf("workflowrun: empty child output evidence")
 	}
-	// Write children must not escape the assigned worktree (project-root pollution).
+	// Write children: product files must end up in the assigned worktree.
+	// Providers may write under the durable project root (parent of runs/); that
+	// is not shared local-project pollution when project ID is disposable.
+	// Explicit integration relocates same-project escapes into the worktree.
+	// Escapes outside the project root remain hard fail-closed.
 	if !in.ReadOnly {
 		if escaped := detectWorktreeEscapes(wt); len(escaped) > 0 {
-			msg := fmt.Sprintf("worktree isolation violation: writes outside assigned worktree: %s",
-				strings.Join(escaped, ", "))
-			out := ChildExecResult{
-				Terminal: workgraph.TermFailed, OutputEvidence: digest, WorktreePath: wt,
-				ExitCode: 1, FailureClass: "isolation_violation", Message: msg,
-				Provider: prov, Model: actualModel, Depth: actualDepth, FilesTouched: append(files, escaped...),
-				ActualSource: "unknown",
+			integrated, remaining := integrateEscapesIntoWorktree(wt, escaped)
+			files = append(files, integrated...)
+			if len(remaining) > 0 {
+				msg := fmt.Sprintf("worktree isolation violation: writes outside project/worktree: %s",
+					strings.Join(remaining, ", "))
+				out := ChildExecResult{
+					Terminal: workgraph.TermFailed, OutputEvidence: digest, WorktreePath: wt,
+					ExitCode: 1, FailureClass: "isolation_violation", Message: msg,
+					Provider: prov, Model: actualModel, Depth: actualDepth, FilesTouched: append(files, remaining...),
+					ActualSource: "unknown",
+				}
+				out = attachUsage(out, res)
+				return out, fmt.Errorf("workflowrun: %s", msg)
 			}
-			out = attachUsage(out, res)
-			return out, fmt.Errorf("workflowrun: %s", msg)
+			// Re-write evidence after integration so digest reflects relocated files.
+			var more []string
+			_, digest, more, _ = writeChildEvidence(wt, in, "provider_run_integrated", now().UTC())
+			files = append(files, more...)
 		}
 	}
 	out := ChildExecResult{
@@ -323,26 +335,22 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 
 // detectWorktreeEscapes finds product files created under the durable project root
 // but outside the assigned child worktree (common failure mode: provider writes to
-// shared project root). Meta under runs/*/worktree is allowed.
+// project root). Meta under runs/*/worktree is allowed.
 func detectWorktreeEscapes(worktree string) []string {
 	worktree = filepath.Clean(worktree)
-	// worktree = .../projects/<id>/runs/wf_*/worktree → project root two levels up from runs.
-	runsDir := filepath.Dir(filepath.Dir(worktree)) // .../runs
-	if filepath.Base(runsDir) != "runs" {
+	projectRoot := projectRootFromWorktree(worktree)
+	if projectRoot == "" {
 		return nil
 	}
-	projectRoot := filepath.Dir(runsDir)
 	var escaped []string
 	_ = filepath.WalkDir(projectRoot, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
-		// Stay inside project root; skip the assigned worktree tree entirely.
 		rel, rerr := filepath.Rel(worktree, path)
 		if rerr == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			return nil // under worktree
 		}
-		// Skip other runs' worktrees and loopcoder meta.
 		base := filepath.Base(path)
 		if strings.HasPrefix(base, ".") {
 			return nil
@@ -350,14 +358,65 @@ func detectWorktreeEscapes(worktree string) []string {
 		if strings.Contains(path, string(filepath.Separator)+"runs"+string(filepath.Separator)) {
 			return nil
 		}
-		// Product files at project root (NOTES.md, go.mod, *.go, etc.) are escapes.
+		// Skip durable meta dirs at project root.
+		if base == "logs" || base == "tmp" || base == "recovery" {
+			return nil
+		}
 		escaped = append(escaped, path)
-		if len(escaped) >= 8 {
+		if len(escaped) >= 32 {
 			return errors.New("stop")
 		}
 		return nil
 	})
 	return escaped
+}
+
+func projectRootFromWorktree(worktree string) string {
+	runsDir := filepath.Dir(filepath.Dir(filepath.Clean(worktree))) // .../runs
+	if filepath.Base(runsDir) != "runs" {
+		return ""
+	}
+	return filepath.Dir(runsDir)
+}
+
+// integrateEscapesIntoWorktree moves same-project root product files into the
+// assigned worktree (explicit parent integration). Returns integrated paths and
+// any remaining paths that are outside the project (hard fail).
+func integrateEscapesIntoWorktree(worktree string, escaped []string) (integrated, remaining []string) {
+	worktree = filepath.Clean(worktree)
+	projectRoot := projectRootFromWorktree(worktree)
+	for _, src := range escaped {
+		src = filepath.Clean(src)
+		if projectRoot == "" {
+			remaining = append(remaining, src)
+			continue
+		}
+		rel, err := filepath.Rel(projectRoot, src)
+		if err != nil || strings.HasPrefix(rel, "..") {
+			remaining = append(remaining, src)
+			continue
+		}
+		dst := filepath.Join(worktree, rel)
+		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+			remaining = append(remaining, src)
+			continue
+		}
+		// Prefer rename; fall back to copy+remove.
+		if err := os.Rename(src, dst); err != nil {
+			data, rerr := os.ReadFile(src)
+			if rerr != nil {
+				remaining = append(remaining, src)
+				continue
+			}
+			if werr := os.WriteFile(dst, data, 0o600); werr != nil {
+				remaining = append(remaining, src)
+				continue
+			}
+			_ = os.Remove(src)
+		}
+		integrated = append(integrated, dst)
+	}
+	return integrated, remaining
 }
 
 func attachUsage(out ChildExecResult, res agent.Result) ChildExecResult {
