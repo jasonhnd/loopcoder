@@ -29,14 +29,20 @@ type Request struct {
 	Model    string
 	// RepoPath for live inventory discover (optional).
 	RepoPath string
-	// DryRun releases capacity after reserve (default true for bounded goal wave).
+	// DryRun when true only plans routes and releases capacity without executing
+	// children (route preview). Default false → real child execution.
 	DryRun *bool
+	// Executor injects the workflow child executor. nil → production real path.
+	// Focused tests inject workflowrun.FakeChildExecutor.
+	Executor workflowrun.ChildExecutor
 	// LoadInventory injects inventory for tests.
 	LoadInventory func(ctx context.Context, repo string, now time.Time) (autoroute.Inventory, capacitysnapshot.Snapshot, error)
 	// OpenLedger injects ledger for tests.
 	OpenLedger func(now func() time.Time) (*capacityledger.Ledger, error)
 	ReportOut  io.Writer
 	Now        func() time.Time
+	// HomeDir overrides child worktree layout (tests).
+	HomeDir string
 }
 
 // ChildReport is one transparent child line for UI/JSONL.
@@ -57,6 +63,10 @@ type ChildReport struct {
 	CapacityAfter    *float64 `json:"capacity_after,omitempty"`
 	CapacityState    string   `json:"capacity_state,omitempty"`
 	CapacityNote     string   `json:"capacity_note,omitempty"`
+	ActualSource     string   `json:"actual_source,omitempty"`
+	AttemptID        string   `json:"attempt_id,omitempty"`
+	OutputEvidence   string   `json:"output_evidence,omitempty"`
+	WorktreePath     string   `json:"worktree_path,omitempty"`
 	Terminal         string   `json:"terminal,omitempty"`
 	NextAction       string   `json:"next_action,omitempty"`
 	Unavailable      bool     `json:"unavailable,omitempty"`
@@ -78,10 +88,16 @@ type Result struct {
 	MultiModelOrDepthOK bool               `json:"multi_model_or_depth_ok"`
 }
 
+// capacityHold tracks a live reservation for post-execute reconcile/release.
+type capacityHold struct {
+	projectID, runID, attemptID string
+}
+
 // Execute decomposes the goal, routes each LoopCoder-owned child independently
-// via bare auto-route + durable capacity rehydrate when not pinned, records
-// capacity ledger lines, runs the bounded workflow graph to human gate, and
-// emits transparent reports (no provider-native subagents).
+// via bare auto-route + durable capacity rehydrate when not pinned, reserves
+// capacity, runs real (or injected) child executors, reconciles actual usage
+// when known (never fabricates), and emits transparent reports.
+// Provider-native subagents are never used.
 func Execute(ctx context.Context, req Request) (Result, error) {
 	nowFn := req.Now
 	if nowFn == nil {
@@ -172,13 +188,18 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		}
 	}
 
-	dryRun := true
+	dryRun := false
 	if req.DryRun != nil {
 		dryRun = *req.DryRun
 	}
 
+	runID := "goalrun_" + shortID(g.GraphID)
 	usedProviders := map[string]bool{}
 	children := make([]ChildReport, 0, len(g.Items))
+	childRoutes := map[string]workflowrun.ChildRoute{}
+	// Track which children hold live reservations for post-execute reconcile.
+	holds := map[string]capacityHold{}
+
 	for idx, it := range g.Items {
 		depth := depthFromRoute(it.RouteRequirement, idx)
 		cr := ChildReport{
@@ -196,6 +217,10 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 			cr.RouteReason = "explicit_pin"
 			cr.CapacityNote = "pin_path"
 			cr.NextAction = "await_wave"
+			childRoutes[it.ID] = workflowrun.ChildRoute{
+				Provider: cr.Provider, Model: cr.Model, Depth: cr.Depth,
+				RouteReason: cr.RouteReason,
+			}
 			children = append(children, cr)
 			emitChild(req.ReportOut, cr)
 			continue
@@ -210,11 +235,6 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 			Inventory:   inv,
 			Effort:      depth,
 			Now:         now,
-		}
-		// After first child, prefer alternate provider when soft ranking still
-		// leaves other eligible candidates (multi-provider acceptance).
-		if len(usedProviders) > 0 {
-			// Soft bias via re-resolve then pick alternate from decision candidates.
 		}
 		res, rerr := autoroute.Resolve(routeIn)
 		if rerr != nil || res.Outcome != autoroute.OutcomeSelected || res.Provider == "" {
@@ -253,7 +273,6 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		}
 
 		if ledger != nil && snap != nil {
-			runID := "goalrun_" + shortID(g.GraphID)
 			attemptID := it.ID
 			entry, rerr := ledger.Reserve(capacityledger.ReserveInput{
 				ProjectID: projectID, RunID: runID, AttemptID: attemptID,
@@ -282,11 +301,14 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 			cr.CapacityState = entry.State
 			cr.CapacityNote = "policy=" + string(entry.Policy)
 			if dryRun {
-				if rel, lerr := ledger.Release(projectID, runID, attemptID, "goalrun_child_wave"); lerr == nil {
+				// Route preview only: release without execution.
+				if rel, lerr := ledger.Release(projectID, runID, attemptID, "goalrun_dry_run_preview"); lerr == nil {
 					cr.CapacityState = rel.State
-					cr.CapacityNote += "; released=child_wave"
+					cr.CapacityNote += "; released=dry_run_preview"
 					cr.RouteReason = rel.RouteReason
 				}
+			} else {
+				holds[it.ID] = capacityHold{projectID: projectID, runID: runID, attemptID: attemptID}
 			}
 		} else {
 			cr.CapacityNote = "ledger_unavailable"
@@ -295,8 +317,59 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		usedProviders[prov] = true
 		cr.Stage = "planned"
 		cr.NextAction = "await_wave"
+		childRoutes[it.ID] = workflowrun.ChildRoute{
+			Provider: prov, Model: model, Depth: effort,
+			AccountRef: cr.AccountRef, RouteReason: cr.RouteReason,
+		}
 		children = append(children, cr)
 		emitChild(req.ReportOut, cr)
+	}
+
+	// Dry-run route preview: do not launch children.
+	if dryRun {
+		out := Result{
+			GraphID: g.GraphID, PlanDigest: g.PlanDigest, Children: children,
+			Status: "planned", Message: "dry-run route preview; no child execution",
+		}
+		out.ProvidersUsed, out.ModelsUsed, out.DepthsUsed = collectUsage(children)
+		out.MultiProviderOK = len(out.ProvidersUsed) >= 2
+		out.MultiModelOrDepthOK = len(out.ModelsUsed) >= 2 || len(out.DepthsUsed) >= 2
+		out.HumanSummary = fmt.Sprintf(
+			"goal graph %s dry-run children=%d providers=%v models=%v depths=%v",
+			g.GraphID, len(children), out.ProvidersUsed, out.ModelsUsed, out.DepthsUsed,
+		)
+		return out, nil
+	}
+
+	// Filter definition to only available (routed) required children when auto-route
+	// left some unavailable — workflowrun still needs a valid graph. Keep full def;
+	// unavailable children are not in childRoutes and will use pin defaults only if
+	// they remain in the graph. Remove unavailable required items by blocking early
+	// when any required child is unavailable.
+	for _, c := range children {
+		if c.Unavailable {
+			// Skip workflow launch for graphs with route/capacity unavailable required kids.
+			// Mark blocked honestly.
+			out := Result{
+				GraphID: g.GraphID, PlanDigest: g.PlanDigest, Children: children,
+				Status: "blocked", Message: "one or more children unavailable for route/capacity",
+			}
+			out.ProvidersUsed, out.ModelsUsed, out.DepthsUsed = collectUsage(children)
+			// Release any holds we already took.
+			if ledger != nil {
+				for id, h := range holds {
+					if _, err := ledger.Release(h.projectID, h.runID, h.attemptID, "sibling_unavailable"); err == nil {
+						for i := range out.Children {
+							if out.Children[i].ChildID == id {
+								out.Children[i].CapacityState = "released"
+								out.Children[i].CapacityNote += "; released=sibling_unavailable"
+							}
+						}
+					}
+				}
+			}
+			return out, fmt.Errorf("goalrun: child unavailable")
+		}
 	}
 
 	wfProv, wfModel := pinProv, pinModel
@@ -306,13 +379,19 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 			break
 		}
 	}
-	svc := workflowrun.Service{Now: nowFn}
+	exec := req.Executor
+	if exec == nil {
+		exec = workflowrun.ProductionChildExecutor{HomeDir: req.HomeDir, Now: nowFn}
+	}
+	svc := workflowrun.Service{Now: nowFn, Executor: exec, HomeDir: req.HomeDir}
 	wres, werr := svc.Execute(ctx, workflowrun.Request{
-		ProjectID:  projectID,
-		Definition: def,
-		Actor:      actor,
-		Provider:   firstNonEmpty(wfProv, "auto"),
-		Model:      firstNonEmpty(wfModel, "auto"),
+		ProjectID:   projectID,
+		Definition:  def,
+		Actor:       actor,
+		Provider:    firstNonEmpty(wfProv, "auto"),
+		Model:       firstNonEmpty(wfModel, "auto"),
+		ChildRoutes: childRoutes,
+		RepoPath:    req.RepoPath,
 	})
 	out := Result{
 		GraphID: g.GraphID, PlanDigest: g.PlanDigest, Children: children, Workflow: wres,
@@ -320,13 +399,38 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 	out.ProvidersUsed, out.ModelsUsed, out.DepthsUsed = collectUsage(children)
 	out.MultiProviderOK = len(out.ProvidersUsed) >= 2
 	out.MultiModelOrDepthOK = len(out.ModelsUsed) >= 2 || len(out.DepthsUsed) >= 2
+
+	// Reconcile capacity from real child outcomes — never fabricate actual.
+	out.Children = applyChildOutcomes(out.Children, wres, ledger, holds)
+
 	if werr != nil {
 		out.Status = "blocked"
 		out.Message = werr.Error()
 		if wres.Error != "" {
 			out.Message = wres.Error
 		}
-		out.Children = stampTerminals(out.Children, wres)
+		// Failure path: release remaining holds.
+		if ledger != nil {
+			for id, h := range holds {
+				// Skip already reconciled/released in applyChildOutcomes.
+				if e, ok := ledger.Get(h.projectID, h.runID, h.attemptID); ok {
+					if e.State == "reconciled" || e.State == "released" {
+						continue
+					}
+				}
+				if rel, err := ledger.Release(h.projectID, h.runID, h.attemptID, "child_failed_or_cancelled"); err == nil {
+					for i := range out.Children {
+						if out.Children[i].ChildID == id && out.Children[i].CapacityState != "reconciled" {
+							out.Children[i].CapacityState = rel.State
+							out.Children[i].CapacityNote += "; released=child_failed_or_cancelled"
+						}
+					}
+				}
+			}
+		}
+		for _, cr := range out.Children {
+			emitChild(req.ReportOut, cr)
+		}
 		return out, werr
 	}
 	out.Status = wres.Status
@@ -335,11 +439,99 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		"goal graph %s digest=%s children=%d status=%s providers=%v models=%v depths=%v multi_provider=%v",
 		g.GraphID, g.PlanDigest, len(g.Items), wres.Status, out.ProvidersUsed, out.ModelsUsed, out.DepthsUsed, out.MultiProviderOK,
 	)
-	out.Children = stampTerminals(out.Children, wres)
 	for _, cr := range out.Children {
 		emitChild(req.ReportOut, cr)
 	}
 	return out, nil
+}
+
+// applyChildOutcomes merges workflow child terminal/evidence into reports and
+// reconciles capacity when actual is known; otherwise releases with honest unknown.
+func applyChildOutcomes(children []ChildReport, wres workflowrun.Result, ledger *capacityledger.Ledger, holds map[string]capacityHold) []ChildReport {
+	byID := map[string]workflowrun.ChildOutcome{}
+	for _, c := range wres.Children {
+		byID[c.WorkItemID] = c
+	}
+	done := map[string]bool{}
+	for _, id := range wres.Integrated {
+		done[id] = true
+	}
+	for i := range children {
+		if children[i].Unavailable {
+			continue
+		}
+		co, ok := byID[children[i].ChildID]
+		if ok {
+			if co.Provider != "" {
+				children[i].Provider = co.Provider
+			}
+			if co.Model != "" {
+				children[i].Model = co.Model
+			}
+			if co.Depth != "" {
+				children[i].Depth = co.Depth
+			}
+			if co.AccountRef != "" {
+				children[i].AccountRef = co.AccountRef
+			}
+			if co.RouteReason != "" {
+				children[i].RouteReason = co.RouteReason
+			}
+			children[i].Terminal = co.Terminal
+			children[i].AttemptID = co.AttemptID
+			children[i].OutputEvidence = co.OutputEvidence
+			children[i].WorktreePath = co.WorktreePath
+			children[i].ActualSource = co.ActualSource
+			if co.ActualCapacity != nil {
+				children[i].CapacityActual = co.ActualCapacity
+			}
+		}
+		if done[children[i].ChildID] || children[i].Terminal == "succeeded" {
+			children[i].Stage = "integrated"
+			if children[i].Terminal == "" {
+				children[i].Terminal = "succeeded"
+			}
+			children[i].NextAction = "parent_continue"
+		} else if wres.Status == workflowrun.StatusHumanGate {
+			children[i].Stage = "human_gate"
+			children[i].NextAction = "owner_merge"
+		} else if children[i].Terminal != "" {
+			children[i].Stage = "terminal"
+			children[i].NextAction = "inspect_failure"
+		}
+
+		// Capacity ledger: reserve → execute → reconcile|release.
+		h, hasHold := holds[children[i].ChildID]
+		if !hasHold || ledger == nil {
+			continue
+		}
+		termOK := children[i].Terminal == "succeeded"
+		if termOK && ok && co.ActualCapacity != nil && co.ActualSource != "" && co.ActualSource != "unknown" {
+			entry, err := ledger.Reconcile(h.projectID, h.runID, h.attemptID, *co.ActualCapacity, co.ActualSource)
+			if err == nil {
+				children[i].CapacityState = entry.State
+				children[i].CapacityActual = entry.Actual
+				children[i].CapacityAfter = entry.After
+				children[i].CapacityNote += "; reconciled=" + co.ActualSource
+				children[i].ActualSource = co.ActualSource
+				continue
+			}
+		}
+		// Unknown actual or failure: honest release — never invent actual.
+		reason := "executed_usage_unknown"
+		if !termOK {
+			reason = "child_" + firstNonEmpty(children[i].Terminal, "failed")
+		}
+		if entry, err := ledger.Release(h.projectID, h.runID, h.attemptID, reason); err == nil {
+			children[i].CapacityState = entry.State
+			children[i].CapacityNote += "; released=" + reason
+			if children[i].ActualSource == "" {
+				children[i].ActualSource = "unknown"
+			}
+			// Actual stays nil — honest unknown.
+		}
+	}
+	return children
 }
 
 func collectUsage(children []ChildReport) (providers, models, depths []string) {
@@ -386,27 +578,6 @@ func depthFromRoute(routeReq string, idx int) string {
 	default:
 		return "low"
 	}
-}
-
-func stampTerminals(children []ChildReport, wres workflowrun.Result) []ChildReport {
-	done := map[string]bool{}
-	for _, id := range wres.Integrated {
-		done[id] = true
-	}
-	for i := range children {
-		if children[i].Unavailable {
-			continue
-		}
-		if done[children[i].ChildID] {
-			children[i].Stage = "integrated"
-			children[i].Terminal = "succeeded"
-			children[i].NextAction = "parent_continue"
-		} else if wres.Status == workflowrun.StatusHumanGate {
-			children[i].Stage = "human_gate"
-			children[i].NextAction = "owner_merge"
-		}
-	}
-	return children
 }
 
 func emitChild(w io.Writer, cr ChildReport) {
