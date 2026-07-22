@@ -56,6 +56,7 @@ Every document is exactly one of these types:
 - [`reference/quota-modes.md`](reference/quota-modes.md): V090-099 quota policy modes, soft reservations, and usage attribution.
 - [`reference/route-decision.md`](reference/route-decision.md): V090-053 persisted route decision and explain surface.
 - [`reference/successor-fallback.md`](reference/successor-fallback.md): V090-054 successor attempt and fallback boundary.
+- [`reference/smart-routing-canary.md`](reference/smart-routing-canary.md): V090-055 smart-routing end-to-end acceptance canary.
 - [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
 - [`reference/v09-home-layout.md`](reference/v09-home-layout.md): global `$LOOPCODER_HOME` layout and owner-only creation.
 - [`reference/project-authority-store.md`](reference/project-authority-store.md): project.db domain tables and immutable events.
