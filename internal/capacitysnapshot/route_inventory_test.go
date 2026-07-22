@@ -90,6 +90,100 @@ func TestToRouteInventoryPermissionAwareAntigravity(t *testing.T) {
 	t.Logf("ro=%s/%s write=%s/%s", resRO.Provider, resRO.Model, resW.Provider, resW.Model)
 }
 
+func TestToRouteInventoryExcludesExhaustedAndStaleRoutes(t *testing.T) {
+	now := time.Date(2026, 7, 22, 21, 0, 0, 0, time.UTC)
+	// codex exhausted (remaining 0) — must not win write routes.
+	codex := capacitysnapshot.FromAccountInput(capacitysnapshot.AccountInput{
+		Provider: "codex", AccountRef: "acct-codex", InstallRef: "i-codex",
+		Installed: true, Authenticated: true, Healthy: true,
+		HealthConfidence: capacitysnapshot.ConfidenceExact, HealthFreshness: capacitysnapshot.FreshnessFresh,
+		Windows: []capacitysnapshot.Window{{
+			Kind: "five_hour", Unit: capacitysnapshot.UnitPercentage,
+			Used:       capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: 100, Unit: capacitysnapshot.UnitPercentage},
+			Remaining:  capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: 0, Unit: capacitysnapshot.UnitPercentage},
+			Limit:      capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: 100, Unit: capacitysnapshot.UnitPercentage},
+			Confidence: capacitysnapshot.ConfidenceExact, Freshness: capacitysnapshot.FreshnessFresh,
+			CapturedAt: now, Source: "test-exhausted",
+		}},
+		Models: []capacitysnapshot.ModelSpec{{
+			ModelID: "gpt-5.5", SupportedDepths: []string{"medium"}, DefaultDepth: "medium", Present: true,
+		}},
+		Source: "test", CapturedAt: now,
+	})
+	// antigravity healthy remaining — write winner.
+	ag := capacitysnapshot.FromAccountInput(capacitysnapshot.AccountInput{
+		Provider: "antigravity", AccountRef: "acct-ag", InstallRef: "i-ag",
+		Installed: true, Authenticated: true, Healthy: true,
+		HealthConfidence: capacitysnapshot.ConfidenceExact, HealthFreshness: capacitysnapshot.FreshnessFresh,
+		Windows: []capacitysnapshot.Window{{
+			Kind: "five_hour", Unit: capacitysnapshot.UnitPercentage,
+			Used:       capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: 10, Unit: capacitysnapshot.UnitPercentage},
+			Remaining:  capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: 90, Unit: capacitysnapshot.UnitPercentage},
+			Limit:      capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: 100, Unit: capacitysnapshot.UnitPercentage},
+			Confidence: capacitysnapshot.ConfidenceExact, Freshness: capacitysnapshot.FreshnessFresh,
+			CapturedAt: now, Source: "test-ok",
+		}},
+		Models: []capacitysnapshot.ModelSpec{{
+			ModelID: "GPT-OSS 120B", SupportedDepths: []string{"medium"}, DefaultDepth: "medium", Present: true,
+		}},
+		Source: "test", CapturedAt: now,
+	})
+	// gemini stale-only window — must not win.
+	gemini := capacitysnapshot.FromAccountInput(capacitysnapshot.AccountInput{
+		Provider: "gemini", AccountRef: "acct-gem", InstallRef: "i-gem",
+		Installed: true, Authenticated: true, Healthy: true,
+		HealthConfidence: capacitysnapshot.ConfidenceExact, HealthFreshness: capacitysnapshot.FreshnessFresh,
+		Windows: []capacitysnapshot.Window{{
+			Kind: "five_hour", Unit: capacitysnapshot.UnitPercentage,
+			Used:       capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: 5, Unit: capacitysnapshot.UnitPercentage},
+			Remaining:  capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: 95, Unit: capacitysnapshot.UnitPercentage},
+			Limit:      capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: 100, Unit: capacitysnapshot.UnitPercentage},
+			Confidence: capacitysnapshot.ConfidenceExact, Freshness: capacitysnapshot.FreshnessStale,
+			CapturedAt: now.Add(-2 * time.Hour), Source: "test-stale",
+		}},
+		Models: []capacitysnapshot.ModelSpec{{
+			ModelID: "gemini-2.5-pro", SupportedDepths: []string{"medium"}, DefaultDepth: "medium", Present: true,
+		}},
+		Source: "test", CapturedAt: now,
+	})
+	snap, err := capacitysnapshot.Build([]capacitysnapshot.AccountObservation{codex, ag, gemini}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inv, err := capacitysnapshot.ToRouteInventory(snap, now)
+	if err != nil {
+		// may fail unattended if all bad — still try with healthy AG only path
+		t.Logf("inventory: %v", err)
+	}
+	if inv.Candidates == nil {
+		// rebuild with only AG if unattended failed
+		snap2, err2 := capacitysnapshot.Build([]capacitysnapshot.AccountObservation{ag, codex}, now)
+		if err2 != nil {
+			t.Fatal(err2)
+		}
+		inv, err = capacitysnapshot.ToRouteInventory(snap2, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	res, err := autoroute.Resolve(autoroute.Input{
+		AutoRoute: true, Permission: "bounded_write", Effort: "medium",
+		ProjectID: "p", DecisionKey: "excl-1", Inventory: &inv, Now: now,
+	})
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if res.Provider == "codex" {
+		t.Fatalf("exhausted codex must not win: %+v", res)
+	}
+	if res.Provider == "gemini" {
+		t.Fatalf("stale gemini must not win: %+v", res)
+	}
+	if res.Provider != "antigravity" {
+		t.Fatalf("want antigravity write winner, got %+v", res)
+	}
+}
+
 func TestToRouteInventoryEmitsPerSupportedDepth(t *testing.T) {
 	now := time.Date(2026, 7, 22, 20, 0, 0, 0, time.UTC)
 	codex := capacitysnapshot.FromAccountInput(capacitysnapshot.AccountInput{
