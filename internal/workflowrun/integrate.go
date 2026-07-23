@@ -338,17 +338,22 @@ func discoverProductFiles(childWT string) ([]string, error) {
 	if err == nil {
 		var files []string
 		for _, line := range strings.Split(st, "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
+			// Do NOT TrimSpace the whole line: porcelain " M notes.go" must keep
+			// the leading status space or path becomes "otes.go" (RC.17 false miss).
+			if strings.TrimSpace(line) == "" {
 				continue
 			}
-			// porcelain: XY PATH or XY ORIG -> PATH
-			path := line
-			if len(line) > 3 {
-				path = strings.TrimSpace(line[3:])
+			// porcelain: XY<path> or XY <path> or XY ORIG -> PATH (rename)
+			if len(line) < 3 {
+				continue
 			}
+			path := line[2:]
+			if strings.HasPrefix(path, " ") {
+				path = path[1:]
+			}
+			path = strings.TrimSpace(path)
 			if i := strings.Index(path, " -> "); i >= 0 {
-				path = path[i+4:]
+				path = strings.TrimSpace(path[i+4:])
 			}
 			path = strings.Trim(path, "\"")
 			if path != "" {

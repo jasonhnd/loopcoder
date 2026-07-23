@@ -458,7 +458,16 @@ func snapshotDirTree(root string) dirSnap {
 		return out
 	}
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+		if err != nil {
+			return nil
+		}
+		base := filepath.Base(path)
+		// Never treat git internals as product mutations (shared objects/index
+		// updates from child worktrees false-failed wi_tests on RC.17).
+		if d.IsDir() {
+			if base == ".git" || base == "runs" || base == "logs" || base == "tmp" || base == "recovery" {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		// Skip other child worktrees under runs/ so concurrent children don't
@@ -466,13 +475,15 @@ func snapshotDirTree(root string) dirSnap {
 		if strings.Contains(path, string(filepath.Separator)+"runs"+string(filepath.Separator)) {
 			return nil
 		}
-		base := filepath.Base(path)
 		if base == "logs" || strings.HasPrefix(base, ".") {
 			// Skip meta/dotfiles at snapshot roots (not child worktree product).
 			return nil
 		}
 		rel, rerr := filepath.Rel(root, path)
 		if rerr != nil || strings.HasPrefix(rel, "..") {
+			return nil
+		}
+		if rel == ".git" || strings.HasPrefix(filepath.ToSlash(rel), ".git/") {
 			return nil
 		}
 		b, rerr := os.ReadFile(path)
@@ -493,6 +504,10 @@ func diffDirTree(before, after dirSnap, excludeRoot string) []string {
 	excludeRoot = filepath.Clean(excludeRoot)
 	for rel, h := range after {
 		if before[rel] == h {
+			continue
+		}
+		// Ignore git internals entirely.
+		if rel == ".git" || strings.HasPrefix(rel, ".git/") {
 			continue
 		}
 		// If excludeRoot is under the snap root we can't map absolute paths here;
