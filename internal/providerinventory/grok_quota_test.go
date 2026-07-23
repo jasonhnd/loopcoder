@@ -494,6 +494,12 @@ func TestGrokCreditsBillingParsesWeeklyUsageAndProduct(t *testing.T) {
 	if primary.ResetAt == "" || primary.FieldConfidences["reset_at"] != ConfidenceExact {
 		t.Fatalf("reset = %#v", primary)
 	}
+	if primary.WindowStart == "" || primary.WindowEnd == "" {
+		t.Fatalf("fixed-week bounds missing: start=%q end=%q", primary.WindowStart, primary.WindowEnd)
+	}
+	if !strings.HasPrefix(primary.WindowStart, "2026-07-21T") || !strings.HasPrefix(primary.WindowEnd, "2026-07-28T") {
+		t.Fatalf("unexpected window bounds start=%q end=%q", primary.WindowStart, primary.WindowEnd)
+	}
 	if strings.Contains(primary.RedactedDiagnostics, "secret-test-token") {
 		t.Fatalf("diagnostics retained token: %#v", primary.RedactedDiagnostics)
 	}
@@ -501,7 +507,40 @@ func TestGrokCreditsBillingParsesWeeklyUsageAndProduct(t *testing.T) {
 	if product.RemainingValue == nil || *product.RemainingValue != 69 {
 		t.Fatalf("product = %#v", product)
 	}
+	if product.WindowStart == "" || product.WindowEnd == "" {
+		t.Fatalf("product fixed-week bounds missing: start=%q end=%q", product.WindowStart, product.WindowEnd)
+	}
+	// Persist path must accept the snapshots (RC.27 defect: Refresh rejected fixed-week without bounds).
+	for _, snapshot := range report.QuotaSnapshots {
+		if snapshot.AdapterID != "grok" {
+			continue
+		}
+		if err := ValidateQuotaSnapshot(sources[0], snapshot); err != nil {
+			t.Fatalf("ValidateQuotaSnapshot(%s): %v\n%#v", snapshot.ProviderQuantityName, err, snapshot)
+		}
+	}
 	// ACP must not be required when credits succeeds.
+}
+
+func TestGrokCreditsBillingWeeklyWithoutStartFallsBackToProviderDefined(t *testing.T) {
+	// Weekly type without start must not claim fixed-week (Refresh requires both bounds).
+	body := []byte(`{"config":{"creditUsagePercent":10,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-07-28T00:00:00Z"}}}`)
+	snaps, err := snapshotsFromGrokCreditsBilling(grokCreditsBillingSource(fixedInventoryNow()), nil, "0.2.111", "acct", body, fixedInventoryNow())
+	if err != nil || len(snaps) < 1 {
+		t.Fatalf("snaps err=%v n=%d", err, len(snaps))
+	}
+	source := grokCreditsBillingSource(fixedInventoryNow())
+	for _, s := range snaps {
+		if s.WindowKind == WindowFixedWeek {
+			t.Fatalf("expected provider-defined fallback without start, got fixed-week: %#v", s)
+		}
+		if s.WindowKind != WindowProviderDefined {
+			t.Fatalf("window = %s, want provider-defined: %#v", s.WindowKind, s)
+		}
+		if err := ValidateQuotaSnapshot(source, s); err != nil {
+			t.Fatalf("ValidateQuotaSnapshot: %v\n%#v", err, s)
+		}
+	}
 }
 
 func TestGrokCreditsBillingAuthShapesAndRedaction(t *testing.T) {
