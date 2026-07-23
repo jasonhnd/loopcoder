@@ -67,4 +67,18 @@ func TestClassifyTaskRole(t *testing.T) {
 	if workflowrun.ClassifyTaskRole("wi_verify", "independent verification", "verifier") != workflowrun.RoleVerify {
 		t.Fatal("verify")
 	}
+	// Goal text embedding "with tests" must not reclassify implement.
+	if workflowrun.ClassifyTaskRole("wi_implement",
+		"implementation: deliver the change for: multi-provider notes with tests and independent verification",
+		"worker") != workflowrun.RoleImplement {
+		t.Fatal("implement misclassified by goal text")
+	}
+	// Implement with only child-output stub fails.
+	err := workflowrun.AcceptSucceededChild("wi_implement",
+		"implementation: deliver the change for: multi-provider notes with tests",
+		"worker",
+		[]string{"child-output-wi_implement.md"}, "", "sha256:x")
+	if err == nil {
+		t.Fatal("implement child-output-only must fail under correct role")
+	}
 }

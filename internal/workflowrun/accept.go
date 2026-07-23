@@ -20,18 +20,34 @@ const (
 )
 
 // ClassifyTaskRole maps work-item id/intent/owner to an acceptance role.
+// Prefer stable work_item_id prefixes so goal text like "with tests" inside an
+// implement intent cannot mis-route wi_implement → RoleTests (false accept).
 func ClassifyTaskRole(workItemID, intent, owner string) TaskRole {
-	id := strings.ToLower(workItemID + " " + intent + " " + owner)
+	id := strings.ToLower(strings.TrimSpace(workItemID))
 	switch {
-	case strings.Contains(id, "wi_tests") || strings.Contains(id, "test"):
+	case strings.HasPrefix(id, "wi_tests") || id == "tests":
 		return RoleTests
-	case strings.Contains(id, "wi_verify") || strings.Contains(id, "verif") || strings.Contains(id, "adversarial"):
+	case strings.HasPrefix(id, "wi_verify") || id == "verify":
 		return RoleVerify
-	case strings.Contains(id, "wi_implement") || strings.Contains(id, "implement") || strings.Contains(id, "deliver the change"):
+	case strings.HasPrefix(id, "wi_implement") || id == "implement":
 		return RoleImplement
-	case strings.Contains(id, "wi_research") || strings.Contains(id, "research") || strings.Contains(id, "survey"):
+	case strings.HasPrefix(id, "wi_research") || id == "research":
 		return RoleResearch
-	case strings.Contains(id, "wi_docs") || strings.Contains(id, "docs"):
+	case strings.HasPrefix(id, "wi_docs") || id == "docs":
+		return RoleDocs
+	}
+	// Fallback: intent/owner only when work_item_id is non-canonical.
+	blob := strings.ToLower(strings.TrimSpace(intent) + " " + strings.TrimSpace(owner))
+	switch {
+	case strings.Contains(blob, "verif") || strings.Contains(blob, "adversarial"):
+		return RoleVerify
+	case strings.HasPrefix(blob, "tests:") || strings.Contains(blob, "add/adjust focused tests"):
+		return RoleTests
+	case strings.HasPrefix(blob, "implementation:") || strings.Contains(blob, "deliver the change"):
+		return RoleImplement
+	case strings.HasPrefix(blob, "research") || strings.Contains(blob, "survey scope"):
+		return RoleResearch
+	case strings.HasPrefix(blob, "docs:") || strings.Contains(blob, "user-facing docs"):
 		return RoleDocs
 	default:
 		return RoleGeneric
@@ -49,12 +65,18 @@ func AcceptSucceededChild(workItemID, intent, owner string, files []string, work
 	}
 	switch role {
 	case RoleTests:
-		if !hasTestProduct(product, worktree) {
+		// Require test files in the child's FilesTouched list — do not count
+		// pre-existing base *_test.go via full worktree walk (false green).
+		if !hasTestProductInList(product) {
 			return fmt.Errorf("workflowrun: tests child %s must add/adjust real test files (*_test.go or tests/); got %v", workItemID, product)
 		}
 	case RoleImplement:
 		if !hasSourceProduct(product) {
 			return fmt.Errorf("workflowrun: implement child %s must produce product source (not meta/clarification only); got %v", workItemID, product)
+		}
+		// child-output-*.md alone is never enough even if worktree has base sources.
+		if onlyChildOutputStubs(product) {
+			return fmt.Errorf("workflowrun: implement child %s produced only child-output stubs, not product source; got %v", workItemID, product)
 		}
 	case RoleVerify:
 		if !hasVerifierVerdict(product, worktree, evidence) {
@@ -133,15 +155,25 @@ func looksLikeClarification(evidence, worktree string, product []string) bool {
 	return false
 }
 
-func hasTestProduct(product []string, worktree string) bool {
+func hasTestProductInList(product []string) bool {
 	for _, f := range product {
 		base := filepath.Base(f)
+		if strings.HasPrefix(base, "child-output-") {
+			continue
+		}
 		if strings.HasSuffix(base, "_test.go") || strings.HasSuffix(base, "_test.py") ||
 			strings.HasSuffix(base, ".test.ts") || strings.HasSuffix(base, ".spec.ts") ||
 			strings.Contains(f, "/tests/") || strings.HasPrefix(f, "tests/") ||
 			strings.Contains(f, "/testdata/") {
 			return true
 		}
+	}
+	return false
+}
+
+func hasTestProduct(product []string, worktree string) bool {
+	if hasTestProductInList(product) {
+		return true
 	}
 	if worktree == "" {
 		return false
@@ -183,6 +215,20 @@ func hasSourceProduct(product []string) bool {
 		}
 	}
 	return false
+}
+
+// onlyChildOutputStubs is true when every product path is a child-output-*.md stub.
+func onlyChildOutputStubs(product []string) bool {
+	if len(product) == 0 {
+		return false
+	}
+	for _, f := range product {
+		base := filepath.Base(f)
+		if !strings.HasPrefix(base, "child-output-") {
+			return false
+		}
+	}
+	return true
 }
 
 func hasDocsProduct(product []string) bool {
