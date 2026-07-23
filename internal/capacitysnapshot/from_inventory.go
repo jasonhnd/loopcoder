@@ -1,12 +1,42 @@
 package capacitysnapshot
 
 import (
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/models"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 )
+
+// capabilityIsDynamicExactFresh reports a provider-machine-readable exact+fresh
+// observation. Adapter-declared static catalogs also use ConfidenceExact in
+// production — they must NOT match this predicate.
+func capabilityIsDynamicExactFresh(m providerinventory.ModelCapability) bool {
+	if m.Confidence != providerinventory.ConfidenceExact {
+		return false
+	}
+	if m.FreshnessState == providerinventory.FreshnessStale ||
+		m.FreshnessState == providerinventory.FreshnessExpired ||
+		m.FreshnessState == providerinventory.FreshnessNotApplicable {
+		return false
+	}
+	// EntrySources is authoritative after catalog merge.
+	for _, s := range m.EntrySources {
+		if s.SourceKind == providerinventory.CatalogSourceProviderMachineReadable &&
+			s.Confidence == providerinventory.ConfidenceExact &&
+			(s.FreshnessState == providerinventory.FreshnessFresh || s.FreshnessState == "") {
+			return true
+		}
+	}
+	// Fallback: top-level Source.Kind when EntrySources empty (tests / partial rows).
+	if len(m.EntrySources) == 0 &&
+		(m.Source.Kind == string(providerinventory.CatalogSourceProviderMachineReadable) ||
+			m.Source.Kind == "provider-machine-readable") {
+		return m.FreshnessState == providerinventory.FreshnessFresh || m.FreshnessState == ""
+	}
+	return false
+}
 
 // FromProviderInventoryReport maps a live providerinventory.Report into AccountObservations.
 //
@@ -83,35 +113,90 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 		}
 	}
 
-	// Live catalog capabilities first (preferred for final acceptance routing).
+	// Production routes prefer provider-machine-readable exact+fresh catalog
+	// rows (EntrySources / Source.Kind). Adapter-declared static catalogs also
+	// carry ConfidenceExact+FreshnessFresh in production — Confidence alone is
+	// not enough to distinguish them.
 	liveModels := map[string]bool{}
+	// Adapters that have at least one machine-readable exact+fresh capability.
+	dynamicExactAdapters := map[string]bool{}
 	for _, m := range rep.ModelCapabilities {
+		if capabilityIsDynamicExactFresh(m) {
+			dynamicExactAdapters[strings.ToLower(strings.TrimSpace(m.AdapterID))] = true
+		}
+	}
+	// Also mark from ModelCatalogSnapshots when present (stronger source of truth).
+	for _, snap := range rep.ModelCatalogSnapshots {
+		if snap.CatalogSourceKind == providerinventory.CatalogSourceProviderMachineReadable &&
+			snap.Confidence == providerinventory.ConfidenceExact &&
+			(snap.FreshnessState == providerinventory.FreshnessFresh || snap.FreshnessState == "") {
+			dynamicExactAdapters[strings.ToLower(strings.TrimSpace(snap.AdapterID))] = true
+		}
+	}
+	modelIdx := map[string]int{}
+	// Prefer dynamic machine-readable rows first, then static-only adapters.
+	caps := append([]providerinventory.ModelCapability(nil), rep.ModelCapabilities...)
+	sort.SliceStable(caps, func(i, j int) bool {
+		di, dj := capabilityIsDynamicExactFresh(caps[i]), capabilityIsDynamicExactFresh(caps[j])
+		if di != dj {
+			return di && !dj
+		}
+		return false
+	})
+	for _, m := range caps {
 		b := ensure(m.AdapterID)
+		adapterKey := strings.ToLower(strings.TrimSpace(m.AdapterID))
+		dynamic := capabilityIsDynamicExactFresh(m)
+		// When this adapter has dynamic exact catalog, only route those rows —
+		// adapter-declared static (even ConfidenceExact) is not observed live.
+		if dynamicExactAdapters[adapterKey] && !dynamic {
+			b.in.Provenance = strings.TrimSpace(b.in.Provenance +
+				"; adapter_declared_static_suppressed=dynamic_machine_readable_present")
+			continue
+		}
 		present := m.CanonicalModelID != "" &&
 			m.AvailabilityState == providerinventory.AvailabilityAvailable &&
 			m.LifecycleState != providerinventory.LifecycleRemoved &&
 			m.LifecycleState != providerinventory.LifecycleDeprecated
-		// Only mark present when catalog freshness is not expired.
 		if m.FreshnessState == providerinventory.FreshnessExpired ||
 			m.FreshnessState == providerinventory.FreshnessStale {
 			present = false
 		}
-		// Account/model capability exclusions (not a silent global delete of the
-		// static registry): ChatGPT Codex accounts reject gpt-5.3-codex.
-		// Record as not-present with provenance; do not invent a replacement window.
+		// Static-only path: still present but not "fresh observed" for production
+		// multi-provider acceptance when no dynamic catalog exists — estimated seed
+		// may fill later via seedStaticModelsEstimated.
+		if !dynamic && dynamicExactAdapters[adapterKey] {
+			present = false
+		}
+		spec := modelSpecFromCapability(m.AdapterID, m)
 		if present && strings.EqualFold(m.AdapterID, "codex") &&
-			strings.EqualFold(m.CanonicalModelID, "gpt-5.3-codex") {
+			(strings.EqualFold(m.CanonicalModelID, "gpt-5.3-codex") || strings.EqualFold(spec.ModelID, "gpt-5.3-codex")) {
 			present = false
 			b.in.Provenance = strings.TrimSpace(b.in.Provenance +
 				"; model_excluded=gpt-5.3-codex reason=chatgpt_account_incompatible")
 		}
-		depths := []string{"low", "medium", "high"}
-		b.in.Models = append(b.in.Models, ModelSpec{
-			ModelID: m.CanonicalModelID, Present: present,
-			SupportedDepths: depths, DefaultDepth: "medium",
-		})
-		if present {
-			liveModels[strings.ToLower(m.AdapterID)+"|"+strings.ToLower(m.CanonicalModelID)] = true
+		if !present || strings.TrimSpace(spec.ModelID) == "" {
+			continue
+		}
+		key := strings.ToLower(m.AdapterID) + "|" + strings.ToLower(spec.ModelID)
+		if idx, ok := modelIdx[key]; ok && idx >= 0 && idx < len(b.in.Models) {
+			mergeModelSpec(&b.in.Models[idx], spec)
+		} else {
+			modelIdx[key] = len(b.in.Models)
+			b.in.Models = append(b.in.Models, ModelSpec{
+				ModelID: spec.ModelID, Present: true,
+				SupportedDepths: append([]string(nil), spec.SupportedDepths...),
+				DefaultDepth:    spec.DefaultDepth,
+			})
+		}
+		liveModels[key] = true
+		liveModels[strings.ToLower(m.AdapterID)+"|"+strings.ToLower(m.CanonicalModelID)] = true
+		if slug := slugifyModelName(spec.ModelID); slug != "" {
+			liveModels[strings.ToLower(m.AdapterID)+"|"+slug] = true
+		}
+		if peel := peelBaseName(spec.ModelID); peel != "" {
+			liveModels[strings.ToLower(m.AdapterID)+"|"+strings.ToLower(peel)] = true
+			liveModels[strings.ToLower(m.AdapterID)+"|"+slugifyModelName(peel)] = true
 		}
 	}
 
@@ -242,17 +327,25 @@ func seedStaticModelsEstimated(in *AccountInput, live map[string]bool) {
 		}
 		depths := make([]string, 0, len(m.Depths))
 		for _, d := range m.Depths {
-			depths = append(depths, d.Token)
+			if t := strings.TrimSpace(d.Token); t != "" {
+				depths = append(depths, t)
+			}
 		}
+		// Curated static only — never invent a full ladder when empty.
 		if len(depths) == 0 {
-			depths = []string{"low", "medium", "high"}
+			depths = []string{"medium"}
 		}
 		def := m.DefaultDepth
 		if def == "" {
 			def = p.DefaultDepth
 		}
 		if def == "" {
-			def = "medium"
+			def = depths[0]
+		}
+		// Also skip when live already registered a slug/base variant of this model.
+		slugKey := strings.ToLower(in.Provider) + "|" + slugifyModelName(m.Name)
+		if live[slugKey] {
+			continue
 		}
 		in.Models = append(in.Models, ModelSpec{
 			ModelID: m.Name, Present: true,

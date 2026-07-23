@@ -18,9 +18,16 @@ func TestBuildUnavailableRetryRequiresUnclaimedExclude(t *testing.T) {
 	if got != nil {
 		t.Fatalf("claimed-only must not invent evidence: %+v", got)
 	}
+	// eligible_not_chosen alone never satisfies unavailable_retry.
+	if got := goalrun.BuildUnavailableRetryEvidence([]goalrun.RouteExclude{
+		{ChildID: "a", Provider: "grok", Reason: "eligible_not_chosen", Claimed: false, Message: "non-winner"},
+	}, "att-x"); got != nil {
+		t.Fatalf("eligible_not_chosen must not satisfy: %+v", got)
+	}
 	got = goalrun.BuildUnavailableRetryEvidence([]goalrun.RouteExclude{
 		{ChildID: "a", Provider: "claude", Reason: "unavailable", Claimed: false, Message: "probe timeout"},
 		{ChildID: "b", Provider: "codex", Reason: "exhausted", Claimed: false},
+		{ChildID: "c", Provider: "grok", Reason: "eligible_not_chosen", Claimed: false},
 	}, "att-retry-1")
 	if got == nil {
 		t.Fatal("want evidence")
@@ -65,13 +72,9 @@ func TestSoftExcludedEligibleExcludesAfterSuccessfulRoute(t *testing.T) {
 	if !got[0].HardEligible || !got[0].SoftExcluded {
 		t.Fatalf("flags %+v", got[0])
 	}
-	// Feeds BuildUnavailableRetryEvidence.
-	ev := goalrun.BuildUnavailableRetryEvidence(got, "att-wi_tests-1")
-	if ev == nil || ev.ExcludedProvider != "antigravity" || ev.ExcludedReason != "soft_excluded" {
-		t.Fatalf("unavail %+v", ev)
-	}
-	if !ev.NoDuplicateClaim || !ev.NoDuplicateFiles || !ev.NoDoubleCapacity || ev.EvidenceRef == "" {
-		t.Fatalf("dup flags %+v", ev)
+	// soft_excluded is not hard unavailability — must not satisfy canary metric.
+	if ev := goalrun.BuildUnavailableRetryEvidence(got, "att-wi_tests-1"); ev != nil {
+		t.Fatalf("soft_excluded must not build unavailable_retry: %+v", ev)
 	}
 	// Winner-only decision → no exclude invented.
 	if goalrun.SoftExcludedEligibleExcludes("wi_x", "codex", []goalrun.SoftExcludedCandidate{
@@ -97,9 +100,9 @@ func TestHardEligibleNonWinnerExcludesIncludesNotChosen(t *testing.T) {
 	if !got[0].HardEligible {
 		t.Fatalf("hard flag %+v", got[0])
 	}
-	ev := goalrun.BuildUnavailableRetryEvidence(got, "att-wi_tests-1")
-	if ev == nil || ev.ExcludedProvider != "antigravity" || ev.ExcludedReason != "eligible_not_chosen" {
-		t.Fatalf("unavail %+v", ev)
+	// eligible_not_chosen is diversity measurement — must NOT satisfy unavailable_retry.
+	if ev := goalrun.BuildUnavailableRetryEvidence(got, "att-wi_tests-1"); ev != nil {
+		t.Fatalf("eligible_not_chosen must not build unavailable_retry: %+v", ev)
 	}
 	// SoftExcluded still preferred when present.
 	got2 := goalrun.HardEligibleNonWinnerExcludes("wi_x", "codex", []goalrun.SoftExcludedCandidate{

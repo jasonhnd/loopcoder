@@ -2299,7 +2299,14 @@ func inspectCatalogCommand(ctx context.Context, discovery *discoveryContext, ada
 		return unavailable(probe.GapReasons, probe.TerminalErrorCode)
 	}
 
-	sources, modelGaps := catalogSourcesFromGrokModels(adapter, installation.Version, output)
+	// Antigravity must never reuse the Grok/xAI catalog parser or attribution.
+	var sources []CatalogSourceInput
+	var modelGaps []string
+	if isAgyCatalogAdapter(adapter) {
+		sources, modelGaps = catalogSourcesFromAgyModels(adapter, installation.Version, output)
+	} else {
+		sources, modelGaps = catalogSourcesFromGrokModels(adapter, installation.Version, output)
+	}
 	if len(sources) == 0 {
 		probe.Outcome = OutcomeInstalledUnusable
 		probe.Confidence = ConfidenceUnknown
@@ -2309,10 +2316,14 @@ func inspectCatalogCommand(ctx context.Context, discovery *discoveryContext, ada
 	}
 	probe.Outcome = OutcomeInstalled
 	probe.Confidence = ConfidenceExact
+	parserName := firstNonEmpty(adapter.CatalogProbeParser, "provider-text")
+	if isAgyCatalogAdapter(adapter) {
+		parserName = "agy-models"
+	}
 	probe.setParsedFields(map[string]string{
 		"model_count":  fmt.Sprintf("%d", countCatalogEntries(sources)),
 		"source_count": fmt.Sprintf("%d", len(sources)),
-		"parser":       firstNonEmpty(adapter.CatalogProbeParser, "provider-text"),
+		"parser":       parserName,
 	})
 	if len(modelGaps) > 0 {
 		probe.GapReasons = append(probe.GapReasons, modelGaps...)

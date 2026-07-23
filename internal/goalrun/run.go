@@ -542,6 +542,7 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		prov, model := res.Provider, res.Model
 		// Prefer alternate provider if already used and decision lists others.
 		// Candidates were already filtered to this permission+depth by autoroute.Resolve.
+		diversifiedFrom := ""
 		if usedProviders[prov] && res.Decision != nil {
 			for _, cv := range res.Decision.Candidates {
 				if cv.Provider == "" || usedProviders[cv.Provider] || !cv.HardEligible || cv.SoftExcluded {
@@ -551,7 +552,9 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 				if isReadOnlyPerm(perm) && !providerSupportsReadOnly(cv.Provider) {
 					continue
 				}
-				// CandidateView may omit Effort; required depth remains bound via reqDepth.
+				// CandidateView has no Effort field; depth was already filtered by
+				// autoroute.Resolve for this child's reqDepth. Bind reqDepth below.
+				diversifiedFrom = prov
 				prov, model = cv.Provider, cv.Model
 				break
 			}
@@ -594,9 +597,21 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		cr.Provider = prov
 		cr.Model = model
 		cr.Depth = effort
+		// Route reason must name the *actual* selected provider/model. Multi-provider
+		// diversification rewrites prov/model after Resolve; never leave the original
+		// winner line (e.g. antigravity) on a Grok child.
 		winnerLine := res.Message
 		if res.Explain != nil && res.Explain.WinnerLine != "" {
 			winnerLine = res.Explain.WinnerLine
+		}
+		if diversifiedFrom != "" && !strings.EqualFold(diversifiedFrom, prov) {
+			winnerLine = fmt.Sprintf(
+				"Winner: %s/%s depth=%s (multi-provider diversification from %s)",
+				prov, model, effort, diversifiedFrom,
+			)
+		} else if !strings.Contains(strings.ToLower(winnerLine), strings.ToLower(prov)) {
+			// Resolve message omitted provider or pointed at a different pin — restate truth.
+			winnerLine = fmt.Sprintf("Winner: %s/%s depth=%s", prov, model, effort)
 		}
 		cr.RouteReason = fmt.Sprintf(
 			"%s; permission=%s; depth requirement=%s selection=%s invocation=%s",

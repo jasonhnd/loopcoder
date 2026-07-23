@@ -1870,7 +1870,7 @@ func expectedAntigravityModelsOutput() string {
 		"  - Opus 4.6\n" +
 		"    depths: medium, high*, xhigh\n" +
 		"  - GPT-OSS 120B\n" +
-		"    depths: low, medium*, high\n"
+		"    depths: medium*\n"
 }
 
 func TestAuditCommandRunsInjectedAuditAndRendersJSON(t *testing.T) {

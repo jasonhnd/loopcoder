@@ -23,13 +23,16 @@ type RouteExclude struct {
 }
 
 // BuildUnavailableRetryEvidence derives canary UnavailableRetry from measured
-// route excludes / retry attempts. Returns nil when evidence is insufficient
-// (never invents no-duplicate flags).
+// *unavailability* route excludes / typed failure retries. Returns nil when
+// evidence is insufficient (never invents no-duplicate flags).
+//
+// eligible_not_chosen is multi-provider diversity measurement, NOT unavailability —
+// it must never satisfy unavailable_retry scorecard metrics.
 func BuildUnavailableRetryEvidence(excludes []RouteExclude, retryAttemptID string) *artifactqual.CanaryUnavailableRetry {
 	if len(excludes) == 0 {
 		return nil
 	}
-	// Prefer an exclude that never claimed work.
+	// Prefer an exclude that never claimed work and is a real unavailability reason.
 	var pick *RouteExclude
 	for i := range excludes {
 		e := &excludes[i]
@@ -37,6 +40,9 @@ func BuildUnavailableRetryEvidence(excludes []RouteExclude, retryAttemptID strin
 			continue
 		}
 		if strings.TrimSpace(e.Provider) == "" || strings.TrimSpace(e.Reason) == "" {
+			continue
+		}
+		if !isUnavailableRetryReason(e.Reason) {
 			continue
 		}
 		pick = e
@@ -56,6 +62,22 @@ func BuildUnavailableRetryEvidence(excludes []RouteExclude, retryAttemptID strin
 		NoDuplicateFiles: true, // no claim ⇒ no files for excluded provider
 		NoDoubleCapacity: true, // no claim ⇒ no capacity hold for excluded provider
 		EvidenceRef:      ref + ";child=" + pick.ChildID + ";msg=" + truncateMsg(pick.Message, 80),
+	}
+}
+
+// isUnavailableRetryReason is the closed set accepted by canary unavailable_retry.
+//
+// Rejected (not unavailability):
+//   - eligible_not_chosen / not_chosen — multi-provider diversity only
+//   - soft_excluded — soft ranking/policy, not hard unavailability
+//   - stale — freshness alone is not a typed unavailable observation
+func isUnavailableRetryReason(reason string) bool {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "exhausted", "rate_limited", "unavailable",
+		"model_unavailable", "capacity_refused", "permission":
+		return true
+	default:
+		return false
 	}
 }
 

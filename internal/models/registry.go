@@ -177,12 +177,13 @@ var staticRegistry = Registry{
 					},
 				},
 				{
+					// Live `agy models` currently exposes only GPT-OSS 120B (Medium).
+					// Do not invent low/high support in the static catalog — routing
+					// must fail closed or pick another model for those depths.
 					Name:         "GPT-OSS 120B",
 					DefaultDepth: "medium",
 					Depths: []Depth{
-						{Token: "low", Label: "low"},
 						{Token: "medium", Label: "medium"},
-						{Token: "high", Label: "high"},
 					},
 				},
 			},

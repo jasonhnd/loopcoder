@@ -120,3 +120,58 @@ func contains(s, sub string) bool {
 			return false
 		})()))
 }
+
+func TestValidateCanaryRejectsEligibleNotChosenUnavailableRetry(t *testing.T) {
+	now := time.Date(2026, 7, 22, 21, 0, 0, 0, time.UTC)
+	digest := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	sha := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	rem := 0.9
+	after := 0.85
+	base := func(reason string) artifactqual.CanaryEvidence {
+		return artifactqual.CanaryEvidence{
+			Schema: artifactqual.SchemaCanaryEvidence, ArchiveDigest: digest, PreProdSHA: sha,
+			BinaryVersion: "0.9.0-rc.9", BinaryCommit: sha, ProjectID: "disp-test123", RunID: "run_test1",
+			ProducedAt: now,
+			ProviderObservations: []artifactqual.CanaryProviderObs{
+				{Provider: "codex", Source: "codexbar", Freshness: "fresh", Remaining: &rem, CapturedAt: now},
+				{Provider: "antigravity", Source: "codexbar", Freshness: "fresh", Remaining: &rem, CapturedAt: now},
+			},
+			Children: []artifactqual.CanaryChild{
+				child("wi_research", "att-r-1", "codex", "gpt-5.5", "low", "succeeded", 0.96, 0.05, after),
+				child("wi_implement", "att-i-1", "antigravity", "GPT-OSS", "medium", "succeeded", 0.9, 0.05, after),
+				child("wi_tests", "att-t-1", "antigravity", "GPT-OSS", "medium", "succeeded", 0.9, 0.05, after),
+				child("wi_verify", "att-v-1", "codex", "gpt-5.5", "high", "succeeded", 0.96, 0.05, after),
+			},
+			UnavailableRetry: &artifactqual.CanaryUnavailableRetry{
+				ExcludedProvider: "grok", ExcludedReason: reason,
+				NoDuplicateClaim: true, NoDuplicateFiles: true, NoDoubleCapacity: true,
+				EvidenceRef: "events:fake",
+			},
+			Restart: &artifactqual.CanaryRestart{
+				Interrupted: true, ResumedFromDurable: true, ExactlyOnce: true,
+				ChildCountUseful: 4, ProcessCeilingOK: true, WorktreeCeilingOK: true,
+				NoLeakedProcesses: true, NoRepoLocalRuntime: true,
+				EvidenceRef: "/tmp/run/workflow-events.jsonl#sha256:deadbeef",
+			},
+			PR: &artifactqual.CanaryPR{
+				URL: "https://github.com/jasonhnd/loopcoder/pull/9999", Number: 9999,
+				RequiredChecks: []string{"verify", "test"}, RequiredChecksGreen: true,
+				IndependentVerifier: "loopreview", VerifierEvidenceRef: "sha256:verifdeadbeef",
+				CreatedByLoopCoder: true,
+			},
+		}
+	}
+	for _, reason := range []string{"eligible_not_chosen", "not_chosen", "soft_excluded", "stale"} {
+		v := artifactqual.ValidateCanaryEvidence(base(reason), digest, sha, now)
+		if v.UnavailableRetryOK {
+			t.Fatalf("reason %q must not satisfy unavailable_retry", reason)
+		}
+		joined := ""
+		for _, r := range v.Reasons {
+			joined += r + ";"
+		}
+		if !contains(joined, "unavailable_retry_reason_not_unavailable") && !contains(joined, "unavailable_retry") {
+			t.Fatalf("reason %q: want unavailable rejection, got %v", reason, v.Reasons)
+		}
+	}
+}

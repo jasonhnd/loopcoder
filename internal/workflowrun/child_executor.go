@@ -302,6 +302,14 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	}
 
 	res, rerr := runner.Run(runCtx, inv)
+	// Typed model_unavailable is fail-closed here: do NOT silently change
+	// required depth or re-run on the same claim (that would fake a route
+	// success and duplicate capacity/files semantics). Scheduler/goalrun must
+	// pick another HardEligible same-depth candidate with a generation-safe
+	// retry attempt when that path is wired; until then surface the class.
+	if isModelUnavailableResult(res, rerr) && res.FailureClass == "" {
+		res.FailureClass = "model_unavailable"
+	}
 	// Always materialize evidence files (even on failure) for audit.
 	_, digest, files, _ := writeChildEvidence(wt, in, "provider_run", now().UTC())
 	// Requested route identity is authoritative (never swap provider←model).
@@ -309,7 +317,7 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	actualDepth := firstNonEmpty(res.Effort, depth)
 	if rerr != nil {
 		term := workgraph.TermFailed
-		fc := "process_failure"
+		fc := firstNonEmpty(res.FailureClass, "process_failure")
 		if errors.Is(rerr, context.Canceled) {
 			term = workgraph.TermCancelled
 			fc = "cancelled"
@@ -772,4 +780,17 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+func isModelUnavailableResult(res agent.Result, err error) bool {
+	if strings.EqualFold(strings.TrimSpace(res.FailureClass), "model_unavailable") {
+		return true
+	}
+	blob := strings.ToLower(res.Summary)
+	if err != nil {
+		blob += " " + strings.ToLower(err.Error())
+	}
+	return strings.Contains(blob, "invalid model selection") ||
+		strings.Contains(blob, "model_unavailable") ||
+		strings.Contains(blob, "not recognized as a known model")
 }
