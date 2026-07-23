@@ -347,11 +347,8 @@ func discoverProductFiles(childWT string) ([]string, error) {
 			if len(line) < 3 {
 				continue
 			}
-			path := line[2:]
-			if strings.HasPrefix(path, " ") {
-				path = path[1:]
-			}
-			path = strings.TrimSpace(path)
+			// XY is two status bytes; path may be " path" or "path".
+			path := strings.TrimSpace(strings.TrimPrefix(line[2:], " "))
 			if i := strings.Index(path, " -> "); i >= 0 {
 				path = strings.TrimSpace(path[i+4:])
 			}
