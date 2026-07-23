@@ -1247,3 +1247,22 @@ func hasArg(arg string) bool {
 func fixedInventoryNow() time.Time {
 	return time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
 }
+
+func TestParseGrokTextModelsSkipsLoginBanner(t *testing.T) {
+	output := "You are logged in with grok.com.\n\nDefault model: grok-4.5\n\nAvailable models:\n  * grok-4.5 (default)\n  * grok-code-fast-1\n"
+	entries := parseGrokTextModels(output)
+	ids := make([]string, 0, len(entries))
+	for _, e := range entries {
+		ids = append(ids, e.ModelID)
+	}
+	for _, bad := range []string{"You", "Default", "Available"} {
+		for _, id := range ids {
+			if id == bad {
+				t.Fatalf("parsed banner word as model id %q from %#v", bad, ids)
+			}
+		}
+	}
+	if len(ids) < 1 || ids[0] != "grok-4.5" {
+		t.Fatalf("ids = %#v, want grok-4.5 first", ids)
+	}
+}

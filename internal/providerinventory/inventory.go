@@ -2475,7 +2475,14 @@ func parseGrokTextModels(output string) []grokModelEntry {
 			continue
 		}
 		lower := strings.ToLower(line)
-		if strings.Contains(lower, "available models") || strings.HasPrefix(lower, "model ") || strings.HasPrefix(lower, "alias ") || strings.Contains(lower, "not authenticated") || networkFailureText(lower) {
+		if strings.Contains(lower, "available models") ||
+			strings.HasPrefix(lower, "model ") ||
+			strings.HasPrefix(lower, "alias ") ||
+			strings.HasPrefix(lower, "default model") ||
+			strings.HasPrefix(lower, "you are ") ||
+			strings.Contains(lower, "logged in") ||
+			strings.Contains(lower, "not authenticated") ||
+			networkFailureText(lower) {
 			continue
 		}
 		entry := grokModelEntry{}
@@ -2656,9 +2663,15 @@ func looksLikeModelID(value string) bool {
 		return false
 	}
 	switch lower {
-	case "default", "name", "description", "provider", "custom", "models":
+	case "default", "name", "description", "provider", "custom", "models", "you", "available":
 		return false
 	default:
+		// Reject bare English words from human-readable `grok models` banners
+		// (e.g. "You are logged in…"). Real model ids include a digit, hyphen,
+		// slash, or dot (grok-4.5, gpt-5.5, vendor/model).
+		if !strings.ContainsAny(value, "0123456789-./_") {
+			return false
+		}
 		return true
 	}
 }
