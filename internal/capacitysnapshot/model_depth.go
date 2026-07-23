@@ -235,27 +235,6 @@ func slugifyModelName(name string) string {
 	return strings.Trim(b.String(), "-")
 }
 
-// formatAgyCLIModel builds the CLI-accepted --model token (Title-case depth).
-func formatAgyCLIModel(base, depth string) string {
-	base = strings.TrimSpace(base)
-	depth = depthpolicy.NormalizeDepth(depth)
-	if base == "" {
-		return ""
-	}
-	if depth == "" {
-		return base
-	}
-	return base + " (" + titleDepth(depth) + ")"
-}
-
-func titleDepth(depth string) string {
-	depth = depthpolicy.NormalizeDepth(depth)
-	if depth == "" {
-		return ""
-	}
-	return strings.ToUpper(depth[:1]) + depth[1:]
-}
-
 func uniqueDepths(in []string) []string {
 	seen := map[string]bool{}
 	var out []string

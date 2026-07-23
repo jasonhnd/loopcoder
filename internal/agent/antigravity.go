@@ -137,25 +137,6 @@ func splitAgySlugDepth(s string) (base, depth string, ok bool) {
 	return "", "", false
 }
 
-func humanizeAgyModelBase(slugBase string) string {
-	switch strings.ToLower(strings.TrimSpace(slugBase)) {
-	case "gpt-oss-120b":
-		return "GPT-OSS 120B"
-	case "gemini-3.1-pro":
-		return "Gemini 3.1 Pro"
-	case "gemini-3.5-flash":
-		return "Gemini 3.5 Flash"
-	case "gemini-3.6-flash":
-		return "Gemini 3.6 Flash"
-	case "claude-sonnet-4-6":
-		return "Claude Sonnet 4.6"
-	case "claude-opus-4-6-thinking", "claude-opus-4-6":
-		return "Claude Opus 4.6"
-	default:
-		return slugBase
-	}
-}
-
 func (AntigravityRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	selectedModel := AntigravitySelectedModel(inv.Model, inv.Effort)
 	selectedEffort := strings.TrimSpace(inv.Effort)
