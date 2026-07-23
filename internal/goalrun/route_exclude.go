@@ -113,6 +113,22 @@ type SoftExcludedCandidate struct {
 // hard-eligible soft-excluded candidates other than the winner. Never invents
 // excludes when the decision set is empty.
 func SoftExcludedEligibleExcludes(childID, winnerProvider string, cands []SoftExcludedCandidate) []RouteExclude {
+	return hardEligibleNonWinnerExcludes(childID, winnerProvider, cands, true)
+}
+
+// HardEligibleNonWinnerExcludes derives Claimed=false RouteExclude rows for
+// hard-eligible decision-set candidates other than the winner:
+//   - SoftExcluded → reason soft_excluded
+//   - otherwise → reason eligible_not_chosen (measured multi-provider exclusion
+//     without a work claim; never invents SoftExcluded=true)
+//
+// Used after a successful route so unavailable_retry has real exclude evidence
+// even when no provider is currently soft-excluded by quota.
+func HardEligibleNonWinnerExcludes(childID, winnerProvider string, cands []SoftExcludedCandidate) []RouteExclude {
+	return hardEligibleNonWinnerExcludes(childID, winnerProvider, cands, false)
+}
+
+func hardEligibleNonWinnerExcludes(childID, winnerProvider string, cands []SoftExcludedCandidate, softOnly bool) []RouteExclude {
 	childID = strings.TrimSpace(childID)
 	winnerProvider = strings.TrimSpace(winnerProvider)
 	if childID == "" || len(cands) == 0 {
@@ -122,7 +138,10 @@ func SoftExcludedEligibleExcludes(childID, winnerProvider string, cands []SoftEx
 	var out []RouteExclude
 	for _, cv := range cands {
 		p := strings.TrimSpace(cv.Provider)
-		if p == "" || !cv.HardEligible || !cv.SoftExcluded {
+		if p == "" || !cv.HardEligible {
+			continue
+		}
+		if softOnly && !cv.SoftExcluded {
 			continue
 		}
 		if winnerProvider != "" && strings.EqualFold(p, winnerProvider) {
@@ -133,7 +152,12 @@ func SoftExcludedEligibleExcludes(childID, winnerProvider string, cands []SoftEx
 			continue
 		}
 		seen[key] = true
-		msg := "hard-eligible soft-excluded candidate"
+		reason := "eligible_not_chosen"
+		msg := "hard-eligible non-winner candidate"
+		if cv.SoftExcluded {
+			reason = "soft_excluded"
+			msg = "hard-eligible soft-excluded candidate"
+		}
 		if strings.TrimSpace(cv.Model) != "" {
 			msg += " model=" + strings.TrimSpace(cv.Model)
 		}
@@ -141,8 +165,8 @@ func SoftExcludedEligibleExcludes(childID, winnerProvider string, cands []SoftEx
 			msg += "; winner=" + winnerProvider
 		}
 		out = append(out, RouteExclude{
-			ChildID: childID, Provider: p, Reason: "soft_excluded",
-			HardEligible: true, SoftExcluded: true, Claimed: false, Message: msg,
+			ChildID: childID, Provider: p, Reason: reason,
+			HardEligible: true, SoftExcluded: cv.SoftExcluded, Claimed: false, Message: msg,
 		})
 	}
 	return out

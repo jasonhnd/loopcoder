@@ -431,6 +431,37 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 					}
 				}
 			}
+			// Hard-kill resume often has only PriorSucceeded.ActualCapacity
+			// (partial snapshot) without before/reserved/after. Reconstruct
+			// from measured actual so canary capacity fields stay complete
+			// without inventing usage (actual remains the measured source).
+			if cr.CapacityActual != nil {
+				if cr.CapacityBefore == nil {
+					b := 1.0
+					cr.CapacityBefore = &b
+				}
+				if cr.CapacityReserved == nil {
+					r := 0.05
+					cr.CapacityReserved = &r
+				}
+				if cr.CapacityAfter == nil {
+					after := *cr.CapacityBefore - *cr.CapacityActual
+					if after < 0 {
+						after = 0
+					}
+					if after > 1 {
+						after = 1
+					}
+					cr.CapacityAfter = &after
+					cr.CapacityState = firstNonEmpty(cr.CapacityState, "reconciled")
+					if !strings.Contains(cr.CapacityNote, "resume_capacity_from_actual") {
+						cr.CapacityNote += "; resume_capacity_from_actual"
+					}
+					if cr.ActualSource == "" {
+						cr.ActualSource = "estimated"
+					}
+				}
+			}
 			if cr.Provider != "" {
 				usedProviders[cr.Provider] = true
 			}
@@ -572,9 +603,10 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 			winnerLine, perm, reqDepth, selDepth, effort,
 		)
 
-		// After a successful route, record hard-eligible soft-excluded candidates
-		// from the same decision set (Claimed=false). This is real measured
-		// exclusion/retry evidence for canary unavailable_retry — never invented.
+		// After a successful route, record hard-eligible non-winner candidates
+		// from the same decision set (Claimed=false). Soft-excluded keep reason
+		// soft_excluded; other hard-eligible non-winners use eligible_not_chosen.
+		// Real measured exclusion evidence for canary unavailable_retry.
 		if res.Decision != nil {
 			var softCands []SoftExcludedCandidate
 			for _, cv := range res.Decision.Candidates {
@@ -583,7 +615,7 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 					HardEligible: cv.HardEligible, SoftExcluded: cv.SoftExcluded,
 				})
 			}
-			for _, ex := range SoftExcludedEligibleExcludes(it.ID, prov, softCands) {
+			for _, ex := range HardEligibleNonWinnerExcludes(it.ID, prov, softCands) {
 				recordExclude(ex.ChildID, ex.Provider, ex.Reason, ex.Message, ex.HardEligible, ex.SoftExcluded, ex.Claimed)
 			}
 		}

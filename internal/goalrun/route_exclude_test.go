@@ -80,3 +80,33 @@ func TestSoftExcludedEligibleExcludesAfterSuccessfulRoute(t *testing.T) {
 		t.Fatal("must not invent")
 	}
 }
+
+func TestHardEligibleNonWinnerExcludesIncludesNotChosen(t *testing.T) {
+	// Both hard-eligible SoftExcluded=false; winner codex → antigravity eligible_not_chosen.
+	got := goalrun.HardEligibleNonWinnerExcludes("wi_research", "codex", []goalrun.SoftExcludedCandidate{
+		{Provider: "codex", Model: "gpt-5.5", HardEligible: true, SoftExcluded: false},
+		{Provider: "antigravity", Model: "GPT-OSS 120B", HardEligible: true, SoftExcluded: false},
+		{Provider: "grok", Model: "x", HardEligible: false, SoftExcluded: false},
+	})
+	if len(got) != 1 {
+		t.Fatalf("want 1 exclude, got %+v", got)
+	}
+	if got[0].Provider != "antigravity" || got[0].Reason != "eligible_not_chosen" || got[0].Claimed || got[0].SoftExcluded {
+		t.Fatalf("%+v", got[0])
+	}
+	if !got[0].HardEligible {
+		t.Fatalf("hard flag %+v", got[0])
+	}
+	ev := goalrun.BuildUnavailableRetryEvidence(got, "att-wi_tests-1")
+	if ev == nil || ev.ExcludedProvider != "antigravity" || ev.ExcludedReason != "eligible_not_chosen" {
+		t.Fatalf("unavail %+v", ev)
+	}
+	// SoftExcluded still preferred when present.
+	got2 := goalrun.HardEligibleNonWinnerExcludes("wi_x", "codex", []goalrun.SoftExcludedCandidate{
+		{Provider: "codex", HardEligible: true, SoftExcluded: false},
+		{Provider: "antigravity", HardEligible: true, SoftExcluded: true},
+	})
+	if len(got2) != 1 || got2[0].Reason != "soft_excluded" {
+		t.Fatalf("%+v", got2)
+	}
+}
