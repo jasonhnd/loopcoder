@@ -252,37 +252,56 @@ func TestGrokRunnerCapabilityNegotiationFailsClosed(t *testing.T) {
 			want: "does not support bounded headless execution",
 		},
 		{
-			name: "missing read-only enforcement",
+			name: "missing core headless flags",
 			probe: func(_ context.Context, argv []string, _ string, _ []string, _ time.Duration, _ int64) (grokProbeResult, error) {
 				if reflect.DeepEqual(argv, []string{"grok", "version"}) {
 					return grokProbeResult{Stdout: "grok 0.1.211\n"}, nil
 				}
-				return grokProbeResult{Stdout: "-p --cwd --output-format --no-auto-update --no-alt-screen"}, nil
+				// Current CLI help may omit --no-auto-update and sandbox profile
+				// names; still require -p/--cwd/--output-format/--sandbox/etc.
+				return grokProbeResult{Stdout: "-p --cwd --output-format --no-alt-screen"}, nil
 			},
 			want: "missing required flags",
 		},
 		{
-			name: "missing write enforcement",
+			name: "missing permission mode",
 			probe: func(_ context.Context, argv []string, _ string, _ []string, _ time.Duration, _ int64) (grokProbeResult, error) {
 				if reflect.DeepEqual(argv, []string{"grok", "version"}) {
 					return grokProbeResult{Stdout: "grok 0.1.211\n"}, nil
 				}
-				return grokProbeResult{Stdout: "-p --cwd --output-format --no-auto-update --no-alt-screen --sandbox --allow --deny --permission-mode dontAsk workspace"}, nil
+				return grokProbeResult{Stdout: "-p --cwd --output-format --no-alt-screen --sandbox --allow --deny"}, nil
 			},
 			want: "missing required flags",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			readOnly := tt.name != "missing write enforcement"
 			_, err := (GrokRunner{probe: tt.probe}).Run(context.Background(), Invocation{
 				WorktreePath: t.TempDir(),
 				Prompt:       "inspect",
-				ReadOnly:     readOnly,
+				ReadOnly:     true,
 				LogPath:      filepath.Join(t.TempDir(), "grok.log"),
 			})
 			assertGrokError(t, err, GrokErrUnsupportedCapability, tt.want)
 		})
+	}
+}
+
+func TestGrokCapabilityAcceptsHelpWithoutNoAutoUpdateOrProfileNames(t *testing.T) {
+	// Grok Build CLI v0.2.111 advertises --sandbox but not always profile names
+	// or --no-auto-update in --help; negotiation must still succeed.
+	probe := func(_ context.Context, argv []string, _ string, _ []string, _ time.Duration, _ int64) (grokProbeResult, error) {
+		if reflect.DeepEqual(argv, []string{"grok", "version"}) {
+			return grokProbeResult{Stdout: "grok 0.2.111 (94172f2aa4e5) [stable]\n"}, nil
+		}
+		return grokProbeResult{Stdout: "-p --single --cwd --output-format plain json streaming-json --no-alt-screen --sandbox --permission-mode dontAsk --allow --deny"}, nil
+	}
+	cap, err := (GrokRunner{probe: probe}).negotiateCapability(context.Background(), Invocation{ReadOnly: false}, nil)
+	if err != nil {
+		t.Fatalf("negotiateCapability: %v", err)
+	}
+	if !strings.Contains(cap.Version, "0.2.111") {
+		t.Fatalf("version = %q", cap.Version)
 	}
 }
 

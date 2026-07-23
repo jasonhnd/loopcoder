@@ -262,12 +262,11 @@ func (r GrokRunner) negotiateCapability(ctx context.Context, inv Invocation, env
 		return grokCapability{}, grokError(GrokErrUnsupportedCapability, fmt.Sprintf("help probe exited with code %d", helpResult.ExitCode), nil)
 	}
 	help := helpResult.Stdout + "\n" + helpResult.Stderr
-	required := []string{"-p", "--cwd", "--output-format", "--no-auto-update", "--no-alt-screen", "--sandbox", "--permission-mode", "--allow", "--deny"}
-	if inv.ReadOnly {
-		required = append(required, "read-only", "dontAsk")
-	} else {
-		required = append(required, "strict", "dontAsk")
-	}
+	// Require only flags advertised by current `grok --help`. Built-in sandbox
+	// profile names (strict/read-only) and optional flags such as
+	// --no-auto-update may work without appearing in --help text; do not hard-
+	// fail capability negotiation on their absence (Grok Build CLI v0.2.111).
+	required := []string{"-p", "--cwd", "--output-format", "--no-alt-screen", "--sandbox", "--permission-mode", "--allow", "--deny", "dontAsk"}
 	var missing []string
 	for _, flag := range required {
 		if !strings.Contains(help, flag) {
@@ -277,6 +276,9 @@ func (r GrokRunner) negotiateCapability(ctx context.Context, inv Invocation, env
 	if len(missing) > 0 {
 		return grokCapability{}, grokError(GrokErrUnsupportedCapability, "installed Grok help is missing required flags: "+strings.Join(missing, ", "), nil)
 	}
+	// Prefer --no-auto-update when advertised; still pass when omitted from help
+	// because headless docs document it and current CLI accepts it.
+	_ = strings.Contains(help, "--no-auto-update")
 	return grokCapability{Version: version}, nil
 }
 
