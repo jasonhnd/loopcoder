@@ -1010,8 +1010,10 @@ func remainingForProviderWindow(snap *capacitysnapshot.Snapshot, provider, accou
 				continue
 			}
 		}
+		// First pass: exact window_kind match. capacityledger maps unknown
+		// provider-defined kinds to five_hour — accept that alias.
 		for _, w := range a.Windows {
-			if windowKind != "" && !strings.EqualFold(string(w.Kind), windowKind) {
+			if windowKind != "" && !windowKindCompatible(windowKind, string(w.Kind)) {
 				continue
 			}
 			if f := capacitysnapshot.RemainingFraction(w); f != nil {
@@ -1019,8 +1021,6 @@ func remainingForProviderWindow(snap *capacitysnapshot.Snapshot, provider, accou
 				if src == "" {
 					src = "capacity_snapshot"
 				}
-				// Reset evidence: snapshot window reset_at in the past relative to capture
-				// is not sufficient alone; only tag when source explicitly mentions reset.
 				resetEv := ""
 				blob := strings.ToLower(src + " " + string(w.Freshness))
 				if strings.Contains(blob, "reset") {
@@ -1029,8 +1029,51 @@ func remainingForProviderWindow(snap *capacitysnapshot.Snapshot, provider, accou
 				return f, src, string(w.Freshness), resetEv, true
 			}
 		}
+		// Fallback: highest remaining on this account (multi-window providers).
+		var best *float64
+		var bestSrc, bestFr, bestReset string
+		for _, w := range a.Windows {
+			f := capacitysnapshot.RemainingFraction(w)
+			if f == nil {
+				continue
+			}
+			if best != nil && *f <= *best {
+				continue
+			}
+			rf := *f
+			best = &rf
+			bestSrc = strings.TrimSpace(w.Source)
+			if bestSrc == "" {
+				bestSrc = "capacity_snapshot"
+			}
+			bestFr = string(w.Freshness)
+			bestReset = ""
+			if strings.Contains(strings.ToLower(bestSrc+" "+bestFr), "reset") {
+				bestReset = bestSrc
+			}
+		}
+		if best != nil {
+			return best, bestSrc, bestFr, bestReset, true
+		}
 	}
 	return nil, "", "", "", false
+}
+
+// windowKindCompatible maps capacityledger normalization back to observation kinds.
+// ledger pickWindow maps provider-defined → five_hour; after-observation must accept it.
+func windowKindCompatible(want, have string) bool {
+	want = strings.ToLower(strings.TrimSpace(want))
+	have = strings.ToLower(strings.TrimSpace(have))
+	if want == "" || have == "" || want == have {
+		return true
+	}
+	if want == "five_hour" || want == "five-hour" {
+		return have == "provider-defined" || have == "five_hour" || have == "five-hour" || have == "primary_5h"
+	}
+	if want == "weekly" || want == "fixed-week" || want == "fixed_week" {
+		return have == "weekly" || have == "fixed-week" || have == "fixed_week" || have == "provider-defined"
+	}
+	return false
 }
 
 func collectUsage(children []ChildReport) (providers, models, depths []string) {
