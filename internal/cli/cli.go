@@ -214,8 +214,11 @@ func Commands() []Command {
 }
 
 // Run executes the CLI and returns a process exit code.
+// Real process entry setup (SIGINT/SIGTERM → CommandContext cancel) is shared
+// with RunWithBuildInfo via ensureProcessEntry — never skipped for published
+// binaries, and never installed from RunWithDeps test call sites.
 func Run(args []string, stdout, stderr io.Writer) int {
-	installShutdownOnSignal(stderr)
+	ensureProcessEntry(stderr)
 	return RunWithDeps(args, stdout, stderr, DefaultDeps())
 }
 
@@ -226,7 +229,12 @@ func normalizeCLINow(now func() time.Time) func() time.Time {
 	return DefaultDeps().Now
 }
 
+// RunWithBuildInfo is the production main entry (cmd/loopcoder/main.go). It must
+// share the same process entry setup as Run so release artifacts install the
+// durable interrupt signal handler; skipping it left SIGTERM at default
+// disposition (exit -15) with no ledger interrupt event.
 func RunWithBuildInfo(args []string, stdout, stderr io.Writer, build BuildInfo) int {
+	ensureProcessEntry(stderr)
 	deps := DefaultDeps()
 	deps.BuildInfo = build
 	return RunWithDeps(args, stdout, stderr, deps)
