@@ -516,12 +516,12 @@ func (h ProductionHost) CreatePR(ctx context.Context, head, base, title, body st
 	if base == "" {
 		base = "main"
 	}
-	cmd := exec.CommandContext(ctx, "gh", "pr", "create",
+	cmd := ghCommandContext(ctx, "pr", "create",
 		"--head", head, "--base", base, "--title", title, "--body", body)
 	cmd.Dir = h.RepoPath
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		msg := strings.TrimSpace(string(out))
+		msg := strings.TrimSpace(stripANSI(string(out)))
 		// Idempotent re-entry: adopt existing open PR for the same head branch
 		// so wait-pr-checks / FinalizePREvidence can still bind green checks.
 		if strings.Contains(msg, "already exists") {
@@ -535,7 +535,7 @@ func (h ProductionHost) CreatePR(ctx context.Context, head, base, title, body st
 		}
 		return "", fmt.Errorf("gh pr create: %w: %s", err, msg)
 	}
-	url := strings.TrimSpace(string(out))
+	url := strings.TrimSpace(stripANSI(string(out)))
 	if u := firstPullURL(url); u != "" {
 		return u, nil
 	}
@@ -558,37 +558,47 @@ func firstPullURL(s string) string {
 }
 
 func (h ProductionHost) viewPRURL(ctx context.Context, head string) (string, error) {
-	cmd := exec.CommandContext(ctx, "gh", "pr", "view", head, "--json", "url", "-q", ".url")
+	cmd := ghCommandContext(ctx, "pr", "view", head, "--json", "url", "-q", ".url")
 	cmd.Dir = h.RepoPath
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	return strings.TrimSpace(stripANSI(string(out))), nil
 }
 
 func (h ProductionHost) ListChecks(ctx context.Context, prNumber int) ([]string, bool, error) {
-	cmd := exec.CommandContext(ctx, "gh", "pr", "checks", strconv.Itoa(prNumber), "--json", "name,state,bucket")
+	cmd := ghCommandContext(ctx, "pr", "checks", strconv.Itoa(prNumber), "--json", "name,state,bucket")
 	cmd.Dir = h.RepoPath
 	out, err := cmd.CombinedOutput()
 	// gh exits non-zero for pending/fail; still parse JSON when present.
-	raw := strings.TrimSpace(string(out))
+	// Host shells often export CLICOLOR_FORCE/FORCE_COLOR; gh then paints ANSI
+	// into --json. Without strip, wait-pr-checks never observes green.
+	raw := strings.TrimSpace(stripANSI(string(out)))
 	if raw == "" {
 		if err != nil {
 			return nil, false, err
 		}
 		return nil, false, nil
 	}
+	names, allGreen, jerr := parsePRChecksJSON(raw)
+	if jerr != nil {
+		if err != nil {
+			return nil, false, err
+		}
+		return nil, false, jerr
+	}
+	return names, allGreen, nil
+}
+
+// parsePRChecksJSON maps gh pr checks --json name,state,bucket to names + allGreen.
+func parsePRChecksJSON(raw string) ([]string, bool, error) {
 	var rows []struct {
 		Name   string `json:"name"`
 		State  string `json:"state"`
 		Bucket string `json:"bucket"`
 	}
 	if jerr := json.Unmarshal([]byte(raw), &rows); jerr != nil {
-		// Non-JSON table form — treat as observation unavailable.
-		if err != nil {
-			return nil, false, err
-		}
 		return nil, false, jerr
 	}
 	names := make([]string, 0, len(rows))
@@ -600,7 +610,6 @@ func (h ProductionHost) ListChecks(ctx context.Context, prNumber int) ([]string,
 		names = append(names, r.Name)
 		st := strings.ToUpper(r.State + " " + r.Bucket)
 		if !strings.Contains(st, "SUCCESS") && !strings.Contains(st, "PASS") && !strings.Contains(st, "SKIP") {
-			// pending/fail → not green
 			if strings.Contains(st, "FAIL") || strings.Contains(st, "PENDING") || strings.Contains(st, "QUEUED") ||
 				strings.Contains(st, "IN_PROGRESS") || strings.Contains(st, "CANCEL") {
 				allGreen = false
@@ -613,6 +622,64 @@ func (h ProductionHost) ListChecks(ctx context.Context, prNumber int) ([]string,
 		allGreen = false
 	}
 	return names, allGreen, nil
+}
+
+// ghCommandContext runs gh with a color-safe environment so --json stays parseable.
+func ghCommandContext(ctx context.Context, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "gh", args...)
+	cmd.Env = ghColorSafeEnv(os.Environ())
+	return cmd
+}
+
+func ghColorSafeEnv(parent []string) []string {
+	out := make([]string, 0, len(parent)+4)
+	for _, e := range parent {
+		if strings.HasPrefix(e, "CLICOLOR_FORCE=") ||
+			strings.HasPrefix(e, "FORCE_COLOR=") ||
+			strings.HasPrefix(e, "COLORTERM=") ||
+			strings.HasPrefix(e, "NO_COLOR=") ||
+			strings.HasPrefix(e, "CLICOLOR=") ||
+			strings.HasPrefix(e, "TERM=") {
+			continue
+		}
+		out = append(out, e)
+	}
+	return append(out,
+		"NO_COLOR=1",
+		"CLICOLOR=0",
+		"TERM=dumb",
+		"GH_PAGER=cat",
+	)
+}
+
+// stripANSI removes ECMA-48 CSI/SGR sequences (colorized gh --json).
+func stripANSI(s string) string {
+	if !strings.ContainsRune(s, '\x1b') {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\x1b' {
+			b.WriteByte(s[i])
+			continue
+		}
+		if i+1 < len(s) && s[i+1] == '[' {
+			i += 2
+			for i < len(s) {
+				c := s[i]
+				if c >= 0x40 && c <= 0x7e {
+					break
+				}
+				i++
+			}
+			continue
+		}
+		if i+1 < len(s) {
+			i++
+		}
+	}
+	return b.String()
 }
 
 var prNumRe = regexp.MustCompile(`/pull/(\d+)`)
