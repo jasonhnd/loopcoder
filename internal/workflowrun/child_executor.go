@@ -370,6 +370,11 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 			return out, fmt.Errorf("workflowrun: %s", msg)
 		}
 	}
+	// Discover real provider product writes (not only evidence stubs). Accept
+	// and integrate must see notes.go / *_test.go changes, not just child-output.
+	if discovered, derr := discoverProductFiles(wt); derr == nil && len(discovered) > 0 {
+		files = mergeUniquePaths(files, discovered)
+	}
 	out := ChildExecResult{
 		Terminal: workgraph.TermSucceeded, OutputEvidence: digest, WorktreePath: wt,
 		ExitCode: 0, Message: firstNonEmpty(res.Summary, "provider_ok"),
@@ -377,6 +382,20 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	}
 	out = attachUsage(out, res)
 	return out, nil
+}
+
+func mergeUniquePaths(base, extra []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(base)+len(extra))
+	for _, p := range append(append([]string{}, base...), extra...) {
+		p = filepath.ToSlash(filepath.Clean(p))
+		if p == "" || p == "." || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	return out
 }
 
 // detectWorktreeEscapes finds product files created under the durable project root

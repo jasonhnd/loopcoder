@@ -521,20 +521,50 @@ func (h ProductionHost) CreatePR(ctx context.Context, head, base, title, body st
 	cmd.Dir = h.RepoPath
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("gh pr create: %w: %s", err, strings.TrimSpace(string(out)))
+		msg := strings.TrimSpace(string(out))
+		// Idempotent re-entry: adopt existing open PR for the same head branch
+		// so wait-pr-checks / FinalizePREvidence can still bind green checks.
+		if strings.Contains(msg, "already exists") {
+			if url := firstPullURL(msg); url != "" {
+				return url, nil
+			}
+			// Resolve via gh pr view --head when create stderr lacks URL.
+			if u, verr := h.viewPRURL(ctx, head); verr == nil && u != "" {
+				return u, nil
+			}
+		}
+		return "", fmt.Errorf("gh pr create: %w: %s", err, msg)
 	}
 	url := strings.TrimSpace(string(out))
-	// gh may print extra lines; take last URL-looking line.
-	for _, line := range strings.Split(url, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.Contains(line, "/pull/") {
-			return line, nil
-		}
+	if u := firstPullURL(url); u != "" {
+		return u, nil
 	}
 	if url == "" {
 		return "", fmt.Errorf("gh pr create: empty url")
 	}
 	return url, nil
+}
+
+func firstPullURL(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "/pull/") {
+			// strip trailing punctuation / quotes
+			line = strings.Trim(line, "\"'` ")
+			return line
+		}
+	}
+	return ""
+}
+
+func (h ProductionHost) viewPRURL(ctx context.Context, head string) (string, error) {
+	cmd := exec.CommandContext(ctx, "gh", "pr", "view", head, "--json", "url", "-q", ".url")
+	cmd.Dir = h.RepoPath
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 func (h ProductionHost) ListChecks(ctx context.Context, prNumber int) ([]string, bool, error) {
