@@ -593,21 +593,22 @@ type Options struct {
 }
 
 type Deps struct {
-	Getenv       func(string) string
-	LookupEnv    func(string) (string, bool)
-	UserHomeDir  func() (string, error)
-	Lstat        func(string) (os.FileInfo, error)
-	Abs          func(string) (string, error)
-	EvalSymlinks func(string) (string, error)
-	RunProbe     func(context.Context, ProbeExecution) (ProbeExecutionResult, error)
-	RunCodexRPC  func(context.Context, CodexAppServerRequest) (CodexAppServerResult, error)
-	RunClaudePTY func(context.Context, ClaudePTYRequest) (ClaudePTYResult, error)
-	RunGrokACP   func(context.Context, GrokACPBillingRequest) (GrokACPBillingResult, error)
-	RunCodexBar  func(context.Context, CodexBarRequest) (CodexBarResult, error)
-	MkdirTemp    func(string, string) (string, error)
-	RemoveAll    func(string) error
-	WriteFile    func(string, []byte, os.FileMode) error
-	RandomID     func() string
+	Getenv         func(string) string
+	LookupEnv      func(string) (string, bool)
+	UserHomeDir    func() (string, error)
+	Lstat          func(string) (os.FileInfo, error)
+	Abs            func(string) (string, error)
+	EvalSymlinks   func(string) (string, error)
+	RunProbe       func(context.Context, ProbeExecution) (ProbeExecutionResult, error)
+	RunCodexRPC    func(context.Context, CodexAppServerRequest) (CodexAppServerResult, error)
+	RunClaudePTY   func(context.Context, ClaudePTYRequest) (ClaudePTYResult, error)
+	RunGrokACP     func(context.Context, GrokACPBillingRequest) (GrokACPBillingResult, error)
+	RunGrokCredits func(context.Context, GrokCreditsBillingRequest) (GrokCreditsBillingResult, error)
+	RunCodexBar    func(context.Context, CodexBarRequest) (CodexBarResult, error)
+	MkdirTemp      func(string, string) (string, error)
+	RemoveAll      func(string) error
+	WriteFile      func(string, []byte, os.FileMode) error
+	RandomID       func() string
 }
 
 type ProbeExecution struct {
@@ -639,21 +640,22 @@ type cachedProbeResult struct {
 
 func DefaultDeps() Deps {
 	return Deps{
-		Getenv:       os.Getenv,
-		LookupEnv:    os.LookupEnv,
-		UserHomeDir:  os.UserHomeDir,
-		Lstat:        os.Lstat,
-		Abs:          filepath.Abs,
-		EvalSymlinks: filepath.EvalSymlinks,
-		RunProbe:     runProbeCommand,
-		RunCodexRPC:  runCodexAppServer,
-		RunClaudePTY: runClaudeUsagePTY,
-		RunGrokACP:   runGrokACPBilling,
-		RunCodexBar:  runCodexBarQuota,
-		MkdirTemp:    os.MkdirTemp,
-		RemoveAll:    os.RemoveAll,
-		WriteFile:    os.WriteFile,
-		RandomID:     randomProbeID,
+		Getenv:         os.Getenv,
+		LookupEnv:      os.LookupEnv,
+		UserHomeDir:    os.UserHomeDir,
+		Lstat:          os.Lstat,
+		Abs:            filepath.Abs,
+		EvalSymlinks:   filepath.EvalSymlinks,
+		RunProbe:       runProbeCommand,
+		RunCodexRPC:    runCodexAppServer,
+		RunClaudePTY:   runClaudeUsagePTY,
+		RunGrokACP:     runGrokACPBilling,
+		RunGrokCredits: runGrokCreditsBilling,
+		RunCodexBar:    runCodexBarQuota,
+		MkdirTemp:      os.MkdirTemp,
+		RemoveAll:      os.RemoveAll,
+		WriteFile:      os.WriteFile,
+		RandomID:       randomProbeID,
 	}
 }
 
@@ -3922,6 +3924,9 @@ func normalizeDeps(deps Deps) Deps {
 	}
 	if deps.RunGrokACP == nil {
 		deps.RunGrokACP = defaults.RunGrokACP
+	}
+	if deps.RunGrokCredits == nil {
+		deps.RunGrokCredits = defaults.RunGrokCredits
 	}
 	if deps.RunCodexBar == nil {
 		deps.RunCodexBar = defaults.RunCodexBar

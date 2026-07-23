@@ -410,9 +410,9 @@ func buildCatalogSnapshot(adapter AdapterDeclaration, providerInstallationID *st
 func catalogEntryFromModel(adapterID string, model models.Model) CatalogInputEntry {
 	provider, providerOK := runtimecap.LookupProvider(adapterID)
 	entry := CatalogInputEntry{
-		CanonicalModelID:    model.Name,
-		DisplayName:         model.Name,
-		LifecycleState:      LifecycleAvailable,
+		CanonicalModelID: model.Name,
+		DisplayName:      model.Name,
+		LifecycleState:   LifecycleAvailable,
 		// Adapter-declared static registry models are product-available for routing.
 		// Account restriction and auth readiness remain separate gates.
 		AvailabilityState:   AvailabilityAvailable,
