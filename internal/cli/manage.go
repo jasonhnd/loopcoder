@@ -47,7 +47,12 @@ func CommandContext() context.Context {
 // workflow can flush interrupt ledger + partial. Second signal exits immediately.
 // It only ever touches processes THIS loopcoder spawned (via the in-process
 // kill-group registry) — never a process by bare name (spec 0390, Decision 11).
+//
+// Shell background jobs (&) often inherit SIGINT/SIGTERM as SIG_IGN. Call
+// signal.Reset before Notify so disposition returns to default and Notify can
+// deliver external kill -INT/-TERM into this handler (durable interrupt ledger).
 func installShutdownOnSignal(stderr io.Writer) {
+	signal.Reset(os.Interrupt, syscall.SIGTERM)
 	ch := make(chan os.Signal, 2)
 	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
 	go func() {

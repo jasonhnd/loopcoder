@@ -462,6 +462,8 @@ func (ProductionGit) RevParse(ctx context.Context, repo, rev string) (string, er
 
 func (ProductionGit) CheckoutNewBranch(ctx context.Context, repo, branch, startPoint string) error {
 	// If branch exists, check it out; else create from startPoint.
+	// Integrate path is responsible for releasing temp worktrees so the goal
+	// branch is free; do not paper over leaks with silent prune here.
 	if _, err := runGit(ctx, repo, "rev-parse", "--verify", branch); err == nil {
 		_, err := runGit(ctx, repo, "checkout", branch)
 		return err

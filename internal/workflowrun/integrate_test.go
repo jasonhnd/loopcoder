@@ -242,3 +242,71 @@ func TestEmptyProductFailsIntegrate(t *testing.T) {
 		t.Fatal("meta-only must not integrate")
 	}
 }
+
+// TestIntegrateReleasesTempWorktreeForPRCheckout is the RC.31 regression:
+// after product integrate, the main disposable repo must be able to check out
+// the goal branch for automatic PR open without "already used by worktree".
+func TestIntegrateReleasesTempWorktreeForPRCheckout(t *testing.T) {
+	repo := initGitRepo(t)
+	goal := "loopcoder/goal-pr-free"
+	integ := workflowrun.GitBranchIntegrator{Now: func() time.Time { return t0() }}
+	if _, err := integ.EnsureGoalBranch(context.Background(), repo, "main", goal); err != nil {
+		t.Fatal(err)
+	}
+	child := t.TempDir()
+	runChild := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = child
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s", err, out)
+		}
+	}
+	runChild("git", "init")
+	_ = os.MkdirAll(filepath.Join(child, "notes"), 0o700)
+	_ = os.WriteFile(filepath.Join(child, "notes/notes.go"), []byte("package notes\n"), 0o600)
+	runChild("git", "add", "notes/notes.go")
+
+	if _, err := integ.IntegrateChild(context.Background(), workflowrun.IntegrateRequest{
+		RepoPath: repo, GoalBranch: goal,
+		WorkItemID: "wi_implement", AttemptID: "att-impl-1", ChildWorktree: child,
+		ProductFiles: []string{"notes/notes.go"},
+	}); err != nil {
+		t.Fatalf("IntegrateChild: %v", err)
+	}
+
+	// No live worktree should still hold the goal branch (list may show main only).
+	list := exec.Command("git", "worktree", "list", "--porcelain")
+	list.Dir = repo
+	out, err := list.CombinedOutput()
+	if err != nil {
+		t.Fatalf("worktree list: %v %s", err, out)
+	}
+	if strings.Contains(string(out), "loopcoder-integrate-") {
+		t.Fatalf("stale integrate worktree still registered:\n%s", out)
+	}
+	if strings.Count(string(out), "worktree ") > 1 {
+		// Only the main repo worktree entry should remain (one "worktree " line).
+		// porcelain format: "worktree /path" per entry.
+		lines := 0
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.HasPrefix(line, "worktree ") {
+				lines++
+			}
+		}
+		if lines != 1 {
+			t.Fatalf("want exactly 1 worktree entry after release, got %d:\n%s", lines, out)
+		}
+	}
+
+	// Automatic PR open checks out the goal branch in the disposable repo itself.
+	co := exec.Command("git", "checkout", goal)
+	co.Dir = repo
+	if out, err := co.CombinedOutput(); err != nil {
+		t.Fatalf("PR checkout of goal branch must succeed after integrate: %v\n%s", err, out)
+	}
+}

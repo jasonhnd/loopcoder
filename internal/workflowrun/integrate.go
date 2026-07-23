@@ -131,11 +131,17 @@ func (g GitBranchIntegrator) IntegrateChild(ctx context.Context, req IntegrateRe
 	if err != nil {
 		return out, err
 	}
-	defer func() { _ = os.RemoveAll(tmpWT) }()
+	// Must git-worktree-remove (not only RemoveAll): deleting the directory
+	// leaves the goal branch registered to a missing worktree, so later PR
+	// checkout fails with "already used by worktree".
+	defer func() {
+		releaseIntegrateWorktree(req.RepoPath, tmpWT)
+	}()
 
 	// Prefer git worktree add for the goal branch.
 	if _, err := runGitRepo(ctx, req.RepoPath, "worktree", "add", "--force", tmpWT, req.GoalBranch); err != nil {
-		// Fallback: clone local + checkout branch.
+		// Fallback: clone local + checkout branch (not linked as a worktree).
+		// Still run releaseIntegrateWorktree in defer (remove --force is a no-op).
 		_ = os.RemoveAll(tmpWT)
 		if err := os.MkdirAll(tmpWT, 0o700); err != nil {
 			return out, err
@@ -367,6 +373,29 @@ func discoverProductFiles(childWT string) ([]string, error) {
 	// No walk fallback: listing the whole tree falsely treats base product files
 	// as child output. Prefer empty + acceptance failure over false green.
 	return nil, err
+}
+
+// releaseIntegrateWorktree deregisters a temporary integrate worktree from the
+// parent repo and removes its directory. RemoveAll alone leaves git still
+// believing the goal branch is checked out in the vanished path.
+//
+// Always attempts `git worktree remove --force <path>` even when the directory
+// is already gone, then prunes; failures are ignored so cleanup is best-effort
+// and never masks the integrate result.
+func releaseIntegrateWorktree(repoPath, tmpWT string) {
+	tmpWT = strings.TrimSpace(tmpWT)
+	repoPath = strings.TrimSpace(repoPath)
+	if tmpWT == "" {
+		return
+	}
+	if repoPath != "" {
+		// Force-remove registration even if the dir is missing or half-deleted.
+		_, _ = runGitRepo(context.Background(), repoPath, "worktree", "remove", "--force", tmpWT)
+	}
+	_ = os.RemoveAll(tmpWT)
+	if repoPath != "" {
+		_, _ = runGitRepo(context.Background(), repoPath, "worktree", "prune")
+	}
 }
 
 func filterProductFiles(files []string) []string {
