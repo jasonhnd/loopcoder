@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -155,4 +156,74 @@ func InterruptedFromEvents(events []Event) (interrupted bool, aborted map[string
 		}
 	}
 	return interrupted, aborted
+}
+
+// OpenLaunchesWithoutTerminal returns work items with a launch/pid and no
+// terminal/reuse/integrate. Used to derive forced-kill recovery interrupts
+// from the append-only ledger (never invent booleans without launch facts).
+func OpenLaunchesWithoutTerminal(events []Event) map[string]string {
+	launched := map[string]string{}
+	terminal := map[string]bool{}
+	for _, ev := range events {
+		switch ev.Kind {
+		case "launch", "pid":
+			if ev.WorkItemID != "" && ev.AttemptID != "" {
+				launched[ev.WorkItemID] = ev.AttemptID
+			}
+		case "terminal", "reuse", "integrate":
+			if ev.WorkItemID != "" {
+				terminal[ev.WorkItemID] = true
+			}
+		}
+	}
+	open := map[string]string{}
+	for id, att := range launched {
+		if !terminal[id] {
+			open[id] = att
+		}
+	}
+	return open
+}
+
+// RecoverOpenLaunchInterrupts appends interrupt events for launches that have
+// no terminal and no prior interrupt. This covers true process kill (parent
+// SIGKILL / hard exit) where the graceful cancel path never ran. Facts come
+// only from the existing ledger (open launch lines); nothing is invented when
+// the ledger already has interrupt or no open launches.
+// Returns the number of interrupt lines appended.
+func RecoverOpenLaunchInterrupts(elog *EventLog, projectID, runID string) (int, error) {
+	if elog == nil {
+		return 0, nil
+	}
+	events, err := elog.ReadAll()
+	if err != nil {
+		return 0, err
+	}
+	if interrupted, _ := InterruptedFromEvents(events); interrupted {
+		return 0, nil
+	}
+	open := OpenLaunchesWithoutTerminal(events)
+	if len(open) == 0 {
+		return 0, nil
+	}
+	n := 0
+	// Stable order for tests/determinism.
+	ids := make([]string, 0, len(open))
+	for id := range open {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		att := open[id]
+		if err := elog.Append(Event{
+			ProjectID: projectID, RunID: runID,
+			Kind: "interrupt", WorkItemID: id, AttemptID: att,
+			Terminal: "cancelled",
+			Message:  "forced process kill recovery; open launch without terminal in ledger",
+		}); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, nil
 }
