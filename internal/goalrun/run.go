@@ -284,6 +284,19 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 						attemptGen[id] = 1
 					}
 				}
+				// Failed/cancelled terminals: bump past the highest -gN so retry
+				// does not re-launch the same attempt_id (exactly_once / dupLaunch).
+				// Skip ids already in priorSucceeded (reuse path).
+				for id, next := range workflowrun.FailedRetryGenerations(events) {
+					if priorSucceeded != nil {
+						if _, ok := priorSucceeded[id]; ok {
+							continue
+						}
+					}
+					if cur, ok := attemptGen[id]; !ok || next > cur {
+						attemptGen[id] = next
+					}
+				}
 				if interrupted {
 					resumed = resumed || len(priorSucceeded) > 0 || len(aborted) > 0
 				}

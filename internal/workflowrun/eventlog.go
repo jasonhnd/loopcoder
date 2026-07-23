@@ -185,6 +185,63 @@ func OpenLaunchesWithoutTerminal(events []Event) map[string]string {
 	return open
 }
 
+// FailedRetryGenerations returns work-item → next attempt generation for
+// children whose latest terminal is non-succeeded (failed/cancelled/etc).
+// Resume retries must not re-launch the same attempt_id (exactly_once /
+// dupLaunch). Succeeded / reused children are omitted; callers that already
+// seed PriorSucceeded will skip re-exec entirely.
+// Generation is max seen -gN for that work item + 1.
+func FailedRetryGenerations(events []Event) map[string]int {
+	maxGen := map[string]int{}
+	// last non-empty terminal per work item (event order).
+	lastTerm := map[string]string{}
+	for _, ev := range events {
+		id := strings.TrimSpace(ev.WorkItemID)
+		if id == "" {
+			continue
+		}
+		if g := parseAttemptGeneration(ev.AttemptID); g >= 0 {
+			if g > maxGen[id] {
+				maxGen[id] = g
+			}
+		}
+		switch ev.Kind {
+		case "terminal":
+			if t := strings.TrimSpace(ev.Terminal); t != "" {
+				lastTerm[id] = t
+			}
+		case "reuse", "integrate":
+			// Durable success path — do not treat as failed retry.
+			lastTerm[id] = "succeeded"
+		}
+	}
+	out := map[string]int{}
+	for id, term := range lastTerm {
+		if strings.EqualFold(term, "succeeded") {
+			continue
+		}
+		out[id] = maxGen[id] + 1
+	}
+	return out
+}
+
+// parseAttemptGeneration extracts N from att-…-gN. Returns -1 when absent.
+func parseAttemptGeneration(attemptID string) int {
+	attemptID = strings.TrimSpace(attemptID)
+	idx := strings.LastIndex(attemptID, "-g")
+	if idx < 0 || idx+2 >= len(attemptID) {
+		return -1
+	}
+	n := 0
+	for _, r := range attemptID[idx+2:] {
+		if r < '0' || r > '9' {
+			return -1
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n
+}
+
 // RecoverOpenLaunchInterrupts appends interrupt events for launches that have
 // no terminal and no prior interrupt. This covers true process kill (parent
 // SIGKILL / hard exit) where the graceful cancel path never ran. Facts come
