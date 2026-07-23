@@ -299,6 +299,9 @@ func prepareGrokExecutionProfile(inv Invocation, environ []string) (grokExecutio
 	}
 	bounded := inv
 	bounded.WorktreePath = workspace.Identity
+	// Prefer explicit XAI_API_KEY; otherwise map official CLI login into the
+	// only documented credential passthrough so isolated HOME workers can auth.
+	environ = injectGrokCLIAuthAsAPIKey(environ)
 	return grokExecutionProfile{
 		Invocation: bounded,
 		Env:        grokBoundedEnv(environ, bounded, runtimeRoot),
