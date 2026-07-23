@@ -331,9 +331,11 @@ func (g GitBranchIntegrator) detectPathConflict(repo, workItemID, attemptID, int
 }
 
 func discoverProductFiles(childWT string) ([]string, error) {
-	// Prefer git status in child worktree.
+	// Only git-status changes count as product (added/modified/untracked).
+	// Full worktree walk would treat base notes.go as "product" and let
+	// implement accept without writing real source (RC.16 false green).
 	st, err := runGitRepo(context.Background(), childWT, "status", "--porcelain")
-	if err == nil && strings.TrimSpace(st) != "" {
+	if err == nil {
 		var files []string
 		for _, line := range strings.Split(st, "\n") {
 			line = strings.TrimSpace(line)
@@ -355,33 +357,9 @@ func discoverProductFiles(childWT string) ([]string, error) {
 		}
 		return files, nil
 	}
-	// Fallback: walk non-meta files newer than .loopcoder-owned-worktree
-	var files []string
-	_ = filepath.Walk(childWT, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info == nil {
-			return nil
-		}
-		rel, rerr := filepath.Rel(childWT, path)
-		if rerr != nil || rel == "." {
-			return nil
-		}
-		if info.IsDir() {
-			base := filepath.Base(path)
-			if base == ".git" || base == ".loopcoder" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if filepath.Base(path) == ".loopcoder-owned-worktree" {
-			return nil
-		}
-		if strings.HasPrefix(rel, ".loopcoder"+string(filepath.Separator)) {
-			return nil
-		}
-		files = append(files, rel)
-		return nil
-	})
-	return files, nil
+	// No walk fallback: listing the whole tree falsely treats base product files
+	// as child output. Prefer empty + acceptance failure over false green.
+	return nil, err
 }
 
 func filterProductFiles(files []string) []string {
