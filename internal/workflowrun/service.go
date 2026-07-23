@@ -185,6 +185,21 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 	elog, _ := OpenEventLog(s.HomeDir, projectID, runID)
 	if elog != nil {
 		out.EventLogPath = elog.Path()
+		// Recover interrupt facts for open launches left by hard process kill
+		// (parent exited before graceful cancel wrote interrupt). Ledger-derived only.
+		if n, rerr := RecoverOpenLaunchInterrupts(elog, projectID, runID); rerr == nil && n > 0 {
+			out.Interrupted = true
+			if events, rerr2 := elog.ReadAll(); rerr2 == nil {
+				_, aborted := InterruptedFromEvents(events)
+				if out.AbortedAttempts == nil {
+					out.AbortedAttempts = map[string]string{}
+				}
+				for id, att := range aborted {
+					out.AbortedAttempts[id] = att
+				}
+			}
+			emit(fmt.Sprintf("interrupt:recover_open_launches n=%d", n))
+		}
 		_ = elog.Append(Event{ProjectID: projectID, RunID: runID, Kind: "run.start", Message: "workflow execute"})
 	}
 	logEv := func(ev Event) {

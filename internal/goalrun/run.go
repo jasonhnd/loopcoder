@@ -241,6 +241,21 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 					resumed = true
 				}
 			}
+			// Ledger-derived forced-kill recovery: open launch without terminal →
+			// interrupt + generation bump (same as graceful cancel path).
+			if elog, eerr := workflowrun.OpenEventLog(req.HomeDir, projectID, runID); eerr == nil {
+				if n, rerr := workflowrun.RecoverOpenLaunchInterrupts(elog, projectID, runID); rerr == nil && n > 0 {
+					if events, rerr2 := elog.ReadAll(); rerr2 == nil {
+						_, aborted := workflowrun.InterruptedFromEvents(events)
+						for id := range aborted {
+							if _, ok := attemptGen[id]; !ok {
+								attemptGen[id] = 1
+							}
+						}
+					}
+					resumed = resumed || len(priorSucceeded) > 0
+				}
+			}
 
 			for id, g0 := range cp.AttemptGeneration {
 				if _, ok := attemptGen[id]; !ok {

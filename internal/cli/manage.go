@@ -19,18 +19,52 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
-// installShutdownOnSignal terminates this loopcoder instance's managed child
-// process groups on SIGINT/SIGTERM, so a Ctrl-C'd loopcoder never leaks a
-// running provider CLI. It only ever touches processes THIS loopcoder spawned
-// (via the in-process kill-group registry) — never a process by bare name
-// (spec 0390, Decision 11).
+// rootCmdCtx is cancelled on SIGINT/SIGTERM so long-running commands
+// (workflow goal) can write interrupt events + partial checkpoints before exit.
+// Hard os.Exit alone left the event ledger without interrupt, which blocks
+// exact-binary canary evidence (fail-closed: no hand-written interrupted=true).
+var (
+	rootCmdCtx    context.Context
+	rootCmdCancel context.CancelFunc
+)
+
+func init() {
+	rootCmdCtx, rootCmdCancel = context.WithCancel(context.Background())
+}
+
+// CommandContext returns the process root context cancelled on SIGINT/SIGTERM.
+// Commands that must record forced-interrupt evidence should use this instead
+// of context.Background().
+func CommandContext() context.Context {
+	if rootCmdCtx == nil {
+		return context.Background()
+	}
+	return rootCmdCtx
+}
+
+// installShutdownOnSignal cancels CommandContext, terminates this loopcoder
+// instance's managed child process groups, then exits after a short grace so
+// workflow can flush interrupt ledger + partial. Second signal exits immediately.
+// It only ever touches processes THIS loopcoder spawned (via the in-process
+// kill-group registry) — never a process by bare name (spec 0390, Decision 11).
 func installShutdownOnSignal(stderr io.Writer) {
-	ch := make(chan os.Signal, 1)
+	ch := make(chan os.Signal, 2)
 	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-ch
+		if rootCmdCancel != nil {
+			rootCmdCancel()
+		}
 		if n := supervisedexec.Shutdown(); n > 0 {
 			fmt.Fprintf(stderr, "\n[loopcoder] interrupted; terminated %d managed process group(s)\n", n)
+		} else {
+			fmt.Fprintf(stderr, "\n[loopcoder] interrupted; cancelling in-flight workflow\n")
+		}
+		// Grace: allow goalrun/workflowrun to observe cancel, append interrupt
+		// events, fsync partial, and return. Second signal or timeout force-exits.
+		select {
+		case <-ch:
+		case <-time.After(8 * time.Second):
 		}
 		os.Exit(130)
 	}()

@@ -93,7 +93,9 @@ func runWorkflowGoal(args []string, stdout, stderr io.Writer, deps Deps) int {
 			return inv, snap, ierr
 		}
 	}
-	res, err := goalrun.Execute(context.Background(), req)
+	// Use CommandContext so SIGTERM/SIGINT cancel propagates into workflowrun
+	// and forces interrupt events into the append-only ledger (true process kill).
+	res, err := goalrun.Execute(CommandContext(), req)
 	if err != nil && res.GraphID == "" {
 		fmt.Fprintf(stderr, "workflow goal: %v\n", err)
 		return 4
