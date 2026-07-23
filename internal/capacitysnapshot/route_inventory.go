@@ -45,6 +45,14 @@ func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 		hasFreshWindow := false
 		hasStaleWindow := false
 		hasAnyWindow := false
+		// Soft ranking receives a single window per provider. Multi-window
+		// companies (e.g. Antigravity primary_5h≈98% + secondary/3p≈11%) used
+		// to bind the first RemainingFraction in iteration order. When that was
+		// the scarce secondary window, Luna/Tera reserve floors soft-excluded
+		// the whole provider even though primary capacity was abundant — leaving
+		// only codex executable for multi-provider canaries.
+		// Prefer the highest remaining among fresh exact/estimated windows (and
+		// exact over estimated at a tie) for the soft-score binding window.
 		for _, w := range a.Windows {
 			hasAnyWindow = true
 			if w.Freshness == FreshnessStale || w.Freshness == FreshnessExpired {
@@ -54,22 +62,35 @@ func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 				continue
 			}
 			hasFreshWindow = true
-			if f := RemainingFraction(w); f != nil {
-				rem = f
-				switch w.Confidence {
-				case ConfidenceExact:
-					confSoft = quotapolicy.EvidenceExact
-				case ConfidenceEstimated:
-					confSoft = quotapolicy.EvidenceEstimated
+			f := RemainingFraction(w)
+			if f == nil {
+				continue
+			}
+			var ev quotapolicy.EvidenceClass
+			switch w.Confidence {
+			case ConfidenceExact:
+				ev = quotapolicy.EvidenceExact
+			case ConfidenceEstimated:
+				ev = quotapolicy.EvidenceEstimated
+			default:
+				// Unknown confidence is not a soft-binding observation.
+				continue
+			}
+			better := rem == nil || *f > *rem ||
+				(*f == *rem && confSoft != quotapolicy.EvidenceExact && ev == quotapolicy.EvidenceExact)
+			if !better {
+				continue
+			}
+			rf := *f
+			rem = &rf
+			confSoft = ev
+			ttr = nil
+			if w.ResetAt != nil {
+				d := w.ResetAt.Sub(now)
+				if d < 0 {
+					d = 0
 				}
-				if w.ResetAt != nil {
-					d := w.ResetAt.Sub(now)
-					if d < 0 {
-						d = 0
-					}
-					ttr = &d
-				}
-				break
+				ttr = &d
 			}
 		}
 		staleOnly := hasStaleWindow && !hasFreshWindow
