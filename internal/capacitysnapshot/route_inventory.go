@@ -102,6 +102,11 @@ func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 			if !m.PresentInCatalog || m.ModelID == "" {
 				continue
 			}
+			// Fail closed: static seed / adapter-declared / source-less hints
+			// stay in the snapshot for display only — never production auto-route.
+			if m.CatalogHintOnly {
+				continue
+			}
 			// Emit one candidate per supported depth so per-child required depth
 			// (route_requirement depth=low|medium|high) can filter and bind
 			// eligibility. Never invent depths the model does not support.

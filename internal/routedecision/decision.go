@@ -85,9 +85,14 @@ type Winner struct {
 }
 
 // CandidateView is one ordered candidate in the decision.
+// Effort and Permission are the observed eligibility fields for this row —
+// never synthesized from the request. Distinct depth/permission lanes must
+// not collapse into a single provider/model identity.
 type CandidateView struct {
 	Provider      string   `json:"provider"`
 	Model         string   `json:"model"`
+	Effort        string   `json:"effort,omitempty"`
+	Permission    string   `json:"permission,omitempty"`
 	HardEligible  bool     `json:"hard_eligible"`
 	SoftExcluded  bool     `json:"soft_excluded"`
 	SoftScore     float64  `json:"soft_score,omitempty"`
@@ -235,19 +240,29 @@ func Evaluate(req Request) (Decision, error) {
 	}
 
 	// Soft rank only hard-eligible candidates (filter SoftCandidates by hard set).
+	// Identity includes effort+permission so distinct depths never collapse.
 	eligibleKeys := map[string]eligibility.CandidateView{}
+	eligiblePM := map[string]bool{} // provider/model only — soft rank still keys on PM
 	for _, e := range hard.Eligible {
-		eligibleKeys[norm(e.Provider, e.Model)] = e
+		eligibleKeys[candIdentity(e.Provider, e.Model, e.Effort, e.Permission)] = e
+		eligiblePM[norm(e.Provider, e.Model)] = true
 	}
 	softIn := make([]quotapolicy.Candidate, 0, len(req.SoftCandidates))
 	for _, c := range req.SoftCandidates {
-		if _, ok := eligibleKeys[norm(c.Provider, c.Model)]; ok {
+		if eligiblePM[norm(c.Provider, c.Model)] {
 			softIn = append(softIn, c)
 		}
 	}
-	// If no soft candidates provided, synthesize neutral ones from hard eligible.
+	// If no soft candidates provided, synthesize neutral ones from hard eligible
+	// (one soft row per unique provider/model; depth lives on CandidateView).
 	if len(softIn) == 0 {
+		seenPM := map[string]bool{}
 		for _, e := range hard.Eligible {
+			k := norm(e.Provider, e.Model)
+			if seenPM[k] {
+				continue
+			}
+			seenPM[k] = true
 			softIn = append(softIn, quotapolicy.Candidate{
 				Provider: e.Provider, Model: e.Model,
 				Windows: []quotapolicy.Window{{
@@ -280,15 +295,15 @@ func Evaluate(req Request) (Decision, error) {
 	// Build candidate views ordered by mode ranking.
 	d.Candidates = candidateViewsFromHard(hard, &modeRank, eligibleKeys)
 
-	// Winner selection: first non-soft-excluded adjusted score.
+	// Winner selection: first non-soft-excluded adjusted score that has at least
+	// one hard-eligible identity for that provider/model.
 	var winner *Winner
 	for _, sc := range modeRank.Scores {
 		if sc.SoftExcluded {
 			d.SoftExcluded = append(d.SoftExcluded, norm(sc.Provider, sc.Model))
 			continue
 		}
-		// must also be hard eligible
-		if _, ok := eligibleKeys[norm(sc.Provider, sc.Model)]; !ok {
+		if !eligiblePM[norm(sc.Provider, sc.Model)] {
 			continue
 		}
 		winner = &Winner{
@@ -296,10 +311,14 @@ func Evaluate(req Request) (Decision, error) {
 			SoftScore: sc.AdjustedScore,
 			Reasons:   append([]string{"winner"}, sc.Reasons...),
 		}
-		// attach effort/permission from hard view if present
-		if hv, ok := eligibleKeys[norm(sc.Provider, sc.Model)]; ok {
-			winner.Effort = hv.Effort
-			winner.Permission = hv.Permission
+		// Attach observed effort/permission from a hard-eligible row for this PM
+		// (prefer first hard.Eligible match — already depth-filtered by caller).
+		for _, e := range hard.Eligible {
+			if strings.EqualFold(e.Provider, sc.Provider) && e.Model == sc.Model {
+				winner.Effort = e.Effort
+				winner.Permission = e.Permission
+				break
+			}
 		}
 		break
 	}
@@ -399,62 +418,66 @@ func ExplainJSON(d Decision) ([]byte, error) {
 }
 
 func candidateViewsFromHard(hard eligibility.Decision, mode *quotamode.ModeRanking, eligible map[string]eligibility.CandidateView) []CandidateView {
-	scoreIdx := map[string]quotamode.AdjustedScore{}
-	order := []string{}
+	scoreByPM := map[string]quotamode.AdjustedScore{}
 	if mode != nil {
 		for _, sc := range mode.Scores {
-			k := norm(sc.Provider, sc.Model)
-			scoreIdx[k] = sc
-			order = append(order, k)
+			scoreByPM[norm(sc.Provider, sc.Model)] = sc
 		}
 	}
-	// ensure all hard eligible appear
-	for k := range eligible {
-		if _, ok := scoreIdx[k]; !ok {
-			order = append(order, k)
-		}
-	}
-	// hard excluded
-	for _, ex := range hard.Excluded {
-		k := norm(ex.Provider, ex.Model)
-		if _, ok := scoreIdx[k]; !ok {
-			order = append(order, k)
-		}
-	}
-	// unique preserve
-	seen := map[string]struct{}{}
 	var views []CandidateView
-	for _, k := range order {
-		if _, ok := seen[k]; ok {
+	// One view per hard-eligible identity (provider+model+effort+permission).
+	seenID := map[string]struct{}{}
+	for _, e := range hard.Eligible {
+		id := candIdentity(e.Provider, e.Model, e.Effort, e.Permission)
+		if _, ok := seenID[id]; ok {
 			continue
 		}
-		seen[k] = struct{}{}
-		parts := strings.SplitN(k, "/", 2)
-		p, m := parts[0], ""
-		if len(parts) > 1 {
-			m = parts[1]
+		seenID[id] = struct{}{}
+		v := CandidateView{
+			Provider: e.Provider, Model: e.Model,
+			Effort: e.Effort, Permission: e.Permission,
+			HardEligible: true,
 		}
-		v := CandidateView{Provider: p, Model: m}
-		if _, ok := eligible[k]; ok {
-			v.HardEligible = true
-		}
-		if sc, ok := scoreIdx[k]; ok {
+		if sc, ok := scoreByPM[norm(e.Provider, e.Model)]; ok {
 			v.SoftExcluded = sc.SoftExcluded
 			v.SoftScore = sc.BaseSoftScore
 			v.AdjustedScore = sc.AdjustedScore
-			v.Reasons = sc.Reasons
-		} else if !v.HardEligible {
-			// hard excluded
-			for _, ex := range hard.Excluded {
-				if norm(ex.Provider, ex.Model) == k {
-					v.Reasons = ex.Reasons
-					break
-				}
+			v.Reasons = append([]string(nil), sc.Reasons...)
+		}
+		// Prefer eligibility map when provided (same identity).
+		if eligible != nil {
+			if hv, ok := eligible[id]; ok {
+				v.Effort = hv.Effort
+				v.Permission = hv.Permission
 			}
 		}
 		views = append(views, v)
 	}
-	// stable sort: hard eligible & not soft excluded first, then by adjusted score
+	// Hard excluded rows (no effort on Exclusion — provider/model only).
+	for _, ex := range hard.Excluded {
+		k := norm(ex.Provider, ex.Model)
+		hasEligiblePM := false
+		for _, v := range views {
+			if norm(v.Provider, v.Model) == k && v.HardEligible {
+				hasEligiblePM = true
+				break
+			}
+		}
+		if hasEligiblePM {
+			continue
+		}
+		id := "ex|" + k
+		if _, ok := seenID[id]; ok {
+			continue
+		}
+		seenID[id] = struct{}{}
+		views = append(views, CandidateView{
+			Provider: ex.Provider, Model: ex.Model,
+			HardEligible: false, Reasons: append([]string(nil), ex.Reasons...),
+		})
+	}
+	// stable sort: hard eligible & not soft excluded first, then by adjusted score,
+	// then by full identity (effort/permission) so depths never collapse.
 	sort.SliceStable(views, func(i, j int) bool {
 		iOK := views[i].HardEligible && !views[i].SoftExcluded
 		jOK := views[j].HardEligible && !views[j].SoftExcluded
@@ -467,13 +490,26 @@ func candidateViewsFromHard(hard eligibility.Decision, mode *quotamode.ModeRanki
 		if views[i].Provider != views[j].Provider {
 			return views[i].Provider < views[j].Provider
 		}
-		return views[i].Model < views[j].Model
+		if views[i].Model != views[j].Model {
+			return views[i].Model < views[j].Model
+		}
+		if views[i].Effort != views[j].Effort {
+			return views[i].Effort < views[j].Effort
+		}
+		return views[i].Permission < views[j].Permission
 	})
 	return views
 }
 
 func norm(provider, model string) string {
 	return strings.ToLower(strings.TrimSpace(provider)) + "/" + strings.TrimSpace(model)
+}
+
+// candIdentity is the durable decision-set identity including observed depth and permission.
+func candIdentity(provider, model, effort, permission string) string {
+	return strings.ToLower(strings.TrimSpace(provider)) + "/" + strings.TrimSpace(model) +
+		"|" + strings.ToLower(strings.TrimSpace(effort)) +
+		"|" + strings.ToLower(strings.TrimSpace(permission))
 }
 
 func digestDecision(d Decision) string {

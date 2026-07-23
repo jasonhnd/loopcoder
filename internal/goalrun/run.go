@@ -372,6 +372,8 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 	childRoutes := map[string]workflowrun.ChildRoute{}
 	// Track which children hold live reservations for post-execute reconcile.
 	holds := map[string]capacityHold{}
+	// Per-child decision-set candidates for model_unavailable same-depth alternate.
+	sameDepthAlts := map[string][]workflowrun.AlternateCandidate{}
 	var routeExcludes []RouteExclude
 	recordExclude := func(childID, provider, reason, msg string, hard, soft, claimed bool) {
 		if strings.TrimSpace(provider) == "" && strings.TrimSpace(reason) == "" {
@@ -541,7 +543,8 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		}
 		prov, model := res.Provider, res.Model
 		// Prefer alternate provider if already used and decision lists others.
-		// Candidates were already filtered to this permission+depth by autoroute.Resolve.
+		// Diversification must verify observed Effort/Permission match the
+		// requirement — never assume CandidateView lost depth/permission fields.
 		diversifiedFrom := ""
 		if usedProviders[prov] && res.Decision != nil {
 			for _, cv := range res.Decision.Candidates {
@@ -552,8 +555,14 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 				if isReadOnlyPerm(perm) && !providerSupportsReadOnly(cv.Provider) {
 					continue
 				}
-				// CandidateView has no Effort field; depth was already filtered by
-				// autoroute.Resolve for this child's reqDepth. Bind reqDepth below.
+				obsDepth := normalizeDepth(cv.Effort)
+				obsPerm := normalizePerm(cv.Permission)
+				if obsDepth == "" || obsDepth != reqDepth {
+					continue
+				}
+				if obsPerm == "" || obsPerm != normalizePerm(perm) {
+					continue
+				}
 				diversifiedFrom = prov
 				prov, model = cv.Provider, cv.Model
 				break
@@ -622,13 +631,38 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		// from the same decision set (Claimed=false). Soft-excluded keep reason
 		// soft_excluded; other hard-eligible non-winners use eligible_not_chosen.
 		// Real measured exclusion evidence for canary unavailable_retry.
+		// Stash same-depth alternates only when CandidateView carries observed
+		// Effort/Permission that exactly match the requirement — never synthesize.
 		if res.Decision != nil {
 			var softCands []SoftExcludedCandidate
+			var alts []workflowrun.AlternateCandidate
 			for _, cv := range res.Decision.Candidates {
 				softCands = append(softCands, SoftExcludedCandidate{
 					Provider: cv.Provider, Model: cv.Model,
 					HardEligible: cv.HardEligible, SoftExcluded: cv.SoftExcluded,
 				})
+				if !cv.HardEligible || cv.SoftExcluded {
+					continue
+				}
+				if strings.TrimSpace(cv.Provider) == "" || strings.TrimSpace(cv.Model) == "" {
+					continue
+				}
+				obsDepth := normalizeDepth(cv.Effort)
+				obsPerm := normalizePerm(cv.Permission)
+				if obsDepth == "" || obsDepth != reqDepth {
+					continue
+				}
+				if obsPerm == "" || obsPerm != normalizePerm(perm) {
+					continue
+				}
+				alts = append(alts, workflowrun.AlternateCandidate{
+					Provider: cv.Provider, Model: cv.Model,
+					Effort: obsDepth, Permission: obsPerm,
+					HardEligible: true, SoftExcluded: false,
+				})
+			}
+			if len(alts) > 0 {
+				sameDepthAlts[it.ID] = alts
 			}
 			for _, ex := range HardEligibleNonWinnerExcludes(it.ID, prov, softCands) {
 				recordExclude(ex.ChildID, ex.Provider, ex.Reason, ex.Message, ex.HardEligible, ex.SoftExcluded, ex.Claimed)
@@ -636,6 +670,8 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		}
 
 		if ledger != nil && snap != nil {
+			// Capacity attempt id starts as work-item id; model_unavailable alternate
+			// releases this hold and reserves under the workflow attempt id.
 			attemptID := it.ID
 			entry, rerr := ledger.Reserve(capacityledger.ReserveInput{
 				ProjectID: projectID, RunID: runID, AttemptID: attemptID,
@@ -756,19 +792,29 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 	if goalBranch == "" {
 		goalBranch = "loopcoder/goal-" + runID
 	}
+	// Capacity bridge: on model_unavailable alternate, release prior reservation
+	// and reserve the new attempt (distinct durable attempt id). Never double-hold.
+	var capHook workflowrun.CapacityRerouteHook
+	if ledger != nil && snap != nil {
+		capHook = &goalCapacityReroute{
+			ledger: ledger, snap: snap, projectID: projectID, runID: runID, holds: holds,
+		}
+	}
 	wres, werr := svc.Execute(ctx, workflowrun.Request{
-		ProjectID:         projectID,
-		RunID:             runID,
-		Definition:        def,
-		Actor:             actor,
-		Provider:          firstNonEmpty(wfProv, "auto"),
-		Model:             firstNonEmpty(wfModel, "auto"),
-		ChildRoutes:       childRoutes,
-		RepoPath:          req.RepoPath,
-		BaseRef:           firstNonEmpty(req.PRBaseRef, "main"),
-		GoalBranch:        goalBranch,
-		PriorSucceeded:    priorSucceeded,
-		AttemptGeneration: attemptGen,
+		ProjectID:           projectID,
+		RunID:               runID,
+		Definition:          def,
+		Actor:               actor,
+		Provider:            firstNonEmpty(wfProv, "auto"),
+		Model:               firstNonEmpty(wfModel, "auto"),
+		ChildRoutes:         childRoutes,
+		SameDepthAlternates: sameDepthAlts,
+		CapacityReroute:     capHook,
+		RepoPath:            req.RepoPath,
+		BaseRef:             firstNonEmpty(req.PRBaseRef, "main"),
+		GoalBranch:          goalBranch,
+		PriorSucceeded:      priorSucceeded,
+		AttemptGeneration:   attemptGen,
 	})
 	out := Result{
 		GraphID: g.GraphID, PlanDigest: g.PlanDigest, RunID: runID, ProjectID: projectID,
@@ -780,6 +826,8 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 	out.ReuseCount = wres.ReuseCount
 	out.WorktreePeak = wres.WorktreePeak
 	out.ProcessPeak = wres.ProcessPeak
+	// Durable model_unavailable → reroute event refs into route excludes.
+	_ = recordModelUnavailableExcludes(wres, recordExclude)
 	out.RouteExcludes = routeExcludes
 
 	// Reconcile capacity from real child outcomes — never fabricate actual.
@@ -1323,4 +1371,101 @@ func providerSupportsReadOnly(provider string) bool {
 	default:
 		return true
 	}
+}
+
+// goalCapacityReroute implements workflowrun.CapacityRerouteHook against the
+// capacity ledger. After the new attempt is claimed: reconcile known actual on
+// the prior reservation (or honest release when unknown), then reserve the
+// alternate under NewAttemptID. Never double-holds; never invents actual.
+type goalCapacityReroute struct {
+	ledger    *capacityledger.Ledger
+	snap      *capacitysnapshot.Snapshot
+	projectID string
+	runID     string
+	holds     map[string]capacityHold
+}
+
+func (g *goalCapacityReroute) OnModelUnavailableAlternate(in workflowrun.CapacityRerouteInput) (workflowrun.CapacityRerouteResult, error) {
+	var zero workflowrun.CapacityRerouteResult
+	if g == nil || g.ledger == nil || g.snap == nil {
+		return zero, fmt.Errorf("goalrun: capacity reroute requires ledger and snapshot")
+	}
+	// Prior hold: prefer map entry, fall back to PriorHoldAttempt / work-item id.
+	priorAttempt := strings.TrimSpace(in.PriorHoldAttempt)
+	if h, ok := g.holds[in.WorkItemID]; ok && strings.TrimSpace(h.attemptID) != "" {
+		priorAttempt = h.attemptID
+	}
+	if priorAttempt == "" {
+		priorAttempt = in.WorkItemID
+	}
+	priorState := ""
+	if priorAttempt != "" {
+		// Capacity truth: reconcile known actual/source; only honest release when unknown.
+		if in.PriorActual != nil && strings.TrimSpace(in.PriorSource) != "" &&
+			!strings.EqualFold(strings.TrimSpace(in.PriorSource), "unknown") {
+			ent, err := g.ledger.Reconcile(g.projectID, g.runID, priorAttempt, *in.PriorActual, in.PriorSource)
+			if err != nil {
+				return zero, fmt.Errorf("reconcile prior reservation: %w", err)
+			}
+			priorState = ent.State
+		} else {
+			ent, err := g.ledger.Release(g.projectID, g.runID, priorAttempt, "model_unavailable_supersede")
+			if err != nil {
+				return zero, fmt.Errorf("release prior reservation: %w", err)
+			}
+			priorState = ent.State
+			// Actual stays nil — honest unknown.
+		}
+		delete(g.holds, in.WorkItemID)
+	}
+	entry, err := g.ledger.Reserve(capacityledger.ReserveInput{
+		ProjectID: g.projectID, RunID: g.runID, AttemptID: in.NewAttemptID,
+		Provider: in.AltProvider, Model: in.AltModel, Depth: in.Depth,
+		Snapshot: g.snap, RouteReason: in.RouteReason,
+	})
+	if err != nil {
+		return zero, err
+	}
+	if entry.State == "refused" {
+		return zero, fmt.Errorf("capacity refused for alternate %s/%s", in.AltProvider, in.AltModel)
+	}
+	g.holds[in.WorkItemID] = capacityHold{
+		projectID: g.projectID, runID: g.runID, attemptID: in.NewAttemptID,
+	}
+	return workflowrun.CapacityRerouteResult{
+		AccountRef:     entry.AccountRef,
+		WindowKind:     entry.WindowKind,
+		PriorState:     priorState,
+		AlternateState: entry.State,
+		ReservationID:  entry.ReservationID,
+	}, nil
+}
+
+// recordModelUnavailableExcludes binds durable typed failure → reroute evidence
+// from workflow child outcomes (Claimed=true on the failed attempt; new attempt
+// is the retry id). Success alternate outcomes carry SupersedesAttemptID +
+// RerouteEventRef; the failed attempt row carries FailureClass=model_unavailable.
+func recordModelUnavailableExcludes(wres workflowrun.Result, record func(childID, provider, reason, msg string, hard, soft, claimed bool)) string {
+	retryID := ""
+	eventRef := ""
+	var failedProv, failedChild string
+	for _, co := range wres.Children {
+		if strings.EqualFold(strings.TrimSpace(co.FailureClass), "model_unavailable") {
+			failedProv = co.Provider
+			failedChild = co.WorkItemID
+		}
+		if strings.TrimSpace(co.SupersedesAttemptID) != "" && strings.TrimSpace(co.AttemptID) != "" {
+			retryID = co.AttemptID
+			eventRef = firstNonEmpty(co.RerouteEventRef, eventRef)
+		}
+	}
+	if failedProv == "" || failedChild == "" {
+		return retryID
+	}
+	msg := firstNonEmpty(eventRef, "model_unavailable claimed failure")
+	if retryID != "" && eventRef != "" {
+		msg = eventRef + ";retry=" + retryID
+	}
+	record(failedChild, failedProv, "model_unavailable", msg, true, false, true)
+	return retryID
 }

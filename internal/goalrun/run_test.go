@@ -626,7 +626,7 @@ func TestResumeBumpsGenerationWhenInterruptAlreadyInLedger(t *testing.T) {
 	// Simulated first pass: research done, implement launched, hard kill.
 	must := func(e workflowrun.Event) {
 		e.ProjectID, e.RunID = projectID, runID
-		if err := elog.Append(e); err != nil {
+		if _, err := elog.Append(e); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -721,7 +721,7 @@ func TestResumeWithoutGoalCheckpointUsesPartialAndGenBump(t *testing.T) {
 	}
 	must := func(e workflowrun.Event) {
 		e.ProjectID, e.RunID = projectID, runID
-		if err := elog.Append(e); err != nil {
+		if _, err := elog.Append(e); err != nil {
 			t.Fatal(err)
 		}
 	}

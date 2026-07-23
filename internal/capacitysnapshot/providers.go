@@ -81,6 +81,9 @@ type ModelSpec struct {
 	DefaultDepth    string
 	ClassHint       string
 	Present         bool
+	// CatalogHintOnly: static/adapter-declared/source-less catalog hint.
+	// Present may still be true for display; production auto-route must skip.
+	CatalogHintOnly bool
 }
 
 // AccountInput is a provider-neutral observation used when not mapping from *quota packages.
@@ -112,6 +115,7 @@ func FromAccountInput(in AccountInput) AccountObservation {
 			DefaultDepth:     m.DefaultDepth,
 			ClassHint:        m.ClassHint,
 			PresentInCatalog: m.Present,
+			CatalogHintOnly:  m.CatalogHintOnly,
 		})
 	}
 	return AccountObservation{

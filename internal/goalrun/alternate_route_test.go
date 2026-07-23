@@ -51,3 +51,19 @@ func TestPickAlternateRouteSameDepth_SkipsSoftExcludedAndSameRoute(t *testing.T)
 		t.Fatalf("want antigravity as only remaining hard-eligible, got %+v", got)
 	}
 }
+
+func TestPickAlternateRequiresNonemptyPermissionWhenRequired(t *testing.T) {
+	cands := []goalrun.RouteCandidate{
+		{Provider: "codex", Model: "gpt-5.5", Effort: "medium", Permission: "", HardEligible: true},
+		{Provider: "claude", Model: "c", Effort: "medium", Permission: "bounded_write", HardEligible: true},
+	}
+	got := goalrun.PickAlternateRouteSameDepthPerm(cands, "antigravity", "x", "medium", "bounded_write")
+	if got.Provider != "claude" {
+		t.Fatalf("empty perm must skip: %+v", got)
+	}
+	// When reqPerm empty, empty cand perm may pass depth-only path via PickAlternateRouteSameDepth
+	got2 := goalrun.PickAlternateRouteSameDepth(cands, "antigravity", "x", "medium")
+	if got2.Provider == "" {
+		t.Fatalf("depth-only should still pick: %+v", got2)
+	}
+}

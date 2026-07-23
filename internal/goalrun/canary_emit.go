@@ -56,7 +56,7 @@ func EmitCanaryFromResult(res Result, opts CanaryEmitOptions) (artifactqual.Cana
 
 	children := canaryChildrenFromReports(res)
 	obs := canaryProviderObsFromReports(res)
-	unavail := BuildUnavailableRetryEvidence(res.RouteExcludes, firstRetryAttempt(res))
+	unavail := BuildUnavailableRetryEvidenceWithProof(res.RouteExcludes, firstRetryAttempt(res), proofFromResult(res))
 
 	var prURL, prBranch, prVer, prVerRef string
 	var prNum int
@@ -180,11 +180,90 @@ func canaryProviderObsFromReports(res Result) []artifactqual.CanaryProviderObs {
 
 func firstRetryAttempt(res Result) string {
 	for _, c := range res.Workflow.Children {
+		if strings.TrimSpace(c.SupersedesAttemptID) != "" && strings.TrimSpace(c.AttemptID) != "" {
+			return c.AttemptID
+		}
+	}
+	for _, c := range res.Workflow.Children {
 		if strings.Contains(c.AttemptID, "-g1") || strings.Contains(c.AttemptID, "-g2") {
 			return c.AttemptID
 		}
 	}
 	return ""
+}
+
+// proofFromResult derives concrete UnavailableRetryProof from workflow children
+// and capacity notes — never invents no_duplicate flags from prose alone.
+func proofFromResult(res Result) *UnavailableRetryProof {
+	var failed, retry *workflowrun.ChildOutcome
+	for i := range res.Workflow.Children {
+		c := &res.Workflow.Children[i]
+		if strings.EqualFold(strings.TrimSpace(c.FailureClass), "model_unavailable") {
+			failed = c
+		}
+		if strings.TrimSpace(c.SupersedesAttemptID) != "" {
+			retry = c
+		}
+	}
+	if failed == nil || retry == nil {
+		return nil
+	}
+	// Parse event_ids from RerouteEventRef (event_id=a;event_id=b;...).
+	var eventIDs []string
+	for _, part := range strings.Split(retry.RerouteEventRef, ";") {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "event_id=") {
+			id := strings.TrimPrefix(part, "event_id=")
+			if id != "" {
+				eventIDs = append(eventIDs, id)
+			}
+		}
+	}
+	// Capacity states from goal ChildReport notes when present.
+	priorState, altState := "", ""
+	for _, cr := range res.Children {
+		if cr.ChildID != failed.WorkItemID && cr.ChildID != retry.WorkItemID {
+			continue
+		}
+		if strings.Contains(cr.CapacityNote, "released=") || cr.CapacityState == "released" {
+			if priorState == "" {
+				priorState = "released"
+			}
+		}
+		if cr.CapacityState == "reconciled" {
+			if priorState == "" {
+				priorState = "reconciled"
+			}
+			altState = "reconciled"
+		}
+		if cr.CapacityState == "reserved" {
+			altState = "reserved"
+		}
+		if cr.CapacityState == "released" && altState == "" {
+			altState = "released"
+		}
+	}
+	// When notes incomplete, do not invent — leave empty so Valid fails closed.
+	failedIntegrated := false
+	retryIntegrated := strings.TrimSpace(retry.IntegrateCommitSHA) != "" ||
+		strings.EqualFold(retry.Terminal, "succeeded")
+	// Failed attempt must not have been integrated as success.
+	if strings.EqualFold(failed.Terminal, "succeeded") || strings.TrimSpace(failed.IntegrateCommitSHA) != "" {
+		failedIntegrated = true
+	}
+	return &UnavailableRetryProof{
+		FailedAttemptID:    failed.AttemptID,
+		RetryAttemptID:     retry.AttemptID,
+		FailedClaimClosed:  strings.TrimSpace(failed.Terminal) != "",
+		RetryClaimClosed:   strings.TrimSpace(retry.Terminal) != "",
+		FailedIntegrated:   failedIntegrated,
+		RetryIntegrated:    retryIntegrated,
+		FailedProductFiles: append([]string(nil), failed.FilesTouched...),
+		RetryProductFiles:  append([]string(nil), retry.FilesTouched...),
+		PriorCapacityState: priorState,
+		AltCapacityState:   altState,
+		EventIDs:           eventIDs,
+	}
 }
 
 func extractKV(s, key string) string {

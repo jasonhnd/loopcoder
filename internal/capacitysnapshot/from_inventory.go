@@ -9,31 +9,32 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 )
 
-// capabilityIsDynamicExactFresh reports a provider-machine-readable exact+fresh
-// observation. Adapter-declared static catalogs also use ConfidenceExact in
-// production — they must NOT match this predicate.
+// capabilityIsDynamicExactFresh reports a production-routable catalog row.
+// Fail closed: requires explicit source_kind=provider-machine-readable AND
+// confidence=exact AND freshness=fresh. Empty, unknown, estimated, stale, or
+// adapter-declared rows are never routable (no backward-compat empty fields).
 func capabilityIsDynamicExactFresh(m providerinventory.ModelCapability) bool {
-	if m.Confidence != providerinventory.ConfidenceExact {
-		return false
-	}
-	if m.FreshnessState == providerinventory.FreshnessStale ||
-		m.FreshnessState == providerinventory.FreshnessExpired ||
-		m.FreshnessState == providerinventory.FreshnessNotApplicable {
-		return false
-	}
-	// EntrySources is authoritative after catalog merge.
+	// EntrySources is the authoritative production-route gate when present.
 	for _, s := range m.EntrySources {
-		if s.SourceKind == providerinventory.CatalogSourceProviderMachineReadable &&
-			s.Confidence == providerinventory.ConfidenceExact &&
-			(s.FreshnessState == providerinventory.FreshnessFresh || s.FreshnessState == "") {
-			return true
+		if s.SourceKind != providerinventory.CatalogSourceProviderMachineReadable {
+			continue
 		}
+		if s.Confidence != providerinventory.ConfidenceExact {
+			continue
+		}
+		if s.FreshnessState != providerinventory.FreshnessFresh {
+			continue
+		}
+		return true
 	}
-	// Fallback: top-level Source.Kind when EntrySources empty (tests / partial rows).
+	// Partial rows with empty EntrySources: only when top-level Source.Kind,
+	// Confidence, and FreshnessState are all explicit machine-readable/exact/fresh.
 	if len(m.EntrySources) == 0 &&
 		(m.Source.Kind == string(providerinventory.CatalogSourceProviderMachineReadable) ||
-			m.Source.Kind == "provider-machine-readable") {
-		return m.FreshnessState == providerinventory.FreshnessFresh || m.FreshnessState == ""
+			m.Source.Kind == "provider-machine-readable") &&
+		m.Confidence == providerinventory.ConfidenceExact &&
+		m.FreshnessState == providerinventory.FreshnessFresh {
+		return true
 	}
 	return false
 }
@@ -129,7 +130,7 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 	for _, snap := range rep.ModelCatalogSnapshots {
 		if snap.CatalogSourceKind == providerinventory.CatalogSourceProviderMachineReadable &&
 			snap.Confidence == providerinventory.ConfidenceExact &&
-			(snap.FreshnessState == providerinventory.FreshnessFresh || snap.FreshnessState == "") {
+			snap.FreshnessState == providerinventory.FreshnessFresh {
 			dynamicExactAdapters[strings.ToLower(strings.TrimSpace(snap.AdapterID))] = true
 		}
 	}
@@ -147,8 +148,8 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 		b := ensure(m.AdapterID)
 		adapterKey := strings.ToLower(strings.TrimSpace(m.AdapterID))
 		dynamic := capabilityIsDynamicExactFresh(m)
-		// When this adapter has dynamic exact catalog, only route those rows —
-		// adapter-declared static (even ConfidenceExact) is not observed live.
+		// When this adapter has dynamic exact catalog, drop adapter-declared static
+		// rows entirely from the model list (display comes from dynamic rows).
 		if dynamicExactAdapters[adapterKey] && !dynamic {
 			b.in.Provenance = strings.TrimSpace(b.in.Provenance +
 				"; adapter_declared_static_suppressed=dynamic_machine_readable_present")
@@ -162,12 +163,6 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 			m.FreshnessState == providerinventory.FreshnessStale {
 			present = false
 		}
-		// Static-only path: still present but not "fresh observed" for production
-		// multi-provider acceptance when no dynamic catalog exists — estimated seed
-		// may fill later via seedStaticModelsEstimated.
-		if !dynamic && dynamicExactAdapters[adapterKey] {
-			present = false
-		}
 		spec := modelSpecFromCapability(m.AdapterID, m)
 		if present && strings.EqualFold(m.AdapterID, "codex") &&
 			(strings.EqualFold(m.CanonicalModelID, "gpt-5.3-codex") || strings.EqualFold(spec.ModelID, "gpt-5.3-codex")) {
@@ -178,25 +173,41 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 		if !present || strings.TrimSpace(spec.ModelID) == "" {
 			continue
 		}
+		// Fail closed: only fresh machine-readable is production-routable.
+		// Adapter-declared static and source-less rows stay as catalog hints.
+		hintOnly := !dynamic
+		if hintOnly {
+			b.in.Provenance = strings.TrimSpace(b.in.Provenance +
+				"; catalog_hint_only=non_machine_readable model=" + spec.ModelID)
+		}
 		key := strings.ToLower(m.AdapterID) + "|" + strings.ToLower(spec.ModelID)
 		if idx, ok := modelIdx[key]; ok && idx >= 0 && idx < len(b.in.Models) {
 			mergeModelSpec(&b.in.Models[idx], spec)
+			// Never promote a hint to routable via merge; demote if either was hint.
+			if hintOnly {
+				b.in.Models[idx].CatalogHintOnly = true
+			}
 		} else {
 			modelIdx[key] = len(b.in.Models)
 			b.in.Models = append(b.in.Models, ModelSpec{
 				ModelID: spec.ModelID, Present: true,
 				SupportedDepths: append([]string(nil), spec.SupportedDepths...),
 				DefaultDepth:    spec.DefaultDepth,
+				CatalogHintOnly: hintOnly,
 			})
 		}
-		liveModels[key] = true
-		liveModels[strings.ToLower(m.AdapterID)+"|"+strings.ToLower(m.CanonicalModelID)] = true
-		if slug := slugifyModelName(spec.ModelID); slug != "" {
-			liveModels[strings.ToLower(m.AdapterID)+"|"+slug] = true
-		}
-		if peel := peelBaseName(spec.ModelID); peel != "" {
-			liveModels[strings.ToLower(m.AdapterID)+"|"+strings.ToLower(peel)] = true
-			liveModels[strings.ToLower(m.AdapterID)+"|"+slugifyModelName(peel)] = true
+		// liveModels keys only for production-routable rows so static seed does
+		// not treat a hint as "live catalog present".
+		if !hintOnly {
+			liveModels[key] = true
+			liveModels[strings.ToLower(m.AdapterID)+"|"+strings.ToLower(m.CanonicalModelID)] = true
+			if slug := slugifyModelName(spec.ModelID); slug != "" {
+				liveModels[strings.ToLower(m.AdapterID)+"|"+slug] = true
+			}
+			if peel := peelBaseName(spec.ModelID); peel != "" {
+				liveModels[strings.ToLower(m.AdapterID)+"|"+strings.ToLower(peel)] = true
+				liveModels[strings.ToLower(m.AdapterID)+"|"+slugifyModelName(peel)] = true
+			}
 		}
 	}
 
@@ -256,11 +267,10 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 				b.in.HealthConfidence = ConfidenceEstimated
 			}
 		}
-		// Static model seed: estimated catalog only when live catalog has zero
-		// present models. Never creates capacity windows and never bypasses the
-		// requirement for fresh live catalog on final multi-provider acceptance
-		// (callers must still require live capability rows for RC acceptance).
-		if !hasPresentModel(b.in.Models) {
+		// Static model seed: estimated catalog hints only when no production-
+		// routable (machine-readable) model is present. Never creates capacity
+		// windows and never enters production auto-route (CatalogHintOnly).
+		if !hasProductionRoutableModel(b.in.Models) {
 			seedStaticModelsEstimated(&b.in, liveModels)
 		}
 		// Prefer gpt-5.5 ordering among present models (capability preference).
@@ -277,6 +287,16 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 func hasPresentModel(models []ModelSpec) bool {
 	for _, m := range models {
 		if m.Present && strings.TrimSpace(m.ModelID) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// hasProductionRoutableModel reports a present, non-hint catalog model.
+func hasProductionRoutableModel(models []ModelSpec) bool {
+	for _, m := range models {
+		if m.Present && !m.CatalogHintOnly && strings.TrimSpace(m.ModelID) != "" {
 			return true
 		}
 	}
@@ -305,7 +325,9 @@ func preferCodexDefaultModel(in *AccountInput) {
 }
 
 // seedStaticModelsEstimated adds static registry models as estimated catalog
-// hints only. Does not invent capacity. Does not claim live freshness.
+// hints only (CatalogHintOnly=true). Does not invent capacity, does not claim
+// live freshness, and must never enter production auto-route — even when the
+// account has real quota windows.
 func seedStaticModelsEstimated(in *AccountInput, live map[string]bool) {
 	if in == nil {
 		return
@@ -350,9 +372,11 @@ func seedStaticModelsEstimated(in *AccountInput, live map[string]bool) {
 		in.Models = append(in.Models, ModelSpec{
 			ModelID: m.Name, Present: true,
 			SupportedDepths: depths, DefaultDepth: def,
+			CatalogHintOnly: true,
 		})
 	}
-	in.Provenance = strings.TrimSpace(in.Provenance + "; models_source=static_registry_estimated")
+	in.Provenance = strings.TrimSpace(in.Provenance +
+		"; models_source=static_registry_estimated; catalog_hint_only=static_seed_non_routable")
 }
 
 func mapPIConfidence(c providerinventory.Confidence) Confidence {

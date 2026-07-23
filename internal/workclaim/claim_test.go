@@ -221,3 +221,188 @@ func TestRenewFence(t *testing.T) {
 		t.Fatalf("%+v %v", rr, err)
 	}
 }
+
+func TestClosedAttemptImmutable_NewGenerationClaimsOnce(t *testing.T) {
+	now := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	s := NewStore(func() time.Time { return now })
+	// Attempt g0 claims and fails (model_unavailable class at workflow layer).
+	r0, err := s.Claim(baseReq("wi_a", "att-wi_a-g0", "ex1"))
+	if err != nil || r0.Code != ResultClaimed {
+		t.Fatalf("g0 claim: %+v %v", r0, err)
+	}
+	cr0, err := s.Close(CloseRequest{
+		ClaimID: r0.Claim.ClaimID, Generation: r0.Claim.Generation,
+		ExecutorID: "ex1", AttemptID: "att-wi_a-g0",
+		Terminal: workgraph.TermFailed, OutputEvidence: "failed:model_unavailable:wi_a",
+	})
+	if err != nil || cr0.Code != ResultClosed {
+		t.Fatalf("g0 close: %+v %v", cr0, err)
+	}
+	// Old attempt cannot re-exec: same AttemptID is immutable.
+	rReplay, _ := s.Claim(baseReq("wi_a", "att-wi_a-g0", "ex1"))
+	if rReplay.Code != ResultTerminalReused {
+		t.Fatalf("replay g0 want terminal_reused, got %+v", rReplay)
+	}
+	// Prior claim terminal unchanged.
+	got0, err := s.GetByAttempt("p1", "g1", 1, "wi_a", "att-wi_a-g0")
+	if err != nil || got0.Terminal != workgraph.TermFailed || got0.State != StateClosed {
+		t.Fatalf("g0 immutable: %+v %v", got0, err)
+	}
+	// New generation claims once with explicit supersedes relation.
+	r1, err := s.Claim(ClaimRequest{
+		ProjectID: "p1", Graph: testGraph(), WorkItemID: "wi_a",
+		AttemptID: "att-wi_a-g1", ExecutorID: "ex1", Lease: time.Minute,
+		SupersedesAttemptID: "att-wi_a-g0",
+	})
+	if err != nil || r1.Code != ResultClaimed {
+		t.Fatalf("g1 claim: %+v %v", r1, err)
+	}
+	if r1.Claim.SupersedesAttemptID != "att-wi_a-g0" {
+		t.Fatalf("supersedes relation: %+v", r1.Claim)
+	}
+	if r1.Claim.Generation <= r0.Claim.Generation {
+		t.Fatalf("generation must bump: g0=%d g1=%d", r0.Claim.Generation, r1.Claim.Generation)
+	}
+	// Second claim of g1 while live → already running.
+	r1b, _ := s.Claim(ClaimRequest{
+		ProjectID: "p1", Graph: testGraph(), WorkItemID: "wi_a",
+		AttemptID: "att-wi_a-g1", ExecutorID: "ex2", Lease: time.Minute,
+		SupersedesAttemptID: "att-wi_a-g0",
+	})
+	if r1b.Code != ResultAlreadyRunning {
+		t.Fatalf("g1 double-claim: %+v", r1b)
+	}
+	// Close g1 success.
+	if _, err := s.Close(CloseRequest{
+		ClaimID: r1.Claim.ClaimID, Generation: r1.Claim.Generation,
+		ExecutorID: "ex1", AttemptID: "att-wi_a-g1",
+		Terminal: workgraph.TermSucceeded, OutputEvidence: "sha:ok",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// g0 still failed immutable; g1 succeeded.
+	got0, _ = s.GetByAttempt("p1", "g1", 1, "wi_a", "att-wi_a-g0")
+	if got0.Terminal != workgraph.TermFailed {
+		t.Fatalf("g0 mutated: %+v", got0)
+	}
+	got1, _ := s.GetByAttempt("p1", "g1", 1, "wi_a", "att-wi_a-g1")
+	if got1.Terminal != workgraph.TermSucceeded {
+		t.Fatalf("g1: %+v", got1)
+	}
+	// Further attempts blocked by logical success.
+	r2, _ := s.Claim(baseReq("wi_a", "att-wi_a-g2", "ex1"))
+	if r2.Code != ResultTerminalReused {
+		t.Fatalf("after success want terminal_reused, got %+v", r2)
+	}
+}
+
+func TestRestartReusesCompletedGenerationWithoutDuplication(t *testing.T) {
+	now := time.Date(2026, 7, 23, 13, 0, 0, 0, time.UTC)
+	s := NewStore(func() time.Time { return now })
+	r, err := s.Claim(baseReq("wi_a", "att-wi_a-g0", "ex1"))
+	if err != nil || r.Code != ResultClaimed {
+		t.Fatalf("%+v %v", r, err)
+	}
+	if _, err := s.Close(CloseRequest{
+		ClaimID: r.Claim.ClaimID, Generation: r.Claim.Generation,
+		ExecutorID: "ex1", AttemptID: "att-wi_a-g0",
+		Terminal: workgraph.TermSucceeded, OutputEvidence: "sha:prior",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Restart: accepted terminals show succeeded; claim of any attempt is reused.
+	ev := s.AcceptedTerminals("p1", "g1", 1)
+	if ev["wi_a"] != workgraph.TermSucceeded {
+		t.Fatalf("accepted: %v", ev)
+	}
+	// Same attempt identity cannot re-exec.
+	rSame, _ := s.Claim(ClaimRequest{
+		ProjectID: "p1", Graph: testGraph(), Evidence: ev,
+		WorkItemID: "wi_a", AttemptID: "att-wi_a-g0", ExecutorID: "ex1", Lease: time.Minute,
+	})
+	if rSame.Code != ResultTerminalReused {
+		t.Fatalf("same attempt on restart: %+v", rSame)
+	}
+	// New attempt also blocked (logical success + evidence terminal).
+	rNew, _ := s.Claim(ClaimRequest{
+		ProjectID: "p1", Graph: testGraph(), Evidence: ev,
+		WorkItemID: "wi_a", AttemptID: "att-wi_a-g1", ExecutorID: "ex1", Lease: time.Minute,
+	})
+	if rNew.Code != ResultTerminalReused {
+		t.Fatalf("new attempt after success: %+v", rNew)
+	}
+	// Without evidence, logical success still blocks (exactly-once).
+	rNoEv, _ := s.Claim(baseReq("wi_a", "att-wi_a-g9", "ex9"))
+	if rNoEv.Code != ResultTerminalReused {
+		t.Fatalf("logical success must block: %+v", rNoEv)
+	}
+}
+
+func TestFailedAttemptDoesNotReopenByKey(t *testing.T) {
+	now := time.Date(2026, 7, 23, 14, 0, 0, 0, time.UTC)
+	s := NewStore(func() time.Time { return now })
+	r, _ := s.Claim(baseReq("wi_a", "att-fail", "ex"))
+	s.Close(CloseRequest{
+		ClaimID: r.Claim.ClaimID, Generation: r.Claim.Generation,
+		ExecutorID: "ex", AttemptID: "att-fail",
+		Terminal: workgraph.TermFailed, OutputEvidence: "failed:x",
+	})
+	// Mutating close with different terminal must conflict, not reopen.
+	cr, err := s.Close(CloseRequest{
+		ClaimID: r.Claim.ClaimID, Generation: r.Claim.Generation,
+		ExecutorID: "ex", AttemptID: "att-fail",
+		Terminal: workgraph.TermSucceeded, OutputEvidence: "sha:forged",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cr.Code != ResultConflict {
+		t.Fatalf("must not reopen closed failed: %+v", cr)
+	}
+	got, _ := s.Get(r.Claim.ClaimID)
+	if got.Terminal != workgraph.TermFailed || got.State != StateClosed {
+		t.Fatalf("mutated: %+v", got)
+	}
+}
+
+func TestAcceptedTerminalsHighestGenerationDeterministic(t *testing.T) {
+	now := time.Date(2026, 7, 23, 15, 0, 0, 0, time.UTC)
+	s := NewStore(func() time.Time { return now })
+	// g0 failed
+	r0, _ := s.Claim(baseReq("wi_a", "att-g0", "ex"))
+	s.Close(CloseRequest{
+		ClaimID: r0.Claim.ClaimID, Generation: r0.Claim.Generation,
+		ExecutorID: "ex", AttemptID: "att-g0", Terminal: workgraph.TermFailed, OutputEvidence: "f",
+	})
+	// g1 cancelled (same rank as failed) then would be nondeterministic without generation
+	r1, _ := s.Claim(ClaimRequest{
+		ProjectID: "p1", Graph: testGraph(), WorkItemID: "wi_a",
+		AttemptID: "att-g1", ExecutorID: "ex", Lease: time.Minute,
+		SupersedesAttemptID: "att-g0",
+	})
+	s.Close(CloseRequest{
+		ClaimID: r1.Claim.ClaimID, Generation: r1.Claim.Generation,
+		ExecutorID: "ex", AttemptID: "att-g1", Terminal: workgraph.TermCancelled, OutputEvidence: "c",
+	})
+	// g2 succeeded
+	r2, _ := s.Claim(ClaimRequest{
+		ProjectID: "p1", Graph: testGraph(), WorkItemID: "wi_a",
+		AttemptID: "att-g2", ExecutorID: "ex", Lease: time.Minute,
+		SupersedesAttemptID: "att-g1",
+	})
+	s.Close(CloseRequest{
+		ClaimID: r2.Claim.ClaimID, Generation: r2.Claim.Generation,
+		ExecutorID: "ex", AttemptID: "att-g2", Terminal: workgraph.TermSucceeded, OutputEvidence: "sha:ok",
+	})
+	for i := 0; i < 20; i++ {
+		ev := s.AcceptedTerminals("p1", "g1", 1)
+		if ev["wi_a"] != workgraph.TermSucceeded {
+			t.Fatalf("iter %d: want succeeded from highest gen, got %v", i, ev)
+		}
+	}
+	// Restart: logical success still final.
+	r3, _ := s.Claim(baseReq("wi_a", "att-g9", "ex"))
+	if r3.Code != ResultTerminalReused {
+		t.Fatalf("restart must not re-claim: %+v", r3)
+	}
+}

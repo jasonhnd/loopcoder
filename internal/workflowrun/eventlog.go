@@ -19,24 +19,31 @@ const EventSchema = "loopcoder.workflow.event.v1"
 // not from hand-written booleans.
 type Event struct {
 	Schema     string    `json:"schema"`
+	EventID    string    `json:"event_id,omitempty"`
 	At         time.Time `json:"at"`
 	ProjectID  string    `json:"project_id"`
 	RunID      string    `json:"run_id"`
-	Kind       string    `json:"kind"` // claim|launch|pid|terminal|integrate|interrupt|reuse|accept
+	Kind       string    `json:"kind"` // claim|launch|pid|terminal|integrate|interrupt|reuse|accept|model_unavailable|reroute
 	WorkItemID string    `json:"work_item_id,omitempty"`
 	AttemptID  string    `json:"attempt_id,omitempty"`
 	Terminal   string    `json:"terminal,omitempty"`
 	PID        int       `json:"pid,omitempty"`
 	CommitSHA  string    `json:"commit_sha,omitempty"`
 	Message    string    `json:"message,omitempty"`
-	Evidence   string    `json:"evidence,omitempty"`
-	Generation int       `json:"generation,omitempty"`
+	// Payload is structured JSON (map/object), never semicolon-delimited prose.
+	// Do not encode relations into Kind.
+	Payload    json.RawMessage `json:"payload,omitempty"`
+	Evidence   string          `json:"evidence,omitempty"`
+	Generation int             `json:"generation,omitempty"`
 }
 
 // EventLog is an append-only JSONL log under the project runs directory.
 type EventLog struct {
 	mu   sync.Mutex
 	path string
+	seq  int64
+	// FailAppend when non-nil forces Append to fail (tests only).
+	FailAppend error
 }
 
 // OpenEventLog opens/creates the durable event log for a run under
@@ -70,9 +77,13 @@ func (e *EventLog) Path() string {
 }
 
 // Append writes one event line (fail-closed on I/O error for interrupt evidence).
-func (e *EventLog) Append(ev Event) error {
+// Assigns a durable EventID when empty and returns the persisted event.
+func (e *EventLog) Append(ev Event) (Event, error) {
 	if e == nil {
-		return nil
+		return ev, nil
+	}
+	if e.FailAppend != nil {
+		return Event{}, e.FailAppend
 	}
 	if strings.TrimSpace(ev.Schema) == "" {
 		ev.Schema = EventSchema
@@ -80,24 +91,31 @@ func (e *EventLog) Append(ev Event) error {
 	if ev.At.IsZero() {
 		ev.At = time.Now().UTC()
 	}
-	raw, err := json.Marshal(ev)
-	if err != nil {
-		return err
-	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if strings.TrimSpace(ev.EventID) == "" {
+		e.seq++
+		ev.EventID = fmt.Sprintf("wev_%d_%d", ev.At.UnixNano(), e.seq)
+	}
+	raw, err := json.Marshal(ev)
+	if err != nil {
+		return Event{}, err
+	}
 	if err := os.MkdirAll(filepath.Dir(e.path), 0o700); err != nil {
-		return err
+		return Event{}, err
 	}
 	f, err := os.OpenFile(e.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		return err
+		return Event{}, err
 	}
 	defer f.Close()
 	if _, err := f.Write(append(raw, '\n')); err != nil {
-		return err
+		return Event{}, err
 	}
-	return f.Sync()
+	if err := f.Sync(); err != nil {
+		return Event{}, err
+	}
+	return ev, nil
 }
 
 // ReadAll loads all events (tests / evidence builders).
@@ -272,7 +290,7 @@ func RecoverOpenLaunchInterrupts(elog *EventLog, projectID, runID string) (int, 
 	sort.Strings(ids)
 	for _, id := range ids {
 		att := open[id]
-		if err := elog.Append(Event{
+		if _, err := elog.Append(Event{
 			ProjectID: projectID, RunID: runID,
 			Kind: "interrupt", WorkItemID: id, AttemptID: att,
 			Terminal: "cancelled",

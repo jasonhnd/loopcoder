@@ -220,3 +220,32 @@ func TestExplainListsHardExclusions(t *testing.T) {
 		t.Fatalf("%s", ex.Human)
 	}
 }
+
+func TestCandidateViewsCarryEffortPermissionDistinctDepths(t *testing.T) {
+	// Two hard-eligible rows same provider/model, different efforts must both appear.
+	hard := eligibility.Decision{
+		Eligible: []eligibility.CandidateView{
+			{Provider: "codex", Model: "gpt-5.5", Effort: "low", Permission: "bounded_write", Eligible: true},
+			{Provider: "codex", Model: "gpt-5.5", Effort: "high", Permission: "bounded_write", Eligible: true},
+			{Provider: "claude", Model: "claude-sonnet-4-5", Effort: "medium", Permission: "read-only", Eligible: true},
+		},
+	}
+	views := candidateViewsFromHard(hard, nil, nil)
+	if len(views) < 3 {
+		t.Fatalf("want 3 distinct identities, got %+v", views)
+	}
+	seen := map[string]bool{}
+	for _, v := range views {
+		if v.Effort == "" && v.HardEligible {
+			t.Fatalf("hard-eligible must carry observed effort: %+v", v)
+		}
+		key := v.Provider + "|" + v.Model + "|" + v.Effort + "|" + v.Permission
+		if seen[key] {
+			t.Fatalf("collapsed identity: %s", key)
+		}
+		seen[key] = true
+	}
+	if !seen["codex|gpt-5.5|low|bounded_write"] || !seen["codex|gpt-5.5|high|bounded_write"] {
+		t.Fatalf("depths collapsed: %v", seen)
+	}
+}

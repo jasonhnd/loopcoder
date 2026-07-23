@@ -94,6 +94,9 @@ type FakeChildExecutor struct {
 	// ProductFiles optional per-work-item relative paths to write as product
 	// content (for integrate tests). Default: notes/<id>.md + optional test.
 	ProductFiles map[string][]string
+	// FailModel triggers model_unavailable when Route.Model matches (case-insensitive).
+	// Used for generation-safe alternate reroute tests.
+	FailModel string
 	// HomeDir overrides layout root (tests).
 	HomeDir string
 	Now     func() time.Time
@@ -138,6 +141,16 @@ func (f FakeChildExecutor) Execute(ctx context.Context, in ChildExecInput) (Chil
 		return ChildExecResult{
 			Terminal: workgraph.TermFailed, OutputEvidence: digest, WorktreePath: wt,
 			ExitCode: 1, FailureClass: "injected_fail", Message: "fake fail " + in.WorkItemID,
+			Provider: in.Route.Provider, Model: in.Route.Model, Depth: in.Route.Depth,
+			FilesTouched: files, ActualSource: "unknown",
+		}, nil
+	}
+	if strings.TrimSpace(f.FailModel) != "" &&
+		strings.EqualFold(strings.TrimSpace(in.Route.Model), strings.TrimSpace(f.FailModel)) {
+		return ChildExecResult{
+			Terminal: workgraph.TermFailed, OutputEvidence: digest, WorktreePath: wt,
+			ExitCode: 1, FailureClass: "model_unavailable",
+			Message:  "invalid model selection " + in.Route.Model,
 			Provider: in.Route.Provider, Model: in.Route.Model, Depth: in.Route.Depth,
 			FilesTouched: files, ActualSource: "unknown",
 		}, nil

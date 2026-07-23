@@ -113,3 +113,42 @@ func TestHardEligibleNonWinnerExcludesIncludesNotChosen(t *testing.T) {
 		t.Fatalf("%+v", got2)
 	}
 }
+
+func TestBuildUnavailableRetryFromClaimedModelUnavailableRequiresProof(t *testing.T) {
+	// Claimed-only prose/event_ref → nil (must not invent no_dup flags).
+	if got := goalrun.BuildUnavailableRetryEvidence([]goalrun.RouteExclude{
+		{ChildID: "wi_x", Provider: "antigravity", Reason: "model_unavailable", Claimed: true,
+			Message: "event_id=wev1;event_id=wev2;supersedes=att-g0"},
+	}, "att-g1"); got != nil {
+		t.Fatalf("prose/event_ref only must not invent: %+v", got)
+	}
+	// Concrete proof required.
+	proof := &goalrun.UnavailableRetryProof{
+		FailedAttemptID: "att-g0", RetryAttemptID: "att-g1",
+		FailedClaimClosed: true, RetryClaimClosed: true,
+		FailedIntegrated: false, RetryIntegrated: true,
+		FailedProductFiles: []string{"notes/bad.md"},
+		RetryProductFiles:  []string{"notes/good.md"},
+		PriorCapacityState: "released", AltCapacityState: "reserved",
+		EventIDs: []string{"wev_1", "wev_2"},
+	}
+	got := goalrun.BuildUnavailableRetryEvidenceWithProof([]goalrun.RouteExclude{
+		{ChildID: "wi_x", Provider: "antigravity", Reason: "model_unavailable", Claimed: true, Message: "typed failure"},
+	}, "att-g1", proof)
+	if got == nil {
+		t.Fatal("want evidence from concrete proof")
+	}
+	if got.ExcludedProvider != "antigravity" || !got.NoDuplicateClaim || !got.NoDuplicateFiles || !got.NoDoubleCapacity {
+		t.Fatalf("%+v", got)
+	}
+	if !strings.Contains(got.EvidenceRef, "event_ids=wev_1") {
+		t.Fatalf("evidence ref: %q", got.EvidenceRef)
+	}
+	// Overlapping product files → nil (no invent true).
+	proof.RetryProductFiles = []string{"notes/bad.md"}
+	if got := goalrun.BuildUnavailableRetryEvidenceWithProof([]goalrun.RouteExclude{
+		{ChildID: "wi_x", Provider: "antigravity", Reason: "model_unavailable", Claimed: true},
+	}, "att-g1", proof); got != nil {
+		t.Fatalf("overlapping files must not green: %+v", got)
+	}
+}

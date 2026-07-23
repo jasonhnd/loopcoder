@@ -22,7 +22,7 @@ func TestRecoverOpenLaunchInterrupts_FromLedgerOnly(t *testing.T) {
 		if e.At.IsZero() {
 			e.At = time.Now().UTC()
 		}
-		if err := elog.Append(e); err != nil {
+		if _, err := elog.Append(e); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -63,8 +63,8 @@ func TestRecoverOpenLaunchInterrupts_FromLedgerOnly(t *testing.T) {
 	// no open launches → 0
 	home2 := t.TempDir()
 	elog2, _ := workflowrun.OpenEventLog(home2, "p", "r")
-	_ = elog2.Append(workflowrun.Event{Kind: "launch", WorkItemID: "a", AttemptID: "1", ProjectID: "p", RunID: "r"})
-	_ = elog2.Append(workflowrun.Event{Kind: "terminal", WorkItemID: "a", AttemptID: "1", Terminal: "succeeded", ProjectID: "p", RunID: "r"})
+	_, _ = elog2.Append(workflowrun.Event{Kind: "launch", WorkItemID: "a", AttemptID: "1", ProjectID: "p", RunID: "r"})
+	_, _ = elog2.Append(workflowrun.Event{Kind: "terminal", WorkItemID: "a", AttemptID: "1", Terminal: "succeeded", ProjectID: "p", RunID: "r"})
 	n3, err := workflowrun.RecoverOpenLaunchInterrupts(elog2, "p", "r")
 	if err != nil || n3 != 0 {
 		t.Fatalf("complete run recover n=%d err=%v", n3, err)
