@@ -149,6 +149,10 @@ func TestCodexAndGrokQuotaObservationsRemainProviderScoped(t *testing.T) {
 	deps.RunGrokACP = func(context.Context, GrokACPBillingRequest) (GrokACPBillingResult, error) {
 		return GrokACPBillingResult{Stdout: grokStdout, ExitCode: 0}, nil
 	}
+	// Keep ACP fixture path: do not hit live official credits HTTP.
+	deps.RunGrokCredits = func(context.Context, GrokCreditsBillingRequest) (GrokCreditsBillingResult, error) {
+		return GrokCreditsBillingResult{}, ErrGrokCreditsAuthMissing
+	}
 
 	report, err := Discover(context.Background(), Options{
 		Config: config.Config{Adapters: config.Adapters{Worker: "codex", Verifier: "grok"}},
@@ -258,6 +262,19 @@ func TestGrokACPBillingExhaustionAndStaleFixtures(t *testing.T) {
 func TestGrokACPBillingCapabilityRequiredBeforeMethodProbe(t *testing.T) {
 	exe := writeFakeGrok(t)
 	deps := grokQuotaDeps(t, exe, GrokACPBillingResult{}, nil)
+	// Isolate from host ~/.grok/auth.json so credits path reports auth-missing.
+	emptyHome := t.TempDir()
+	deps.UserHomeDir = func() (string, error) { return emptyHome, nil }
+	prevEnv := deps.Getenv
+	deps.Getenv = func(key string) string {
+		if key == "HOME" || key == "GROK_HOME" {
+			return emptyHome
+		}
+		if prevEnv != nil {
+			return prevEnv(key)
+		}
+		return ""
+	}
 	called := false
 	deps.RunProbe = func(_ context.Context, req ProbeExecution) (ProbeExecutionResult, error) {
 		switch {
@@ -282,7 +299,9 @@ func TestGrokACPBillingCapabilityRequiredBeforeMethodProbe(t *testing.T) {
 		t.Fatal("Grok ACP billing method was called without advertised billing capability")
 	}
 	got := onlyQuotaSnapshot(t, report, "grok")
-	if got.TerminalErrorCode != "ErrQuotaSourceUnsupported" || !containsString(got.GapReasons, "billing-capability-not-advertised") {
+	// Primary path is official credits billing; without auth and without ACP
+	// capability the typed gap is credits-auth-missing (not a silent invent).
+	if got.TerminalErrorCode != "ErrGrokCreditsAuthMissing" || !containsString(got.GapReasons, "credits-auth-missing") {
 		t.Fatalf("capability snapshot = %#v", got)
 	}
 }
@@ -341,6 +360,10 @@ func grokQuotaDeps(t *testing.T, exe string, result GrokACPBillingResult, runErr
 	deps.RunGrokACP = func(context.Context, GrokACPBillingRequest) (GrokACPBillingResult, error) {
 		return result, runErr
 	}
+	// Force ACP-path tests to skip official credits HTTP (auth absent in fixture home).
+	deps.RunGrokCredits = func(context.Context, GrokCreditsBillingRequest) (GrokCreditsBillingResult, error) {
+		return GrokCreditsBillingResult{}, ErrGrokCreditsAuthMissing
+	}
 	return deps
 }
 
@@ -387,4 +410,155 @@ func grokACPJSONL(t *testing.T, message jsonRPCMessage) string {
 		t.Fatalf("Marshal JSONL: %v", err)
 	}
 	return string(data)
+}
+
+func TestGrokCreditsBillingParsesWeeklyUsageAndProduct(t *testing.T) {
+	exe := writeFakeGrok(t)
+	body := []byte(`{
+  "config": {
+    "currentPeriod": {
+      "type": "USAGE_PERIOD_TYPE_WEEKLY",
+      "start": "2026-07-21T23:18:03.510207+00:00",
+      "end": "2026-07-28T23:18:03.510207+00:00"
+    },
+    "creditUsagePercent": 31,
+    "productUsage": [{"product": "GrokBuild", "usagePercent": 31}],
+    "isUnifiedBillingUser": true
+  }
+}`)
+	var sawToken bool
+	deps := grokQuotaDeps(t, exe, GrokACPBillingResult{}, nil)
+	deps.RunGrokCredits = func(_ context.Context, req GrokCreditsBillingRequest) (GrokCreditsBillingResult, error) {
+		if req.Token == "" {
+			t.Fatal("token required for credits billing")
+		}
+		if strings.Contains(req.Token, "secret") {
+			// ok; token itself is the secret — must not appear in diagnostics later
+		}
+		sawToken = true
+		if req.URL != "" && !strings.Contains(req.URL, "billing") {
+			t.Fatalf("unexpected URL %q", req.URL)
+		}
+		return GrokCreditsBillingResult{StatusCode: 200, Body: body}, nil
+	}
+	// Provide fake auth via HOME auth.json (account-keyed nested key).
+	home := t.TempDir()
+	authDir := filepath.Join(home, ".grok")
+	if err := os.MkdirAll(authDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	auth := map[string]any{
+		"https://auth.x.ai::acct-fixture": map[string]any{
+			"key":        "secret-test-token-not-for-logs",
+			"auth_mode":  "oidc",
+			"expires_at": fixedInventoryNow().Add(time.Hour).Format(time.RFC3339Nano),
+		},
+	}
+	raw, _ := json.Marshal(auth)
+	if err := os.WriteFile(filepath.Join(authDir, "auth.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prevHome := deps.Getenv
+	deps.Getenv = func(key string) string {
+		if key == "HOME" {
+			return home
+		}
+		if key == "PATH" {
+			return filepath.Dir(exe)
+		}
+		if prevHome != nil {
+			return prevHome(key)
+		}
+		return ""
+	}
+	deps.UserHomeDir = func() (string, error) { return home, nil }
+
+	report, err := Discover(context.Background(), grokQuotaOptions(), deps)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if !sawToken {
+		t.Fatal("RunGrokCredits was not invoked")
+	}
+	sources := quotaSourcesFor(report, "grok")
+	if len(sources) != 1 || sources[0].SourceSchemaVersion != grokCreditsBillingSourceSchema {
+		t.Fatalf("sources = %#v", sources)
+	}
+	primary := quotaSnapshotByKey(t, report, "credit_usage_percent", WindowFixedWeek, "provider:grok/account:acct-fixture/detail:credits_usage")
+	if primary.UsedValue == nil || *primary.UsedValue != 31 || primary.RemainingValue == nil || *primary.RemainingValue != 69 {
+		t.Fatalf("primary = %#v", primary)
+	}
+	if primary.LimitValue == nil || *primary.LimitValue != 100 || primary.Unit != "percent" || primary.Confidence != ConfidenceExact {
+		t.Fatalf("primary flags = %#v", primary)
+	}
+	if primary.ResetAt == "" || primary.FieldConfidences["reset_at"] != ConfidenceExact {
+		t.Fatalf("reset = %#v", primary)
+	}
+	if strings.Contains(primary.RedactedDiagnostics, "secret-test-token") {
+		t.Fatalf("diagnostics retained token: %#v", primary.RedactedDiagnostics)
+	}
+	product := quotaSnapshotByKey(t, report, "product_usage_percent", WindowFixedWeek, "provider:grok/account:acct-fixture/detail:product_grokbuild")
+	if product.RemainingValue == nil || *product.RemainingValue != 69 {
+		t.Fatalf("product = %#v", product)
+	}
+	// ACP must not be required when credits succeeds.
+}
+
+func TestGrokCreditsBillingAuthShapesAndRedaction(t *testing.T) {
+	// Account-keyed nested key (current).
+	home := t.TempDir()
+	authDir := filepath.Join(home, ".grok")
+	_ = os.MkdirAll(authDir, 0o700)
+	_ = os.WriteFile(filepath.Join(authDir, "auth.json"), []byte(`{"https://auth.x.ai::u1":{"key":"tok-a","refresh_token":"ref-should-not-be-used"}}`), 0o600)
+	tok, ref, err := loadGrokCLIAuthToken(home, nil)
+	if err != nil || tok != "tok-a" || ref == "" {
+		t.Fatalf("account-keyed: tok=%q ref=%q err=%v", tok, ref, err)
+	}
+	// Root access_token compatible shape.
+	home2 := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(home2, ".grok"), 0o700)
+	_ = os.WriteFile(filepath.Join(home2, ".grok", "auth.json"), []byte(`{"access_token":"tok-root"}`), 0o600)
+	tok, ref, err = loadGrokCLIAuthToken(home2, nil)
+	if err != nil || tok != "tok-root" || ref != "root" {
+		t.Fatalf("root access_token: tok=%q ref=%q err=%v", tok, ref, err)
+	}
+	// Missing auth.
+	home3 := t.TempDir()
+	if _, _, err := loadGrokCLIAuthToken(home3, nil); err == nil {
+		t.Fatal("expected missing auth error")
+	}
+	// snapshotsFromGrokCreditsBilling refuses credential-like body noise that looks like secrets.
+	body := []byte(`{"config":{"creditUsagePercent":10,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-07-28T00:00:00Z"}}}`)
+	snaps, err := snapshotsFromGrokCreditsBilling(grokCreditsBillingSource(fixedInventoryNow()), nil, "0.2.111", "acct", body, fixedInventoryNow())
+	if err != nil || len(snaps) < 1 {
+		t.Fatalf("snaps err=%v n=%d", err, len(snaps))
+	}
+	for _, s := range snaps {
+		if strings.Contains(strings.ToLower(s.RedactedDiagnostics), "bearer ") || strings.Contains(s.RedactedDiagnostics, "tok-") {
+			t.Fatalf("diagnostics leaked credential material: %q", s.RedactedDiagnostics)
+		}
+	}
+}
+
+func TestGrokCreditsBillingRequiresNetworkGrant(t *testing.T) {
+	exe := writeFakeGrok(t)
+	deps := grokQuotaDeps(t, exe, GrokACPBillingResult{}, nil)
+	called := false
+	deps.RunGrokCredits = func(context.Context, GrokCreditsBillingRequest) (GrokCreditsBillingResult, error) {
+		called = true
+		return GrokCreditsBillingResult{StatusCode: 200, Body: []byte(`{"config":{"creditUsagePercent":1}}`)}, nil
+	}
+	opts := grokQuotaOptions()
+	opts.NetworkGrants = nil // deny
+	report, err := Discover(context.Background(), opts, deps)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if called {
+		t.Fatal("credits HTTP must not run without network grant")
+	}
+	got := onlyQuotaSnapshot(t, report, "grok")
+	if !containsString(got.GapReasons, "quota-collection-not-granted") {
+		t.Fatalf("grant snapshot = %#v", got)
+	}
 }

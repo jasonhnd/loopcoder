@@ -58,6 +58,21 @@ type grokACPJSONRPCRequest struct {
 }
 
 func inspectGrokACPBilling(ctx context.Context, discovery *discoveryContext, adapter AdapterDeclaration, candidate candidate, installation ProviderInstallation, now time.Time, deps Deps) (QuotaTelemetrySource, []QuotaSnapshot, ProbeResult) {
+	// Primary: official CLI-owned credits billing HTTP endpoint. Current Grok
+	// Build CLI does not advertise ACP billing/read; the CLI-owned
+	// /v1/billing?format=credits path is the truthful observation source.
+	if source, snaps, probe, err := collectGrokCreditsBilling(ctx, discovery, adapter, installation, now, deps); err == nil && len(snaps) > 0 {
+		return source, snaps, probe
+	} else if err != nil {
+		// Remember credits failure for final gap when ACP also unavailable.
+		// Network grant denials short-circuit without ACP attempt.
+		if probe.NetworkPermission != NetworkGranted || containsString(probe.GapReasons, "quota-collection-not-granted") {
+			return source, snaps, probe
+		}
+		// Fall through to ACP only when credits failed for non-grant reasons.
+		_ = err
+	}
+
 	source := grokACPBillingSource(now)
 	installationID := installation.ProviderInstallationID
 	probe := baseProbe(adapter, now, deps)
@@ -94,7 +109,19 @@ func inspectGrokACPBilling(ctx context.Context, discovery *discoveryContext, ada
 		return unavailable("quota-collection-not-granted", "ErrQuotaCollectionGrantRequired")
 	}
 	if !grokACPBillingCapabilityAdvertised(ctx, discovery, candidate, env, deps) {
+		// ACP unavailable (current CLI). Prefer credits-auth-missing when that
+		// was the primary path failure; otherwise surface both gaps.
 		probe.SideEffectClass = "local-read"
+		// Re-attempt credits only for reason reporting is unnecessary; surface
+		// billing-capability-not-advertised and note credits path when auth missing.
+		home, _ := deps.UserHomeDir()
+		if h := strings.TrimSpace(deps.Getenv("HOME")); h != "" {
+			home = h
+		}
+		if _, _, aerr := loadGrokCLIAuthToken(home, deps.Getenv); aerr != nil {
+			return unavailable("credits-auth-missing", "ErrGrokCreditsAuthMissing")
+		}
+		// Auth present but credits collect failed earlier and ACP not advertised.
 		return unavailable("billing-capability-not-advertised", "ErrQuotaSourceUnsupported")
 	}
 
