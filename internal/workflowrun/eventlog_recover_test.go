@@ -83,3 +83,22 @@ func TestOpenLaunchesWithoutTerminal(t *testing.T) {
 		t.Fatalf("open=%v", open)
 	}
 }
+
+func TestFailedRetryGenerationsBumpsPastTerminalFailed(t *testing.T) {
+	evs := []workflowrun.Event{
+		{Kind: "launch", WorkItemID: "wi_research", AttemptID: "att-wi_research-x-g0"},
+		{Kind: "terminal", WorkItemID: "wi_research", AttemptID: "att-wi_research-x-g0", Terminal: "succeeded"},
+		{Kind: "integrate", WorkItemID: "wi_research", AttemptID: "att-wi_research-x-g0"},
+		{Kind: "launch", WorkItemID: "wi_implement", AttemptID: "att-wi_implement-x-g0"},
+		{Kind: "interrupt", WorkItemID: "wi_implement", AttemptID: "att-wi_implement-x-g0", Terminal: "cancelled"},
+		{Kind: "launch", WorkItemID: "wi_implement", AttemptID: "att-wi_implement-x-g1"},
+		{Kind: "terminal", WorkItemID: "wi_implement", AttemptID: "att-wi_implement-x-g1", Terminal: "failed"},
+	}
+	got := workflowrun.FailedRetryGenerations(evs)
+	if got["wi_implement"] != 2 {
+		t.Fatalf("implement next gen=%v want 2", got)
+	}
+	if _, ok := got["wi_research"]; ok {
+		t.Fatalf("research should not retry-bump: %v", got)
+	}
+}
