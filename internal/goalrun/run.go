@@ -626,6 +626,8 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 				Status: "blocked", Message: "one or more children unavailable for route/capacity",
 			}
 			out.ProvidersUsed, out.ModelsUsed, out.DepthsUsed = collectUsage(children)
+			out.MultiProviderOK = len(out.ProvidersUsed) >= 2
+			out.RouteExcludes = routeExcludes // keep measured excludes for canary unavailable_retry
 			// Release any holds we already took.
 			if ledger != nil {
 				for id, h := range holds {

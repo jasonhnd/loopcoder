@@ -450,12 +450,25 @@ func pickWindow(in ReserveInput) (quotapolicy.WindowKind, float64, quotapolicy.E
 			if w.Confidence == capacitysnapshot.ConfidenceUnknown {
 				continue
 			}
-			if capacitysnapshot.RemainingFraction(*w) == nil {
+			fw := capacitysnapshot.RemainingFraction(*w)
+			if fw == nil {
 				continue
 			}
-			// Prefer soonest reset among usable windows.
+			// Multi-window companies (Antigravity primary≈98% + secondary/3p≈11%)
+			// used to bind soonest-reset first, often the scarce secondary pool, so
+			// capacity_before=0.11 and subsequent reserves failed headroom while
+			// primary capacity was abundant. Prefer highest remaining; tie-break
+			// soonest reset among equal remaining.
 			if best == nil {
 				best = w
+				continue
+			}
+			fb := capacitysnapshot.RemainingFraction(*best)
+			if fb == nil || *fw > *fb {
+				best = w
+				continue
+			}
+			if *fw < *fb {
 				continue
 			}
 			if w.ResetAt != nil && (best.ResetAt == nil || w.ResetAt.Before(*best.ResetAt)) {

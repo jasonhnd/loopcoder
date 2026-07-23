@@ -281,3 +281,57 @@ func TestObserveAfterRejectsWindowMismatch(t *testing.T) {
 		t.Fatal("want window mismatch")
 	}
 }
+
+func TestReservePrefersHighestRemainingMultiWindow(t *testing.T) {
+	// Scarce secondary resets sooner; primary abundant. Reserve must bind ~0.98 not 0.11.
+	now := time.Date(2026, 7, 23, 5, 0, 0, 0, time.UTC)
+	soon := now.Add(30 * time.Minute)
+	later := now.Add(4 * time.Hour)
+	pct := func(rem float64, reset time.Time) capacitysnapshot.Window {
+		return capacitysnapshot.Window{
+			Kind: "provider-defined", Unit: capacitysnapshot.UnitPercentage,
+			Remaining:  capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: rem, Unit: capacitysnapshot.UnitPercentage},
+			Limit:      capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: 100, Unit: capacitysnapshot.UnitPercentage},
+			Confidence: capacitysnapshot.ConfidenceExact, Freshness: capacitysnapshot.FreshnessFresh,
+			ResetAt: &reset, CapturedAt: now, Source: "test",
+		}
+	}
+	acc := capacitysnapshot.FromAccountInput(capacitysnapshot.AccountInput{
+		Provider: "antigravity", AccountRef: "acct-ag", InstallRef: "i-ag",
+		Installed: true, Authenticated: true, Healthy: true,
+		HealthConfidence: capacitysnapshot.ConfidenceExact, HealthFreshness: capacitysnapshot.FreshnessFresh,
+		Windows: []capacitysnapshot.Window{
+			pct(11, soon),
+			pct(98, later),
+		},
+		Models: []capacitysnapshot.ModelSpec{{
+			ModelID: "GPT-OSS 120B", SupportedDepths: []string{"medium"}, DefaultDepth: "medium", Present: true,
+		}},
+		Source: "test", CapturedAt: now,
+	})
+	snap, err := capacitysnapshot.Build([]capacitysnapshot.AccountObservation{acc}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "capacity-ledger.json")
+	l, err := capacityledger.OpenPath(path, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := l.Reserve(capacityledger.ReserveInput{
+		ProjectID: "p", RunID: "run-ag", AttemptID: "att1",
+		Policy:   capacityledger.PolicyUseBeforeReset,
+		Provider: "antigravity", Model: "GPT-OSS 120B", Depth: "medium",
+		Snapshot: &snap, RouteReason: "multi-window",
+		DemandFraction: 0.05, DemandConfidence: quotapolicy.EvidenceEstimated,
+	})
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if e.State != "reserved" {
+		t.Fatalf("state=%s reason=%s", e.State, e.RouteReason)
+	}
+	if e.Before < 0.9 {
+		t.Fatalf("bound scarce window: before=%v want >=0.9", e.Before)
+	}
+}
