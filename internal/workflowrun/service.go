@@ -263,6 +263,10 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 	bounds := waveschedule.DefaultBounds()
 	for wave := 0; wave < maxWaves; wave++ {
 		if ctx.Err() != nil {
+			out.Interrupted = true
+			logEv(Event{Kind: "interrupt", Message: "cancelled mid-wave (forced process interrupt)"})
+			emit("interrupt:mid_wave")
+			_ = writePartialPrior(s.HomeDir, projectID, runID, out)
 			return fail(out, StatusBlocked, "cancelled mid-wave")
 		}
 		ready := workgraph.EvaluateReady(g, ev)
@@ -497,6 +501,8 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 
 			out.Children = append(out.Children, outcome)
 			emit(fmt.Sprintf("child.terminal:%s term=%s evidence=%s", id, closeTerm, short(closeEvidence)))
+			// Durable partial snapshot for forced process kill recovery.
+			_ = writePartialPrior(s.HomeDir, projectID, runID, out)
 
 			// Required child failure blocks the parent (do not pretend human_gate success).
 			if it.Status == workgraph.ItemRequired && closeTerm != workgraph.TermSucceeded {
