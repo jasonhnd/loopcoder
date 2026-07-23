@@ -43,4 +43,40 @@ func TestClassifyExcludeReason(t *testing.T) {
 	if goalrun.ClassifyExcludeReason("", "", "stale window") != "stale" {
 		t.Fatal("stale")
 	}
+	if goalrun.ClassifyExcludeReason("", "", "soft excluded reserve.breach") != "soft_excluded" {
+		t.Fatal("soft")
+	}
+}
+
+func TestSoftExcludedEligibleExcludesAfterSuccessfulRoute(t *testing.T) {
+	// Winner codex; antigravity hard-eligible but soft-excluded → Claimed=false exclude.
+	got := goalrun.SoftExcludedEligibleExcludes("wi_implement", "codex", []goalrun.SoftExcludedCandidate{
+		{Provider: "codex", Model: "gpt-5.5", HardEligible: true, SoftExcluded: false},
+		{Provider: "antigravity", Model: "GPT-OSS 120B", HardEligible: true, SoftExcluded: true},
+		{Provider: "antigravity", Model: "Gemini 3.1 Pro", HardEligible: true, SoftExcluded: true}, // dedup
+		{Provider: "grok", Model: "x", HardEligible: false, SoftExcluded: true},                    // hard-ineligible ignored
+	})
+	if len(got) != 1 {
+		t.Fatalf("want 1 exclude, got %+v", got)
+	}
+	if got[0].Provider != "antigravity" || got[0].Reason != "soft_excluded" || got[0].Claimed {
+		t.Fatalf("%+v", got[0])
+	}
+	if !got[0].HardEligible || !got[0].SoftExcluded {
+		t.Fatalf("flags %+v", got[0])
+	}
+	// Feeds BuildUnavailableRetryEvidence.
+	ev := goalrun.BuildUnavailableRetryEvidence(got, "att-wi_tests-1")
+	if ev == nil || ev.ExcludedProvider != "antigravity" || ev.ExcludedReason != "soft_excluded" {
+		t.Fatalf("unavail %+v", ev)
+	}
+	if !ev.NoDuplicateClaim || !ev.NoDuplicateFiles || !ev.NoDoubleCapacity || ev.EvidenceRef == "" {
+		t.Fatalf("dup flags %+v", ev)
+	}
+	// Winner-only decision → no exclude invented.
+	if goalrun.SoftExcludedEligibleExcludes("wi_x", "codex", []goalrun.SoftExcludedCandidate{
+		{Provider: "codex", HardEligible: true, SoftExcluded: false},
+	}) != nil {
+		t.Fatal("must not invent")
+	}
 }

@@ -540,6 +540,22 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 			winnerLine, perm, reqDepth, selDepth, effort,
 		)
 
+		// After a successful route, record hard-eligible soft-excluded candidates
+		// from the same decision set (Claimed=false). This is real measured
+		// exclusion/retry evidence for canary unavailable_retry — never invented.
+		if res.Decision != nil {
+			var softCands []SoftExcludedCandidate
+			for _, cv := range res.Decision.Candidates {
+				softCands = append(softCands, SoftExcludedCandidate{
+					Provider: cv.Provider, Model: cv.Model,
+					HardEligible: cv.HardEligible, SoftExcluded: cv.SoftExcluded,
+				})
+			}
+			for _, ex := range SoftExcludedEligibleExcludes(it.ID, prov, softCands) {
+				recordExclude(ex.ChildID, ex.Provider, ex.Reason, ex.Message, ex.HardEligible, ex.SoftExcluded, ex.Claimed)
+			}
+		}
+
 		if ledger != nil && snap != nil {
 			attemptID := it.ID
 			entry, rerr := ledger.Reserve(capacityledger.ReserveInput{
