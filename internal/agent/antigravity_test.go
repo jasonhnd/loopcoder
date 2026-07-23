@@ -46,7 +46,7 @@ func TestBuildAntigravityArgs(t *testing.T) {
 				"--add-dir", "wt",
 				"--dangerously-skip-permissions",
 				"--new-project",
-				"--model", "Gemini 3.1 Pro (medium)",
+				"--model", "Gemini 3.1 Pro (Medium)",
 			},
 		},
 		{
@@ -75,7 +75,7 @@ func TestBuildAntigravityArgs(t *testing.T) {
 				"--add-dir", "wt",
 				"--dangerously-skip-permissions",
 				"--new-project",
-				"--model", "Gemini 3.1 Pro (medium)",
+				"--model", "Gemini 3.1 Pro (Medium)",
 			},
 		},
 		{
@@ -90,7 +90,73 @@ func TestBuildAntigravityArgs(t *testing.T) {
 				"--add-dir", "wt",
 				"--dangerously-skip-permissions",
 				"--new-project",
-				"--model", "Opus 4.6 (high)",
+				"--model", "Opus 4.6 (High)",
+			},
+		},
+		{
+			// Unsupported depth must NOT invent GPT-OSS 120B (Low) or silently
+			// downgrade to Medium — keep base only (fail closed at CLI if misrouted).
+			name: "gpt-oss unsupported low does not synthesize or downgrade",
+			inv: Invocation{
+				WorktreePath: "wt",
+				Prompt:       "do the work",
+				Model:        "GPT-OSS 120B",
+				Effort:       "low",
+			},
+			want: []string{
+				"-p", "do the work",
+				"--add-dir", "wt",
+				"--dangerously-skip-permissions",
+				"--new-project",
+				"--model", "GPT-OSS 120B",
+			},
+		},
+		{
+			// Exact live slug is passed through (observed selection).
+			name: "live slug is exact observed model selection",
+			inv: Invocation{
+				WorktreePath: "wt",
+				Prompt:       "do the work",
+				Model:        "gpt-oss-120b-medium",
+			},
+			want: []string{
+				"-p", "do the work",
+				"--add-dir", "wt",
+				"--dangerously-skip-permissions",
+				"--new-project",
+				"--model", "gpt-oss-120b-medium",
+			},
+		},
+		{
+			name: "exact parenthetical passes through",
+			inv: Invocation{
+				WorktreePath: "wt",
+				Prompt:       "do the work",
+				Model:        "GPT-OSS 120B (Medium)",
+				Effort:       "low", // must not rewrite exact token
+			},
+			want: []string{
+				"-p", "do the work",
+				"--add-dir", "wt",
+				"--dangerously-skip-permissions",
+				"--new-project",
+				"--model", "GPT-OSS 120B (Medium)",
+			},
+		},
+		{
+			name: "supported medium formats title-case CLI token from base",
+			inv: Invocation{
+				WorktreePath: "wt",
+				Prompt:       "do the work",
+				Model:        "GPT-OSS 120B",
+				Effort:       "medium",
+			},
+			want: []string{
+				"-p", "do the work",
+				"--add-dir", "wt",
+				"--dangerously-skip-permissions",
+				"--new-project",
+				"--model", "GPT-OSS 120B (Medium)",
 			},
 		},
 	}
@@ -114,6 +180,51 @@ func TestBuildAntigravityArgs(t *testing.T) {
 	}
 }
 
+func TestAntigravityRunner_ModelUnavailableDoesNotExec(t *testing.T) {
+	// Explicit unsupported depth / exact-token mismatch must fail closed before agy launch.
+	execCalls := 0
+	restore := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
+		execCalls++
+		t.Fatalf("agy must not exec on model_unavailable; args=%v", cmd.Args)
+		return supervisedexec.Result{}, nil
+	})
+	defer restore()
+	logPath := filepath.Join(t.TempDir(), "agy.log")
+	// GPT-OSS curated medium-only + effort low → model_unavailable, no exec.
+	res, err := AntigravityRunner{}.Run(context.Background(), Invocation{
+		WorktreePath: t.TempDir(), Prompt: "x", LogPath: logPath,
+		Model: "GPT-OSS 120B", Effort: "low",
+	})
+	if err == nil || res.FailureClass != "model_unavailable" {
+		t.Fatalf("want model_unavailable, got err=%v res=%+v", err, res)
+	}
+	if execCalls != 0 {
+		t.Fatalf("execCalls=%d", execCalls)
+	}
+	// Exact Medium token + effort low → mismatch, no exec.
+	res, err = AntigravityRunner{}.Run(context.Background(), Invocation{
+		WorktreePath: t.TempDir(), Prompt: "x", LogPath: logPath,
+		Model: "GPT-OSS 120B (Medium)", Effort: "low",
+	})
+	if err == nil || res.FailureClass != "model_unavailable" {
+		t.Fatalf("want model_unavailable for token/effort mismatch, got err=%v res=%+v", err, res)
+	}
+	if execCalls != 0 {
+		t.Fatalf("execCalls=%d after exact mismatch", execCalls)
+	}
+	// Slug medium + effort high → mismatch, no exec.
+	res, err = AntigravityRunner{}.Run(context.Background(), Invocation{
+		WorktreePath: t.TempDir(), Prompt: "x", LogPath: logPath,
+		Model: "gpt-oss-120b-medium", Effort: "high",
+	})
+	if err == nil || res.FailureClass != "model_unavailable" {
+		t.Fatalf("want model_unavailable for slug mismatch, got err=%v res=%+v", err, res)
+	}
+	if execCalls != 0 {
+		t.Fatalf("execCalls=%d after slug mismatch", execCalls)
+	}
+}
+
 func TestAntigravityRunnerClosesStdinPinsWorktreeAndCapturesPlainText(t *testing.T) {
 	worktree := t.TempDir()
 	logPath := filepath.Join(t.TempDir(), "antigravity.log")
@@ -128,7 +239,7 @@ func TestAntigravityRunnerClosesStdinPinsWorktreeAndCapturesPlainText(t *testing
 		if cmd.Stdin != nil {
 			t.Fatalf("Stdin = %#v, want nil closed stdin", cmd.Stdin)
 		}
-		wantArgs := []string{"agy", "-p", prompt, "--add-dir", worktree, "--dangerously-skip-permissions", "--new-project", "--model", "Gemini 3.1 Pro (medium)"}
+		wantArgs := []string{"agy", "-p", prompt, "--add-dir", worktree, "--dangerously-skip-permissions", "--new-project", "--model", "Gemini 3.1 Pro (Medium)"}
 		if !reflect.DeepEqual(cmd.Args, wantArgs) {
 			t.Fatalf("Args = %#v, want %#v", cmd.Args, wantArgs)
 		}
@@ -148,7 +259,7 @@ func TestAntigravityRunnerClosesStdinPinsWorktreeAndCapturesPlainText(t *testing
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
-	if result.ExitCode != 0 || result.Summary != "plain text summary" || result.Model != "Gemini 3.1 Pro (medium)" || result.Effort != "medium" {
+	if result.ExitCode != 0 || result.Summary != "plain text summary" || result.Model != "Gemini 3.1 Pro (Medium)" || result.Effort != "medium" {
 		t.Fatalf("result = %#v", result)
 	}
 	assertNilInt64Ptr(t, result.Usage.TotalTokens)
@@ -232,7 +343,7 @@ func TestAntigravityRunnerReadOnlyFailsClosedWithoutLaunchingAgy(t *testing.T) {
 			t.Fatalf("Run error = %v, want substring %q", err, want)
 		}
 	}
-	if result.ExitCode != 1 || result.Model != "Gemini 3.1 Pro (medium)" || result.Effort != "medium" {
+	if result.ExitCode != 1 || result.Model != "Gemini 3.1 Pro (Medium)" || result.Effort != "medium" {
 		t.Fatalf("read-only result = %#v", result)
 	}
 }

@@ -96,6 +96,16 @@ func TestLookupHelpers(t *testing.T) {
 	if depth, ok := model.LookupDepth("medium"); !ok || depth.Label != "medium" {
 		t.Fatalf("LookupDepth High = %#v/%t", depth, ok)
 	}
+	gpt, ok := provider.LookupModel("GPT-OSS 120B")
+	if !ok {
+		t.Fatal("LookupModel GPT-OSS 120B")
+	}
+	if got, want := gpt.DepthTokens(), []string{"medium"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("GPT-OSS DepthTokens = %#v, want medium only (no invented low/high)", got)
+	}
+	if _, ok := gpt.LookupDepth("low"); ok {
+		t.Fatal("GPT-OSS must not advertise unsupported low depth")
+	}
 	if _, ok := models.LookupProvider("agy"); ok {
 		t.Fatal("LookupProvider agy returned true, want provider key antigravity only")
 	}

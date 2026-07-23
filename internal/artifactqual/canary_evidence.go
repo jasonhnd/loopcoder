@@ -79,7 +79,10 @@ type CanaryChild struct {
 // CanaryUnavailableRetry proves exclude/retry without duplicate claim/output.
 type CanaryUnavailableRetry struct {
 	ExcludedProvider string `json:"excluded_provider"`
-	ExcludedReason   string `json:"excluded_reason"` // exhausted|stale|rate_limited|unavailable
+	// ExcludedReason must be a real unavailability class only:
+	// exhausted|stale|rate_limited|unavailable|soft_excluded|model_unavailable.
+	// eligible_not_chosen is multi-provider diversity, not unavailability.
+	ExcludedReason   string `json:"excluded_reason"`
 	RetryAttemptID   string `json:"retry_attempt_id,omitempty"`
 	NoDuplicateClaim bool   `json:"no_duplicate_claim"`
 	NoDuplicateFiles bool   `json:"no_duplicate_files"`
@@ -290,12 +293,16 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 	}
 
 	// Unavailable retry — require evidence_ref binding (no bare true flags).
+	// eligible_not_chosen / soft non-winner diversity is NOT unavailability.
 	if ev.UnavailableRetry == nil {
 		add("unavailable_retry_missing")
 	} else {
 		u := ev.UnavailableRetry
-		if strings.TrimSpace(u.ExcludedProvider) == "" || strings.TrimSpace(u.ExcludedReason) == "" {
+		reason := strings.ToLower(strings.TrimSpace(u.ExcludedReason))
+		if strings.TrimSpace(u.ExcludedProvider) == "" || reason == "" {
 			add("unavailable_retry_incomplete")
+		} else if !isCanaryUnavailableReason(reason) {
+			add("unavailable_retry_reason_not_unavailable")
 		} else if !u.NoDuplicateClaim || !u.NoDuplicateFiles || !u.NoDoubleCapacity {
 			add("unavailable_retry_dup_flags_false")
 		} else if strings.TrimSpace(u.EvidenceRef) == "" {
@@ -374,6 +381,21 @@ func hasReasonPrefix(reasons []string, prefix string) bool {
 		}
 	}
 	return false
+}
+
+// isCanaryUnavailableReason is the closed set of unavailability classes that may
+// satisfy unavailable_retry.
+//
+// Rejected: eligible_not_chosen / not_chosen (diversity), soft_excluded (soft
+// policy), stale (freshness alone without typed failure).
+func isCanaryUnavailableReason(reason string) bool {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "exhausted", "rate_limited", "unavailable",
+		"model_unavailable", "capacity_refused", "permission":
+		return true
+	default:
+		return false
+	}
 }
 
 // DigestCanaryBody hashes a stable subset for optional anti-tamper.
