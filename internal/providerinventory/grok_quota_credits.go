@@ -463,23 +463,23 @@ func snapshotsFromGrokCreditsBilling(
 	periodType := strings.TrimSpace(cfg.CurrentPeriod.Type)
 	resetAt := firstNonEmpty(cfg.CurrentPeriod.End, cfg.BillingPeriodEnd)
 	periodStart := firstNonEmpty(cfg.CurrentPeriod.Start, cfg.BillingPeriodStart)
+
+	// Normalize period bounds to RFC3339 when parseable. ValidateQuotaSnapshot
+	// requires window_start+window_end for fixed-week; without them Refresh
+	// rejects the whole inventory report and Grok installs never persist.
+	windowStart := normalizeGrokRFC3339(periodStart)
+	resetNorm := normalizeGrokRFC3339(resetAt)
+
 	windowKind := WindowProviderDefined
 	if strings.Contains(strings.ToUpper(periodType), "WEEKLY") {
-		windowKind = WindowFixedWeek
+		// Only claim fixed-week when both bounds are present and truthful.
+		if windowStart != "" && resetNorm != "" {
+			windowKind = WindowFixedWeek
+		} else {
+			windowKind = WindowProviderDefined
+		}
 	} else if periodType == "" {
 		windowKind = WindowUnknown
-	}
-
-	// Normalize reset to RFC3339 when parseable.
-	resetNorm := ""
-	if resetAt != "" {
-		if t, err := time.Parse(time.RFC3339Nano, resetAt); err == nil {
-			resetNorm = t.UTC().Format(time.RFC3339Nano)
-		} else if t, err := time.Parse(time.RFC3339, resetAt); err == nil {
-			resetNorm = t.UTC().Format(time.RFC3339Nano)
-		} else {
-			resetNorm = resetAt
-		}
 	}
 
 	var snaps []QuotaSnapshot
@@ -504,6 +504,9 @@ func snapshotsFromGrokCreditsBilling(
 		if resetNorm == "" {
 			gaps = append(gaps, "missing-reset-at")
 		}
+		if windowKind == WindowFixedWeek && (windowStart == "" || resetNorm == "") {
+			gaps = append(gaps, "missing-fixed-window-bounds")
+		}
 		terminal := ""
 		if remI <= 0 {
 			terminal = "ErrQuotaExhausted"
@@ -520,6 +523,8 @@ func snapshotsFromGrokCreditsBilling(
 			ProviderQuantityName:   "credit_usage_percent",
 			Unit:                   "percent",
 			WindowKind:             windowKind,
+			WindowStart:            windowStart,
+			WindowEnd:              resetNorm,
 			ResetAt:                resetNorm,
 			ResetSemantics:         grokResetSemantics(resetNorm, windowKind),
 			LimitValue:             &limI,
@@ -533,13 +538,15 @@ func snapshotsFromGrokCreditsBilling(
 			ValidUntil:             resetNorm,
 			StaleAfter:             firstNonEmpty(resetNorm, formatTime(now.Add(30*time.Minute))),
 			RawSourceHash:          rawHash,
-			RedactedDiagnostics:    fmt.Sprintf("grok official CLI credits billing parser %s cli version %s period=%s unified=%v", grokCreditsBillingSourceSchema, safeSummary(cliVersion), safeSummary(periodType), boolPtrString(cfg.IsUnifiedBillingUser)),
-			ConflictSet:            []string{},
-			GapReasons:             gaps,
-			TerminalErrorCode:      terminal,
-			CreatedAt:              formatTime(now),
-			UpdatedAt:              formatTime(now),
-			PolicyVersion:          PolicyVersion,
+			// Avoid key=value forms that trip secretLike generic patterns
+			// (e.g. period=USAGE_PERIOD_TYPE_WEEKLY) and block Refresh.
+			RedactedDiagnostics: fmt.Sprintf("grok official CLI credits billing parser %s cli version %s period_type %s unified %s", grokCreditsBillingSourceSchema, safeSummary(cliVersion), safeSummary(periodType), boolPtrString(cfg.IsUnifiedBillingUser)),
+			ConflictSet:         []string{},
+			GapReasons:          gaps,
+			TerminalErrorCode:   terminal,
+			CreatedAt:           formatTime(now),
+			UpdatedAt:           formatTime(now),
+			PolicyVersion:       PolicyVersion,
 		}))
 	}
 
@@ -578,6 +585,8 @@ func snapshotsFromGrokCreditsBilling(
 			ProviderQuantityName:   "product_usage_percent",
 			Unit:                   "percent",
 			WindowKind:             windowKind,
+			WindowStart:            windowStart,
+			WindowEnd:              resetNorm,
 			ResetAt:                resetNorm,
 			ResetSemantics:         grokResetSemantics(resetNorm, windowKind),
 			LimitValue:             &limI,
@@ -591,7 +600,7 @@ func snapshotsFromGrokCreditsBilling(
 			ValidUntil:             resetNorm,
 			StaleAfter:             firstNonEmpty(resetNorm, formatTime(now.Add(30*time.Minute))),
 			RawSourceHash:          rawHash,
-			RedactedDiagnostics:    fmt.Sprintf("grok official CLI credits billing product=%s parser %s", safeSummary(product), grokCreditsBillingSourceSchema),
+			RedactedDiagnostics:    fmt.Sprintf("grok official CLI credits billing product %s parser %s", safeSummary(product), grokCreditsBillingSourceSchema),
 			ConflictSet:            []string{},
 			GapReasons:             []string{},
 			CreatedAt:              formatTime(now),
@@ -601,7 +610,7 @@ func snapshotsFromGrokCreditsBilling(
 	}
 
 	// Period metadata window when percent missing but period present (estimated/unknown usage).
-	if len(snaps) == 0 && (periodStart != "" || resetNorm != "") {
+	if len(snaps) == 0 && (windowStart != "" || resetNorm != "") {
 		scope := grokScope(account, "", "billing_period")
 		snaps = append(snaps, normalizeQuotaSnapshot(QuotaSnapshot{
 			QuotaSnapshotID:        quotaSnapshotID("grok", source.QuotaSourceID, scope, "billing_period", formatTime(now)),
@@ -614,6 +623,8 @@ func snapshotsFromGrokCreditsBilling(
 			ProviderQuantityName:   "billing_period",
 			Unit:                   "provider-defined",
 			WindowKind:             windowKind,
+			WindowStart:            windowStart,
+			WindowEnd:              resetNorm,
 			ResetAt:                resetNorm,
 			ResetSemantics:         grokResetSemantics(resetNorm, windowKind),
 			ValueScale:             0,
@@ -647,6 +658,23 @@ func snapshotsFromGrokCreditsBilling(
 	}
 	sort.Slice(snaps, func(i, j int) bool { return snaps[i].QuotaSnapshotID < snaps[j].QuotaSnapshotID })
 	return snaps, nil
+}
+
+// normalizeGrokRFC3339 parses common RFC3339/RFC3339Nano timestamps and
+// rewrites them in UTC RFC3339Nano. Unparseable non-empty values are returned
+// as-is for diagnostics; empty input stays empty.
+func normalizeGrokRFC3339(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if t, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return t.UTC().Format(time.RFC3339Nano)
+	}
+	if t, err := time.Parse(time.RFC3339, value); err == nil {
+		return t.UTC().Format(time.RFC3339Nano)
+	}
+	return value
 }
 
 func clampPercent(v float64) float64 {
