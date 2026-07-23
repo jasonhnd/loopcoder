@@ -243,17 +243,30 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 			}
 			// Ledger-derived forced-kill recovery: open launch without terminal →
 			// interrupt + generation bump (same as graceful cancel path).
+			// Always re-read aborted/open launches after RecoverOpen — even when an
+			// interrupt line already exists (SIGTERM graceful path wrote interrupt
+			// first, so RecoverOpen returns n=0). Without this, in-flight children
+			// resume with the same attempt_id and re-launch, breaking exactly_once
+			// (dupLaunch detection in canary emit).
 			if elog, eerr := workflowrun.OpenEventLog(req.HomeDir, projectID, runID); eerr == nil {
-				if n, rerr := workflowrun.RecoverOpenLaunchInterrupts(elog, projectID, runID); rerr == nil && n > 0 {
-					if events, rerr2 := elog.ReadAll(); rerr2 == nil {
-						_, aborted := workflowrun.InterruptedFromEvents(events)
-						for id := range aborted {
-							if _, ok := attemptGen[id]; !ok {
-								attemptGen[id] = 1
-							}
+				_, _ = workflowrun.RecoverOpenLaunchInterrupts(elog, projectID, runID)
+				if events, rerr2 := elog.ReadAll(); rerr2 == nil {
+					interrupted, aborted := workflowrun.InterruptedFromEvents(events)
+					for id := range aborted {
+						if _, ok := attemptGen[id]; !ok {
+							attemptGen[id] = 1
 						}
 					}
-					resumed = resumed || len(priorSucceeded) > 0
+					// Open launches without terminal must bump even if not yet in aborted
+					// map (ordering edge: interrupt without WorkItemID).
+					for id := range workflowrun.OpenLaunchesWithoutTerminal(events) {
+						if _, ok := attemptGen[id]; !ok {
+							attemptGen[id] = 1
+						}
+					}
+					if interrupted {
+						resumed = resumed || len(priorSucceeded) > 0 || len(aborted) > 0
+					}
 				}
 			}
 

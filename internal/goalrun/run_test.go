@@ -610,3 +610,98 @@ func TestCheckpointRefuseReuseWithoutEvidence(t *testing.T) {
 		t.Fatalf("%+v", got)
 	}
 }
+
+func TestResumeBumpsGenerationWhenInterruptAlreadyInLedger(t *testing.T) {
+	// SIGTERM path often writes a generic interrupt before RecoverOpenLaunch
+	// returns n=0; open launches must still get gen+1 so attempt IDs change.
+	home := testHome(t)
+	now := time.Date(2026, 7, 23, 7, 0, 0, 0, time.UTC)
+	projectID := "proj-gen-bump"
+	runID := "run_gen_bump_1"
+	elog, err := workflowrun.OpenEventLog(home, projectID, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulated first pass: research done, implement launched, hard kill.
+	must := func(e workflowrun.Event) {
+		e.ProjectID, e.RunID = projectID, runID
+		if err := elog.Append(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(workflowrun.Event{Kind: "run.start", Message: "workflow execute"})
+	must(workflowrun.Event{Kind: "launch", WorkItemID: "wi_research", AttemptID: "att-wi_research-deadbeef-g0"})
+	must(workflowrun.Event{Kind: "terminal", WorkItemID: "wi_research", AttemptID: "att-wi_research-deadbeef-g0", Terminal: "succeeded"})
+	must(workflowrun.Event{Kind: "integrate", WorkItemID: "wi_research", AttemptID: "att-wi_research-deadbeef-g0"})
+	must(workflowrun.Event{Kind: "launch", WorkItemID: "wi_implement", AttemptID: "att-wi_implement-deadbeef-g0"})
+	// Generic interrupt already present (graceful SIGTERM) — RecoverOpen returns 0.
+	must(workflowrun.Event{Kind: "interrupt", Message: "cancelled mid-wave (forced process interrupt)"})
+
+	// Durable prior for research only.
+	cp := goalrun.Checkpoint{
+		Schema: goalrun.CheckpointSchema, ProjectID: projectID, RunID: runID,
+		GraphID: "g1", PlanDigest: "sha256:deadbeef", Goal: "implement gen bump", Issue: "1343", Actor: "owner",
+		Status: "blocked", Interrupted: true,
+		PriorSucceeded: map[string]workflowrun.ChildOutcome{
+			"wi_research": {
+				WorkItemID: "wi_research", Terminal: "succeeded",
+				AttemptID: "att-wi_research-deadbeef-g0", OutputEvidence: "sha256:abc",
+				Provider: "fixture", Model: "fixture-model", Depth: "low",
+			},
+		},
+		AbortedAttempts: map[string]string{"wi_implement": "att-wi_implement-deadbeef-g0"},
+		SavedAt:         now,
+	}
+	if _, err := goalrun.SaveCheckpoint(home, cp); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := map[string]int{}
+	res, err := goalrun.Execute(context.Background(), goalrun.Request{
+		ProjectID: projectID, RunID: runID, Resume: true,
+		Goal: "implement gen bump multi-child routing with tests", Issue: "1343",
+		Actor: "owner", Owner: "worker",
+		Provider: "fixture", Model: "fixture-model",
+		HomeDir: home, Now: func() time.Time { return now.Add(time.Minute) },
+		Executor: workflowrun.FakeChildExecutor{
+			HomeDir: home, Now: func() time.Time { return now.Add(time.Minute) },
+			Calls: calls,
+		},
+	})
+	if err != nil {
+		t.Fatalf("resume: %v status=%s msg=%s", err, res.Status, res.Message)
+	}
+	// Research must reuse, not re-exec.
+	if calls["wi_research"] != 0 {
+		t.Fatalf("research re-exec on resume: %+v", calls)
+	}
+	// Implement must use a new generation attempt id (g1+), not g0.
+	for _, c := range res.Workflow.Children {
+		if c.WorkItemID == "wi_implement" {
+			if c.AttemptID == "att-wi_implement-deadbeef-g0" {
+				t.Fatalf("implement re-used aborted attempt id %s", c.AttemptID)
+			}
+			if !strings.Contains(c.AttemptID, "-g1") && !strings.Contains(c.AttemptID, "-g2") {
+				// gen may be 1 from aborted map
+				t.Logf("implement attempt=%s", c.AttemptID)
+			}
+			if strings.HasSuffix(c.AttemptID, "-g0") {
+				t.Fatalf("implement still g0: %s", c.AttemptID)
+			}
+		}
+	}
+	// Event ledger must not re-launch the same implement g0 attempt.
+	events, err := elog.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	g0Launch := 0
+	for _, e := range events {
+		if e.Kind == "launch" && e.AttemptID == "att-wi_implement-deadbeef-g0" {
+			g0Launch++
+		}
+	}
+	if g0Launch != 1 {
+		t.Fatalf("implement g0 launch count=%d want 1 (no re-launch)", g0Launch)
+	}
+}
