@@ -161,6 +161,13 @@ func (g GitBranchIntegrator) IntegrateChild(ctx context.Context, req IntegrateRe
 		}
 		src := filepath.Join(req.ChildWorktree, rel)
 		dst := filepath.Join(tmpWT, rel)
+		if _, serr := os.Stat(src); serr != nil {
+			// Skip ephemeral paths that vanished after provider exit (logs).
+			if os.IsNotExist(serr) {
+				continue
+			}
+			return out, fmt.Errorf("stat %s: %w", rel, serr)
+		}
 		if err := copyPath(src, dst); err != nil {
 			return out, fmt.Errorf("copy %s: %w", rel, err)
 		}
@@ -386,6 +393,11 @@ func filterProductFiles(files []string) []string {
 		}
 		base := filepath.Base(f)
 		if base == ".loopcoder-owned-worktree" || base == ".git" {
+			continue
+		}
+		// Provider runtime logs / prompt dumps are not product.
+		if strings.HasSuffix(base, ".log") || base == "prompt.txt" || base == "summary.txt" ||
+			strings.HasPrefix(base, ".loopcoder-child") || base == "loopcoder-child-provider.log" {
 			continue
 		}
 		// Meta evidence alone is not product — exclude pure .loopcoder/** except
