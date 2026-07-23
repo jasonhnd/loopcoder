@@ -198,14 +198,18 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 	if runID == "" {
 		runID = "run_" + shortID(fmt.Sprintf("%s|%d", projectID, now.UnixNano()))
 	}
-	// Forced restart: load durable checkpoint for same RunID → PriorSucceeded seed
-	// and attempt generation bumps for aborted/in-flight children.
+	// Forced restart: seed PriorSucceeded + attempt generation bumps for
+	// aborted/in-flight children. Mid-run hard kill often exits before
+	// saveRunCheckpoint, so goal-checkpoint.json may be absent — partial
+	// prior and the event ledger must still recover exactly-once (reuse
+	// succeeded children; gen-bump aborted launches so attempt_id changes).
 	priorSucceeded := req.PriorSucceeded
 	attemptGen := map[string]int{}
 	resumed := false
 	var loadedCP Checkpoint
 	if req.Resume || priorSucceeded == nil {
-		if cp, _, lerr := LoadCheckpoint(req.HomeDir, projectID, runID); lerr == nil {
+		cp, _, lerr := LoadCheckpoint(req.HomeDir, projectID, runID)
+		if lerr == nil {
 			loadedCP = cp
 			if priorSucceeded == nil && len(cp.PriorSucceeded) > 0 {
 				priorSucceeded = cp.PriorSucceeded
@@ -221,55 +225,6 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 				}
 				attemptGen[id] = prev + 1
 			}
-			// Merge mid-run partial (forced kill before goal-checkpoint rewrite).
-			if part, perr := workflowrun.LoadPartialPrior(req.HomeDir, projectID, runID); perr == nil {
-				if priorSucceeded == nil {
-					priorSucceeded = map[string]workflowrun.ChildOutcome{}
-				}
-				for id, c := range part.PriorSucceeded {
-					if _, ok := priorSucceeded[id]; !ok {
-						priorSucceeded[id] = c
-					}
-				}
-				for id, att := range part.Aborted {
-					if _, ok := attemptGen[id]; !ok {
-						attemptGen[id] = 1
-					}
-					_ = att
-				}
-				if len(part.PriorSucceeded) > 0 {
-					resumed = true
-				}
-			}
-			// Ledger-derived forced-kill recovery: open launch without terminal →
-			// interrupt + generation bump (same as graceful cancel path).
-			// Always re-read aborted/open launches after RecoverOpen — even when an
-			// interrupt line already exists (SIGTERM graceful path wrote interrupt
-			// first, so RecoverOpen returns n=0). Without this, in-flight children
-			// resume with the same attempt_id and re-launch, breaking exactly_once
-			// (dupLaunch detection in canary emit).
-			if elog, eerr := workflowrun.OpenEventLog(req.HomeDir, projectID, runID); eerr == nil {
-				_, _ = workflowrun.RecoverOpenLaunchInterrupts(elog, projectID, runID)
-				if events, rerr2 := elog.ReadAll(); rerr2 == nil {
-					interrupted, aborted := workflowrun.InterruptedFromEvents(events)
-					for id := range aborted {
-						if _, ok := attemptGen[id]; !ok {
-							attemptGen[id] = 1
-						}
-					}
-					// Open launches without terminal must bump even if not yet in aborted
-					// map (ordering edge: interrupt without WorkItemID).
-					for id := range workflowrun.OpenLaunchesWithoutTerminal(events) {
-						if _, ok := attemptGen[id]; !ok {
-							attemptGen[id] = 1
-						}
-					}
-					if interrupted {
-						resumed = resumed || len(priorSucceeded) > 0 || len(aborted) > 0
-					}
-				}
-			}
-
 			for id, g0 := range cp.AttemptGeneration {
 				if _, ok := attemptGen[id]; !ok {
 					attemptGen[id] = g0
@@ -282,6 +237,57 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 			}
 		} else if req.Resume && !osIsNotExist(lerr) {
 			return Result{}, fmt.Errorf("goalrun: resume load checkpoint: %w", lerr)
+		}
+		// Always merge mid-run partial when present — even if goal-checkpoint is
+		// missing (forced kill before goalrun rewrite). This is the primary
+		// exactly-once seed for hard-kill recovery.
+		if part, perr := workflowrun.LoadPartialPrior(req.HomeDir, projectID, runID); perr == nil {
+			if priorSucceeded == nil {
+				priorSucceeded = map[string]workflowrun.ChildOutcome{}
+			}
+			for id, c := range part.PriorSucceeded {
+				if _, ok := priorSucceeded[id]; !ok {
+					priorSucceeded[id] = c
+				}
+			}
+			for id, att := range part.Aborted {
+				if _, ok := attemptGen[id]; !ok {
+					attemptGen[id] = 1
+				}
+				_ = att
+			}
+			if len(part.PriorSucceeded) > 0 {
+				resumed = true
+			}
+		}
+		// Ledger-derived forced-kill recovery: open launch without terminal →
+		// interrupt + generation bump (same as graceful cancel path).
+		// Always re-read aborted/open launches after RecoverOpen — even when an
+		// interrupt line already exists (SIGTERM graceful path wrote interrupt
+		// first, so RecoverOpen returns n=0). Without this, in-flight children
+		// resume with the same attempt_id and re-launch, breaking exactly_once
+		// (dupLaunch detection in canary emit). Runs whether or not a goal
+		// checkpoint exists (hard kill before saveRunCheckpoint).
+		if elog, eerr := workflowrun.OpenEventLog(req.HomeDir, projectID, runID); eerr == nil {
+			_, _ = workflowrun.RecoverOpenLaunchInterrupts(elog, projectID, runID)
+			if events, rerr2 := elog.ReadAll(); rerr2 == nil {
+				interrupted, aborted := workflowrun.InterruptedFromEvents(events)
+				for id := range aborted {
+					if _, ok := attemptGen[id]; !ok {
+						attemptGen[id] = 1
+					}
+				}
+				// Open launches without terminal must bump even if not yet in aborted
+				// map (ordering edge: interrupt without WorkItemID).
+				for id := range workflowrun.OpenLaunchesWithoutTerminal(events) {
+					if _, ok := attemptGen[id]; !ok {
+						attemptGen[id] = 1
+					}
+				}
+				if interrupted {
+					resumed = resumed || len(priorSucceeded) > 0 || len(aborted) > 0
+				}
+			}
 		}
 	}
 	if req.Resume && runID == "" {

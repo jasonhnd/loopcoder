@@ -3,6 +3,7 @@ package goalrun_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -703,5 +704,122 @@ func TestResumeBumpsGenerationWhenInterruptAlreadyInLedger(t *testing.T) {
 	}
 	if g0Launch != 1 {
 		t.Fatalf("implement g0 launch count=%d want 1 (no re-launch)", g0Launch)
+	}
+}
+
+func TestResumeWithoutGoalCheckpointUsesPartialAndGenBump(t *testing.T) {
+	// Hard kill mid-workflow exits before saveRunCheckpoint. Only partial prior
+	// + event ledger exist. Resume must still reuse succeeded children and
+	// gen-bump aborted launches (exactly_once: no g0 re-launch).
+	home := testHome(t)
+	now := time.Date(2026, 7, 23, 8, 0, 0, 0, time.UTC)
+	projectID := "proj-no-checkpoint"
+	runID := "run_no_checkpoint_1"
+	elog, err := workflowrun.OpenEventLog(home, projectID, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	must := func(e workflowrun.Event) {
+		e.ProjectID, e.RunID = projectID, runID
+		if err := elog.Append(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(workflowrun.Event{Kind: "run.start", Message: "workflow execute"})
+	must(workflowrun.Event{Kind: "launch", WorkItemID: "wi_research", AttemptID: "att-wi_research-cafebabe-g0"})
+	must(workflowrun.Event{Kind: "terminal", WorkItemID: "wi_research", AttemptID: "att-wi_research-cafebabe-g0", Terminal: "succeeded", Evidence: "sha256:research"})
+	must(workflowrun.Event{Kind: "integrate", WorkItemID: "wi_research", AttemptID: "att-wi_research-cafebabe-g0"})
+	must(workflowrun.Event{Kind: "launch", WorkItemID: "wi_implement", AttemptID: "att-wi_implement-cafebabe-g0"})
+	// No interrupt line yet (true hard kill). No goal-checkpoint.json.
+
+	// Mid-run partial snapshot (written after each child terminal in production).
+	partialPath := filepath.Join(filepath.Dir(elog.Path()), "workflow-partial.json")
+	partialBody, err := json.Marshal(map[string]any{
+		"schema":      "loopcoder.workflow.partial.v1",
+		"project_id":  projectID,
+		"run_id":      runID,
+		"saved_at":    now.Format(time.RFC3339),
+		"interrupted": true,
+		"prior_succeeded": map[string]any{
+			"wi_research": map[string]any{
+				"work_item_id":    "wi_research",
+				"provider":        "fixture",
+				"model":           "fixture-model",
+				"depth":           "low",
+				"terminal":        "succeeded",
+				"output_evidence": "sha256:research",
+				"attempt_id":      "att-wi_research-cafebabe-g0",
+			},
+		},
+		"aborted_attempts": map[string]string{
+			"wi_implement": "att-wi_implement-cafebabe-g0",
+		},
+		"event_log_path": elog.Path(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(partialPath, partialBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Confirm goal-checkpoint is absent.
+	if _, _, err := goalrun.LoadCheckpoint(home, projectID, runID); err == nil {
+		t.Fatal("expected no goal-checkpoint for this scenario")
+	}
+
+	calls := map[string]int{}
+	res, err := goalrun.Execute(context.Background(), goalrun.Request{
+		ProjectID: projectID, RunID: runID, Resume: true,
+		Goal: "implement multi-child routing with tests and docs", Issue: "1343",
+		Actor: "owner", Owner: "worker",
+		Provider: "fixture", Model: "fixture-model",
+		HomeDir: home, Now: func() time.Time { return now.Add(time.Minute) },
+		Executor: workflowrun.FakeChildExecutor{
+			HomeDir: home, Now: func() time.Time { return now.Add(time.Minute) },
+			Calls: calls,
+		},
+	})
+	if err != nil {
+		t.Fatalf("resume without checkpoint: %v status=%s msg=%s", err, res.Status, res.Message)
+	}
+	if !res.Resumed {
+		t.Fatalf("expected resumed=true from partial prior, got %+v", res)
+	}
+	if calls["wi_research"] != 0 {
+		t.Fatalf("research re-exec without checkpoint: calls=%+v", calls)
+	}
+	for _, c := range res.Workflow.Children {
+		if c.WorkItemID == "wi_implement" {
+			if strings.HasSuffix(c.AttemptID, "-g0") {
+				t.Fatalf("implement still g0 without checkpoint recovery: %s", c.AttemptID)
+			}
+			if !strings.Contains(c.AttemptID, "-g1") && !strings.Contains(c.AttemptID, "-g2") {
+				t.Logf("implement attempt=%s (gen bump expected)", c.AttemptID)
+			}
+		}
+		if c.WorkItemID == "wi_research" && c.AttemptID != "att-wi_research-cafebabe-g0" {
+			// reuse keeps original attempt id
+			t.Logf("research attempt=%s", c.AttemptID)
+		}
+	}
+	events, err := elog.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	g0Impl := 0
+	reuseResearch := 0
+	for _, e := range events {
+		if e.Kind == "launch" && e.AttemptID == "att-wi_implement-cafebabe-g0" {
+			g0Impl++
+		}
+		if e.Kind == "reuse" && e.WorkItemID == "wi_research" {
+			reuseResearch++
+		}
+	}
+	if g0Impl != 1 {
+		t.Fatalf("implement g0 launch count=%d want 1 (no re-launch of aborted attempt)", g0Impl)
+	}
+	if reuseResearch < 1 {
+		t.Fatalf("research must emit reuse event without checkpoint; events missing reuse")
 	}
 }
