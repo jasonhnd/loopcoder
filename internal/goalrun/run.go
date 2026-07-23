@@ -156,6 +156,12 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 	if nowFn == nil {
 		nowFn = time.Now
 	}
+	// Production: honor LOOPCODER_HOME for event log / partial / child worktrees.
+	if strings.TrimSpace(req.HomeDir) == "" {
+		if h := strings.TrimSpace(os.Getenv("LOOPCODER_HOME")); h != "" {
+			req.HomeDir = h
+		}
+	}
 	now := nowFn().UTC()
 	actor := strings.TrimSpace(req.Actor)
 	if actor == "" {
