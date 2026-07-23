@@ -225,10 +225,20 @@ func (r GrokRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 		return result, grokError(GrokErrNonzeroExit, fmt.Sprintf("process exited with code %d", result.ExitCode), nil)
 	}
 	if !sink.terminalSeen() {
-		return result, grokError(GrokErrTransportLoss, "stream ended before a terminal result frame", nil)
+		// Grok Build CLI streaming-json may end with progress/usage frames only
+		// (no typed result/final event) while still exiting 0 with usable output.
+		if !sink.acceptCleanExitAsTerminal(result) {
+			return result, grokError(GrokErrTransportLoss, "stream ended before a terminal result frame", nil)
+		}
 	}
 	if strings.TrimSpace(result.Model) == "" {
-		return result, grokError(GrokErrMalformedFrame, "terminal result did not identify a model", nil)
+		// Prefer provider-reported model; fall back to the requested pin when the
+		// stream only carried usage/session frames.
+		if pin := strings.TrimSpace(inv.Model); pin != "" {
+			result.Model = pin
+		} else {
+			return result, grokError(GrokErrMalformedFrame, "terminal result did not identify a model", nil)
+		}
 	}
 	return result, nil
 }
@@ -864,9 +874,16 @@ func normalizeGrokFrame(payload map[string]any) (grokNormalizedRecord, error) {
 	return sanitizeGrokRecord(record), nil
 }
 
+func usagePositive(u reporter.Usage) bool {
+	return (u.InputTokens != nil && *u.InputTokens > 0) ||
+		(u.OutputTokens != nil && *u.OutputTokens > 0) ||
+		(u.TotalTokens != nil && *u.TotalTokens > 0)
+}
+
 func normalizeGrokKind(kind string) string {
 	switch kind {
-	case "result", "final", "done", "completed", "completion", "terminal":
+	case "result", "final", "done", "completed", "completion", "terminal",
+		"stop", "end", "message_stop", "response", "agent_result", "turn_complete", "turn_end":
 		return "terminal"
 	case "error":
 		return "terminal"
@@ -880,6 +897,37 @@ func normalizeGrokKind(kind string) string {
 		}
 		return "progress"
 	}
+}
+
+// acceptCleanExitAsTerminal promotes a clean process exit (code 0, no stream
+// error) with session/usage/summary evidence to a synthetic terminal when the
+// provider never emitted a typed result frame.
+func (s *grokStreamSink) acceptCleanExitAsTerminal(result Result) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.firstErr != nil || s.terminal {
+		return s.terminal
+	}
+	// Require token usage evidence so a lone assistant delta without a result
+	// frame still fails closed as transport-loss (restart recovery path).
+	hasUsage := usagePositive(result.Usage) || usagePositive(s.meta.Usage)
+	if !hasUsage {
+		return false
+	}
+	s.terminal = true
+	s.writeRecordLocked(grokNormalizedRecord{
+		Kind:       "terminal",
+		Provider:   "grok",
+		SessionRef: firstNonEmptyGrok(result.ExternalSessionRef, s.meta.ExternalSessionRef),
+		Model:      firstNonEmptyGrok(result.Model, s.meta.Model),
+		Usage:      s.meta.Usage,
+		Text:       strings.TrimSpace(s.summaryText.value),
+		GapReasons: []string{"synthetic-terminal-from-clean-exit"},
+	})
+	return true
 }
 
 func sanitizeGrokRecord(record grokNormalizedRecord) grokNormalizedRecord {
