@@ -245,3 +245,92 @@ func TestToRouteInventoryEmitsPerSupportedDepth(t *testing.T) {
 		t.Fatal("expected fail-closed for unsupported xhigh")
 	}
 }
+
+func TestToRouteInventorySoftBindsHighestRemainingWindow(t *testing.T) {
+	// Regression: Antigravity multi-window (primary≈98%, secondary/3p≈11%).
+	// First-window binding soft-excluded the whole provider under Luna reserve.
+	now := time.Date(2026, 7, 23, 4, 0, 0, 0, time.UTC)
+	pct := func(rem float64) capacitysnapshot.Window {
+		return capacitysnapshot.Window{
+			Kind: "provider-defined", Unit: capacitysnapshot.UnitPercentage,
+			Used:       capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: 100 - rem, Unit: capacitysnapshot.UnitPercentage},
+			Remaining:  capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: rem, Unit: capacitysnapshot.UnitPercentage},
+			Limit:      capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: 100, Unit: capacitysnapshot.UnitPercentage},
+			Confidence: capacitysnapshot.ConfidenceExact, Freshness: capacitysnapshot.FreshnessFresh,
+			CapturedAt: now, Source: "test",
+		}
+	}
+	// Scarce secondary listed first — must not bind soft remaining to 11%.
+	ag := capacitysnapshot.FromAccountInput(capacitysnapshot.AccountInput{
+		Provider: "antigravity", AccountRef: "acct-ag", InstallRef: "i-ag",
+		Installed: true, Authenticated: true, Healthy: true,
+		HealthConfidence: capacitysnapshot.ConfidenceExact, HealthFreshness: capacitysnapshot.FreshnessFresh,
+		Windows: []capacitysnapshot.Window{
+			pct(11), // secondary / 3p — scarce
+			pct(98), // primary — abundant
+		},
+		Models: []capacitysnapshot.ModelSpec{{
+			ModelID: "Gemini 3.1 Pro", SupportedDepths: []string{"medium"}, DefaultDepth: "medium", Present: true,
+		}},
+		Source: "test", CapturedAt: now,
+	})
+	codex := capacitysnapshot.FromAccountInput(capacitysnapshot.AccountInput{
+		Provider: "codex", AccountRef: "acct-codex", InstallRef: "i-codex",
+		Installed: true, Authenticated: true, Healthy: true,
+		HealthConfidence: capacitysnapshot.ConfidenceExact, HealthFreshness: capacitysnapshot.FreshnessFresh,
+		Windows: []capacitysnapshot.Window{pct(95)},
+		Models: []capacitysnapshot.ModelSpec{{
+			ModelID: "gpt-5.5", SupportedDepths: []string{"medium"}, DefaultDepth: "medium", Present: true,
+		}},
+		Source: "test", CapturedAt: now,
+	})
+	snap, err := capacitysnapshot.Build([]capacitysnapshot.AccountObservation{ag, codex}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inv, err := capacitysnapshot.ToRouteInventory(snap, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var agSoftRem float64 = -1
+	for _, s := range inv.Soft {
+		if s.Provider != "antigravity" {
+			continue
+		}
+		if len(s.Windows) == 0 || s.Windows[0].RemainingFraction == nil {
+			t.Fatalf("antigravity soft missing remaining: %+v", s)
+		}
+		agSoftRem = *s.Windows[0].RemainingFraction
+		break
+	}
+	if agSoftRem < 0.9 {
+		t.Fatalf("soft remaining bound to scarce window: rem=%v want ~0.98", agSoftRem)
+	}
+	// Write route: antigravity must not be soft-excluded solely due to secondary scarcity.
+	res, err := autoroute.Resolve(autoroute.Input{
+		AutoRoute: true, Permission: "bounded_write", Effort: "medium",
+		ProjectID: "p", DecisionKey: "mp-soft-1", Inventory: &inv, Now: now,
+	})
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if res.Decision == nil {
+		t.Fatal("nil decision")
+	}
+	foundAGHard := false
+	agSoftEx := true
+	for _, cv := range res.Decision.Candidates {
+		if cv.Provider != "antigravity" {
+			continue
+		}
+		foundAGHard = cv.HardEligible
+		agSoftEx = cv.SoftExcluded
+		break
+	}
+	if !foundAGHard {
+		t.Fatalf("antigravity not hard-eligible: candidates=%+v", res.Decision.Candidates)
+	}
+	if agSoftEx {
+		t.Fatalf("antigravity soft-excluded after highest-remaining soft bind: candidates=%+v", res.Decision.Candidates)
+	}
+}
