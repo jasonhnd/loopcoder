@@ -295,8 +295,10 @@ func (g GitBranchIntegrator) saveLedger(repo string, c IntegrateCommit) error {
 	return os.Rename(tmp, p)
 }
 
-// detectPathConflict fail-closes when a product path was already integrated by a
-// *different* attempt with different content (true merge conflict).
+// detectPathConflict fail-closes only when the *same* work item re-integrates
+// a path from a different attempt (exactly-once). Sequential goal children
+// (implement then tests) may refine the same product path on the shared goal
+// branch — RC.17 recovery blocked wi_tests on notes_test.go owned by implement.
 func (g GitBranchIntegrator) detectPathConflict(repo, workItemID, attemptID, integrateWT string, files []string) error {
 	p := g.ledgerPath(repo)
 	raw, err := os.ReadFile(p)
@@ -307,9 +309,12 @@ func (g GitBranchIntegrator) detectPathConflict(repo, workItemID, attemptID, int
 	if json.Unmarshal(raw, &doc) != nil || doc.Entries == nil {
 		return nil
 	}
-	// Map path → prior attempt content hash from files on integrate WT vs child
 	for _, prev := range doc.Entries {
 		if prev.AttemptID == attemptID {
+			continue
+		}
+		// Different work items on a shared goal branch are sequential refinements.
+		if prev.WorkItemID != workItemID {
 			continue
 		}
 		for _, f := range prev.Files {
@@ -317,16 +322,16 @@ func (g GitBranchIntegrator) detectPathConflict(repo, workItemID, attemptID, int
 				if f != nf {
 					continue
 				}
-				// Same path claimed by different attempt — fail closed (v1: no
-				// silent overwrite across work items).
-				if prev.WorkItemID != workItemID {
-					return fmt.Errorf("%w: path %s owned by attempt %s (%s), conflicting with %s (%s)",
-						ErrIntegrateConflict, f, prev.AttemptID, prev.WorkItemID, attemptID, workItemID)
-				}
-				_ = integrateWT // reserved for future content-equal allowlist
+				// Same work item, different attempt claiming same path: fail closed
+				// unless this is an explicit generation bump re-integrate (allowed
+				// only when prior attempt is not already succeeded in ledger with
+				// identical path ownership — v1 keeps fail-closed for same-id races).
+				return fmt.Errorf("%w: path %s owned by attempt %s (%s), conflicting with %s (%s)",
+					ErrIntegrateConflict, f, prev.AttemptID, prev.WorkItemID, attemptID, workItemID)
 			}
 		}
 	}
+	_ = integrateWT
 	return nil
 }
 

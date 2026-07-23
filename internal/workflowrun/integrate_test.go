@@ -151,13 +151,13 @@ func TestIntegrateExactlyOnceSameAttempt(t *testing.T) {
 	}
 }
 
-func TestIntegrateConflictFailClosed(t *testing.T) {
+func TestIntegrateSequentialWorkItemsMayRefineSharedPath(t *testing.T) {
 	repo := initGitRepo(t)
 	integ := workflowrun.GitBranchIntegrator{}
 	if _, err := integ.EnsureGoalBranch(context.Background(), repo, "main", "loopcoder/goal-conflict"); err != nil {
 		t.Fatal(err)
 	}
-	mkChild := func(name, body string) string {
+	mkChild := func(body string) string {
 		d := t.TempDir()
 		cmd := exec.Command("git", "init")
 		cmd.Dir = d
@@ -166,22 +166,56 @@ func TestIntegrateConflictFailClosed(t *testing.T) {
 		_ = os.WriteFile(filepath.Join(d, "notes/clash.go"), []byte(body), 0o600)
 		return d
 	}
-	c1 := mkChild("a", "package notes\nfunc A() {}\n")
+	c1 := mkChild("package notes\nfunc A() {}\n")
 	if _, err := integ.IntegrateChild(context.Background(), workflowrun.IntegrateRequest{
 		RepoPath: repo, GoalBranch: "loopcoder/goal-conflict",
-		WorkItemID: "a", AttemptID: "att-a", ChildWorktree: c1,
+		WorkItemID: "wi_implement", AttemptID: "att-a", ChildWorktree: c1,
 		ProductFiles: []string{"notes/clash.go"},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	c2 := mkChild("b", "package notes\nfunc B() {}\n")
-	_, err := integ.IntegrateChild(context.Background(), workflowrun.IntegrateRequest{
+	// Sequential tests child may refine the same product path.
+	c2 := mkChild("package notes\nfunc B() {}\n")
+	if _, err := integ.IntegrateChild(context.Background(), workflowrun.IntegrateRequest{
 		RepoPath: repo, GoalBranch: "loopcoder/goal-conflict",
-		WorkItemID: "b", AttemptID: "att-b", ChildWorktree: c2,
+		WorkItemID: "wi_tests", AttemptID: "att-b", ChildWorktree: c2,
+		ProductFiles: []string{"notes/clash.go"},
+	}); err != nil {
+		t.Fatalf("sequential refine should be allowed: %v", err)
+	}
+}
+
+func TestIntegrateSameWorkItemDifferentAttemptConflicts(t *testing.T) {
+	repo := initGitRepo(t)
+	integ := workflowrun.GitBranchIntegrator{}
+	if _, err := integ.EnsureGoalBranch(context.Background(), repo, "main", "loopcoder/goal-same"); err != nil {
+		t.Fatal(err)
+	}
+	mkChild := func(body string) string {
+		d := t.TempDir()
+		cmd := exec.Command("git", "init")
+		cmd.Dir = d
+		_ = cmd.Run()
+		_ = os.MkdirAll(filepath.Join(d, "notes"), 0o700)
+		_ = os.WriteFile(filepath.Join(d, "notes/clash.go"), []byte(body), 0o600)
+		return d
+	}
+	c1 := mkChild("package notes\nfunc A() {}\n")
+	if _, err := integ.IntegrateChild(context.Background(), workflowrun.IntegrateRequest{
+		RepoPath: repo, GoalBranch: "loopcoder/goal-same",
+		WorkItemID: "wi_implement", AttemptID: "att-a", ChildWorktree: c1,
+		ProductFiles: []string{"notes/clash.go"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	c2 := mkChild("package notes\nfunc B() {}\n")
+	_, err := integ.IntegrateChild(context.Background(), workflowrun.IntegrateRequest{
+		RepoPath: repo, GoalBranch: "loopcoder/goal-same",
+		WorkItemID: "wi_implement", AttemptID: "att-b", ChildWorktree: c2,
 		ProductFiles: []string{"notes/clash.go"},
 	})
 	if err == nil {
-		t.Fatal("expected path conflict")
+		t.Fatal("expected same-work-item path conflict")
 	}
 	if !strings.Contains(err.Error(), "conflict") {
 		t.Fatalf("want conflict, got %v", err)
