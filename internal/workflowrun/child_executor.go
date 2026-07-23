@@ -738,6 +738,8 @@ func writeChildEvidence(wt string, in ChildExecInput, kind string, at time.Time)
 	if err := os.WriteFile(stubPath, []byte(stub), 0o600); err != nil {
 		return "", "", nil, err
 	}
+	// Stage stub so git porcelain discovery sees it (not base tree walk).
+	_ = exec.Command("git", "-C", wt, "add", "--", stubName).Run()
 	sum := sha256.Sum256(raw)
 	digest = "sha256:" + hex.EncodeToString(sum[:])
 	files = []string{
