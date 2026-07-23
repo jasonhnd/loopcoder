@@ -91,10 +91,61 @@ func ClassifyExcludeReason(note, terminal, routeReason string) string {
 	case strings.Contains(blob, "permission"):
 		return "unavailable"
 	case strings.Contains(blob, "soft"):
-		return "stale"
+		// Hard-eligible soft-excluded candidates are real measured excludes
+		// (e.g. reserve.breach), not stale inventory.
+		return "soft_excluded"
 	default:
 		return "unavailable"
 	}
+}
+
+// SoftExcludedEligibleExclude is one decision-set candidate that was hard-eligible
+// but soft-excluded (no work claim). Used after a successful route to record
+// unavailable_retry evidence without inventing flags.
+type SoftExcludedCandidate struct {
+	Provider     string
+	Model        string
+	HardEligible bool
+	SoftExcluded bool
+}
+
+// SoftExcludedEligibleExcludes derives Claimed=false RouteExclude rows for
+// hard-eligible soft-excluded candidates other than the winner. Never invents
+// excludes when the decision set is empty.
+func SoftExcludedEligibleExcludes(childID, winnerProvider string, cands []SoftExcludedCandidate) []RouteExclude {
+	childID = strings.TrimSpace(childID)
+	winnerProvider = strings.TrimSpace(winnerProvider)
+	if childID == "" || len(cands) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []RouteExclude
+	for _, cv := range cands {
+		p := strings.TrimSpace(cv.Provider)
+		if p == "" || !cv.HardEligible || !cv.SoftExcluded {
+			continue
+		}
+		if winnerProvider != "" && strings.EqualFold(p, winnerProvider) {
+			continue
+		}
+		key := strings.ToLower(p)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		msg := "hard-eligible soft-excluded candidate"
+		if strings.TrimSpace(cv.Model) != "" {
+			msg += " model=" + strings.TrimSpace(cv.Model)
+		}
+		if winnerProvider != "" {
+			msg += "; winner=" + winnerProvider
+		}
+		out = append(out, RouteExclude{
+			ChildID: childID, Provider: p, Reason: "soft_excluded",
+			HardEligible: true, SoftExcluded: true, Claimed: false, Message: msg,
+		})
+	}
+	return out
 }
 
 // FormatExcludeEvidence is a stable single-line for event logs.
