@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -26,6 +27,12 @@ import (
 var (
 	rootCmdCtx    context.Context
 	rootCmdCancel context.CancelFunc
+
+	// processEntryOnce ensures production entrypoints install the SIGINT/SIGTERM
+	// handler exactly once. Run and RunWithBuildInfo share this setup; RunWithDeps
+	// does not, so unit tests that call RunWithDeps repeatedly cannot leak
+	// Notify goroutines/handlers.
+	processEntryOnce sync.Once
 )
 
 func init() {
@@ -42,6 +49,18 @@ func CommandContext() context.Context {
 	return rootCmdCtx
 }
 
+// ensureProcessEntry is the single real CLI process setup shared by Run and
+// RunWithBuildInfo (cmd/loopcoder/main.go uses RunWithBuildInfo). It installs
+// signal handling at most once per process.
+//
+// RunWithDeps intentionally never calls this: tests exercise the command surface
+// many times in one process without installing a process-global handler.
+func ensureProcessEntry(stderr io.Writer) {
+	processEntryOnce.Do(func() {
+		installShutdownOnSignal(stderr)
+	})
+}
+
 // installShutdownOnSignal cancels CommandContext, terminates this loopcoder
 // instance's managed child process groups, then exits after a short grace so
 // workflow can flush interrupt ledger + partial. Second signal exits immediately.
@@ -51,6 +70,8 @@ func CommandContext() context.Context {
 // Shell background jobs (&) often inherit SIGINT/SIGTERM as SIG_IGN. Call
 // signal.Reset before Notify so disposition returns to default and Notify can
 // deliver external kill -INT/-TERM into this handler (durable interrupt ledger).
+//
+// Callers must go through ensureProcessEntry so Notify is registered only once.
 func installShutdownOnSignal(stderr io.Writer) {
 	signal.Reset(os.Interrupt, syscall.SIGTERM)
 	ch := make(chan os.Signal, 2)
