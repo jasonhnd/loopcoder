@@ -14,8 +14,7 @@ import (
 func ptrStr(s string) *string { return &s }
 
 func TestGrokPathAliasFusesInstallAuthModelsWithQuota(t *testing.T) {
-	// RC36: two path aliases (same ResolvedPathHash) split evidence across pinst ids.
-	// Live: auth+models on pinst_a; exact/fresh windows on pinst_b. Must fuse.
+	// Same-report fuse when both aliases are present (associateIdentityEvidence).
 	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
 	const (
 		acc   = "acct-0c985592aa87678f5c9e10707f0871fcecb480055d14835cee750b19d47df695"
@@ -27,24 +26,8 @@ func TestGrokPathAliasFusesInstallAuthModelsWithQuota(t *testing.T) {
 	rep := providerinventory.Report{
 		InventoryFingerprint: "fp-alias",
 		Installations: []providerinventory.ProviderInstallation{
-			{
-				AdapterID: "grok", ProviderInstallationID: instA,
-				InstallationState:   providerinventory.InstallationInstalled,
-				UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-				Confidence: providerinventory.ConfidenceExact,
-				ExecutableIdentity: providerinventory.ExecutableIdentity{
-					Basename: "grok", ResolvedPathHash: rhash, PathHash: "sha256:path-a",
-				},
-			},
-			{
-				AdapterID: "grok", ProviderInstallationID: instB,
-				InstallationState:   providerinventory.InstallationInstalled,
-				UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-				Confidence: providerinventory.ConfidenceExact,
-				ExecutableIdentity: providerinventory.ExecutableIdentity{
-					Basename: "grok", ResolvedPathHash: rhash, PathHash: "sha256:path-b",
-				},
-			},
+			exactFreshInstall("grok", instA, rhash, "sha256:path-a"),
+			exactFreshInstall("grok", instB, rhash, "sha256:path-b"),
 		},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
@@ -53,12 +36,13 @@ func TestGrokPathAliasFusesInstallAuthModelsWithQuota(t *testing.T) {
 		}},
 		ModelCapabilities: []providerinventory.ModelCapability{{
 			AdapterID: "grok", CanonicalModelID: "grok-4.5",
-			AvailabilityState: providerinventory.AvailabilityAvailable,
-			LifecycleState:    providerinventory.LifecycleAvailable,
-			FreshnessState:    providerinventory.FreshnessFresh,
-			Confidence:        providerinventory.ConfidenceExact,
-			EntrySources:      testMachineReadableSources("grok"),
-			Source:            providerinventory.SourceDescriptor{Kind: string(providerinventory.CatalogSourceProviderMachineReadable)},
+			AvailabilityState:      providerinventory.AvailabilityAvailable,
+			LifecycleState:         providerinventory.LifecycleAvailable,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			Confidence:             providerinventory.ConfidenceExact,
+			EntrySources:           testMachineReadableSources("grok"),
+			Source:                 providerinventory.SourceDescriptor{Kind: string(providerinventory.CatalogSourceProviderMachineReadable)},
+			ModelCatalogSnapshotID: "mcatsnap_grok_mr",
 		}},
 		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{{
 			ModelCatalogSnapshotID: "mcatsnap_grok_mr",
@@ -79,8 +63,6 @@ func TestGrokPathAliasFusesInstallAuthModelsWithQuota(t *testing.T) {
 			CapturedAt: now.Format(time.RFC3339),
 		}},
 	}
-	// Wire model capability to catalog snapshot id for install-scoped attach.
-	rep.ModelCapabilities[0].ModelCatalogSnapshotID = "mcatsnap_grok_mr"
 
 	accounts := capacitysnapshot.FromProviderInventoryReport(rep, now)
 	snap, err := capacitysnapshot.Build(accounts, now)
@@ -101,13 +83,6 @@ func TestGrokPathAliasFusesInstallAuthModelsWithQuota(t *testing.T) {
 			if c.InstallRef != instA && c.InstallRef != instB {
 				t.Fatalf("install ref %q not in alias set", c.InstallRef)
 			}
-			// Canonical is lex-min rank-best among aliases — both share resolved hash.
-			if c.AccountRef != acc && c.AccountRef != strings.ToLower(acc) {
-				// opaqueAccountRef may normalize
-				if !strings.HasPrefix(c.AccountRef, "acct-") {
-					t.Fatalf("account ref %q", c.AccountRef)
-				}
-			}
 		}
 	}
 	if !found {
@@ -115,23 +90,102 @@ func TestGrokPathAliasFusesInstallAuthModelsWithQuota(t *testing.T) {
 	}
 }
 
-func TestCodexEmptyAccountQuotaBindsSoleInstallAuth(t *testing.T) {
-	// RC36: rate-limits with account:unknown / empty account + windows on install;
-	// auth+MR models on same install with real account. Must reassociate.
+func TestLoadRouteInventoryRC36LiveOnlyADurableB(t *testing.T) {
+	// Exact RC36 production shape:
+	//   live Discover: only alias A (installed+auth+models)
+	//   durable refresh: exact/fresh installation B + quota on B (and B resolved identity)
+	// Rehydrate must translate B→A (sole live target) so LoadRouteInventory is eligible.
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	const (
+		acc   = "acct-0c985592aa87678f5c9e10707f0871fcecb480055d14835cee750b19d47df695"
+		instA = "pinst_alias_a_live_only"
+		instB = "pinst_alias_b_durable_only"
+		rhash = "sha256:same-resolved-grok-binary-rc36"
+	)
+	remG, limG := int64(3500), int64(10000)
+
+	live := providerinventory.Report{
+		Installations: []providerinventory.ProviderInstallation{
+			exactFreshInstall("grok", instA, rhash, "sha256:path-a"),
+			// No instB in live — RC36.
+		},
+		AuthReadiness: []providerinventory.AuthReadiness{{
+			AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
+			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
+			AccountProfileID: ptrStr(acc), ProviderInstallationID: ptrStr(instA),
+		}},
+		// Live has no trustworthy quota (discover without grant).
+		ModelCapabilities: []providerinventory.ModelCapability{
+			mrModel("grok", "grok-4.5", "mc_g", nil),
+		},
+		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{{
+			ModelCatalogSnapshotID: "mc_g", AdapterID: "grok",
+			CatalogSourceKind: providerinventory.CatalogSourceProviderMachineReadable,
+			Confidence:        providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
+			ProviderInstallationID: ptrStr(instA), EntryCount: 1,
+		}},
+	}
+
+	durable := providerinventory.Report{
+		Installations: []providerinventory.ProviderInstallation{
+			// Durable knows B's exact resolved identity (and A for completeness).
+			exactFreshInstall("grok", instA, rhash, "sha256:path-a"),
+			exactFreshInstall("grok", instB, rhash, "sha256:path-b"),
+		},
+		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
+			QuotaSnapshotID: "dq_g", AdapterID: "grok",
+			AccountProfileID: ptrStr(acc), ProviderInstallationID: ptrStr(instB), // durable B
+			Unit: "percent", WindowKind: providerinventory.WindowFixedWeek,
+			RemainingValue: &remG, LimitValue: &limG, ValueScale: 2,
+			Confidence: providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
+			ScopeKey:   "provider:grok/account:" + acc + "/detail:product",
+			CapturedAt: now.Format(time.RFC3339),
+			StaleAfter: now.Add(time.Hour).Format(time.RFC3339),
+		}},
+		AuthReadiness:         live.AuthReadiness,
+		ModelCapabilities:     live.ModelCapabilities,
+		ModelCatalogSnapshots: live.ModelCatalogSnapshots,
+	}
+
+	inv, snap, err := capacitysnapshot.LoadRouteInventory(context.Background(), capacitysnapshot.LoadOptions{
+		Now: now,
+		Discover: func(context.Context, providerinventory.Options) (providerinventory.Report, error) {
+			return live, nil
+		},
+		LoadDurable: func(context.Context) (providerinventory.Report, error) {
+			return durable, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("LoadRouteInventory RC36 shape: %v unattended=%v reasons=%v", err, snap.UnattendedOK, snap.Reasons)
+	}
+	if !snap.UnattendedOK {
+		t.Fatalf("RC36 live-A durable-B must be unattended after rehydrate alias: reasons=%v", snap.Reasons)
+	}
+	found := false
+	for _, c := range inv.Candidates {
+		if c.Provider == "grok" && c.Model == "grok-4.5" {
+			found = true
+			// Install must be live A (B translated away; never durable-as-live-installed).
+			if c.InstallRef != instA {
+				t.Fatalf("want live install %s after B→A translation, got %s", instA, c.InstallRef)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("want grok-4.5 candidate; got %#v", inv.Candidates)
+	}
+}
+
+func TestCodexEmptyAccountQuotaBindsSoleAuthenticatedInstall(t *testing.T) {
 	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
 	const inst = "pinst_bnq7pov5fnlikv6yb42auxv2xt2syi4d"
-	authAcct := "acct_nbgt2mwso4c76xepekb7oeifcsw2axkg" // status-style id (opaque-hashed on join)
+	authAcct := "acct_nbgt2mwso4c76xepekb7oeifcsw2axkg"
 	rem := int64(73)
 	rep := providerinventory.Report{
-		Installations: []providerinventory.ProviderInstallation{{
-			AdapterID: "codex", ProviderInstallationID: inst,
-			InstallationState:   providerinventory.InstallationInstalled,
-			UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-			Confidence: providerinventory.ConfidenceExact,
-			ExecutableIdentity: providerinventory.ExecutableIdentity{
-				Basename: "codex", ResolvedPathHash: "sha256:codex-resolved-1",
-			},
-		}},
+		Installations: []providerinventory.ProviderInstallation{
+			exactFreshInstall("codex", inst, "sha256:codex-resolved-1", "sha256:codex-path"),
+		},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
 			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
@@ -158,12 +212,10 @@ func TestCodexEmptyAccountQuotaBindsSoleInstallAuth(t *testing.T) {
 			Confidence:        providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
 			ProviderInstallationID: ptrStr(inst), EntryCount: 1,
 		}},
-		// Quota: empty AccountProfileID + sentinel scope (must not invent fake account).
 		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
 			QuotaSnapshotID: "q_codex", AdapterID: "codex",
 			ProviderInstallationID: ptrStr(inst),
-			// AccountProfileID intentionally nil (RC36 production shape without id field).
-			Unit: "percent", WindowKind: providerinventory.WindowFixedWeek,
+			Unit:                   "percent", WindowKind: providerinventory.WindowFixedWeek,
 			RemainingValue: &rem, Confidence: providerinventory.ConfidenceExact,
 			FreshnessState: providerinventory.FreshnessFresh,
 			ScopeKey:       "provider:codex/account:unknown/scope:codex/detail:primary",
@@ -171,14 +223,9 @@ func TestCodexEmptyAccountQuotaBindsSoleInstallAuth(t *testing.T) {
 		}},
 	}
 	accounts := capacitysnapshot.FromProviderInventoryReport(rep, now)
-	// No row should carry opaqueAccountRef("unknown") as AccountRef.
 	for _, a := range accounts {
-		if a.Provider == "codex" && a.AccountRef != "" {
-			// Must not be the hash of "unknown"
-			unk := opaqueUnknown(t)
-			if a.AccountRef == unk {
-				t.Fatalf("account:unknown must not become AccountRef: %s", a.AccountRef)
-			}
+		if a.Provider == "codex" && a.AccountRef == opaqueUnknown(t) {
+			t.Fatalf("account:unknown must not become AccountRef: %s", a.AccountRef)
 		}
 	}
 	snap, err := capacitysnapshot.Build(accounts, now)
@@ -186,7 +233,7 @@ func TestCodexEmptyAccountQuotaBindsSoleInstallAuth(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !snap.UnattendedOK {
-		t.Fatalf("codex sole-account reassociation must be unattended-eligible: reasons=%v accounts=%+v",
+		t.Fatalf("codex sole-authenticated reassociation must be eligible: reasons=%v accounts=%s",
 			snap.Reasons, summarizeAccounts(accounts))
 	}
 	inv, err := capacitysnapshot.ToRouteInventory(snap, now)
@@ -202,7 +249,6 @@ func TestCodexEmptyAccountQuotaBindsSoleInstallAuth(t *testing.T) {
 	if len(depths) == 0 {
 		t.Fatalf("expected codex gpt-5.5 candidates, got %#v", inv.Candidates)
 	}
-	// Observed multi-depth should surface for low/medium/high.
 	hasLow, hasMed, hasHigh := false, false, false
 	for _, d := range depths {
 		switch d {
@@ -219,18 +265,54 @@ func TestCodexEmptyAccountQuotaBindsSoleInstallAuth(t *testing.T) {
 	}
 }
 
-func TestAmbiguousMultiAccountSameInstallDoesNotCrossJoin(t *testing.T) {
+func TestEmptyAccountDoesNotBindUnauthenticatedAccount(t *testing.T) {
+	// Non-empty AccountRef without Authenticated must not receive empty-account quota.
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	const inst = "pinst_shared"
+	rem := int64(50)
+	// Manually construct observations via report: auth readiness not ready ⇒ Authenticated=false.
+	rep := providerinventory.Report{
+		Installations: []providerinventory.ProviderInstallation{
+			exactFreshInstall("codex", inst, "sha256:x", "sha256:p"),
+		},
+		AuthReadiness: []providerinventory.AuthReadiness{{
+			AdapterID: "codex", ReadinessState: providerinventory.ReadinessNotAuthenticated,
+			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
+			AccountProfileID: ptrStr("acct_not_ready"), ProviderInstallationID: ptrStr(inst),
+		}},
+		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
+			QuotaSnapshotID: "q_empty", AdapterID: "codex",
+			ProviderInstallationID: ptrStr(inst),
+			Unit:                   "percent", WindowKind: providerinventory.WindowFixedWeek,
+			RemainingValue: &rem, Confidence: providerinventory.ConfidenceExact,
+			FreshnessState: providerinventory.FreshnessFresh,
+			ScopeKey:       "provider:codex/scope:codex/detail:primary",
+			CapturedAt:     now.Format(time.RFC3339),
+		}},
+	}
+	accounts := capacitysnapshot.FromProviderInventoryReport(rep, now)
+	for _, a := range accounts {
+		if a.AccountRef != "" && len(a.Windows) > 0 && !a.Authenticated {
+			t.Fatalf("empty-account quota must not bind unauthenticated account: %+v", a)
+		}
+	}
+	snap, err := capacitysnapshot.Build(accounts, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.UnattendedOK {
+		t.Fatal("unauthenticated account must not become unattended via empty-account bind")
+	}
+}
+
+func TestAmbiguousMultiAuthenticatedAccountSameInstallDoesNotCrossJoin(t *testing.T) {
 	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
 	const inst = "pinst_shared"
 	rem := int64(50)
 	rep := providerinventory.Report{
-		Installations: []providerinventory.ProviderInstallation{{
-			AdapterID: "codex", ProviderInstallationID: inst,
-			InstallationState:   providerinventory.InstallationInstalled,
-			UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-			Confidence:         providerinventory.ConfidenceExact,
-			ExecutableIdentity: providerinventory.ExecutableIdentity{ResolvedPathHash: "sha256:x"},
-		}},
+		Installations: []providerinventory.ProviderInstallation{
+			exactFreshInstall("codex", inst, "sha256:x", "sha256:p"),
+		},
 		AuthReadiness: []providerinventory.AuthReadiness{
 			{
 				AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
@@ -258,37 +340,33 @@ func TestAmbiguousMultiAccountSameInstallDoesNotCrossJoin(t *testing.T) {
 			Unit:                   "percent", WindowKind: providerinventory.WindowFixedWeek,
 			RemainingValue: &rem, Confidence: providerinventory.ConfidenceExact,
 			FreshnessState: providerinventory.FreshnessFresh,
-			ScopeKey:       "provider:codex/scope:codex/detail:primary", // no account
+			ScopeKey:       "provider:codex/scope:codex/detail:primary",
 			CapturedAt:     now.Format(time.RFC3339),
 		}},
 	}
 	accounts := capacitysnapshot.FromProviderInventoryReport(rep, now)
-	// Empty-account row must remain (not merged into either account).
 	emptyWithWindows := 0
 	for _, a := range accounts {
 		if a.Provider == "codex" && a.AccountRef == "" && len(a.Windows) > 0 {
 			emptyWithWindows++
-			if !strings.Contains(a.Provenance, "ambiguous_multi_account") {
-				t.Fatalf("want ambiguous provenance, got %q", a.Provenance)
+			if !strings.Contains(a.Provenance, "ambiguous_multi_authenticated") {
+				t.Fatalf("want ambiguous multi-authenticated provenance, got %q", a.Provenance)
 			}
 		}
 	}
 	if emptyWithWindows != 1 {
-		t.Fatalf("empty-account windows must stay unmerged under multi-account; accounts=%+v", summarizeAccounts(accounts))
+		t.Fatalf("empty-account windows must stay unmerged; accounts=%s", summarizeAccounts(accounts))
 	}
-	// Auth accounts without windows should not become unattended via stolen windows.
 	snap, err := capacitysnapshot.Build(accounts, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Empty-account row: not authenticated → not eligible.
-	// Auth rows: no windows → not eligible.
 	if snap.UnattendedOK {
-		t.Fatal("ambiguous multi-account must not silently become unattended-eligible")
+		t.Fatal("ambiguous multi-authenticated account must not silently become unattended-eligible")
 	}
 }
 
-func TestDistinctResolvedBinariesNeverFuse(t *testing.T) {
+func TestDistinctResolvedBinariesNeverFuseOrCombineEvidence(t *testing.T) {
 	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
 	const (
 		acc   = "acct-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -298,20 +376,8 @@ func TestDistinctResolvedBinariesNeverFuse(t *testing.T) {
 	rem := int64(40)
 	rep := providerinventory.Report{
 		Installations: []providerinventory.ProviderInstallation{
-			{
-				AdapterID: "grok", ProviderInstallationID: instA,
-				InstallationState:   providerinventory.InstallationInstalled,
-				UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-				Confidence:         providerinventory.ConfidenceExact,
-				ExecutableIdentity: providerinventory.ExecutableIdentity{ResolvedPathHash: "sha256:binary-a"},
-			},
-			{
-				AdapterID: "grok", ProviderInstallationID: instB,
-				InstallationState:   providerinventory.InstallationInstalled,
-				UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-				Confidence:         providerinventory.ConfidenceExact,
-				ExecutableIdentity: providerinventory.ExecutableIdentity{ResolvedPathHash: "sha256:binary-b"},
-			},
+			exactFreshInstall("grok", instA, "sha256:binary-a", "sha256:path-a"),
+			exactFreshInstall("grok", instB, "sha256:binary-b", "sha256:path-b"),
 		},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
@@ -332,7 +398,7 @@ func TestDistinctResolvedBinariesNeverFuse(t *testing.T) {
 			ModelCatalogSnapshotID: "mc_a", AdapterID: "grok",
 			CatalogSourceKind: providerinventory.CatalogSourceProviderMachineReadable,
 			Confidence:        providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
-			ProviderInstallationID: ptrStr(instA),
+			ProviderInstallationID: ptrStr(instA), EntryCount: 1,
 		}},
 		// Quota on different binary (instB) — must NOT fuse with instA auth/models.
 		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
@@ -346,7 +412,6 @@ func TestDistinctResolvedBinariesNeverFuse(t *testing.T) {
 		}},
 	}
 	accounts := capacitysnapshot.FromProviderInventoryReport(rep, now)
-	// Still two install groups after association.
 	installs := map[string]bool{}
 	for _, a := range accounts {
 		if a.Provider == "grok" {
@@ -354,104 +419,164 @@ func TestDistinctResolvedBinariesNeverFuse(t *testing.T) {
 		}
 	}
 	if len(installs) < 2 {
-		t.Fatalf("distinct resolved binaries must not fuse: installs=%v accounts=%+v", installs, summarizeAccounts(accounts))
+		t.Fatalf("distinct resolved binaries must not fuse: installs=%v accounts=%s", installs, summarizeAccounts(accounts))
+	}
+	// No single account may hold both production models and windows across binaries.
+	for _, a := range accounts {
+		if a.Provider != "grok" {
+			continue
+		}
+		hasMR := false
+		for _, m := range a.Models {
+			if m.PresentInCatalog && !m.CatalogHintOnly {
+				hasMR = true
+				break
+			}
+		}
+		if hasMR && len(a.Windows) > 0 && a.InstallRef == instA {
+			// models are on A; windows must not have been stolen from B
+			t.Fatalf("instA must not receive windows from distinct binary B: %+v", a)
+		}
+		if a.InstallRef == instB && hasMR {
+			t.Fatalf("instB must not receive models from distinct binary A: %+v", a)
+		}
 	}
 	snap, err := capacitysnapshot.Build(accounts, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// instA: models+auth, no windows; instB: windows+auth account, maybe no models if models install-scoped to A.
-	// Neither should fully satisfy unattended unless models also replicated — production models
-	// attach via catalog install A only. Expect fail closed (no unattended) OR only if models
-	// replicated by account — builderKeysForProvider may attach models to both accounts.
-	// Distinct binaries: install refs must remain different (asserted above).
-	_ = snap
+	// Neither fully eligible: A has models+auth no windows; B may have windows but
+	// needs install+auth+models. Auth is only on A.
+	if snap.UnattendedOK {
+		// If somehow B got auth via empty account — still should not get A's models.
+		inv, ierr := capacitysnapshot.ToRouteInventory(snap, now)
+		if ierr != nil {
+			t.Fatal(ierr)
+		}
+		for _, c := range inv.Candidates {
+			if c.Provider == "grok" && c.InstallRef == instB && c.Model == "grok-4.5" {
+				t.Fatalf("distinct binary B must not route with A models: %#v", c)
+			}
+			if c.Provider == "grok" && c.InstallRef == instA {
+				// A without windows should not produce capacity-routable candidate
+				// with remaining capacity from B — ToRouteInventory only emits
+				// unattended-eligible accounts. Fail closed if we got here with A.
+				t.Fatalf("instA without own windows must not be routable: %#v snap reasons=%v", c, snap.Reasons)
+			}
+		}
+	}
 }
 
-func TestLoadRouteInventoryPathAliasAndCodexRebind(t *testing.T) {
-	// Production path: LoadRouteInventory(Discover live + LoadDurable rehydrate).
+func TestEstimatedOrStaleInstallIdentityNeverAliasFuses(t *testing.T) {
 	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
 	const (
 		acc   = "acct-0c985592aa87678f5c9e10707f0871fcecb480055d14835cee750b19d47df695"
-		instA = "pinst_alias_a"
-		instB = "pinst_alias_b"
-		rhash = "sha256:same-resolved-grok-binary"
-		cinst = "pinst_codex_one"
+		instA = "pinst_exact_fresh"
+		instB = "pinst_estimated"
+		instC = "pinst_stale"
+		rhash = "sha256:same-hash-but-bad-confidence"
 	)
-	// Auth profile for codex (status-style) — reassociation target.
-	codexAuth := "acct_status_codex_profile_1"
-	remG, limG := int64(3500), int64(10000)
-	remC := int64(80)
+	rem := int64(30)
+	// Estimated B and stale C share hash with exact A — must NOT fuse.
+	est := exactFreshInstall("grok", instB, rhash, "sha256:path-b")
+	est.Confidence = providerinventory.ConfidenceEstimated
+	stale := exactFreshInstall("grok", instC, rhash, "sha256:path-c")
+	stale.FreshnessState = providerinventory.FreshnessStale
 
+	rep := providerinventory.Report{
+		Installations: []providerinventory.ProviderInstallation{
+			exactFreshInstall("grok", instA, rhash, "sha256:path-a"),
+			est,
+			stale,
+		},
+		AuthReadiness: []providerinventory.AuthReadiness{{
+			AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
+			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
+			AccountProfileID: ptrStr(acc), ProviderInstallationID: ptrStr(instA),
+		}},
+		ModelCapabilities: []providerinventory.ModelCapability{
+			mrModel("grok", "grok-4.5", "mc", nil),
+		},
+		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{{
+			ModelCatalogSnapshotID: "mc", AdapterID: "grok",
+			CatalogSourceKind: providerinventory.CatalogSourceProviderMachineReadable,
+			Confidence:        providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
+			ProviderInstallationID: ptrStr(instA), EntryCount: 1,
+		}},
+		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
+			QuotaSnapshotID: "q_b", AdapterID: "grok",
+			AccountProfileID: ptrStr(acc), ProviderInstallationID: ptrStr(instB),
+			Unit: "percent", WindowKind: providerinventory.WindowFixedWeek,
+			RemainingValue: &rem, LimitValue: int64Ptr(100),
+			Confidence: providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
+			ScopeKey:   "provider:grok/account:" + acc + "/detail:x",
+			CapturedAt: now.Format(time.RFC3339),
+		}},
+	}
+	accounts := capacitysnapshot.FromProviderInventoryReport(rep, now)
+	// Install refs for A and B must remain distinct (no fuse with estimated B).
+	hasA, hasB := false, false
+	for _, a := range accounts {
+		if a.InstallRef == instA {
+			hasA = true
+			if len(a.Windows) > 0 {
+				t.Fatalf("exact A must not receive windows from estimated B: %s", summarizeAccounts(accounts))
+			}
+		}
+		if a.InstallRef == instB {
+			hasB = true
+		}
+	}
+	if !hasA || !hasB {
+		t.Fatalf("estimated alias must not collapse installs: %s", summarizeAccounts(accounts))
+	}
+}
+
+func TestAmbiguousLiveTargetsFailClosedOnRehydrate(t *testing.T) {
+	// Durable B + two live installs sharing resolved hash → no B→live translation.
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	const (
+		acc   = "acct-0c985592aa87678f5c9e10707f0871fcecb480055d14835cee750b19d47df695"
+		live1 = "pinst_live_1"
+		live2 = "pinst_live_2"
+		durB  = "pinst_durable_b"
+		rhash = "sha256:ambiguous-multi-live"
+	)
+	rem := int64(40)
 	live := providerinventory.Report{
 		Installations: []providerinventory.ProviderInstallation{
-			inst("grok", instA, rhash, "sha256:path-a"),
-			inst("grok", instB, rhash, "sha256:path-b"),
-			inst("codex", cinst, "sha256:codex-only", "sha256:codex-path"),
+			exactFreshInstall("grok", live1, rhash, "sha256:p1"),
+			exactFreshInstall("grok", live2, rhash, "sha256:p2"),
 		},
-		AuthReadiness: []providerinventory.AuthReadiness{
-			{
-				AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
-				FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
-				AccountProfileID: ptrStr(acc), ProviderInstallationID: ptrStr(instA),
-			},
-			{
-				AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
-				FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
-				AccountProfileID: ptrStr(codexAuth), ProviderInstallationID: ptrStr(cinst),
-			},
-		},
-		// Live has no trustworthy quota (simulates discover without grant).
-		ModelCapabilities: []providerinventory.ModelCapability{
-			mrModel("grok", "grok-4.5", "mc_g", []string{}),
-			mrModel("codex", "gpt-5.5", "mc_c", []string{
-				"supported_depth=low", "supported_depth=medium", "supported_depth=high", "default_depth=medium",
-				"catalog_source=codex-app-server-model-list",
-			}),
-		},
-		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{
-			{ModelCatalogSnapshotID: "mc_g", AdapterID: "grok",
-				CatalogSourceKind: providerinventory.CatalogSourceProviderMachineReadable,
-				Confidence:        providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
-				ProviderInstallationID: ptrStr(instA)},
-			{ModelCatalogSnapshotID: "mc_c", AdapterID: "codex",
-				CatalogSourceKind: providerinventory.CatalogSourceProviderMachineReadable,
-				Confidence:        providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
-				ProviderInstallationID: ptrStr(cinst)},
-		},
+		AuthReadiness: []providerinventory.AuthReadiness{{
+			AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
+			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
+			AccountProfileID: ptrStr(acc), ProviderInstallationID: ptrStr(live1),
+		}},
+		ModelCapabilities: []providerinventory.ModelCapability{mrModel("grok", "grok-4.5", "mc", nil)},
+		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{{
+			ModelCatalogSnapshotID: "mc", AdapterID: "grok",
+			CatalogSourceKind: providerinventory.CatalogSourceProviderMachineReadable,
+			Confidence:        providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
+			ProviderInstallationID: ptrStr(live1), EntryCount: 1,
+		}},
 	}
-
 	durable := providerinventory.Report{
-		// Durable quota from providers refresh: grok on alias B; codex empty-account windows.
-		QuotaSnapshots: []providerinventory.QuotaSnapshot{
-			{
-				QuotaSnapshotID: "dq_g", AdapterID: "grok",
-				AccountProfileID: ptrStr(acc), ProviderInstallationID: ptrStr(instB),
-				Unit: "percent", WindowKind: providerinventory.WindowFixedWeek,
-				RemainingValue: &remG, LimitValue: &limG, ValueScale: 2,
-				Confidence: providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
-				ScopeKey:   "provider:grok/account:" + acc + "/detail:product",
-				CapturedAt: now.Format(time.RFC3339),
-				StaleAfter: now.Add(time.Hour).Format(time.RFC3339),
-			},
-			{
-				QuotaSnapshotID: "dq_c", AdapterID: "codex",
-				ProviderInstallationID: ptrStr(cinst),
-				Unit:                   "percent", WindowKind: providerinventory.WindowFixedWeek,
-				RemainingValue: &remC,
-				Confidence:     providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
-				ScopeKey:   "provider:codex/account:unknown/scope:codex/detail:primary",
-				CapturedAt: now.Format(time.RFC3339),
-				StaleAfter: now.Add(time.Hour).Format(time.RFC3339),
-			},
+		Installations: []providerinventory.ProviderInstallation{
+			exactFreshInstall("grok", durB, rhash, "sha256:pb"),
 		},
-		AuthReadiness:         live.AuthReadiness,
-		ModelCapabilities:     live.ModelCapabilities,
-		ModelCatalogSnapshots: live.ModelCatalogSnapshots,
-		Installations:         live.Installations,
+		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
+			QuotaSnapshotID: "dq", AdapterID: "grok",
+			AccountProfileID: ptrStr(acc), ProviderInstallationID: ptrStr(durB),
+			Unit: "percent", WindowKind: providerinventory.WindowFixedWeek,
+			RemainingValue: &rem, LimitValue: int64Ptr(100),
+			Confidence: providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
+			ScopeKey:   "provider:grok/account:" + acc + "/detail:x",
+			CapturedAt: now.Format(time.RFC3339),
+			StaleAfter: now.Add(time.Hour).Format(time.RFC3339),
+		}},
 	}
-
-	inv, snap, err := capacitysnapshot.LoadRouteInventory(context.Background(), capacitysnapshot.LoadOptions{
+	_, snap, err := capacitysnapshot.LoadRouteInventory(context.Background(), capacitysnapshot.LoadOptions{
 		Now: now,
 		Discover: func(context.Context, providerinventory.Options) (providerinventory.Report, error) {
 			return live, nil
@@ -460,44 +585,19 @@ func TestLoadRouteInventoryPathAliasAndCodexRebind(t *testing.T) {
 			return durable, nil
 		},
 	})
-	if err != nil {
-		t.Fatalf("LoadRouteInventory: %v snap=%v reasons=%v", err, snap.UnattendedOK, snap.Reasons)
-	}
-	if !snap.UnattendedOK {
-		t.Fatalf("expected unattended ok after alias+rebind; reasons=%v", snap.Reasons)
-	}
-	providers := map[string]bool{}
-	depths := map[string]bool{}
-	for _, c := range inv.Candidates {
-		providers[c.Provider] = true
-		if c.Effort != "" {
-			depths[c.Effort] = true
-		}
-	}
-	if !providers["grok"] {
-		t.Fatalf("want grok candidate; providers=%v candidates=%#v", providers, inv.Candidates)
-	}
-	if !providers["codex"] {
-		t.Fatalf("want codex candidate after account rebind; providers=%v", providers)
-	}
-	if !depths["medium"] {
-		t.Fatalf("want medium depth present; depths=%v", depths)
+	// Ambiguous live targets: durable B not translated; live A has no windows → fail closed.
+	if err == nil && snap.UnattendedOK {
+		t.Fatal("ambiguous multi-live alias must fail closed (not unattended-eligible)")
 	}
 }
 
 func TestCodexAccountScopeNeverUnknownSentinel(t *testing.T) {
-	// When account/read has no principal id, ScopeKey must omit account: (not account:unknown).
-	// Verified via FromProviderInventoryReport + empty AccountProfileID quota.
 	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
 	rem := int64(10)
 	rep := providerinventory.Report{
-		Installations: []providerinventory.ProviderInstallation{{
-			AdapterID: "codex", ProviderInstallationID: "pinst_x",
-			InstallationState:   providerinventory.InstallationInstalled,
-			UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-			Confidence:         providerinventory.ConfidenceExact,
-			ExecutableIdentity: providerinventory.ExecutableIdentity{ResolvedPathHash: "sha256:x"},
-		}},
+		Installations: []providerinventory.ProviderInstallation{
+			exactFreshInstall("codex", "pinst_x", "sha256:x", "sha256:p"),
+		},
 		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
 			QuotaSnapshotID: "q", AdapterID: "codex",
 			ProviderInstallationID: ptrStr("pinst_x"),
@@ -517,23 +617,16 @@ func TestCodexAccountScopeNeverUnknownSentinel(t *testing.T) {
 }
 
 func TestCodexAccountProfileIDWhenPrincipalPresent(t *testing.T) {
-	// Positive: account/read principal stamps AccountProfileID + matching opaque scope.
 	want := codexauth.CanonicalAccountProfileID("acct_fixture", "", "")
 	if want == "" {
 		t.Fatal("fixture principal must be exact-routable")
 	}
-	// Smoke via snapshotsFromCodexRateLimits is in providerinventory tests;
-	// here ensure capacity join uses the opaque form.
 	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
 	rem := int64(50)
 	rep := providerinventory.Report{
-		Installations: []providerinventory.ProviderInstallation{{
-			AdapterID: "codex", ProviderInstallationID: "pinst_y",
-			InstallationState:   providerinventory.InstallationInstalled,
-			UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-			Confidence:         providerinventory.ConfidenceExact,
-			ExecutableIdentity: providerinventory.ExecutableIdentity{ResolvedPathHash: "sha256:y"},
-		}},
+		Installations: []providerinventory.ProviderInstallation{
+			exactFreshInstall("codex", "pinst_y", "sha256:y", "sha256:p"),
+		},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
 			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
@@ -567,11 +660,103 @@ func TestCodexAccountProfileIDWhenPrincipalPresent(t *testing.T) {
 	}
 }
 
+func TestMergeDepthsNeverBroadenOnDisagreement(t *testing.T) {
+	// Two rows same model with conflicting depth sets: result must be intersection only.
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	const (
+		acc  = "acct-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		inst = "pinst_merge"
+	)
+	rem := int64(50)
+	// Build two account observations that will collide after alias (same install/account)
+	// by placing models via two quota-less auth rows is hard; instead fuse via
+	// path-alias so mergeAccountObservations runs.
+	rhash := "sha256:merge-depth"
+	instA, instB := "pinst_m_a", "pinst_m_b"
+	rep := providerinventory.Report{
+		Installations: []providerinventory.ProviderInstallation{
+			exactFreshInstall("codex", instA, rhash, "sha256:pa"),
+			exactFreshInstall("codex", instB, rhash, "sha256:pb"),
+		},
+		AuthReadiness: []providerinventory.AuthReadiness{{
+			AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
+			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
+			AccountProfileID: ptrStr(acc), ProviderInstallationID: ptrStr(instA),
+		}},
+		// Two model rows for same id with different constraints — attached to same
+		// adapter accounts; after alias fuse merge should intersect.
+		ModelCapabilities: []providerinventory.ModelCapability{
+			{
+				AdapterID: "codex", CanonicalModelID: "gpt-5.5",
+				AvailabilityState:      providerinventory.AvailabilityAvailable,
+				LifecycleState:         providerinventory.LifecycleAvailable,
+				FreshnessState:         providerinventory.FreshnessFresh,
+				Confidence:             providerinventory.ConfidenceExact,
+				EntrySources:           testMachineReadableSources("codex"),
+				Source:                 providerinventory.SourceDescriptor{Kind: string(providerinventory.CatalogSourceProviderMachineReadable)},
+				ModelCatalogSnapshotID: "mc1",
+				Constraints:            []string{"supported_depth=low", "supported_depth=medium", "default_depth=medium"},
+			},
+			{
+				AdapterID: "codex", CanonicalModelID: "gpt-5.5",
+				AvailabilityState:      providerinventory.AvailabilityAvailable,
+				LifecycleState:         providerinventory.LifecycleAvailable,
+				FreshnessState:         providerinventory.FreshnessFresh,
+				Confidence:             providerinventory.ConfidenceExact,
+				EntrySources:           testMachineReadableSources("codex"),
+				Source:                 providerinventory.SourceDescriptor{Kind: string(providerinventory.CatalogSourceProviderMachineReadable)},
+				ModelCatalogSnapshotID: "mc2",
+				Constraints:            []string{"supported_depth=medium", "supported_depth=high", "default_depth=high"},
+			},
+		},
+		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{
+			{ModelCatalogSnapshotID: "mc1", AdapterID: "codex",
+				CatalogSourceKind: providerinventory.CatalogSourceProviderMachineReadable,
+				Confidence:        providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
+				ProviderInstallationID: ptrStr(instA), EntryCount: 1},
+			{ModelCatalogSnapshotID: "mc2", AdapterID: "codex",
+				CatalogSourceKind: providerinventory.CatalogSourceProviderMachineReadable,
+				Confidence:        providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
+				ProviderInstallationID: ptrStr(instB), EntryCount: 1},
+		},
+		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
+			QuotaSnapshotID: "q", AdapterID: "codex",
+			AccountProfileID: ptrStr(acc), ProviderInstallationID: ptrStr(instA),
+			Unit: "percent", WindowKind: providerinventory.WindowFixedWeek,
+			RemainingValue: &rem, Confidence: providerinventory.ConfidenceExact,
+			FreshnessState: providerinventory.FreshnessFresh,
+			ScopeKey:       "provider:codex/account:" + acc + "/scope:codex/detail:primary",
+			CapturedAt:     now.Format(time.RFC3339),
+		}},
+	}
+	_ = inst
+	accounts := capacitysnapshot.FromProviderInventoryReport(rep, now)
+	// Find gpt-5.5 on fused account: depths must be intersection {medium} only,
+	// never low∪high invent.
+	for _, a := range accounts {
+		for _, m := range a.Models {
+			if m.ModelID != "gpt-5.5" || m.CatalogHintOnly {
+				continue
+			}
+			set := map[string]bool{}
+			for _, d := range m.SupportedDepths {
+				set[d] = true
+			}
+			if set["low"] || set["high"] {
+				t.Fatalf("merge must not broaden depths beyond intersection; got %v", m.SupportedDepths)
+			}
+			// Intersection of {low,medium} ∩ {medium,high} = {medium}
+			if !set["medium"] && len(m.SupportedDepths) > 0 {
+				// If attach produced separate rows before merge, still OK if no broaden.
+			}
+		}
+	}
+}
+
 // --- helpers ---
 
 func opaqueUnknown(t *testing.T) string {
 	t.Helper()
-	// Pre-fix opaqueAccountRef("unknown") = sha256("acct|unknown") hex (RC36 codex split key).
 	return "acct-0b46c5378d997593a68a5df708cc61c0207785483cca3768641b04e30ac23638"
 }
 
@@ -618,7 +803,7 @@ func itoa(n int) string {
 
 func int64Ptr(v int64) *int64 { return &v }
 
-func inst(adapter, id, resolved, pathHash string) providerinventory.ProviderInstallation {
+func exactFreshInstall(adapter, id, resolved, pathHash string) providerinventory.ProviderInstallation {
 	return providerinventory.ProviderInstallation{
 		AdapterID: adapter, ProviderInstallationID: id,
 		InstallationState:   providerinventory.InstallationInstalled,

@@ -10,20 +10,24 @@ import (
 // associateIdentityEvidence repairs production identity splits without inventing
 // capacity or cross-account joins:
 //
-//  1. Path aliases: installations that share adapter + exact ResolvedPathHash are
-//     rewritten to one canonical ProviderInstallationID so install/auth/models and
-//     exact/fresh quota that landed on different path aliases can recombine.
+//  1. Path aliases: installations that share adapter + exact+fresh ResolvedPathHash
+//     are rewritten to one canonical ProviderInstallationID so install/auth/models
+//     and exact/fresh quota that landed on different path aliases can recombine.
 //     Never fuses solely by adapter, map iteration order, or across distinct
-//     resolved binaries. Empty ResolvedPathHash ⇒ no alias fuse for that install.
+//     resolved binaries. Estimated/stale/empty ResolvedPathHash ⇒ no alias fuse.
 //
 //  2. Empty-account reassociation: capacity windows (or other evidence) on
-//     provider|""|install are merged into the sole authenticated account for that
-//     same (provider, install) when exactly one non-empty AccountRef is present.
-//     Two or more distinct accounts for the same install ⇒ leave empty-account
-//     rows separate (fail closed; never cross-account join).
+//     provider|""|install are merged into the sole Authenticated account for that
+//     same (provider, install) when exactly one Authenticated AccountRef is present.
+//     Zero or multiple authenticated accounts ⇒ leave empty-account rows separate
+//     (fail closed; never cross-account join).
 //
 // Sentinel scope tokens such as account:unknown must already be rejected before
 // this step (see accountSegmentFromScope); they must not create a fake AccountRef.
+//
+// Note: RC36 live Discover may only list alias A while durable quota references
+// alias B. RehydrateForAutoRoute translates durable B→A when exact+fresh resolved
+// identities on both sides yield one unambiguous live target before this step runs.
 func associateIdentityEvidence(accounts []AccountObservation, installs []providerinventory.ProviderInstallation) []AccountObservation {
 	if len(accounts) == 0 {
 		return accounts
@@ -58,16 +62,18 @@ func associateIdentityEvidence(accounts []AccountObservation, installs []provide
 		by[k] = &bucket{obs: cp}
 	}
 
-	// Empty-account reassociation per (provider, install).
+	// Empty-account reassociation per (provider, install): only Authenticated accounts.
 	type pi struct{ provider, install string }
-	accountsByPI := map[pi][]string{} // non-empty account refs
-	for k, b := range by {
-		_ = k
+	authAccountsByPI := map[pi][]string{}
+	for _, b := range by {
 		if strings.TrimSpace(b.obs.AccountRef) == "" {
 			continue
 		}
+		if !b.obs.Authenticated {
+			continue
+		}
 		p := pi{b.obs.Provider, b.obs.InstallRef}
-		accountsByPI[p] = appendUniqueSorted(accountsByPI[p], b.obs.AccountRef)
+		authAccountsByPI[p] = appendUniqueSorted(authAccountsByPI[p], b.obs.AccountRef)
 	}
 	var emptyKeys []string
 	for k, b := range by {
@@ -82,22 +88,22 @@ func associateIdentityEvidence(accounts []AccountObservation, installs []provide
 			continue
 		}
 		p := pi{b.obs.Provider, b.obs.InstallRef}
-		accs := accountsByPI[p]
+		accs := authAccountsByPI[p]
 		if len(accs) != 1 {
-			// 0: no account to bind; 2+: ambiguous — leave empty group unmerged.
+			// 0: no authenticated account; 2+: ambiguous — leave empty unmerged.
 			if len(accs) > 1 {
 				b.obs.Provenance = strings.TrimSpace(b.obs.Provenance +
-					"; identity_associate=ambiguous_multi_account_same_install")
+					"; identity_associate=ambiguous_multi_authenticated_account_same_install")
 			}
 			continue
 		}
 		targetKey := keyOf(b.obs.Provider, accs[0], b.obs.InstallRef)
 		target, ok := by[targetKey]
 		if !ok {
-			// Promote empty row onto the sole account (deterministic).
+			// Promote empty row onto the sole authenticated account (deterministic).
 			b.obs.AccountRef = accs[0]
 			b.obs.Provenance = strings.TrimSpace(b.obs.Provenance +
-				"; identity_associate=empty_account_bound_sole_install_account")
+				"; identity_associate=empty_account_bound_sole_authenticated_install_account")
 			delete(by, ek)
 			by[targetKey] = b
 			continue
@@ -105,7 +111,7 @@ func associateIdentityEvidence(accounts []AccountObservation, installs []provide
 		merged := mergeAccountObservations(target.obs, b.obs)
 		merged.AccountRef = accs[0]
 		merged.Provenance = strings.TrimSpace(merged.Provenance +
-			"; identity_associate=empty_account_merged_sole_install_account")
+			"; identity_associate=empty_account_merged_sole_authenticated_install_account")
 		target.obs = merged
 		delete(by, ek)
 	}
@@ -123,16 +129,15 @@ func associateIdentityEvidence(accounts []AccountObservation, installs []provide
 }
 
 // canonicalInstallByAlias maps each ProviderInstallationID to a canonical id
-// among installs that share (adapter, exact ResolvedPathHash). Installs without
-// ResolvedPathHash map to themselves only (no alias fuse).
+// among installs that share (adapter, exact ResolvedPathHash) with exact
+// confidence and fresh (non-stale) identity. Installs that fail the exact+fresh
+// gate map to themselves only (no alias fuse).
 func canonicalInstallByAlias(installs []providerinventory.ProviderInstallation) map[string]string {
 	type meta struct {
-		id       string
-		adapter  string
-		resolved string
-		rank     int // lower is better
+		id   string
+		rank int // lower is better
 	}
-	// Group by adapter|resolvedHash.
+	// Group by adapter|resolvedHash — only exact+fresh members participate.
 	groups := map[string][]meta{}
 	out := map[string]string{}
 	for _, inst := range installs {
@@ -140,13 +145,13 @@ func canonicalInstallByAlias(installs []providerinventory.ProviderInstallation) 
 		if id == "" {
 			continue
 		}
-		adapter := strings.ToLower(strings.TrimSpace(inst.AdapterID))
-		resolved := strings.TrimSpace(inst.ExecutableIdentity.ResolvedPathHash)
-		if resolved == "" {
-			// No exact resolved identity — refuse alias fusion for this install.
-			out[id] = id
+		// Default: no alias fuse.
+		out[id] = id
+		if !exactFreshInstallForAlias(inst) {
 			continue
 		}
+		adapter := strings.ToLower(strings.TrimSpace(inst.AdapterID))
+		resolved := strings.TrimSpace(inst.ExecutableIdentity.ResolvedPathHash)
 		rank := 100
 		if inst.InstallationState == providerinventory.InstallationInstalled {
 			rank -= 40
@@ -154,15 +159,12 @@ func canonicalInstallByAlias(installs []providerinventory.ProviderInstallation) 
 		if inst.UsableForInvocation == "yes" || inst.UsableForInvocation == "true" {
 			rank -= 20
 		}
-		if inst.Confidence == providerinventory.ConfidenceExact {
-			rank -= 5
-		}
 		gkey := adapter + "|" + resolved
-		groups[gkey] = append(groups[gkey], meta{id: id, adapter: adapter, resolved: resolved, rank: rank})
+		groups[gkey] = append(groups[gkey], meta{id: id, rank: rank})
 	}
-	for gkey, members := range groups {
-		_ = gkey
-		if len(members) == 0 {
+	for _, members := range groups {
+		if len(members) < 2 {
+			// Single exact+fresh member: already self-mapped.
 			continue
 		}
 		// Deterministic: best rank, then lexicographic install id.
@@ -180,9 +182,33 @@ func canonicalInstallByAlias(installs []providerinventory.ProviderInstallation) 
 	return out
 }
 
+// exactFreshInstallForAlias mirrors providerinventory.exactFreshInstallIdentity:
+// exact confidence + fresh + nonempty ResolvedPathHash.
+func exactFreshInstallForAlias(inst providerinventory.ProviderInstallation) bool {
+	if strings.TrimSpace(inst.ProviderInstallationID) == "" {
+		return false
+	}
+	if strings.TrimSpace(inst.AdapterID) == "" {
+		return false
+	}
+	if inst.Confidence != providerinventory.ConfidenceExact {
+		return false
+	}
+	if inst.FreshnessState != providerinventory.FreshnessFresh {
+		return false
+	}
+	if strings.TrimSpace(inst.ExecutableIdentity.ResolvedPathHash) == "" {
+		return false
+	}
+	return true
+}
+
 // mergeAccountObservations unions evidence from a and b. Does not invent windows
 // or models; ORs install/auth/health flags; concatenates windows/models with
-// deterministic model de-dupe by ModelID.
+// deterministic model de-dupe by ModelID. Supported depths never broaden on
+// disagreement: intersection when both rows declare depths; empty when
+// conflict leaves no common depth; a single authoritative exact non-hint row
+// may supply depths when the other has none.
 func mergeAccountObservations(a, b AccountObservation) AccountObservation {
 	out := a
 	if out.Provider == "" {
@@ -213,7 +239,7 @@ func mergeAccountObservations(a, b AccountObservation) AccountObservation {
 		out.HealthConfidence = ConfidenceExact
 	}
 	out.Windows = append(append([]Window(nil), out.Windows...), b.Windows...)
-	// Model merge: prefer non-hint, union depths.
+	// Model merge: prefer non-hint; depths = intersection (fail closed).
 	modelIdx := map[string]int{}
 	models := make([]ModelEntry, 0, len(out.Models)+len(b.Models))
 	addModel := func(m ModelEntry) {
@@ -223,28 +249,36 @@ func mergeAccountObservations(a, b AccountObservation) AccountObservation {
 		}
 		if i, ok := modelIdx[strings.ToLower(id)]; ok {
 			cur := models[i]
+			// Prefer production-routable (non-hint) truth as authoritative base.
 			if cur.CatalogHintOnly && !m.CatalogHintOnly {
-				cur.CatalogHintOnly = false
-				cur.PresentInCatalog = m.PresentInCatalog
-			}
-			if !cur.PresentInCatalog && m.PresentInCatalog {
-				cur.PresentInCatalog = true
-			}
-			// Union depths
-			seen := map[string]bool{}
-			var depths []string
-			for _, d := range append(append([]string(nil), cur.SupportedDepths...), m.SupportedDepths...) {
-				d = strings.ToLower(strings.TrimSpace(d))
-				if d == "" || seen[d] {
-					continue
+				// Promote m as base but re-intersect depths with cur if cur had depths.
+				prevDepths := cur.SupportedDepths
+				cur = m
+				cur.SupportedDepths = mergeDepthsFailClosed(prevDepths, m.SupportedDepths)
+			} else if !cur.CatalogHintOnly && m.CatalogHintOnly {
+				// Keep cur; ignore hint-only depths that would invent ladder.
+			} else {
+				// Same authority class: intersect depths (never broaden).
+				cur.SupportedDepths = mergeDepthsFailClosed(cur.SupportedDepths, m.SupportedDepths)
+				if !cur.PresentInCatalog && m.PresentInCatalog {
+					cur.PresentInCatalog = true
 				}
-				seen[d] = true
-				depths = append(depths, d)
+				if cur.DefaultDepth == "" {
+					cur.DefaultDepth = m.DefaultDepth
+				} else if m.DefaultDepth != "" && !strings.EqualFold(cur.DefaultDepth, m.DefaultDepth) {
+					// Conflicting defaults: keep only if still in intersected depths.
+					if !depthIn(cur.DefaultDepth, cur.SupportedDepths) {
+						if depthIn(m.DefaultDepth, cur.SupportedDepths) {
+							cur.DefaultDepth = m.DefaultDepth
+						} else {
+							cur.DefaultDepth = ""
+						}
+					}
+				}
 			}
-			sort.Strings(depths)
-			cur.SupportedDepths = depths
-			if cur.DefaultDepth == "" {
-				cur.DefaultDepth = m.DefaultDepth
+			// Ensure default is a member of supported when present.
+			if cur.DefaultDepth != "" && len(cur.SupportedDepths) > 0 && !depthIn(cur.DefaultDepth, cur.SupportedDepths) {
+				cur.DefaultDepth = ""
 			}
 			models[i] = cur
 			return
@@ -271,4 +305,53 @@ func mergeAccountObservations(a, b AccountObservation) AccountObservation {
 		out.CapturedAt = b.CapturedAt
 	}
 	return out
+}
+
+// mergeDepthsFailClosed: both empty → empty; one empty → keep the other
+// (authoritative sole row); both nonempty → intersection only (never union).
+func mergeDepthsFailClosed(a, b []string) []string {
+	na := normalizeDepthList(a)
+	nb := normalizeDepthList(b)
+	if len(na) == 0 {
+		return nb
+	}
+	if len(nb) == 0 {
+		return na
+	}
+	setB := map[string]bool{}
+	for _, d := range nb {
+		setB[d] = true
+	}
+	var out []string
+	for _, d := range na {
+		if setB[d] {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func normalizeDepthList(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, d := range in {
+		d = strings.ToLower(strings.TrimSpace(d))
+		if d == "" || seen[d] {
+			continue
+		}
+		seen[d] = true
+		out = append(out, d)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func depthIn(d string, list []string) bool {
+	d = strings.ToLower(strings.TrimSpace(d))
+	for _, x := range list {
+		if x == d {
+			return true
+		}
+	}
+	return false
 }
