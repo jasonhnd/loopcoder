@@ -72,6 +72,8 @@ func exactInstallRef(id string) string {
 
 // accountSegmentFromScope extracts the exact "account:" segment from a ScopeKey
 // such as "provider:grok/account:X/detail:credits_usage". Never hashes the whole scope.
+// Sentinel tokens (unknown / empty / root) are rejected so they cannot invent a
+// fake AccountRef that splits capacity from auth (RC36 codex account:unknown).
 func accountSegmentFromScope(scopeKey string) string {
 	scopeKey = strings.TrimSpace(scopeKey)
 	if scopeKey == "" {
@@ -81,12 +83,22 @@ func accountSegmentFromScope(scopeKey string) string {
 		part = strings.TrimSpace(part)
 		if strings.HasPrefix(part, "account:") {
 			acc := strings.TrimSpace(strings.TrimPrefix(part, "account:"))
-			if acc != "" {
-				return opaqueAccountRef(acc)
+			if acc == "" || isSentinelAccountToken(acc) {
+				return ""
 			}
+			return opaqueAccountRef(acc)
 		}
 	}
 	return ""
+}
+
+func isSentinelAccountToken(acc string) bool {
+	switch strings.ToLower(strings.TrimSpace(acc)) {
+	case "unknown", "root", "account", "none", "null", "nil":
+		return true
+	default:
+		return false
+	}
 }
 
 // FromProviderInventoryReport maps a live providerinventory.Report into AccountObservations.
@@ -102,6 +114,9 @@ func accountSegmentFromScope(scopeKey string) string {
 //     validated fallback extracting the exact account: segment (never whole scope)
 //   - No truncation of AccountRef / InstallRef / ProviderInstallationID
 //   - Deterministic joins (sorted keys); unknown joins stay unknown/non-routable
+//   - After grouping, associateIdentityEvidence coalesces path aliases (same
+//     adapter + ResolvedPathHash) and rebinds empty-account capacity to the sole
+//     account on that install; ambiguous multi-account stays fail-closed.
 func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []AccountObservation {
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -499,7 +514,8 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 		}
 		out = append(out, FromAccountInput(b.in))
 	}
-	return out
+	// Path-alias + empty-account reassociation (fail closed on ambiguity).
+	return associateIdentityEvidence(out, rep.Installations)
 }
 
 func appendUniqueSorted(ss []string, v string) []string {

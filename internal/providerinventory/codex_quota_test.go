@@ -157,7 +157,7 @@ func TestCodexQuotaCollectsFiveHourWeeklyCreditsAndScopes(t *testing.T) {
 			t.Fatalf("diagnostics retained credential canary: %#v", snapshot)
 		}
 	}
-	defaultPrimaryScope := "provider:codex/account:acct_fixture/scope:codex/detail:primary"
+	defaultPrimaryScope := "provider:codex/account:acct-5f82be5fbd98a843b9a806ea4b93970bf195c3091ca56bdbc5ddcd49cc0c2b73/scope:codex/detail:primary"
 	five := byName["primary_used_percent|rolling|"+defaultPrimaryScope]
 	if five.RollingDurationMS != int64((5*time.Hour).Milliseconds()) || five.UsedValue == nil || *five.UsedValue != 25 || five.RemainingValue == nil || *five.RemainingValue != 75 || five.Unit != "percent" {
 		t.Fatalf("five-hour snapshot = %#v", five)
@@ -165,22 +165,22 @@ func TestCodexQuotaCollectsFiveHourWeeklyCreditsAndScopes(t *testing.T) {
 	if five.LimitValue != nil || five.FieldConfidences["remaining_value"] != ConfidenceEstimated || !containsString(five.GapReasons, "remaining-derived-from-used-percent") {
 		t.Fatalf("five-hour percentage semantics = %#v, want no fabricated limit and derived remaining", five)
 	}
-	weekly := byName["secondary_used_percent|fixed-week|provider:codex/account:acct_fixture/scope:codex/detail:secondary"]
+	weekly := byName["secondary_used_percent|fixed-week|provider:codex/account:acct-5f82be5fbd98a843b9a806ea4b93970bf195c3091ca56bdbc5ddcd49cc0c2b73/scope:codex/detail:secondary"]
 	if weekly.ResetAt != formatTime(time.Unix(resetWeek, 0)) || weekly.RollingDurationMS != int64((7*24*time.Hour).Milliseconds()) {
 		t.Fatalf("weekly snapshot = %#v", weekly)
 	}
 	if weekly.WindowStart != formatTime(time.Unix(resetWeek, 0).Add(-7*24*time.Hour)) || weekly.WindowEnd != formatTime(time.Unix(resetWeek, 0)) || weekly.ResetSemantics != ResetWindowBoundary {
 		t.Fatalf("weekly fixed boundary fields = %#v", weekly)
 	}
-	credits := byName["credits_balance|unbounded|provider:codex/account:acct_fixture/scope:codex/detail:credits"]
+	credits := byName["credits_balance|unbounded|provider:codex/account:acct-5f82be5fbd98a843b9a806ea4b93970bf195c3091ca56bdbc5ddcd49cc0c2b73/scope:codex/detail:credits"]
 	if credits.QuantityKind != QuantityProviderDefined || credits.RemainingValue == nil || *credits.RemainingValue != 4275 || credits.ValueScale != 2 {
 		t.Fatalf("credits snapshot = %#v", credits)
 	}
-	workspace := byName["primary_used_percent|rolling|provider:codex/account:acct_fixture/scope:workspace/detail:primary"]
+	workspace := byName["primary_used_percent|rolling|provider:codex/account:acct-5f82be5fbd98a843b9a806ea4b93970bf195c3091ca56bdbc5ddcd49cc0c2b73/scope:workspace/detail:primary"]
 	if workspace.RemainingValue == nil || *workspace.RemainingValue != 90 {
 		t.Fatalf("workspace snapshot = %#v", workspace)
 	}
-	resetCredits := byName["rate_limit_reset_credits|unbounded|provider:codex/account:acct_fixture/scope:default/detail:reset_credits"]
+	resetCredits := byName["rate_limit_reset_credits|unbounded|provider:codex/account:acct-5f82be5fbd98a843b9a806ea4b93970bf195c3091ca56bdbc5ddcd49cc0c2b73/scope:default/detail:reset_credits"]
 	if resetCredits.RemainingValue == nil || *resetCredits.RemainingValue != 2 || resetCredits.ValidUntil != formatTime(time.Unix(resetCreditExpiry, 0)) {
 		t.Fatalf("reset credits snapshot = %#v", resetCredits)
 	}
@@ -210,7 +210,7 @@ func TestCodexQuotaCollectsFiveHourWeeklyCreditsAndScopes(t *testing.T) {
 	if loadedFive.RollingDurationMS != int64((5*time.Hour).Milliseconds()) || loadedFive.ResetAt != formatTime(time.Unix(resetFiveHour, 0)) || loadedFive.ResetSemantics != ResetRolling || loadedFive.WindowStart != "" || loadedFive.WindowEnd != "" {
 		t.Fatalf("loaded five-hour fields = %#v", loadedFive)
 	}
-	loadedWeekly := quotaSnapshotByKey(t, loaded, "secondary_used_percent", WindowFixedWeek, "provider:codex/account:acct_fixture/scope:codex/detail:secondary")
+	loadedWeekly := quotaSnapshotByKey(t, loaded, "secondary_used_percent", WindowFixedWeek, "provider:codex/account:acct-5f82be5fbd98a843b9a806ea4b93970bf195c3091ca56bdbc5ddcd49cc0c2b73/scope:codex/detail:secondary")
 	if loadedWeekly.WindowStart != formatTime(time.Unix(resetWeek, 0).Add(-7*24*time.Hour)) || loadedWeekly.WindowEnd != formatTime(time.Unix(resetWeek, 0)) || loadedWeekly.ResetAt != formatTime(time.Unix(resetWeek, 0)) || loadedWeekly.ResetSemantics != ResetWindowBoundary || loadedWeekly.RollingDurationMS != int64((7*24*time.Hour).Milliseconds()) {
 		t.Fatalf("loaded weekly fields = %#v", loadedWeekly)
 	}
@@ -310,27 +310,27 @@ func TestCodexQuotaInvalidWindowInputsPersistAsNonFixed(t *testing.T) {
 		t.Fatalf("Load reopened: %v", err)
 	}
 
-	validWeekly := quotaSnapshotByKey(t, loaded, "primary_used_percent", WindowFixedWeek, "provider:codex/account:acct_mixed/scope:codex/detail:primary")
+	validWeekly := quotaSnapshotByKey(t, loaded, "primary_used_percent", WindowFixedWeek, "provider:codex/account:acct-31945f4dc691eae233d18909c4cd8371dab62fba97427af6d73340d7db2aeb2c/scope:codex/detail:primary")
 	if validWeekly.WindowStart != formatTime(time.Unix(weekReset, 0).Add(-7*24*time.Hour)) || validWeekly.WindowEnd != formatTime(time.Unix(weekReset, 0)) {
 		t.Fatalf("valid weekly fields = %#v", validWeekly)
 	}
-	noReset := quotaSnapshotByKey(t, loaded, "primary_used_percent", WindowProviderDefined, "provider:codex/account:acct_mixed/scope:noreset/detail:primary")
+	noReset := quotaSnapshotByKey(t, loaded, "primary_used_percent", WindowProviderDefined, "provider:codex/account:acct-31945f4dc691eae233d18909c4cd8371dab62fba97427af6d73340d7db2aeb2c/scope:noreset/detail:primary")
 	if noReset.WindowStart != "" || noReset.WindowEnd != "" || noReset.ResetAt != "" || noReset.RollingDurationMS != int64((7*24*time.Hour).Milliseconds()) || !containsString(noReset.GapReasons, "missing-reset-at") {
 		t.Fatalf("no-reset weekly fields = %#v", noReset)
 	}
-	zero := quotaSnapshotByKey(t, loaded, "secondary_used_percent", WindowUnknown, "provider:codex/account:acct_mixed/scope:codex/detail:secondary")
+	zero := quotaSnapshotByKey(t, loaded, "secondary_used_percent", WindowUnknown, "provider:codex/account:acct-31945f4dc691eae233d18909c4cd8371dab62fba97427af6d73340d7db2aeb2c/scope:codex/detail:secondary")
 	if zero.RollingDurationMS != 0 || zero.WindowStart != "" || zero.WindowEnd != "" || !containsString(zero.GapReasons, "invalid-window-duration") {
 		t.Fatalf("zero-duration fields = %#v", zero)
 	}
-	negative := quotaSnapshotByKey(t, loaded, "primary_used_percent", WindowUnknown, "provider:codex/account:acct_mixed/scope:negative/detail:primary")
+	negative := quotaSnapshotByKey(t, loaded, "primary_used_percent", WindowUnknown, "provider:codex/account:acct-31945f4dc691eae233d18909c4cd8371dab62fba97427af6d73340d7db2aeb2c/scope:negative/detail:primary")
 	if negative.RollingDurationMS != 0 || !containsString(negative.GapReasons, "invalid-window-duration") {
 		t.Fatalf("negative-duration fields = %#v", negative)
 	}
-	overflow := quotaSnapshotByKey(t, loaded, "primary_used_percent", WindowUnknown, "provider:codex/account:acct_mixed/scope:overflow/detail:primary")
+	overflow := quotaSnapshotByKey(t, loaded, "primary_used_percent", WindowUnknown, "provider:codex/account:acct-31945f4dc691eae233d18909c4cd8371dab62fba97427af6d73340d7db2aeb2c/scope:overflow/detail:primary")
 	if overflow.RollingDurationMS != 0 || !containsString(overflow.GapReasons, "invalid-window-duration") {
 		t.Fatalf("overflow-duration fields = %#v", overflow)
 	}
-	outOfRange := quotaSnapshotByKey(t, loaded, "primary_used_percent", WindowProviderDefined, "provider:codex/account:acct_mixed/scope:outofrange/detail:primary")
+	outOfRange := quotaSnapshotByKey(t, loaded, "primary_used_percent", WindowProviderDefined, "provider:codex/account:acct-31945f4dc691eae233d18909c4cd8371dab62fba97427af6d73340d7db2aeb2c/scope:outofrange/detail:primary")
 	if outOfRange.WindowStart != "" || outOfRange.WindowEnd != "" || outOfRange.ResetAt != "" || !containsString(outOfRange.GapReasons, "invalid-reset-at") {
 		t.Fatalf("out-of-range reset fields = %#v", outOfRange)
 	}

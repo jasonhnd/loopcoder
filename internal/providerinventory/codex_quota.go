@@ -1162,31 +1162,56 @@ func codexProtocolSummary(output string) string {
 }
 
 func codexAccountScope(account map[string]any) string {
+	// Prefer the same principal used for AccountProfileID so scope and profile match.
+	if acct := codexCanonicalAccountProfileID(account); acct != "" {
+		// Scope token is the opaque acct- binding (safe, non-secret).
+		if safeScopeToken(acct) {
+			return acct
+		}
+	}
 	for _, container := range []map[string]any{account, codexMapField(account, "account"), codexMapField(account, "profile")} {
 		if container == nil {
 			continue
 		}
-		value := codexStringField(container, "id", "account_id", "accountID", "profile_id", "profileID")
+		value := codexStringField(container,
+			"id", "account_id", "accountID", "profile_id", "profileID",
+			"chatgpt_account_id", "chatgptAccountId", "chatgpt_user_id", "chatgptUserId",
+		)
+		if value == "" || strings.Contains(value, "@") {
+			continue
+		}
+		if strings.EqualFold(value, "unknown") || strings.EqualFold(value, "root") {
+			continue
+		}
 		if safeScopeToken(value) {
 			return value
 		}
 	}
-	return "unknown"
+	// Empty — never emit account:unknown (that invents a fake join key and splits
+	// rate-limit windows from the installation's authenticated account; RC36).
+	return ""
 }
 
 // codexCanonicalAccountProfileID returns the shared opaque acct- binding used by
 // inventory and agent execution (internal/codexauth). Empty when not exact-routable.
 //
-// Only account/read RPC-affirmed identity is accepted. Never falls back to a
-// local auth.json (that would stamp RPC quota under a different process identity).
-// Canonical hash is provider+stable principal only (plan is separate evidence).
+// Only account/read RPC-affirmed identity fields are accepted. Never falls back to
+// a local auth.json (that would stamp RPC quota under a different process identity).
+// Never invents from email/plan alone. Canonical hash is provider+stable principal
+// only (plan is separate evidence).
 func codexCanonicalAccountProfileID(account map[string]any) string {
 	for _, container := range []map[string]any{account, codexMapField(account, "account"), codexMapField(account, "profile")} {
 		if container == nil {
 			continue
 		}
-		id := codexStringField(container, "id", "account_id", "accountID", "chatgpt_account_id")
+		id := codexStringField(container,
+			"id", "account_id", "accountID", "chatgpt_account_id", "chatgptAccountId",
+			"chatgpt_user_id", "chatgptUserId",
+		)
 		if id == "" || strings.Contains(id, "@") {
+			continue
+		}
+		if strings.EqualFold(id, "unknown") || strings.EqualFold(id, "root") {
 			continue
 		}
 		// plan ignored for identity; codexauth.CanonicalAccountProfileID is principal-only.
@@ -1194,7 +1219,7 @@ func codexCanonicalAccountProfileID(account map[string]any) string {
 			return acct
 		}
 	}
-	// Fail unknown — do not invent from local auth file.
+	// Fail unknown — do not invent from local auth file or email/planType.
 	return ""
 }
 
