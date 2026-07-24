@@ -684,7 +684,46 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 		}
 	}
 	// Re-hash product after isolation check; mutation must invalidate acceptance.
+	// Provider logs/summaries alone are not product (see productOutputDigest).
+	// Research/verify are often provider-sandbox read-only and still need durable
+	// product for acceptance — materialize from independently observed provider
+	// Summary after process exit (LoopCoder-owned write, not Actual* echo).
+	//
+	// If materialize is attempted and fails, surface the real typed failure —
+	// never swallow into generic missing_evidence (RC39 Stage D diagnostics).
 	digest, files, _ = productOutputDigest(wt)
+	if strings.TrimSpace(digest) == "" {
+		role := ClassifyTaskRole(in.WorkItemID, in.Intent, "")
+		var merr error
+		var fc string
+		switch role {
+		case RoleResearch:
+			fc = FailureClassResearchFindingsMaterialization
+			merr = materializeResearchFindings(wt, res.Summary, in)
+		case RoleVerify:
+			fc = FailureClassVerifierVerdictMaterialization
+			merr = materializeVerifierVerdict(wt, res.Summary, in)
+		}
+		if fc != "" {
+			if merr != nil {
+				out := ChildExecResult{
+					Terminal: workgraph.TermFailed, WorktreePath: wt,
+					FailureClass: fc, Message: merr.Error(),
+					Provider: actualProv, Model: actualModel, Depth: actualDepth,
+					ActualSource: "unknown",
+					InvokedRoute: ChildRoute{
+						Provider: actualProv, Model: actualModel, Depth: actualDepth,
+						Permission: actualPerm, AccountRef: actualAcct, InstallRef: actualInstall,
+					},
+				}
+				bindSources(&out)
+				bindSpawn(&out)
+				out = attachUsage(out, res)
+				return out, merr
+			}
+			digest, files, _ = productOutputDigest(wt)
+		}
+	}
 	if strings.TrimSpace(digest) == "" {
 		out := ChildExecResult{
 			Terminal: workgraph.TermFailed, WorktreePath: wt, FailureClass: "missing_evidence",
@@ -936,9 +975,11 @@ func mergePayloadStringMap(dst, src map[string]string) map[string]string {
 }
 
 // productOutputDigest hashes actual changed product paths/content under the
-// worktree (excluding .loopcoder audit stubs and ownership markers). Empty when
-// no useful product change exists — cannot become successful evidence.
-// Directory entries from discovery are hard failures (must not silently skip).
+// worktree (excluding .loopcoder audit stubs, ownership markers, and provider
+// runtime logs/summaries). Empty when no useful product change exists — cannot
+// become successful evidence. Directory entries from discovery are hard failures
+// (must not silently skip). Align exclusions with filterProductFiles so success
+// digests cannot be built from files acceptance will discard (RC39 research).
 func productOutputDigest(wt string) (digest string, files []string, err error) {
 	discovered, derr := discoverProductFiles(wt)
 	if derr != nil {
@@ -954,6 +995,12 @@ func productOutputDigest(wt string) (digest string, files []string, err error) {
 			continue
 		}
 		if strings.HasPrefix(rel, "child-output-") {
+			continue
+		}
+		base := filepath.Base(rel)
+		// Provider runtime artifacts are not product (same list as filterProductFiles).
+		if strings.HasSuffix(base, ".log") || base == "prompt.txt" || base == "summary.txt" ||
+			strings.HasPrefix(base, ".loopcoder-child") || base == "loopcoder-child-provider.log" {
 			continue
 		}
 		product = append(product, rel)
@@ -985,6 +1032,164 @@ func productOutputDigest(wt string) (digest string, files []string, err error) {
 		return "", nil, nil
 	}
 	return "sha256:" + hex.EncodeToString(h.Sum(nil)), files, nil
+}
+
+// materializeResearchFindings writes findings.md from the provider Summary after a
+// successful research run when the sandbox left no product files.
+func materializeResearchFindings(wt, summary string, in ChildExecInput) error {
+	summary = strings.TrimSpace(summary)
+	if wt == "" || len(summary) < 80 {
+		return fmt.Errorf("research summary too short to materialize findings")
+	}
+	low := strings.ToLower(summary)
+	for _, p := range []string{"please clarify", "need clarification", "need more information", "what should i"} {
+		if strings.Contains(low, p) && len(summary) < 400 {
+			return fmt.Errorf("research summary looks like clarification-only")
+		}
+	}
+	body := "# Research findings\n\n" +
+		"Work item: " + strings.TrimSpace(in.WorkItemID) + "\n\n" +
+		"Intent: " + strings.TrimSpace(in.Intent) + "\n\n" +
+		"## Provider survey\n\n" + summary + "\n"
+	return writeProductFileSecurely(wt, "findings.md", body, "research findings")
+}
+
+// materializeVerifierVerdict writes verdict.md from the provider Summary after a
+// successful verify run when the sandbox left no product files (read-only soul).
+func materializeVerifierVerdict(wt, summary string, in ChildExecInput) error {
+	summary = strings.TrimSpace(summary)
+	if wt == "" || len(summary) < 80 {
+		return fmt.Errorf("verifier summary too short to materialize verdict")
+	}
+	low := strings.ToLower(summary)
+	for _, p := range []string{"please clarify", "need clarification", "need more information", "what should i"} {
+		if strings.Contains(low, p) && len(summary) < 400 {
+			return fmt.Errorf("verifier summary looks like clarification-only")
+		}
+	}
+	// Explicit reject empty-review shells that would fail hasVerifierVerdict.
+	if strings.Contains(low, "nothing to review") || strings.Contains(low, "no implementation") {
+		if len(summary) < 400 {
+			return fmt.Errorf("verifier summary is empty-review shell")
+		}
+	}
+	body := "# Verification verdict\n\n" +
+		"Work item: " + strings.TrimSpace(in.WorkItemID) + "\n\n" +
+		"Intent: " + strings.TrimSpace(in.Intent) + "\n\n" +
+		"## Adversarial review\n\n" + summary + "\n"
+	return writeProductFileSecurely(wt, "verdict.md", body, "verifier verdict")
+}
+
+// writeProductFileSecurely writes leafName under worktree via 0600 temp + Rename
+// (replaces symlink node, never follows). git add errors are returned.
+func writeProductFileSecurely(wt, leafName, body, label string) error {
+	leafName = filepath.Base(strings.TrimSpace(leafName))
+	if leafName == "" || leafName == "." || leafName == ".." {
+		return fmt.Errorf("%s: invalid leaf name", label)
+	}
+	wtAbs, err := filepath.Abs(wt)
+	if err != nil {
+		return fmt.Errorf("%s worktree abs: %w", label, err)
+	}
+	if st, err := os.Lstat(wtAbs); err != nil {
+		return fmt.Errorf("%s worktree: %w", label, err)
+	} else if !st.IsDir() {
+		return fmt.Errorf("%s worktree is not a directory", label)
+	}
+	dest := filepath.Join(wtAbs, leafName)
+	if err := requirePathUnderRoot(wtAbs, dest); err != nil {
+		return fmt.Errorf("%s dest: %w", label, err)
+	}
+	if st, err := os.Lstat(dest); err == nil {
+		if st.Mode()&os.ModeSymlink == 0 && !st.Mode().IsRegular() {
+			return fmt.Errorf("%s dest is not a regular file or symlink (mode=%v)", label, st.Mode())
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("%s dest lstat: %w", label, err)
+	}
+	tmp, err := os.CreateTemp(wtAbs, "."+leafName+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("%s temp create: %w", label, err)
+	}
+	tmpName := tmp.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := requirePathUnderRoot(wtAbs, tmpName); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("%s temp path: %w", label, err)
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("%s temp chmod: %w", label, err)
+	}
+	if _, err := tmp.Write([]byte(body)); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("%s temp write: %w", label, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("%s temp sync: %w", label, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("%s temp close: %w", label, err)
+	}
+	if err := requireRegularNonSymlinkFile(tmpName); err != nil {
+		return fmt.Errorf("%s temp: %w", label, err)
+	}
+	if err := os.Rename(tmpName, dest); err != nil {
+		return fmt.Errorf("%s rename: %w", label, err)
+	}
+	cleanupTmp = false
+	if err := requirePathUnderRoot(wtAbs, dest); err != nil {
+		return fmt.Errorf("%s post path: %w", label, err)
+	}
+	if err := requireRegularNonSymlinkFile(dest); err != nil {
+		return fmt.Errorf("%s post: %w", label, err)
+	}
+	cmd := exec.Command("git", "-C", wtAbs, "add", "--", leafName)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%s git add: %w: %s", label, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// requirePathUnderRoot ensures candidate resolves under root (no escape via ..).
+func requirePathUnderRoot(root, candidate string) error {
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	candAbs, err := filepath.Abs(candidate)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(rootAbs, candAbs)
+	if err != nil {
+		return err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("path %q escapes worktree root %q", candAbs, rootAbs)
+	}
+	return nil
+}
+
+// requireRegularNonSymlinkFile uses Lstat only — never follows symlinks.
+func requireRegularNonSymlinkFile(path string) error {
+	st, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if st.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a symlink (refused)", path)
+	}
+	if !st.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file (mode=%v)", path, st.Mode())
+	}
+	return nil
 }
 
 func mergeUniquePaths(base, extra []string) []string {

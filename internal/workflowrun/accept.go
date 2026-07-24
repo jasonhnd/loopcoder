@@ -2,6 +2,7 @@ package workflowrun
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -60,6 +61,22 @@ func ClassifyTaskRole(workItemID, intent, owner string) TaskRole {
 func AcceptSucceededChild(workItemID, intent, owner string, files []string, worktree, evidence string) error {
 	role := ClassifyTaskRole(workItemID, intent, owner)
 	product := filterProductFiles(files)
+	// Greenfield research surveys often say "no existing tests/implementation" —
+	// that is legitimate scope finding, not empty clarification. Only apply the
+	// clarification gate to research when there is no substantial findings product
+	// (## Provider survey / findings.md body). Implement/tests/verify stay strict.
+	if role == RoleResearch {
+		if len(product) == 0 && !hasAnyFindings(worktree) {
+			return fmt.Errorf("workflowrun: research child %s produced no findings product", workItemID)
+		}
+		if hasSubstantialResearchFindings(worktree, product) {
+			return nil
+		}
+		if looksLikeClarification(evidence, worktree, product) {
+			return fmt.Errorf("workflowrun: acceptance refused for %s: clarification/empty work is not success", workItemID)
+		}
+		return nil
+	}
 	if looksLikeClarification(evidence, worktree, product) {
 		return fmt.Errorf("workflowrun: acceptance refused for %s: clarification/empty work is not success", workItemID)
 	}
@@ -81,10 +98,6 @@ func AcceptSucceededChild(workItemID, intent, owner string, files []string, work
 	case RoleVerify:
 		if !hasVerifierVerdict(product, worktree, evidence) {
 			return fmt.Errorf("workflowrun: verify child %s must produce independent verdict with digest over integrated head; clarification refused", workItemID)
-		}
-	case RoleResearch:
-		if len(product) == 0 && !hasAnyFindings(worktree) {
-			return fmt.Errorf("workflowrun: research child %s produced no findings product", workItemID)
 		}
 	case RoleDocs:
 		if !hasDocsProduct(product) && len(product) == 0 {
@@ -243,17 +256,165 @@ func hasDocsProduct(product []string) bool {
 	return false
 }
 
-func hasAnyFindings(worktree string) bool {
+// hasSubstantialResearchFindings is true when durable research product has a
+// real survey body (materializeResearchFindings "## Provider survey" section or
+// equivalent lengthy findings). Used so greenfield "no existing tests" language
+// in a survey does not trip looksLikeClarification.
+func hasSubstantialResearchFindings(worktree string, product []string) bool {
+	check := func(raw []byte) bool {
+		if len(raw) < 200 {
+			return false
+		}
+		low := strings.ToLower(string(raw))
+		if strings.Contains(low, "## provider survey") {
+			return true
+		}
+		// Long structured findings without the exact header still count.
+		return strings.Count(low, "\n") >= 10 && len(raw) >= 400 &&
+			(strings.Contains(low, "scope") || strings.Contains(low, "constraint") ||
+				strings.Contains(low, "survey") || strings.Contains(low, "findings"))
+	}
+	for _, rel := range product {
+		base := filepath.Base(rel)
+		if base != "findings.md" && base != "FINDINGS.md" && !strings.HasPrefix(base, "child-output-") {
+			continue
+		}
+		if worktree == "" {
+			continue
+		}
+		if raw, ok := readRegularFindingsFile(worktree, base); ok && check(raw) {
+			return true
+		}
+	}
 	if worktree == "" {
 		return false
 	}
-	// findings.md or child-output with substantial body
 	for _, name := range []string{"findings.md", "FINDINGS.md"} {
-		if st, err := os.Stat(filepath.Join(worktree, name)); err == nil && st.Size() > 40 {
+		if raw, ok := readRegularFindingsFile(worktree, name); ok && check(raw) {
 			return true
 		}
 	}
 	return false
+}
+
+func hasAnyFindings(worktree string) bool {
+	if worktree == "" {
+		return false
+	}
+	wtAbs, err := filepath.Abs(worktree)
+	if err != nil {
+		return false
+	}
+	// findings.md or child-output with substantial body (not route-metadata stubs alone).
+	// Security: Lstat only — never follow symlinks (external file must not count).
+	for _, name := range []string{"findings.md", "FINDINGS.md"} {
+		if raw, ok := readRegularFindingsFile(wtAbs, name); ok && len(raw) > 40 {
+			return true
+		}
+	}
+	entries, err := os.ReadDir(wtAbs)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "child-output-") {
+			continue
+		}
+		raw, ok := readRegularFindingsFile(wtAbs, name)
+		if !ok || len(raw) < 200 {
+			continue
+		}
+		// Require survey body beyond the short writeChildEvidence route stub.
+		low := strings.ToLower(string(raw))
+		if strings.Contains(low, "## provider survey") || strings.Contains(low, "findings") ||
+			(strings.Count(low, "\n") >= 8 && len(raw) > 400) {
+			return true
+		}
+	}
+	return false
+}
+
+// readRegularFindingsFile Lstats then reads a leaf under worktree. Rejects
+// symlinks, directories, FIFOs, and any path escape.
+//
+// Identity chain (fail closed on race):
+//  1. preLstat path — must be regular non-symlink under worktree
+//  2. Open path
+//  3. f.Stat() — must be regular; os.SameFile(preLstat, fdStat)
+//  4. read from fd
+//  5. postLstat path — must be regular non-symlink; os.SameFile(fdStat, postLstat)
+//
+// Without SameFile, Lstat→Open can follow a swapped symlink and leak external
+// content into acceptance while path Lstats still look clean.
+func readRegularFindingsFile(worktreeAbs, name string) ([]byte, bool) {
+	return readRegularFindingsFileChecked(worktreeAbs, name)
+}
+
+// readRegularFindingsFileChecked is the testable implementation. Returns
+// (nil, false) on any identity/safety failure.
+func readRegularFindingsFileChecked(worktreeAbs, name string) ([]byte, bool) {
+	raw, err := readRegularFindingsFileErr(worktreeAbs, name)
+	return raw, err == nil
+}
+
+// readRegularFindingsFileErr returns a non-nil error describing identity/safety
+// failures (used by unit tests). Callers that only need bool use Checked.
+func readRegularFindingsFileErr(worktreeAbs, name string) ([]byte, error) {
+	name = filepath.Base(strings.TrimSpace(name))
+	if name == "" || name == "." || name == ".." {
+		return nil, fmt.Errorf("findings leaf name invalid")
+	}
+	full := filepath.Join(worktreeAbs, name)
+	if err := requirePathUnderRoot(worktreeAbs, full); err != nil {
+		return nil, err
+	}
+	pre, err := os.Lstat(full)
+	if err != nil {
+		return nil, err
+	}
+	if pre.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("%s is a symlink", name)
+	}
+	if !pre.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file (mode=%v)", name, pre.Mode())
+	}
+	const maxFindings = 1 << 20
+	f, err := os.Open(full)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fdStat, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fdStat.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s fd is not a regular file", name)
+	}
+	// Opened fd must be the same inode as the pre-open Lstat (no symlink swap).
+	if !os.SameFile(pre, fdStat) {
+		return nil, fmt.Errorf("%s identity mismatch: pre-lstat vs open fd", name)
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, maxFindings+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > maxFindings {
+		return nil, fmt.Errorf("%s exceeds max findings size", name)
+	}
+	post, err := os.Lstat(full)
+	if err != nil {
+		return nil, err
+	}
+	if post.Mode()&os.ModeSymlink != 0 || !post.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s post-read node is not a regular non-symlink file", name)
+	}
+	// Path node after read must still be the same file as the opened fd.
+	if !os.SameFile(fdStat, post) {
+		return nil, fmt.Errorf("%s identity mismatch: open fd vs post-lstat", name)
+	}
+	return raw, nil
 }
 
 func hasVerifierVerdict(product []string, worktree, evidence string) bool {

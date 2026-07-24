@@ -130,6 +130,62 @@ func TestSuccessEmptyInvokedModel_RouteIdentityMismatch(t *testing.T) {
 	}
 }
 
+// materializeFailExecutor mimics Production research findings materialization failure
+// after provider success: typed class + observed InvokedRoute, terminal failed.
+type materializeFailExecutor struct{}
+
+func (materializeFailExecutor) Execute(ctx context.Context, in workflowrun.ChildExecInput) (workflowrun.ChildExecResult, error) {
+	_ = ctx
+	msg := "research findings dest is not a regular file or symlink (mode=drwx------)"
+	return workflowrun.ChildExecResult{
+		Terminal:     workgraph.TermFailed,
+		FailureClass: workflowrun.FailureClassResearchFindingsMaterialization,
+		Message:      msg,
+		Provider:     in.Route.Provider,
+		Model:        in.Route.Model,
+		Depth:        in.Route.Depth,
+		InvokedRoute: workflowrun.ChildRoute{
+			Provider: in.Route.Provider, Model: in.Route.Model, Depth: in.Route.Depth,
+			Permission: in.Route.Permission, AccountRef: in.Route.AccountRef,
+			InstallRef: in.Route.InstallRef, WindowKind: in.Route.WindowKind,
+			ReservationID: in.Route.ReservationID,
+		},
+		ActualSource: "unknown",
+	}, fmt.Errorf("%s", msg)
+}
+
+func TestService_ResearchFindingsMaterialization_PreservesTypedFailure(t *testing.T) {
+	home := testHome(t)
+	svc := workflowrun.Service{
+		Now: t0, HomeDir: home,
+		Executor: materializeFailExecutor{},
+	}
+	route := workflowrun.ChildRoute{
+		Provider: "codex", Model: "codex-auto-review", TaskClass: "tera", Depth: "medium",
+		Permission: "bounded_write", AccountRef: "acct-" + strings.Repeat("c", 64),
+		InstallRef: "pinst_test", WindowKind: "weekly", ReservationID: "sres_1",
+	}
+	res, _ := svc.Execute(context.Background(), withExpectedPlanDigest(t, workflowrun.Request{
+		ProjectID: "proj-matfail", RunID: "run_matfail",
+		Definition:  workflowrun.OneNodeDefinition("g-matfail", "research"),
+		Actor:       "owner",
+		ChildRoutes: map[string]workflowrun.ChildRoute{"only": route},
+	}))
+	if len(res.Children) == 0 {
+		t.Fatalf("no children: %+v", res)
+	}
+	c := res.Children[0]
+	if c.FailureClass == "route_identity_mismatch" || c.FailureClass == "missing_evidence" {
+		t.Fatalf("must not overwrite materialize failure: %+v", c)
+	}
+	if c.FailureClass != workflowrun.FailureClassResearchFindingsMaterialization {
+		t.Fatalf("FailureClass=%q want %q msg=%q", c.FailureClass, workflowrun.FailureClassResearchFindingsMaterialization, c.Message)
+	}
+	if !strings.Contains(c.Message, "regular") && !strings.Contains(c.Message, "directory") {
+		t.Fatalf("message must retain dest reason: %q", c.Message)
+	}
+}
+
 func TestGrokPreSpawnFailure_PreservesOriginalFailureClass(t *testing.T) {
 	// Shared service path must preserve non-codex provider pre-spawn failures too.
 	home := testHome(t)
