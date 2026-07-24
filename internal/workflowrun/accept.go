@@ -80,11 +80,17 @@ func AcceptSucceededChild(workItemID, intent, owner string, files []string, work
 		}
 		return nil
 	case RoleDocs:
-		if !hasDocsProduct(product) && len(product) == 0 {
-			return fmt.Errorf("workflowrun: docs child %s produced no docs product", workItemID)
-		}
-		if looksLikeClarification(evidence, worktree, product) {
-			return fmt.Errorf("workflowrun: acceptance refused for %s: clarification/empty work is not success", workItemID)
+		// Fail closed: filename-only hasDocsProduct is insufficient. At least one
+		// docs leaf must secure-read as non-clarification substantial prose.
+		// Symlink root/parent/leaf or missing nested paths must not pseudo-green.
+		if !hasSubstantialDocsProduct(worktree, product) {
+			if looksLikeClarification(evidence, worktree, product) {
+				return fmt.Errorf("workflowrun: acceptance refused for %s: clarification/empty work is not success", workItemID)
+			}
+			if !hasDocsProduct(product) && len(product) == 0 {
+				return fmt.Errorf("workflowrun: docs child %s produced no docs product", workItemID)
+			}
+			return fmt.Errorf("workflowrun: docs child %s docs product is not securely readable substantial documentation (symlink/unreadable/empty refused)", workItemID)
 		}
 		return nil
 	}
@@ -216,6 +222,70 @@ func hasDocsProduct(product []string) bool {
 		if strings.HasPrefix(f, "docs/") {
 			return true
 		}
+	}
+	return false
+}
+
+// isDocsProductRel reports whether a clean relative path is a docs product leaf
+// (markdown or under docs/), excluding child-output stubs.
+func isDocsProductRel(rel string) bool {
+	cleaned, err := cleanWorktreeRelPath(rel)
+	if err != nil {
+		return false
+	}
+	base := filepath.Base(cleaned)
+	if strings.HasPrefix(base, "child-output-") {
+		return false
+	}
+	if strings.HasPrefix(filepath.ToSlash(cleaned), "docs/") {
+		return true
+	}
+	return strings.HasSuffix(strings.ToLower(base), ".md")
+}
+
+// hasSubstantialDocsProduct is true when at least one docs product leaf can be
+// secure-read (non-symlink root/parents/leaf, clean relative path) and the body
+// after scaffold strip is non-clarification substantial prose. Filename presence
+// alone (hasDocsProduct) never greens — unreadable/symlink candidates fail closed.
+func hasSubstantialDocsProduct(worktree string, product []string) bool {
+	check := func(raw []byte) bool {
+		if len(raw) == 0 {
+			return false
+		}
+		if isExplicitClarificationOnly(string(raw)) {
+			return false
+		}
+		body := strings.TrimSpace(bodyAfterMaterializeScaffold(string(raw)))
+		return len(body) >= 80
+	}
+	if worktree == "" {
+		return false
+	}
+	wtAbs, err := filepath.Abs(worktree)
+	if err != nil {
+		return false
+	}
+	if err := requireNonSymlinkDir(wtAbs); err != nil {
+		return false
+	}
+	seen := map[string]bool{}
+	try := func(rel string) bool {
+		cleaned, err := cleanWorktreeRelPath(rel)
+		if err != nil || seen[cleaned] {
+			return false
+		}
+		seen[cleaned] = true
+		raw, ok := readRegularFindingsFile(wtAbs, cleaned)
+		return ok && check(raw)
+	}
+	for _, rel := range product {
+		if isDocsProductRel(rel) && try(rel) {
+			return true
+		}
+	}
+	// Materialize leaf at worktree root (writeProductFileSecurely docs-notes.md).
+	if try("docs-notes.md") {
+		return true
 	}
 	return false
 }

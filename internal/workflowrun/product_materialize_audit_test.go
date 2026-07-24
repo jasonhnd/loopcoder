@@ -313,6 +313,122 @@ func TestSecureRead_ParentComponentSymlinkRejected(t *testing.T) {
 	if looksLikeClarification("sha256:"+strings.Repeat("cc", 32), wt, []string{"docs/notes.md"}) {
 		t.Fatal("must not follow parent symlink into external clarification text")
 	}
+	// Accept must fail closed: hasDocsProduct true + unreadable must not return nil.
+	if err := AcceptSucceededChild("wi_docs", "docs: update user-facing docs", "worker",
+		[]string{"docs/notes.md"}, wt, "sha256:"+strings.Repeat("cc", 32)); err == nil {
+		t.Fatal("parent symlink docs must not AcceptSucceededChild")
+	}
+}
+
+// RoleDocs fail-closed matrix: symlink root/parent/leaf and missing nested paths
+// must not green via hasDocsProduct filename alone.
+func TestAcceptDocs_SymlinkAndUnreadableFailClosed(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("dd", 32)
+	intent := "docs: update user-facing docs"
+	body := "# Documentation notes\n\nWork item: wi_docs\n\n## Documentation\n\n" + longDocs()
+
+	t.Run("parent_symlink", func(t *testing.T) {
+		wt := t.TempDir()
+		outside := t.TempDir()
+		if err := os.WriteFile(filepath.Join(outside, "notes.md"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, filepath.Join(wt, "docs")); err != nil {
+			t.Fatal(err)
+		}
+		if err := AcceptSucceededChild("wi_docs", intent, "worker",
+			[]string{"docs/notes.md"}, wt, digest); err == nil {
+			t.Fatal("parent component symlink must fail Accept")
+		}
+	})
+
+	t.Run("leaf_symlink", func(t *testing.T) {
+		wt := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(wt, "docs"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		outside := t.TempDir()
+		ext := filepath.Join(outside, "notes.md")
+		if err := os.WriteFile(ext, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(ext, filepath.Join(wt, "docs", "notes.md")); err != nil {
+			t.Fatal(err)
+		}
+		if err := AcceptSucceededChild("wi_docs", intent, "worker",
+			[]string{"docs/notes.md"}, wt, digest); err == nil {
+			t.Fatal("leaf symlink must fail Accept")
+		}
+	})
+
+	t.Run("root_symlink", func(t *testing.T) {
+		real := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(real, "docs"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(real, "docs", "notes.md"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		parent := t.TempDir()
+		linkRoot := filepath.Join(parent, "wt-link")
+		if err := os.Symlink(real, linkRoot); err != nil {
+			t.Fatal(err)
+		}
+		if err := AcceptSucceededChild("wi_docs", intent, "worker",
+			[]string{"docs/notes.md"}, linkRoot, digest); err == nil {
+			t.Fatal("symlink worktree root must fail Accept")
+		}
+	})
+
+	t.Run("missing_nested", func(t *testing.T) {
+		wt := t.TempDir()
+		// Product lists nested path that does not exist on disk.
+		if err := AcceptSucceededChild("wi_docs", intent, "worker",
+			[]string{"docs/missing/notes.md"}, wt, digest); err == nil {
+			t.Fatal("missing nested docs must fail Accept")
+		}
+	})
+
+	t.Run("unreadable_nested_empty_dir", func(t *testing.T) {
+		wt := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(wt, "docs"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		// Path exists as directory, not a regular file leaf.
+		if err := AcceptSucceededChild("wi_docs", intent, "worker",
+			[]string{"docs"}, wt, digest); err == nil {
+			t.Fatal("directory-as-docs product must fail Accept")
+		}
+	})
+
+	t.Run("legitimate_nested_success", func(t *testing.T) {
+		wt := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(wt, "docs", "guides"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(wt, "docs", "guides", "api.md"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := AcceptSucceededChild("wi_docs", intent, "worker",
+			[]string{"docs/guides/api.md"}, wt, digest); err != nil {
+			t.Fatalf("legitimate nested docs must Accept: %v", err)
+		}
+	})
+
+	t.Run("filename_only_without_body_fail", func(t *testing.T) {
+		wt := t.TempDir()
+		// hasDocsProduct true by name, no file on disk → fail closed.
+		if !hasDocsProduct([]string{"docs/notes.md"}) {
+			t.Fatal("precondition: hasDocsProduct by name")
+		}
+		if hasSubstantialDocsProduct(wt, []string{"docs/notes.md"}) {
+			t.Fatal("missing leaf must not be substantial")
+		}
+		if err := AcceptSucceededChild("wi_docs", intent, "worker",
+			[]string{"docs/notes.md"}, wt, digest); err == nil {
+			t.Fatal("filename-only unreadable docs must fail Accept")
+		}
+	})
 }
 
 func TestSecureRead_RelativeEscapeRejected(t *testing.T) {
