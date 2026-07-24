@@ -139,10 +139,18 @@ func associateIdentityEvidence(accounts []AccountObservation, installs []provide
 // among installs that share (adapter, exact ResolvedPathHash) with exact
 // confidence and fresh (non-stale) identity. Installs that fail the exact+fresh
 // gate map to themselves only (no alias fuse).
+//
+// Primary selection is PATH / discovery order first so the production-eligible
+// install_ref matches what LookPath would launch (first PATH hit). Secondary
+// path aliases of the same resolved binary are rewritten to that primary and
+// must not remain independently routable. Lexicographic pinst id is only a
+// final tie-break — never preferred over DiscoveryOrder.
+// Distinct ResolvedPathHash values never fuse.
 func canonicalInstallByAlias(installs []providerinventory.ProviderInstallation) map[string]string {
 	type meta struct {
-		id   string
-		rank int // lower is better
+		id    string
+		order int // DiscoveryOrder: lower = earlier PATH = LookPath primary
+		rank  int // secondary rank; lower is better
 	}
 	// Group by adapter|resolvedHash — only exact+fresh members participate.
 	groups := map[string][]meta{}
@@ -159,6 +167,7 @@ func canonicalInstallByAlias(installs []providerinventory.ProviderInstallation) 
 		}
 		adapter := strings.ToLower(strings.TrimSpace(inst.AdapterID))
 		resolved := strings.TrimSpace(inst.ExecutableIdentity.ResolvedPathHash)
+		// Secondary preferences after PATH order.
 		rank := 100
 		if inst.InstallationState == providerinventory.InstallationInstalled {
 			rank -= 40
@@ -167,15 +176,21 @@ func canonicalInstallByAlias(installs []providerinventory.ProviderInstallation) 
 			rank -= 20
 		}
 		gkey := adapter + "|" + resolved
-		groups[gkey] = append(groups[gkey], meta{id: id, rank: rank})
+		groups[gkey] = append(groups[gkey], meta{
+			id: id, order: inst.DiscoveryOrder, rank: rank,
+		})
 	}
 	for _, members := range groups {
 		if len(members) < 2 {
 			// Single exact+fresh member: already self-mapped.
 			continue
 		}
-		// Deterministic: best rank, then lexicographic install id.
+		// Primary = earliest discovery order (PATH primary / LookPath), then
+		// installed+usable rank, then stable install id.
 		sort.SliceStable(members, func(i, j int) bool {
+			if members[i].order != members[j].order {
+				return members[i].order < members[j].order
+			}
 			if members[i].rank != members[j].rank {
 				return members[i].rank < members[j].rank
 			}

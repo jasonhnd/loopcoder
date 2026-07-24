@@ -215,27 +215,27 @@ func TestRehydrateTranslatesDurableAliasInstallToSoleLiveTarget(t *testing.T) {
 	}
 }
 
-func TestRehydrateAmbiguousLiveAliasesNoTranslate(t *testing.T) {
+func TestRehydrateMultiLiveAliasesTranslateToPATHPrimary(t *testing.T) {
 	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
 	const rhash = "sha256:ambig"
 	rem := int64(10)
+	// pinst_l2 is lexically later but DiscoveryOrder 0 = PATH primary.
+	l1 := providerinventory.ProviderInstallation{
+		AdapterID: "grok", ProviderInstallationID: "pinst_l1",
+		DiscoveryOrder: 1, InstallationState: providerinventory.InstallationInstalled,
+		UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
+		Confidence:         providerinventory.ConfidenceExact,
+		ExecutableIdentity: providerinventory.ExecutableIdentity{ResolvedPathHash: rhash},
+	}
+	l2 := providerinventory.ProviderInstallation{
+		AdapterID: "grok", ProviderInstallationID: "pinst_l2",
+		DiscoveryOrder: 0, InstallationState: providerinventory.InstallationInstalled,
+		UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
+		Confidence:         providerinventory.ConfidenceExact,
+		ExecutableIdentity: providerinventory.ExecutableIdentity{ResolvedPathHash: rhash},
+	}
 	live := providerinventory.Report{
-		Installations: []providerinventory.ProviderInstallation{
-			{
-				AdapterID: "grok", ProviderInstallationID: "pinst_l1",
-				InstallationState:   providerinventory.InstallationInstalled,
-				UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-				Confidence:         providerinventory.ConfidenceExact,
-				ExecutableIdentity: providerinventory.ExecutableIdentity{ResolvedPathHash: rhash},
-			},
-			{
-				AdapterID: "grok", ProviderInstallationID: "pinst_l2",
-				InstallationState:   providerinventory.InstallationInstalled,
-				UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-				Confidence:         providerinventory.ConfidenceExact,
-				ExecutableIdentity: providerinventory.ExecutableIdentity{ResolvedPathHash: rhash},
-			},
-		},
+		Installations: []providerinventory.ProviderInstallation{l1, l2},
 		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
 			AdapterID: "grok", QuotaSnapshotID: "live-unavail", QuotaSourceID: "src-live",
 			Confidence: providerinventory.ConfidenceUnavailable, FreshnessState: providerinventory.FreshnessNotApplicable,
@@ -265,10 +265,10 @@ func TestRehydrateAmbiguousLiveAliasesNoTranslate(t *testing.T) {
 	if len(merged.QuotaSnapshots) != 1 {
 		t.Fatalf("%#v", merged.QuotaSnapshots)
 	}
-	// Ambiguous: keep durable id (fail closed translation).
+	// Multi-live path aliases: durable pinst_db → PATH primary pinst_l2 (order 0).
 	if merged.QuotaSnapshots[0].ProviderInstallationID == nil ||
-		*merged.QuotaSnapshots[0].ProviderInstallationID != "pinst_db" {
-		t.Fatalf("ambiguous multi-live must not translate, got %#v", merged.QuotaSnapshots[0].ProviderInstallationID)
+		*merged.QuotaSnapshots[0].ProviderInstallationID != "pinst_l2" {
+		t.Fatalf("want PATH primary pinst_l2, got %#v", merged.QuotaSnapshots[0].ProviderInstallationID)
 	}
 }
 

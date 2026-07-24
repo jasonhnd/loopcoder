@@ -1021,7 +1021,8 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 			GraphID: g.GraphID, PlanDigest: execPlanDigest, GraphDigest: graphDigest, Children: children,
 			Status: "planned", Message: "dry-run route preview; no child execution",
 		}
-		out.ProvidersUsed, out.ModelsUsed, out.DepthsUsed = collectUsage(children)
+		// Dry-run reports planned route diversity only (not actual execution).
+		out.ProvidersUsed, out.ModelsUsed, out.DepthsUsed = collectPlannedRouteUsage(children)
 		out.MultiProviderOK = len(out.ProvidersUsed) >= 2
 		out.MultiModelOrDepthOK = len(out.ModelsUsed) >= 2 || len(out.DepthsUsed) >= 2
 		out.HumanSummary = fmt.Sprintf(
@@ -1111,9 +1112,6 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		RunID: runID, ProjectID: projectID,
 		Children: children, Workflow: wres, Resumed: resumed,
 	}
-	out.ProvidersUsed, out.ModelsUsed, out.DepthsUsed = collectUsage(children)
-	out.MultiProviderOK = len(out.ProvidersUsed) >= 2
-	out.MultiModelOrDepthOK = len(out.ModelsUsed) >= 2 || len(out.DepthsUsed) >= 2
 	out.ReuseCount = wres.ReuseCount
 	out.WorktreePeak = wres.WorktreePeak
 	out.ProcessPeak = wres.ProcessPeak
@@ -1135,6 +1133,12 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		return out, fmt.Errorf("goalrun: apply child outcomes: %w", merr)
 	}
 	out.Children = merged
+	// Usage diversity is measured only after outcomes are applied (integrated /
+	// terminal stages, ActualSources, argv). Planned-only or pre-spawn fail
+	// rows must not count as multi-provider execution.
+	out.ProvidersUsed, out.ModelsUsed, out.DepthsUsed = collectUsage(out.Children)
+	out.MultiProviderOK = len(out.ProvidersUsed) >= 2
+	out.MultiModelOrDepthOK = len(out.ModelsUsed) >= 2 || len(out.DepthsUsed) >= 2
 
 	// After applyChildOutcomes (and any failure-path release below), reload exact
 	// ledger entries by attempt ID into Workflow.CapacityTransitions for canary.
@@ -1741,7 +1745,9 @@ func windowKindCompatible(want, have string) bool {
 	return windowKindExact(want, have)
 }
 
-func collectUsage(children []ChildReport) (providers, models, depths []string) {
+// collectPlannedRouteUsage counts planned route diversity for dry-run previews
+// only. Must not be used as post-execution multi-provider evidence.
+func collectPlannedRouteUsage(children []ChildReport) (providers, models, depths []string) {
 	ps, ms, ds := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	for _, c := range children {
 		if c.Unavailable {
@@ -1757,16 +1763,70 @@ func collectUsage(children []ChildReport) (providers, models, depths []string) {
 			ds[c.Depth] = true
 		}
 	}
-	for p := range ps {
-		providers = append(providers, p)
+	return mapKeys(ps), mapKeys(ms), mapKeys(ds)
+}
+
+// collectUsage reports providers/models/depths that actually executed a
+// provider process with independent proof. Planned-only pins and fail-closed
+// pre-spawn mismatches (no PID/argv/usage) must not count as multi-provider
+// execution evidence.
+func collectUsage(children []ChildReport) (providers, models, depths []string) {
+	ps, ms, ds := map[string]bool{}, map[string]bool{}, map[string]bool{}
+	for _, c := range children {
+		if !childActuallyExecutedProvider(c) {
+			continue
+		}
+		if c.Provider != "" {
+			ps[c.Provider] = true
+		}
+		if c.Model != "" {
+			ms[c.Model] = true
+		}
+		if c.Depth != "" {
+			ds[c.Depth] = true
+		}
 	}
-	for m := range ms {
-		models = append(models, m)
+	return mapKeys(ps), mapKeys(ms), mapKeys(ds)
+}
+
+func mapKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
 	}
-	for d := range ds {
-		depths = append(depths, d)
+	return out
+}
+
+// childActuallyExecutedProvider is true only when the child left independent
+// execution evidence (argv digest, capacity actual, route ActualSources, or
+// integrated success). Stage=planned alone never counts. Terminal=failed with
+// empty sources (e.g. install_ref mismatch before PID) never counts.
+func childActuallyExecutedProvider(c ChildReport) bool {
+	if c.Unavailable {
+		return false
 	}
-	return providers, models, depths
+	stage := strings.ToLower(strings.TrimSpace(c.Stage))
+	if stage == "planned" || stage == "unavailable" {
+		return false
+	}
+	if strings.TrimSpace(c.ArgvDigest) != "" {
+		return true
+	}
+	if c.CapacityActual != nil {
+		return true
+	}
+	if strings.TrimSpace(c.ActualSources.Install) != "" ||
+		strings.TrimSpace(c.ActualSources.Model) != "" ||
+		strings.TrimSpace(c.ActualSources.Account) != "" ||
+		strings.TrimSpace(c.ActualSources.Effort) != "" ||
+		strings.TrimSpace(c.ActualSources.Permission) != "" {
+		return true
+	}
+	// Integrated success is durable product proof even if some sources were stripped.
+	if stage == "integrated" && strings.EqualFold(strings.TrimSpace(c.Terminal), "succeeded") {
+		return true
+	}
+	return false
 }
 
 func emitChild(w io.Writer, cr ChildReport) {

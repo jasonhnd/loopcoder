@@ -22,9 +22,10 @@ import (
 //   - Never promote unavailable/unknown/stale durable rows into usable capacity.
 //   - Never promote durable installations as live-installed host truth.
 //   - When durable quota/catalog references a pinst known only in durable exact/
-//     fresh installation metadata, translate that pinst to the sole live install
-//     with the same adapter + exact ResolvedPathHash (RC36 path-alias rehydrate).
-//     Zero or multiple live targets ⇒ leave id unchanged (fail closed).
+//     fresh installation metadata, translate that pinst to the live PATH-primary
+//     install (lowest DiscoveryOrder) sharing adapter + exact ResolvedPathHash
+//     (RC36 path-alias rehydrate). Zero live targets ⇒ leave id unchanged.
+//     Multiple live path aliases of one binary coalesce onto PATH primary.
 //   - Durable AuthReadiness is historical: Load does not recompute FreshnessState.
 //     Recovery uses a 30m CapturedAt horizon, latest state across ALL readiness
 //     states per identity, and live exact+fresh observations dominate durable.
@@ -155,12 +156,19 @@ func exactFreshInstallIdentity(inst ProviderInstallation) bool {
 	return true
 }
 
-// durableToLiveInstallAliasMap maps durable ProviderInstallationIDs onto live
-// ones when adapter + exact ResolvedPathHash has exactly one live target.
+// durableToLiveInstallAliasMap maps durable ProviderInstallationIDs onto the
+// live PATH-primary installation when adapter + exact ResolvedPathHash matches
+// at least one live target. Primary = lowest DiscoveryOrder among live aliases
+// (LookPath / first PATH hit); secondary live aliases are not independent
+// translation targets. Distinct ResolvedPathHash values never map together.
 // Does not promote durable installs as live-installed.
 func durableToLiveInstallAliasMap(live, durable []ProviderInstallation) map[string]string {
-	// resolvedKey → sorted unique live install ids
-	liveByKey := map[string][]string{}
+	// resolvedKey → live installs eligible for alias (id + discovery order)
+	type liveMeta struct {
+		id    string
+		order int
+	}
+	liveByKey := map[string][]liveMeta{}
 	liveSeen := map[string]map[string]bool{}
 	for _, inst := range live {
 		if !exactFreshInstallIdentity(inst) {
@@ -177,10 +185,18 @@ func durableToLiveInstallAliasMap(live, durable []ProviderInstallation) map[stri
 			continue
 		}
 		liveSeen[key][id] = true
-		liveByKey[key] = append(liveByKey[key], id)
+		liveByKey[key] = append(liveByKey[key], liveMeta{id: id, order: inst.DiscoveryOrder})
 	}
-	for k := range liveByKey {
-		sort.Strings(liveByKey[k])
+	// PATH primary per key: earliest DiscoveryOrder, then stable id.
+	primaryByKey := map[string]string{}
+	for k, members := range liveByKey {
+		sort.SliceStable(members, func(i, j int) bool {
+			if members[i].order != members[j].order {
+				return members[i].order < members[j].order
+			}
+			return members[i].id < members[j].id
+		})
+		primaryByKey[k] = members[0].id
 	}
 
 	out := map[string]string{}
@@ -192,15 +208,15 @@ func durableToLiveInstallAliasMap(live, durable []ProviderInstallation) map[stri
 		resolved := strings.TrimSpace(inst.ExecutableIdentity.ResolvedPathHash)
 		key := adapter + "|" + resolved
 		durID := strings.TrimSpace(inst.ProviderInstallationID)
-		liveIDs := liveByKey[key]
-		if len(liveIDs) != 1 {
-			// 0: no live target; 2+: ambiguous — fail closed (no translation).
+		primary, ok := primaryByKey[key]
+		if !ok || primary == "" {
+			// 0 live targets: no translation.
 			continue
 		}
-		if durID == liveIDs[0] {
+		if durID == primary {
 			continue
 		}
-		out[durID] = liveIDs[0]
+		out[durID] = primary
 	}
 	return out
 }
