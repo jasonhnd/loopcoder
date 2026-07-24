@@ -685,34 +685,44 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	}
 	// Re-hash product after isolation check; mutation must invalidate acceptance.
 	// Provider logs/summaries alone are not product (see productOutputDigest).
-	// Research is read-only in the provider sandbox but must still leave a durable
-	// findings product for acceptance — materialize from independently observed
-	// provider Summary after process exit (LoopCoder-owned write, not Actual* echo).
+	// Research/verify are often provider-sandbox read-only and still need durable
+	// product for acceptance — materialize from independently observed provider
+	// Summary after process exit (LoopCoder-owned write, not Actual* echo).
 	//
 	// If materialize is attempted and fails, surface the real typed failure —
 	// never swallow into generic missing_evidence (RC39 Stage D diagnostics).
 	digest, files, _ = productOutputDigest(wt)
-	if strings.TrimSpace(digest) == "" && isResearchWorkItem(in.WorkItemID, in.Intent) {
-		if merr := materializeResearchFindings(wt, res.Summary, in); merr != nil {
-			out := ChildExecResult{
-				Terminal: workgraph.TermFailed, WorktreePath: wt,
-				FailureClass: FailureClassResearchFindingsMaterialization,
-				Message:      merr.Error(),
-				// Preserve observed spawn/actuals — do not invent route identity
-				// or overwrite with route_mismatch / empty InvokedRoute.
-				Provider: actualProv, Model: actualModel, Depth: actualDepth,
-				ActualSource: "unknown",
-				InvokedRoute: ChildRoute{
-					Provider: actualProv, Model: actualModel, Depth: actualDepth,
-					Permission: actualPerm, AccountRef: actualAcct, InstallRef: actualInstall,
-				},
-			}
-			bindSources(&out)
-			bindSpawn(&out)
-			out = attachUsage(out, res)
-			return out, merr
+	if strings.TrimSpace(digest) == "" {
+		role := ClassifyTaskRole(in.WorkItemID, in.Intent, "")
+		var merr error
+		var fc string
+		switch role {
+		case RoleResearch:
+			fc = FailureClassResearchFindingsMaterialization
+			merr = materializeResearchFindings(wt, res.Summary, in)
+		case RoleVerify:
+			fc = FailureClassVerifierVerdictMaterialization
+			merr = materializeVerifierVerdict(wt, res.Summary, in)
 		}
-		digest, files, _ = productOutputDigest(wt)
+		if fc != "" {
+			if merr != nil {
+				out := ChildExecResult{
+					Terminal: workgraph.TermFailed, WorktreePath: wt,
+					FailureClass: fc, Message: merr.Error(),
+					Provider: actualProv, Model: actualModel, Depth: actualDepth,
+					ActualSource: "unknown",
+					InvokedRoute: ChildRoute{
+						Provider: actualProv, Model: actualModel, Depth: actualDepth,
+						Permission: actualPerm, AccountRef: actualAcct, InstallRef: actualInstall,
+					},
+				}
+				bindSources(&out)
+				bindSpawn(&out)
+				out = attachUsage(out, res)
+				return out, merr
+			}
+			digest, files, _ = productOutputDigest(wt)
+		}
 	}
 	if strings.TrimSpace(digest) == "" {
 		out := ChildExecResult{
@@ -1024,28 +1034,13 @@ func productOutputDigest(wt string) (digest string, files []string, err error) {
 	return "sha256:" + hex.EncodeToString(h.Sum(nil)), files, nil
 }
 
-// isResearchWorkItem reports whether this child is the research role (must leave findings).
-func isResearchWorkItem(workItemID, intent string) bool {
-	return ClassifyTaskRole(workItemID, intent, "") == RoleResearch
-}
-
 // materializeResearchFindings writes findings.md from the provider Summary after a
-// successful research run when the sandbox left no product files. The write is
-// LoopCoder-owned (post-process), never used to invent ActualModel/ActualAccount.
-// Requires substantial summary content so empty/error shells cannot pass.
-//
-// Security (fail closed): never os.WriteFile the final path (follows symlink →
-// worktree escape). Write a 0600 temp regular file inside the worktree root,
-// sync+close, then os.Rename over the target so a pre-planted symlink is replaced
-// as a directory entry rather than followed. Pre/post checks require the final
-// path stays under worktree and is a regular non-symlink file. git add errors
-// are returned (never ignored).
+// successful research run when the sandbox left no product files.
 func materializeResearchFindings(wt, summary string, in ChildExecInput) error {
 	summary = strings.TrimSpace(summary)
 	if wt == "" || len(summary) < 80 {
 		return fmt.Errorf("research summary too short to materialize findings")
 	}
-	// Refuse pure clarification shells (acceptance will also re-check).
 	low := strings.ToLower(summary)
 	for _, p := range []string{"please clarify", "need clarification", "need more information", "what should i"} {
 		if strings.Contains(low, p) && len(summary) < 400 {
@@ -1056,39 +1051,67 @@ func materializeResearchFindings(wt, summary string, in ChildExecInput) error {
 		"Work item: " + strings.TrimSpace(in.WorkItemID) + "\n\n" +
 		"Intent: " + strings.TrimSpace(in.Intent) + "\n\n" +
 		"## Provider survey\n\n" + summary + "\n"
+	return writeProductFileSecurely(wt, "findings.md", body, "research findings")
+}
 
+// materializeVerifierVerdict writes verdict.md from the provider Summary after a
+// successful verify run when the sandbox left no product files (read-only soul).
+func materializeVerifierVerdict(wt, summary string, in ChildExecInput) error {
+	summary = strings.TrimSpace(summary)
+	if wt == "" || len(summary) < 80 {
+		return fmt.Errorf("verifier summary too short to materialize verdict")
+	}
+	low := strings.ToLower(summary)
+	for _, p := range []string{"please clarify", "need clarification", "need more information", "what should i"} {
+		if strings.Contains(low, p) && len(summary) < 400 {
+			return fmt.Errorf("verifier summary looks like clarification-only")
+		}
+	}
+	// Explicit reject empty-review shells that would fail hasVerifierVerdict.
+	if strings.Contains(low, "nothing to review") || strings.Contains(low, "no implementation") {
+		if len(summary) < 400 {
+			return fmt.Errorf("verifier summary is empty-review shell")
+		}
+	}
+	body := "# Verification verdict\n\n" +
+		"Work item: " + strings.TrimSpace(in.WorkItemID) + "\n\n" +
+		"Intent: " + strings.TrimSpace(in.Intent) + "\n\n" +
+		"## Adversarial review\n\n" + summary + "\n"
+	return writeProductFileSecurely(wt, "verdict.md", body, "verifier verdict")
+}
+
+// writeProductFileSecurely writes leafName under worktree via 0600 temp + Rename
+// (replaces symlink node, never follows). git add errors are returned.
+func writeProductFileSecurely(wt, leafName, body, label string) error {
+	leafName = filepath.Base(strings.TrimSpace(leafName))
+	if leafName == "" || leafName == "." || leafName == ".." {
+		return fmt.Errorf("%s: invalid leaf name", label)
+	}
 	wtAbs, err := filepath.Abs(wt)
 	if err != nil {
-		return fmt.Errorf("research findings worktree abs: %w", err)
+		return fmt.Errorf("%s worktree abs: %w", label, err)
 	}
 	if st, err := os.Lstat(wtAbs); err != nil {
-		return fmt.Errorf("research findings worktree: %w", err)
+		return fmt.Errorf("%s worktree: %w", label, err)
 	} else if !st.IsDir() {
-		return fmt.Errorf("research findings worktree is not a directory")
+		return fmt.Errorf("%s worktree is not a directory", label)
 	}
-
-	dest := filepath.Join(wtAbs, "findings.md")
+	dest := filepath.Join(wtAbs, leafName)
 	if err := requirePathUnderRoot(wtAbs, dest); err != nil {
-		return fmt.Errorf("research findings dest: %w", err)
+		return fmt.Errorf("%s dest: %w", label, err)
 	}
-	// Refuse if destination path is already a non-symlink non-file we cannot
-	// safely replace (directory / FIFO). Symlinks are OK — Rename replaces the
-	// link node itself without following.
 	if st, err := os.Lstat(dest); err == nil {
 		if st.Mode()&os.ModeSymlink == 0 && !st.Mode().IsRegular() {
-			return fmt.Errorf("research findings dest is not a regular file or symlink (mode=%v)", st.Mode())
+			return fmt.Errorf("%s dest is not a regular file or symlink (mode=%v)", label, st.Mode())
 		}
 	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("research findings dest lstat: %w", err)
+		return fmt.Errorf("%s dest lstat: %w", label, err)
 	}
-
-	// Create exclusive temp regular file inside worktree root (0600).
-	tmp, err := os.CreateTemp(wtAbs, ".findings-*.tmp")
+	tmp, err := os.CreateTemp(wtAbs, "."+leafName+".*.tmp")
 	if err != nil {
-		return fmt.Errorf("research findings temp create: %w", err)
+		return fmt.Errorf("%s temp create: %w", label, err)
 	}
 	tmpName := tmp.Name()
-	// Always clean temp on any failure path before successful rename.
 	cleanupTmp := true
 	defer func() {
 		if cleanupTmp {
@@ -1097,46 +1120,39 @@ func materializeResearchFindings(wt, summary string, in ChildExecInput) error {
 	}()
 	if err := requirePathUnderRoot(wtAbs, tmpName); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("research findings temp path: %w", err)
+		return fmt.Errorf("%s temp path: %w", label, err)
 	}
 	if err := tmp.Chmod(0o600); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("research findings temp chmod: %w", err)
+		return fmt.Errorf("%s temp chmod: %w", label, err)
 	}
 	if _, err := tmp.Write([]byte(body)); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("research findings temp write: %w", err)
+		return fmt.Errorf("%s temp write: %w", label, err)
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("research findings temp sync: %w", err)
+		return fmt.Errorf("%s temp sync: %w", label, err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("research findings temp close: %w", err)
+		return fmt.Errorf("%s temp close: %w", label, err)
 	}
-	// Temp must be a regular non-symlink before rename.
 	if err := requireRegularNonSymlinkFile(tmpName); err != nil {
-		return fmt.Errorf("research findings temp: %w", err)
+		return fmt.Errorf("%s temp: %w", label, err)
 	}
-
-	// Atomic replace of the directory entry (replaces symlink node, does not follow).
 	if err := os.Rename(tmpName, dest); err != nil {
-		return fmt.Errorf("research findings rename: %w", err)
+		return fmt.Errorf("%s rename: %w", label, err)
 	}
-	cleanupTmp = false // renamed into place
-
-	// Post-conditions: still under worktree, regular file, not a symlink.
+	cleanupTmp = false
 	if err := requirePathUnderRoot(wtAbs, dest); err != nil {
-		return fmt.Errorf("research findings post path: %w", err)
+		return fmt.Errorf("%s post path: %w", label, err)
 	}
 	if err := requireRegularNonSymlinkFile(dest); err != nil {
-		return fmt.Errorf("research findings post: %w", err)
+		return fmt.Errorf("%s post: %w", label, err)
 	}
-
-	// Stage so discoverProductFiles (git ls-files) sees it — errors are fatal.
-	cmd := exec.Command("git", "-C", wtAbs, "add", "--", "findings.md")
+	cmd := exec.Command("git", "-C", wtAbs, "add", "--", leafName)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("research findings git add: %w: %s", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("%s git add: %w: %s", label, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

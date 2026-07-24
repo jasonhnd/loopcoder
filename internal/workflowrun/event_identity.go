@@ -29,6 +29,11 @@ const FailureClassExecutorCancelled = "executor_cancelled"
 // from generic missing_evidence so operators see the real cause.
 const FailureClassResearchFindingsMaterialization = "research_findings_materialization_failed"
 
+// FailureClassVerifierVerdictMaterialization is returned when a verify child
+// succeeded at the provider layer but LoopCoder could not safely materialize
+// verdict.md (same safety contract as research findings).
+const FailureClassVerifierVerdictMaterialization = "verifier_verdict_materialization_failed"
+
 // ChildLifecycleKinds are event kinds that bind a child work item to an attempt.
 // Parent-level interrupt is the only interrupt form that may omit all child identity.
 var ChildLifecycleKinds = map[string]bool{

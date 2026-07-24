@@ -418,3 +418,57 @@ func TestAcceptResearch_PureClarificationStillRefused(t *testing.T) {
 		t.Fatal("pure clarification research must fail closed")
 	}
 }
+
+func TestMaterializeVerifierVerdict_WritesVerdictProduct(t *testing.T) {
+	dir := t.TempDir()
+	initGitRepo(t, dir)
+	summary := strings.Repeat("Adversarial review of integrated head: API shape is sound, tests cover dispatch, residual risk is low. ", 3)
+	if err := materializeVerifierVerdict(dir, summary, ChildExecInput{
+		WorkItemID: "wi_verify", Intent: "independent verification: adversarial review",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dig, files, err := productOutputDigest(dir)
+	if err != nil || dig == "" {
+		t.Fatalf("digest=%q files=%v err=%v", dig, files, err)
+	}
+	found := false
+	for _, f := range files {
+		if f == "verdict.md" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("want verdict.md in %v", files)
+	}
+	if err := AcceptSucceededChild("wi_verify", "independent verification: adversarial review", "verifier",
+		files, dir, dig); err != nil {
+		t.Fatalf("accept verify: %v", err)
+	}
+}
+
+func TestMaterializeVerifierVerdict_SymlinkEscapeRefused(t *testing.T) {
+	wt := t.TempDir()
+	initGitRepo(t, wt)
+	outside := t.TempDir()
+	ext := filepath.Join(outside, "sink.txt")
+	sentinel := "EXTERNAL_VERDICT_SINK_" + strings.Repeat("Y", 40)
+	if err := os.WriteFile(ext, []byte(sentinel), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(ext, filepath.Join(wt, "verdict.md")); err != nil {
+		t.Fatal(err)
+	}
+	summary := strings.Repeat("Adversarial review body with enough substance for materialization. ", 4)
+	if err := materializeVerifierVerdict(wt, summary, ChildExecInput{WorkItemID: "wi_verify", Intent: "verify"}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(ext)
+	if string(got) != sentinel {
+		t.Fatalf("external mutated: %q", got)
+	}
+	st, err := os.Lstat(filepath.Join(wt, "verdict.md"))
+	if err != nil || st.Mode()&os.ModeSymlink != 0 || !st.Mode().IsRegular() {
+		t.Fatalf("verdict.md must be regular after rename: err=%v st=%v", err, st)
+	}
+}
