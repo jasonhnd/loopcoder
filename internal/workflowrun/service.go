@@ -1319,13 +1319,19 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 					outcome.Message = "executor returned no terminal"
 				}
 			}
-			// Route identity mismatch always fails closed (before success path).
-			if invErr := exactRouteMatch(route, childOut.InvokedRoute); invErr != nil {
-				term = workgraph.TermFailed
-				outcome.FailureClass = "route_identity_mismatch"
-				outcome.Message = invErr.Error()
-				if strings.TrimSpace(outcome.OutputEvidence) == "" {
-					outcome.OutputEvidence = "failed:route_identity:" + id
+			// Exact route affirmation rejects claimed SUCCESS when InvokedRoute is
+			// missing or mismatches independently observed identity. Pre-spawn /
+			// process failures already carry authentic FailureClass+Message — never
+			// overwrite them with route_identity_mismatch (RC38: auth_refusal was
+			// masked as "invoked model required nonempty" after empty Actual*).
+			if term == workgraph.TermSucceeded {
+				if invErr := exactRouteMatch(route, childOut.InvokedRoute); invErr != nil {
+					term = workgraph.TermFailed
+					outcome.FailureClass = "route_identity_mismatch"
+					outcome.Message = invErr.Error()
+					if strings.TrimSpace(outcome.OutputEvidence) == "" {
+						outcome.OutputEvidence = "failed:route_identity:" + id
+					}
 				}
 			}
 			// Context cancel mid-child → exactly one typed service_forced_interrupt
