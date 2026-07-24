@@ -72,6 +72,8 @@ func exactInstallRef(id string) string {
 
 // accountSegmentFromScope extracts the exact "account:" segment from a ScopeKey
 // such as "provider:grok/account:X/detail:credits_usage". Never hashes the whole scope.
+// Sentinel tokens (unknown / empty / root) are rejected so they cannot invent a
+// fake AccountRef that splits capacity from auth (RC36 codex account:unknown).
 func accountSegmentFromScope(scopeKey string) string {
 	scopeKey = strings.TrimSpace(scopeKey)
 	if scopeKey == "" {
@@ -81,12 +83,22 @@ func accountSegmentFromScope(scopeKey string) string {
 		part = strings.TrimSpace(part)
 		if strings.HasPrefix(part, "account:") {
 			acc := strings.TrimSpace(strings.TrimPrefix(part, "account:"))
-			if acc != "" {
-				return opaqueAccountRef(acc)
+			if acc == "" || isSentinelAccountToken(acc) {
+				return ""
 			}
+			return opaqueAccountRef(acc)
 		}
 	}
 	return ""
+}
+
+func isSentinelAccountToken(acc string) bool {
+	switch strings.ToLower(strings.TrimSpace(acc)) {
+	case "unknown", "root", "account", "none", "null", "nil":
+		return true
+	default:
+		return false
+	}
 }
 
 // FromProviderInventoryReport maps a live providerinventory.Report into AccountObservations.
@@ -102,6 +114,9 @@ func accountSegmentFromScope(scopeKey string) string {
 //     validated fallback extracting the exact account: segment (never whole scope)
 //   - No truncation of AccountRef / InstallRef / ProviderInstallationID
 //   - Deterministic joins (sorted keys); unknown joins stay unknown/non-routable
+//   - After grouping, associateIdentityEvidence coalesces path aliases (same
+//     adapter + ResolvedPathHash) and rebinds empty-account capacity to the sole
+//     account on that install; ambiguous multi-account stays fail-closed.
 func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []AccountObservation {
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -215,15 +230,18 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 			}
 			accountToInstalls[acc] = appendUniqueSorted(accountToInstalls[acc], iref)
 		}
-		if auth.ReadinessState == providerinventory.ReadinessReady {
+		if productionRoutableAuth(auth) {
 			b.in.Authenticated = true
 			b.in.Healthy = true
-			if b.in.HealthFreshness == FreshnessUnknown {
-				b.in.HealthFreshness = FreshnessFresh
-			}
-			if b.in.HealthConfidence == ConfidenceUnknown {
-				b.in.HealthConfidence = ConfidenceEstimated
-			}
+			b.in.HealthFreshness = FreshnessFresh
+			b.in.HealthConfidence = ConfidenceExact
+		} else if auth.ReadinessState == providerinventory.ReadinessReady {
+			// Non-production Ready (stale/estimated/unknown): keep evidence but
+			// never mark Authenticated for unattended routing.
+			b.in.Provenance = strings.TrimSpace(b.in.Provenance +
+				"; auth_ready_not_production_routable confidence=" + string(auth.Confidence) +
+				" readiness_confidence=" + string(auth.ReadinessConfidence) +
+				" freshness=" + string(auth.FreshnessState))
 		}
 		if acc != "" {
 			b.in.AccountRef = acc
@@ -499,7 +517,8 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 		}
 		out = append(out, FromAccountInput(b.in))
 	}
-	return out
+	// Path-alias + empty-account reassociation (fail closed on ambiguity).
+	return associateIdentityEvidence(out, rep.Installations)
 }
 
 func appendUniqueSorted(ss []string, v string) []string {
@@ -601,6 +620,12 @@ func seedStaticModelsEstimated(in *AccountInput, live map[string]bool) {
 	}
 	in.Provenance = strings.TrimSpace(in.Provenance +
 		"; models_source=static_registry_estimated; catalog_hint_only=static_seed_non_routable")
+}
+
+// productionRoutableAuth delegates to the shared providerinventory gate so
+// capacity Authenticated matches promoteUsableInstallations and rehydrateAuth.
+func productionRoutableAuth(auth providerinventory.AuthReadiness) bool {
+	return providerinventory.ExactFreshReadyAuth(auth)
 }
 
 func mapPIConfidence(c providerinventory.Confidence) Confidence {

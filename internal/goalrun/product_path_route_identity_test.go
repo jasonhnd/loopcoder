@@ -63,10 +63,16 @@ func TestProductPath_InventoryToLaunchBinding(t *testing.T) {
 			{
 				AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
 				AccountProfileID: ptr(accRaw), ProviderInstallationID: ptr(wantInstall),
+				FreshnessState:      providerinventory.FreshnessFresh,
+				Confidence:          providerinventory.ConfidenceExact,
+				ReadinessConfidence: providerinventory.ConfidenceExact,
 			},
 			{
 				AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
 				AccountProfileID: ptr("codex-acct-raw"), ProviderInstallationID: ptr("install-codex-other"),
+				FreshnessState:      providerinventory.FreshnessFresh,
+				Confidence:          providerinventory.ConfidenceExact,
+				ReadinessConfidence: providerinventory.ConfidenceExact,
 			},
 		},
 		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{

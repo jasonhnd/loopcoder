@@ -45,10 +45,16 @@ func TestFromProviderInventory_TwoGrokAccountsTwoInstallsSameModel(t *testing.T)
 			{
 				AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
 				AccountProfileID: ptr(acc1), ProviderInstallationID: ptr(inst1),
+				FreshnessState:      providerinventory.FreshnessFresh,
+				Confidence:          providerinventory.ConfidenceExact,
+				ReadinessConfidence: providerinventory.ConfidenceExact,
 			},
 			{
 				AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
 				AccountProfileID: ptr(acc2), ProviderInstallationID: ptr(inst2),
+				FreshnessState:      providerinventory.FreshnessFresh,
+				Confidence:          providerinventory.ConfidenceExact,
+				ReadinessConfidence: providerinventory.ConfidenceExact,
 			},
 		},
 		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{

@@ -171,7 +171,7 @@ func TestCodexAndGrokQuotaObservationsRemainProviderScoped(t *testing.T) {
 	if got := len(quotaSourcesFor(report, "grok")); got != 1 {
 		t.Fatalf("grok quota sources = %d: %#v", got, report.QuotaTelemetrySources)
 	}
-	codexPrimary := quotaSnapshotByKey(t, report, "primary_used_percent", WindowRolling, "provider:codex/account:acct_codex/scope:codex/detail:primary")
+	codexPrimary := quotaSnapshotByKey(t, report, "primary_used_percent", WindowRolling, "provider:codex/scope:codex/detail:primary")
 	grokCredits := quotaSnapshotByKey(t, report, "api_credits", WindowUnknown, "provider:grok/account:acct_grok/model:grok-4.5/detail:api_credits")
 	grokRate := quotaSnapshotByKey(t, report, "rate_limit_remaining", WindowUnknown, "provider:grok/account:acct_grok/model:grok-4.5/detail:rate_limit_remaining")
 	if codexPrimary.AdapterID != "codex" || grokCredits.AdapterID != "grok" || grokRate.AdapterID != "grok" {
