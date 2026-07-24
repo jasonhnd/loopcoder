@@ -200,11 +200,6 @@ func hasTestProductInList(product []string) bool {
 	return false
 }
 
-func hasTestProduct(product []string, worktree string) bool {
-	// Secure-only: never treat symlink or walk-discovered pre-existing tests as product.
-	return hasSecureTestProduct(worktree, product)
-}
-
 func hasSourceProduct(product []string) bool {
 	for _, f := range product {
 		if isSourceProductRel(f) {
