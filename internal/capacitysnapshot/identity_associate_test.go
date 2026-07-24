@@ -753,6 +753,113 @@ func TestMergeDepthsNeverBroadenOnDisagreement(t *testing.T) {
 	}
 }
 
+func TestCodexDualAccountSchemeDoesNotSplitIdentities(t *testing.T) {
+	// Principal-derived codexauth acct-<sha256> on quota vs live status acct_ AuthReadiness.
+	// No proven mapping: must NOT false-equate or rebind; must not become two-account eligible.
+	// Prefer fail-closed over inventing shared identity.
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	const inst = "pinst_codex_live_one"
+	statusAuthID := "acct_nbgt2mwso4c76xepekb7oeifcsw2axkg" // providerinventory status form
+	codexAuthForm := codexauth.CanonicalAccountProfileID("acct_chatgpt_principal_xyz", "", "")
+	if codexAuthForm == "" || !strings.HasPrefix(codexAuthForm, "acct-") {
+		t.Fatalf("want codexauth acct- form, got %q", codexAuthForm)
+	}
+	if statusAuthID == codexAuthForm {
+		t.Fatal("fixtures must differ across schemes")
+	}
+	rem := int64(73)
+	rep := providerinventory.Report{
+		Installations: []providerinventory.ProviderInstallation{
+			exactFreshInstall("codex", inst, "sha256:codex-resolved", "sha256:codex-path"),
+		},
+		AuthReadiness: []providerinventory.AuthReadiness{{
+			AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
+			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
+			AccountProfileID: ptrStr(statusAuthID), ProviderInstallationID: ptrStr(inst),
+		}},
+		ModelCapabilities: []providerinventory.ModelCapability{{
+			AdapterID: "codex", CanonicalModelID: "gpt-5.5",
+			AvailabilityState:      providerinventory.AvailabilityAvailable,
+			LifecycleState:         providerinventory.LifecycleAvailable,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			Confidence:             providerinventory.ConfidenceExact,
+			EntrySources:           testMachineReadableSources("codex"),
+			Source:                 providerinventory.SourceDescriptor{Kind: string(providerinventory.CatalogSourceProviderMachineReadable)},
+			ModelCatalogSnapshotID: "mc_c",
+			Constraints: []string{
+				"supported_depth=low", "supported_depth=medium", "supported_depth=high",
+				"default_depth=medium", "catalog_source=codex-app-server-model-list",
+			},
+		}},
+		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{{
+			ModelCatalogSnapshotID: "mc_c", AdapterID: "codex",
+			CatalogSourceKind: providerinventory.CatalogSourceProviderMachineReadable,
+			Confidence:        providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
+			ProviderInstallationID: ptrStr(inst), EntryCount: 1,
+		}},
+		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
+			QuotaSnapshotID: "q_codex_auth_form", AdapterID: "codex",
+			AccountProfileID:       ptrStr(codexAuthForm), // conflicting nonempty principal
+			ProviderInstallationID: ptrStr(inst),
+			Unit:                   "percent", WindowKind: providerinventory.WindowFixedWeek,
+			RemainingValue: &rem, Confidence: providerinventory.ConfidenceExact,
+			FreshnessState: providerinventory.FreshnessFresh,
+			ScopeKey:       "provider:codex/account:" + codexAuthForm + "/scope:codex/detail:primary",
+			CapturedAt:     now.Format(time.RFC3339),
+		}},
+	}
+	accounts := capacitysnapshot.FromProviderInventoryReport(rep, now)
+	// Must not merge into one falsely-equivalent account.
+	var statusLike, principalLike, complete int
+	for _, a := range accounts {
+		if a.Provider != "codex" {
+			continue
+		}
+		mc := 0
+		for _, m := range a.Models {
+			if m.PresentInCatalog && !m.CatalogHintOnly {
+				mc++
+			}
+		}
+		if a.Authenticated && mc > 0 && len(a.Windows) > 0 {
+			complete++
+		}
+		if a.Authenticated && mc > 0 {
+			statusLike++
+		}
+		if !a.Authenticated && len(a.Windows) > 0 {
+			principalLike++
+		}
+		// Provenance must not claim orphan rebind / equivalence.
+		if strings.Contains(a.Provenance, "orphan_account") {
+			t.Fatalf("must not rebind/overwrite conflicting principal: %s", a.Provenance)
+		}
+	}
+	if complete > 0 {
+		t.Fatalf("must not invent complete eligibility by equating dual IDs; accounts=%s", summarizeAccounts(accounts))
+	}
+	if statusLike > 0 && principalLike > 0 {
+		// Split is honest; must not yield unattended route.
+		snap, err := capacitysnapshot.Build(accounts, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if snap.UnattendedOK {
+			t.Fatalf("dual-scheme split must fail closed unattended; reasons=%v accounts=%s",
+				snap.Reasons, summarizeAccounts(accounts))
+		}
+		return
+	}
+	// If somehow only one side remains without complete bind, still fail closed.
+	snap, err := capacitysnapshot.Build(accounts, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.UnattendedOK {
+		t.Fatalf("conflicting dual IDs must not be unattended-eligible: %v", snap.Reasons)
+	}
+}
+
 // --- helpers ---
 
 func opaqueUnknown(t *testing.T) string {

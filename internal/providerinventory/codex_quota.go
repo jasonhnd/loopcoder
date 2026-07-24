@@ -623,8 +623,16 @@ func validateCodexInitializeResponse(result json.RawMessage) error {
 }
 
 func snapshotsFromCodexRateLimits(source QuotaTelemetrySource, installationID *string, cliVersion string, account, limits map[string]any, frames []json.RawMessage, now time.Time) ([]QuotaSnapshot, error) {
+	// Account scope intentionally empty for capacity join. Codex AuthReadiness uses
+	// providerinventory status IDs (acct_<base32>) while codexauth.CanonicalAccountProfileID
+	// emits acct-<sha256> from account/read principals — stamping the latter invents a
+	// second AccountProfileID that never equals status auth and splits capacity.
+	// Empty-account rate-limit rows rebind only to the sole Ready AuthReadiness
+	// AccountProfileID on the same live installation (capacitysnapshot). Nonempty
+	// conflicting principals are never overwritten or treated as equivalent.
+	// Never emit account:unknown. Never stamp an unrelated opaque hash as AccountProfileID.
 	accountScope := codexAccountScope(account)
-	acctProfile := codexCanonicalAccountProfileID(account)
+	// codexCanonicalAccountProfileID remains available for catalog/tests; quota does not stamp it.
 	raw := bytes.Join(rawJSONFrames(frames), []byte("\n"))
 	if credentialMaterialLike(string(raw)) {
 		return nil, ErrQuotaCredentialMaterial
@@ -645,13 +653,8 @@ func snapshotsFromCodexRateLimits(source QuotaTelemetrySource, installationID *s
 	if len(snapshots) == 0 {
 		return nil, fmt.Errorf("%w: no supported quota fields", ErrCodexQuotaMalformed)
 	}
-	// Stamp shared opaque AccountProfileID on every snapshot for exact route binding.
-	if acctProfile != "" {
-		for i := range snapshots {
-			id := acctProfile
-			snapshots[i].AccountProfileID = &id
-		}
-	}
+	// Do NOT stamp AccountProfileID from codexCanonicalAccountProfileID here.
+	// That ID scheme is not the AuthReadiness status ID used for capacity routing.
 	sort.Slice(snapshots, func(i, j int) bool {
 		return snapshots[i].QuotaSnapshotID < snapshots[j].QuotaSnapshotID
 	})
@@ -1162,33 +1165,14 @@ func codexProtocolSummary(output string) string {
 }
 
 func codexAccountScope(account map[string]any) string {
-	// Prefer the same principal used for AccountProfileID so scope and profile match.
-	if acct := codexCanonicalAccountProfileID(account); acct != "" {
-		// Scope token is the opaque acct- binding (safe, non-secret).
-		if safeScopeToken(acct) {
-			return acct
-		}
-	}
-	for _, container := range []map[string]any{account, codexMapField(account, "account"), codexMapField(account, "profile")} {
-		if container == nil {
-			continue
-		}
-		value := codexStringField(container,
-			"id", "account_id", "accountID", "profile_id", "profileID",
-			"chatgpt_account_id", "chatgptAccountId", "chatgpt_user_id", "chatgptUserId",
-		)
-		if value == "" || strings.Contains(value, "@") {
-			continue
-		}
-		if strings.EqualFold(value, "unknown") || strings.EqualFold(value, "root") {
-			continue
-		}
-		if safeScopeToken(value) {
-			return value
-		}
-	}
-	// Empty — never emit account:unknown (that invents a fake join key and splits
-	// rate-limit windows from the installation's authenticated account; RC36).
+	// Capacity ScopeKey must not invent an account segment from account/read.
+	// Status AuthReadiness uses acct_<base32>; codexauth uses acct-<sha256>. Putting
+	// either (or a raw principal) into ScopeKey creates a join key that does not
+	// match AuthReadiness and splits rate-limit windows from the authenticated
+	// install account. Empty is correct; capacity rebinds to sole AuthReadiness
+	// AccountProfileID on the same installation when unambiguous.
+	// Never emit account:unknown.
+	_ = account
 	return ""
 }
 

@@ -62,7 +62,16 @@ func associateIdentityEvidence(accounts []AccountObservation, installs []provide
 		by[k] = &bucket{obs: cp}
 	}
 
-	// Empty-account reassociation per (provider, install): only Authenticated accounts.
+	// Empty-account reassociation per (provider, install) only.
+	//
+	// Empty-account quota may bind only to the sole Authenticated (Ready)
+	// AccountRef on that same canonical install. Multiple ready accounts or zero
+	// stay unmerged (fail closed).
+	//
+	// Nonempty conflicting AccountRef (e.g. codexauth acct-<sha256> on quota while
+	// AuthReadiness is status acct_<base32>) must NOT be overwritten or treated as
+	// equivalent — leave both rows and fail closed. No proven principal mapping
+	// across opaque schemes.
 	type pi struct{ provider, install string }
 	authAccountsByPI := map[pi][]string{}
 	for _, b := range by {
@@ -90,7 +99,6 @@ func associateIdentityEvidence(accounts []AccountObservation, installs []provide
 		p := pi{b.obs.Provider, b.obs.InstallRef}
 		accs := authAccountsByPI[p]
 		if len(accs) != 1 {
-			// 0: no authenticated account; 2+: ambiguous — leave empty unmerged.
 			if len(accs) > 1 {
 				b.obs.Provenance = strings.TrimSpace(b.obs.Provenance +
 					"; identity_associate=ambiguous_multi_authenticated_account_same_install")
@@ -100,7 +108,6 @@ func associateIdentityEvidence(accounts []AccountObservation, installs []provide
 		targetKey := keyOf(b.obs.Provider, accs[0], b.obs.InstallRef)
 		target, ok := by[targetKey]
 		if !ok {
-			// Promote empty row onto the sole authenticated account (deterministic).
 			b.obs.AccountRef = accs[0]
 			b.obs.Provenance = strings.TrimSpace(b.obs.Provenance +
 				"; identity_associate=empty_account_bound_sole_authenticated_install_account")
