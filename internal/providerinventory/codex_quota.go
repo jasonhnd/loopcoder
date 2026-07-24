@@ -41,6 +41,10 @@ type CodexAppServerRequest struct {
 	StdoutLimitBytes   int
 	StderrLimitBytes   int
 	CombinedLimitBytes int
+	// Drive, when non-nil, runs the JSON-RPC session after process start.
+	// When nil, the default quota session (account/read + rateLimits/read) is used.
+	// Catalog collection supplies its own Drive (account/read + model/list pages).
+	Drive func(ctx context.Context, stdin io.Writer, events <-chan codexProtocolStdoutEvent) error
 }
 
 type CodexAppServerResult struct {
@@ -308,14 +312,22 @@ func runCodexAppServer(ctx context.Context, req CodexAppServerRequest) (CodexApp
 		err    error
 	}, 1)
 	go func() {
-		result, err := supervisedexec.Run(runCtx, cmd, supervisedexec.Options{HardCap: req.Timeout, LivenessMode: supervisedexec.LivenessModeLogOnly, Role: "codex-quota-app-server"})
+		role := "codex-app-server"
+		if req.Drive == nil {
+			role = "codex-quota-app-server"
+		}
+		result, err := supervisedexec.Run(runCtx, cmd, supervisedexec.Options{HardCap: req.Timeout, LivenessMode: supervisedexec.LivenessModeLogOnly, Role: role})
 		capture.close()
 		runCh <- struct {
 			result supervisedexec.Result
 			err    error
 		}{result: result, err: err}
 	}()
-	protocolErr := driveCodexAppServerProtocolEvents(runCtx, stdin, capture.events)
+	drive := req.Drive
+	if drive == nil {
+		drive = driveCodexAppServerProtocolEvents
+	}
+	protocolErr := drive(runCtx, stdin, capture.events)
 	stopCapture()
 	_ = stdin.Close()
 	if protocolErr != nil {

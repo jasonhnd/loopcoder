@@ -120,6 +120,12 @@ func parseObservedModelDepths(adapterID string, agyOnly bool, canonical, display
 			_, cli, _ = strings.Cut(c, "=")
 			cli = strings.TrimSpace(cli)
 		}
+		if strings.HasPrefix(strings.ToLower(c), "default_depth=") {
+			_, v, _ := strings.Cut(c, "=")
+			if n := depthpolicy.NormalizeDepth(v); n != "" {
+				def = n
+			}
+		}
 	}
 	if agyOnly {
 		// Parenthetical form used by agy error lists: "GPT-OSS 120B (Medium)"
