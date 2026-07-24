@@ -206,14 +206,20 @@ func readSecureRegularProductBytes(worktreeAbs, rel string, maxBytes int64) ([]b
 }
 
 // proveSecureRegularProduct is true when the leaf is a secure regular file
-// (full identity chain). Streams at most 0 payload beyond open/SameFile/post
-// by reading through a discard with max 0... use 1-byte max to exercise read.
+// (full identity chain) with at least one byte of content. Zero-byte empty.go /
+// empty_test.go / generic empty leaves are not useful product for accept gates.
+// Research/verify/docs use stronger body checks separately.
 func proveSecureRegularProduct(worktreeAbs, rel string) error {
-	// Open + SameFile + post is enough; stream zero bytes via LimitReader(0).
 	return withSecureRegularProduct(worktreeAbs, rel, func(f *os.File) error {
-		// Touch the fd so post-chain runs after a real open; do not require content.
-		_, err := io.Copy(io.Discard, io.LimitReader(f, 0))
-		return err
+		var b [1]byte
+		n, err := f.Read(b[:])
+		if err != nil && err != io.EOF {
+			return err
+		}
+		if n < 1 {
+			return fmt.Errorf("%s is empty (zero-byte product refused)", rel)
+		}
+		return nil
 	})
 }
 

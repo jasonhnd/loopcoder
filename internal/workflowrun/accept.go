@@ -215,7 +215,8 @@ func hasSourceProduct(product []string) bool {
 }
 
 // hasSecureRegularMatchingProduct is true when at least one product path both
-// matches role classification and proves as a secure regular leaf under worktree.
+// matches role classification and proves as a secure regular non-empty leaf
+// under worktree (≥1 byte; zero-byte empty.go / empty_test.go refused).
 func hasSecureRegularMatchingProduct(worktree string, product []string, match func(string) bool) bool {
 	if worktree == "" || len(product) == 0 {
 		return false

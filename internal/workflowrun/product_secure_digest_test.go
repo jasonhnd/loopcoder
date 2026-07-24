@@ -272,3 +272,60 @@ func TestFailureClassProductDigestStable(t *testing.T) {
 		t.Fatalf("stable class drifted: %q", FailureClassProductDigest)
 	}
 }
+
+// Accept implement/tests/generic must refuse zero-byte regular leaves even when
+// the path is secure and role-matching (proveSecureRegularProduct requires ≥1 byte).
+func TestAccept_ImplementTestsGeneric_ZeroByteRefused(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("ff", 32)
+
+	t.Run("implement_zero_byte", func(t *testing.T) {
+		wt := t.TempDir()
+		writeRegular(t, filepath.Join(wt, "empty.go"), "")
+		if err := AcceptSucceededChild("wi_implement", "implementation: deliver the change", "worker",
+			[]string{"empty.go"}, wt, digest); err == nil {
+			t.Fatal("implement zero-byte source must fail Accept")
+		}
+	})
+	t.Run("implement_nonempty_control", func(t *testing.T) {
+		wt := t.TempDir()
+		writeRegular(t, filepath.Join(wt, "ok.go"), "package ok\n")
+		if err := AcceptSucceededChild("wi_implement", "implementation: deliver the change", "worker",
+			[]string{"ok.go"}, wt, digest); err != nil {
+			t.Fatalf("implement non-empty control must Accept: %v", err)
+		}
+	})
+
+	t.Run("tests_zero_byte", func(t *testing.T) {
+		wt := t.TempDir()
+		writeRegular(t, filepath.Join(wt, "empty_test.go"), "")
+		if err := AcceptSucceededChild("wi_tests", "tests: add/adjust focused tests", "worker",
+			[]string{"empty_test.go"}, wt, digest); err == nil {
+			t.Fatal("tests zero-byte must fail Accept")
+		}
+	})
+	t.Run("tests_nonempty_control", func(t *testing.T) {
+		wt := t.TempDir()
+		writeRegular(t, filepath.Join(wt, "ok_test.go"), "package ok\n")
+		if err := AcceptSucceededChild("wi_tests", "tests: add/adjust focused tests", "worker",
+			[]string{"ok_test.go"}, wt, digest); err != nil {
+			t.Fatalf("tests non-empty control must Accept: %v", err)
+		}
+	})
+
+	t.Run("generic_zero_byte", func(t *testing.T) {
+		wt := t.TempDir()
+		writeRegular(t, filepath.Join(wt, "empty.txt"), "")
+		if err := AcceptSucceededChild("wi_other", "generic task", "worker",
+			[]string{"empty.txt"}, wt, digest); err == nil {
+			t.Fatal("generic zero-byte must fail Accept")
+		}
+	})
+	t.Run("generic_nonempty_control", func(t *testing.T) {
+		wt := t.TempDir()
+		writeRegular(t, filepath.Join(wt, "note.txt"), "x")
+		if err := AcceptSucceededChild("wi_other", "generic task", "worker",
+			[]string{"note.txt"}, wt, digest); err != nil {
+			t.Fatalf("generic non-empty control must Accept: %v", err)
+		}
+	})
+}
