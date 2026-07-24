@@ -41,7 +41,9 @@ func TestFromInventory_DynamicMachineReadableOnly_ExactToken(t *testing.T) {
 		}},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "antigravity", ReadinessState: providerinventory.ReadinessReady,
-			FreshnessState: providerinventory.FreshnessFresh,
+			FreshnessState:      providerinventory.FreshnessFresh,
+			Confidence:          providerinventory.ConfidenceExact,
+			ReadinessConfidence: providerinventory.ConfidenceExact,
 		}},
 		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{
 			{
@@ -142,7 +144,9 @@ func TestFromInventory_GrokDoesNotUseAgySlugParse(t *testing.T) {
 		}},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
-			FreshnessState: providerinventory.FreshnessFresh,
+			FreshnessState:      providerinventory.FreshnessFresh,
+			Confidence:          providerinventory.ConfidenceExact,
+			ReadinessConfidence: providerinventory.ConfidenceExact,
 		}},
 		// Fresh `grok models` presence: model id only, no observed depth tokens
 		// (production shape). Must not backfill static registry low/high/xhigh.
@@ -231,7 +235,9 @@ func TestFromInventory_LiveMachineReadableNoDepth_NoStaticLadder(t *testing.T) {
 		}},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
-			FreshnessState: providerinventory.FreshnessFresh,
+			FreshnessState:      providerinventory.FreshnessFresh,
+			Confidence:          providerinventory.ConfidenceExact,
+			ReadinessConfidence: providerinventory.ConfidenceExact,
 		}},
 		ModelCapabilities: []providerinventory.ModelCapability{{
 			AdapterID: "codex", CanonicalModelID: "gpt-5.5",

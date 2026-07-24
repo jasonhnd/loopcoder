@@ -1309,9 +1309,12 @@ func discoverCandidates(adapter AdapterDeclaration, deps Deps) []candidate {
 // is installed and at least one bound auth-readiness record is ready.
 // Spec: usable MUST NOT be true from install evidence alone.
 func promoteUsableInstallations(installations []ProviderInstallation, readiness []AuthReadiness) {
+	// Spec: usable MUST NOT be true from install evidence alone, and must not
+	// flip yes for stale/estimated/unknown Ready auth (same exact+fresh gate as
+	// capacity Authenticated and rehydrate recovery).
 	readyInstallations := map[string]bool{}
 	for _, auth := range readiness {
-		if auth.ReadinessState != ReadinessReady {
+		if !ExactFreshReadyAuth(auth) {
 			continue
 		}
 		if auth.ProviderInstallationID == nil {

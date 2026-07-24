@@ -23,8 +23,9 @@ func TestLoadRouteInventoryRehydratesDurableQuotaWithoutSnapshotFlag(t *testing.
 		}},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
-			FreshnessState: providerinventory.FreshnessFresh,
-			Confidence:     providerinventory.ConfidenceExact,
+			FreshnessState:      providerinventory.FreshnessFresh,
+			Confidence:          providerinventory.ConfidenceExact,
+			ReadinessConfidence: providerinventory.ConfidenceExact,
 		}},
 		ModelCapabilities: []providerinventory.ModelCapability{{
 			AdapterID: "codex", CanonicalModelID: "gpt-5.5",

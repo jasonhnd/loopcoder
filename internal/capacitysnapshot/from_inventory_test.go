@@ -31,7 +31,9 @@ func TestFromProviderInventoryReportMapsQuotaAndModels(t *testing.T) {
 		}},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
-			FreshnessState: providerinventory.FreshnessFresh,
+			FreshnessState:      providerinventory.FreshnessFresh,
+			Confidence:          providerinventory.ConfidenceExact,
+			ReadinessConfidence: providerinventory.ConfidenceExact,
 		}},
 		ModelCapabilities: []providerinventory.ModelCapability{{
 			AdapterID: "codex", CanonicalModelID: "gpt-5.5",
@@ -247,7 +249,9 @@ func TestStaticSeedAndSourcelessCapabilityNotProductionRoutable(t *testing.T) {
 		}},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "antigravity", ReadinessState: providerinventory.ReadinessReady,
-			FreshnessState: providerinventory.FreshnessFresh,
+			FreshnessState:      providerinventory.FreshnessFresh,
+			Confidence:          providerinventory.ConfidenceExact,
+			ReadinessConfidence: providerinventory.ConfidenceExact,
 		}},
 		// Bare capability without EntrySources / Source.Kind — CatalogHintOnly.
 		ModelCapabilities: []providerinventory.ModelCapability{{

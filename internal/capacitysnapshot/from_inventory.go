@@ -230,15 +230,18 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 			}
 			accountToInstalls[acc] = appendUniqueSorted(accountToInstalls[acc], iref)
 		}
-		if auth.ReadinessState == providerinventory.ReadinessReady {
+		if productionRoutableAuth(auth) {
 			b.in.Authenticated = true
 			b.in.Healthy = true
-			if b.in.HealthFreshness == FreshnessUnknown {
-				b.in.HealthFreshness = FreshnessFresh
-			}
-			if b.in.HealthConfidence == ConfidenceUnknown {
-				b.in.HealthConfidence = ConfidenceEstimated
-			}
+			b.in.HealthFreshness = FreshnessFresh
+			b.in.HealthConfidence = ConfidenceExact
+		} else if auth.ReadinessState == providerinventory.ReadinessReady {
+			// Non-production Ready (stale/estimated/unknown): keep evidence but
+			// never mark Authenticated for unattended routing.
+			b.in.Provenance = strings.TrimSpace(b.in.Provenance +
+				"; auth_ready_not_production_routable confidence=" + string(auth.Confidence) +
+				" readiness_confidence=" + string(auth.ReadinessConfidence) +
+				" freshness=" + string(auth.FreshnessState))
 		}
 		if acc != "" {
 			b.in.AccountRef = acc
@@ -617,6 +620,12 @@ func seedStaticModelsEstimated(in *AccountInput, live map[string]bool) {
 	}
 	in.Provenance = strings.TrimSpace(in.Provenance +
 		"; models_source=static_registry_estimated; catalog_hint_only=static_seed_non_routable")
+}
+
+// productionRoutableAuth delegates to the shared providerinventory gate so
+// capacity Authenticated matches promoteUsableInstallations and rehydrateAuth.
+func productionRoutableAuth(auth providerinventory.AuthReadiness) bool {
+	return providerinventory.ExactFreshReadyAuth(auth)
 }
 
 func mapPIConfidence(c providerinventory.Confidence) Confidence {

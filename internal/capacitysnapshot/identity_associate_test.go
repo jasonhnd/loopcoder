@@ -32,7 +32,8 @@ func TestGrokPathAliasFusesInstallAuthModelsWithQuota(t *testing.T) {
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
 			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
-			AccountProfileID: ptrStr(acc), ProviderInstallationID: ptrStr(instA),
+			ReadinessConfidence: providerinventory.ConfidenceExact,
+			AccountProfileID:    ptrStr(acc), ProviderInstallationID: ptrStr(instA),
 		}},
 		ModelCapabilities: []providerinventory.ModelCapability{{
 			AdapterID: "grok", CanonicalModelID: "grok-4.5",
@@ -112,7 +113,8 @@ func TestLoadRouteInventoryRC36LiveOnlyADurableB(t *testing.T) {
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
 			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
-			AccountProfileID: ptrStr(acc), ProviderInstallationID: ptrStr(instA),
+			ReadinessConfidence: providerinventory.ConfidenceExact,
+			AccountProfileID:    ptrStr(acc), ProviderInstallationID: ptrStr(instA),
 		}},
 		// Live has no trustworthy quota (discover without grant).
 		ModelCapabilities: []providerinventory.ModelCapability{
@@ -189,7 +191,8 @@ func TestCodexEmptyAccountQuotaBindsSoleAuthenticatedInstall(t *testing.T) {
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
 			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
-			AccountProfileID: ptrStr(authAcct), ProviderInstallationID: ptrStr(inst),
+			ReadinessConfidence: providerinventory.ConfidenceExact,
+			AccountProfileID:    ptrStr(authAcct), ProviderInstallationID: ptrStr(inst),
 		}},
 		ModelCapabilities: []providerinventory.ModelCapability{{
 			AdapterID: "codex", CanonicalModelID: "gpt-5.5",
@@ -317,12 +320,14 @@ func TestAmbiguousMultiAuthenticatedAccountSameInstallDoesNotCrossJoin(t *testin
 			{
 				AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
 				FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
-				AccountProfileID: ptrStr("acct_one"), ProviderInstallationID: ptrStr(inst),
+				ReadinessConfidence: providerinventory.ConfidenceExact,
+				AccountProfileID:    ptrStr("acct_one"), ProviderInstallationID: ptrStr(inst),
 			},
 			{
 				AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
 				FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
-				AccountProfileID: ptrStr("acct_two"), ProviderInstallationID: ptrStr(inst),
+				ReadinessConfidence: providerinventory.ConfidenceExact,
+				AccountProfileID:    ptrStr("acct_two"), ProviderInstallationID: ptrStr(inst),
 			},
 		},
 		ModelCapabilities: []providerinventory.ModelCapability{{
@@ -630,7 +635,8 @@ func TestCodexAccountProfileIDWhenPrincipalPresent(t *testing.T) {
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
 			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
-			AccountProfileID: ptrStr(want), ProviderInstallationID: ptrStr("pinst_y"),
+			ReadinessConfidence: providerinventory.ConfidenceExact,
+			AccountProfileID:    ptrStr(want), ProviderInstallationID: ptrStr("pinst_y"),
 		}},
 		ModelCapabilities: []providerinventory.ModelCapability{{
 			AdapterID: "codex", CanonicalModelID: "gpt-5.5",
@@ -681,7 +687,8 @@ func TestMergeDepthsNeverBroadenOnDisagreement(t *testing.T) {
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
 			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
-			AccountProfileID: ptrStr(acc), ProviderInstallationID: ptrStr(instA),
+			ReadinessConfidence: providerinventory.ConfidenceExact,
+			AccountProfileID:    ptrStr(acc), ProviderInstallationID: ptrStr(instA),
 		}},
 		// Two model rows for same id with different constraints — attached to same
 		// adapter accounts; after alias fuse merge should intersect.

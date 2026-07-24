@@ -25,6 +25,9 @@ import (
 //     fresh installation metadata, translate that pinst to the sole live install
 //     with the same adapter + exact ResolvedPathHash (RC36 path-alias rehydrate).
 //     Zero or multiple live targets ⇒ leave id unchanged (fail closed).
+//   - Durable AuthReadiness is historical: Load does not recompute FreshnessState.
+//     Recovery uses a 30m CapturedAt horizon, latest state across ALL readiness
+//     states per identity, and live exact+fresh observations dominate durable.
 //   - Never copy credential material (payloads are already redacted records).
 func RehydrateForAutoRoute(live, durable Report, now time.Time) Report {
 	if now.IsZero() {
@@ -110,8 +113,8 @@ func RehydrateForAutoRoute(live, durable Report, now time.Time) Report {
 	out.QuotaSnapshots = LinkQuotaConflicts(mergedSnaps)
 	out.QuotaTelemetrySources = mergedSources
 
-	// Auth: if live is not ready for an adapter but durable still has ready+fresh,
-	// rehydrate readiness (restart recovery after prior refresh).
+	// Auth: recover sole recent exact+fresh durable Ready only when live lacks an
+	// exact+fresh observation on that install and durable latest truth allows it.
 	out.AuthReadiness = rehydrateAuth(out.AuthReadiness, durableAuth, now)
 	// Models: fill missing live catalog entries from durable when still fresh.
 	out.ModelCapabilities = rehydrateModels(out.ModelCapabilities, durableModels)
@@ -337,39 +340,229 @@ func sourceReferenced(snaps []QuotaSnapshot, sourceID string) bool {
 	return false
 }
 
-func rehydrateAuth(live, durable []AuthReadiness, now time.Time) []AuthReadiness {
-	_ = now
-	if len(durable) == 0 {
-		return live
+// DurableAuthRecoveryHorizon bounds how long a stored AuthReadiness may be
+// recovered. Aligned with provider auth probe StaleAfter (30m). Load does not
+// recompute auth FreshnessState, so CapturedAt age is the recovery clock.
+const DurableAuthRecoveryHorizon = 30 * time.Minute
+
+// authCaptureFutureSkew tolerates small clock skew; CapturedAt beyond this
+// ahead of now is treated as materially future and not recoverable.
+const authCaptureFutureSkew = 2 * time.Minute
+
+func authAccountInstallKey(a AuthReadiness) string {
+	acc := ""
+	if a.AccountProfileID != nil {
+		acc = strings.TrimSpace(*a.AccountProfileID)
 	}
-	liveBy := map[string]AuthReadiness{}
-	for _, a := range live {
-		liveBy[a.AdapterID] = a
+	inst := ""
+	if a.ProviderInstallationID != nil {
+		inst = strings.TrimSpace(*a.ProviderInstallationID)
+	}
+	return strings.ToLower(strings.TrimSpace(a.AdapterID)) + "|" + acc + "|" + inst
+}
+
+func authAdapterInstallKey(a AuthReadiness) string {
+	inst := ""
+	if a.ProviderInstallationID != nil {
+		inst = strings.TrimSpace(*a.ProviderInstallationID)
+	}
+	return strings.ToLower(strings.TrimSpace(a.AdapterID)) + "|" + inst
+}
+
+// exactFreshAuthObservation is live dominance: exact Confidence, exact
+// ReadinessConfidence, and FreshnessFresh — for any ReadinessState (Ready,
+// NotAuthenticated, Expired, unknown, …).
+func exactFreshAuthObservation(a AuthReadiness) bool {
+	return a.Confidence == ConfidenceExact &&
+		a.ReadinessConfidence == ConfidenceExact &&
+		a.FreshnessState == FreshnessFresh
+}
+
+func parseAuthCapturedAt(value string) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return t.UTC(), true
+	}
+	if t, err := time.Parse(time.RFC3339, value); err == nil {
+		return t.UTC(), true
+	}
+	return time.Time{}, false
+}
+
+func withinDurableAuthRecoveryHorizon(captured, now time.Time) bool {
+	now = now.UTC()
+	captured = captured.UTC()
+	if captured.After(now.Add(authCaptureFutureSkew)) {
+		return false
+	}
+	if now.Sub(captured) > DurableAuthRecoveryHorizon {
+		return false
+	}
+	return true
+}
+
+// authTruthSignature compares equal-time durable rows for conflict. Differing
+// readiness state, confidence, readiness confidence, or freshness ⇒ fail closed.
+func authTruthSignature(a AuthReadiness) string {
+	return string(a.ReadinessState) + "|" +
+		string(a.Confidence) + "|" +
+		string(a.ReadinessConfidence) + "|" +
+		string(a.FreshnessState)
+}
+
+// rehydrateAuth recovers a sole recent durable exact+fresh Ready auth when live
+// has no exact+fresh observation on that adapter+install.
+//
+// Algorithm (fail closed):
+//  1. Live exact+fresh (both confidences) any state on adapter+install blocks
+//     all durable recovery for that install.
+//  2. Group ALL durable rows by adapter+account+translated-install (do not
+//     filter to Ready first).
+//  3. Per identity: any empty/unparseable CapturedAt ⇒ non-recoverable (do not
+//     fall back to an older Ready). Among parseable rows, take max CapturedAt;
+//     equal-time rows with differing state/confidence/freshness ⇒ block.
+//  4. Only the latest row may then pass ExactFreshReadyAuth + recency
+//     (CapturedAt age ≤ DurableAuthRecoveryHorizon, not materially future).
+//  5. Build candidates independently of live row iteration (live may be empty).
+//  6. Group recoverable Ready candidates by adapter+install; recover only when
+//     exactly one distinct account (multi-account ⇒ recover none).
+func rehydrateAuth(live, durable []AuthReadiness, now time.Time) []AuthReadiness {
+	if now.IsZero() {
+		now = time.Now().UTC()
 	}
 	out := append([]AuthReadiness(nil), live...)
+	if len(durable) == 0 {
+		return out
+	}
+
+	// Live dominate: exact+fresh observation of any readiness state blocks
+	// durable recovery on that adapter+install.
+	liveBlockedAI := map[string]bool{}
+	for _, a := range live {
+		if exactFreshAuthObservation(a) {
+			liveBlockedAI[authAdapterInstallKey(a)] = true
+		}
+	}
+
+	// Group ALL durable rows by full identity (adapter|account|install).
+	groups := map[string][]AuthReadiness{}
 	for _, d := range durable {
-		if d.ReadinessState != ReadinessReady {
+		k := authAccountInstallKey(d)
+		groups[k] = append(groups[k], d)
+	}
+
+	type cand struct {
+		auth AuthReadiness
+		acc  string
+		ai   string
+	}
+	// Candidates built from durable resolution only; live emptiness is OK.
+	var candidates []cand
+
+	idKeys := make([]string, 0, len(groups))
+	for k := range groups {
+		idKeys = append(idKeys, k)
+	}
+	sort.Strings(idKeys)
+
+	for _, idKey := range idKeys {
+		rows := groups[idKey]
+		type timed struct {
+			auth AuthReadiness
+			at   time.Time
+		}
+		timedRows := make([]timed, 0, len(rows))
+		identityBlocked := false
+		for _, r := range rows {
+			at, ok := parseAuthCapturedAt(r.CapturedAt)
+			if !ok {
+				// Empty/invalid CapturedAt: identity non-recoverable. A newer
+				// unparseable stamp must not silently expose an older Ready.
+				identityBlocked = true
+				break
+			}
+			timedRows = append(timedRows, timed{auth: r, at: at})
+		}
+		if identityBlocked || len(timedRows) == 0 {
 			continue
 		}
-		if d.FreshnessState == FreshnessStale || d.FreshnessState == FreshnessExpired {
-			continue
+
+		maxAt := timedRows[0].at
+		for _, tr := range timedRows[1:] {
+			if tr.at.After(maxAt) {
+				maxAt = tr.at
+			}
 		}
-		cur, ok := liveBy[d.AdapterID]
-		if ok && (cur.ReadinessState == ReadinessReady) {
-			continue
+		var latest []AuthReadiness
+		for _, tr := range timedRows {
+			if tr.at.Equal(maxAt) {
+				latest = append(latest, tr.auth)
+			}
 		}
-		// Replace non-ready live row or append.
-		replaced := false
-		for i := range out {
-			if out[i].AdapterID == d.AdapterID {
-				out[i] = d
-				replaced = true
+		sig0 := authTruthSignature(latest[0])
+		conflict := false
+		for _, a := range latest[1:] {
+			if authTruthSignature(a) != sig0 {
+				conflict = true
 				break
 			}
 		}
-		if !replaced {
-			out = append(out, d)
+		if conflict {
+			continue
 		}
+		chosen := latest[0]
+
+		// Only after latest-state resolution: exact+fresh Ready + recency.
+		if !ExactFreshReadyAuth(chosen) {
+			continue
+		}
+		if !withinDurableAuthRecoveryHorizon(maxAt, now) {
+			continue
+		}
+		acc := ""
+		if chosen.AccountProfileID != nil {
+			acc = strings.TrimSpace(*chosen.AccountProfileID)
+		}
+		if acc == "" {
+			continue
+		}
+		ai := authAdapterInstallKey(chosen)
+		if liveBlockedAI[ai] {
+			continue
+		}
+		candidates = append(candidates, cand{auth: chosen, acc: acc, ai: ai})
+	}
+
+	// One distinct recoverable account per adapter+install.
+	byAI := map[string][]cand{}
+	for _, c := range candidates {
+		byAI[c.ai] = append(byAI[c.ai], c)
+	}
+	aiKeys := make([]string, 0, len(byAI))
+	for ai := range byAI {
+		aiKeys = append(aiKeys, ai)
+	}
+	sort.Strings(aiKeys)
+	for _, ai := range aiKeys {
+		list := byAI[ai]
+		byAcc := map[string]AuthReadiness{}
+		for _, c := range list {
+			if _, ok := byAcc[c.acc]; !ok {
+				byAcc[c.acc] = c.auth
+			}
+		}
+		if len(byAcc) != 1 {
+			continue
+		}
+		accKeys := make([]string, 0, 1)
+		for acc := range byAcc {
+			accKeys = append(accKeys, acc)
+		}
+		sort.Strings(accKeys)
+		out = append(out, byAcc[accKeys[0]])
 	}
 	return out
 }

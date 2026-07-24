@@ -34,6 +34,7 @@ func TestCodexMachineReadableCatalog_RoutesHighAndLow(t *testing.T) {
 			AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
 			AccountProfileID: ptr(acct), ProviderInstallationID: ptr(inst),
 			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
+			ReadinessConfidence: providerinventory.ConfidenceExact,
 		}},
 		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{{
 			ModelCatalogSnapshotID: snapID, AdapterID: "codex",
