@@ -1013,6 +1013,13 @@ func isResearchWorkItem(workItemID, intent string) bool {
 // successful research run when the sandbox left no product files. The write is
 // LoopCoder-owned (post-process), never used to invent ActualModel/ActualAccount.
 // Requires substantial summary content so empty/error shells cannot pass.
+//
+// Security (fail closed): never os.WriteFile the final path (follows symlink →
+// worktree escape). Write a 0600 temp regular file inside the worktree root,
+// sync+close, then os.Rename over the target so a pre-planted symlink is replaced
+// as a directory entry rather than followed. Pre/post checks require the final
+// path stays under worktree and is a regular non-symlink file. git add errors
+// are returned (never ignored).
 func materializeResearchFindings(wt, summary string, in ChildExecInput) error {
 	summary = strings.TrimSpace(summary)
 	if wt == "" || len(summary) < 80 {
@@ -1029,12 +1036,123 @@ func materializeResearchFindings(wt, summary string, in ChildExecInput) error {
 		"Work item: " + strings.TrimSpace(in.WorkItemID) + "\n\n" +
 		"Intent: " + strings.TrimSpace(in.Intent) + "\n\n" +
 		"## Provider survey\n\n" + summary + "\n"
-	path := filepath.Join(wt, "findings.md")
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+
+	wtAbs, err := filepath.Abs(wt)
+	if err != nil {
+		return fmt.Errorf("research findings worktree abs: %w", err)
+	}
+	if st, err := os.Lstat(wtAbs); err != nil {
+		return fmt.Errorf("research findings worktree: %w", err)
+	} else if !st.IsDir() {
+		return fmt.Errorf("research findings worktree is not a directory")
+	}
+
+	dest := filepath.Join(wtAbs, "findings.md")
+	if err := requirePathUnderRoot(wtAbs, dest); err != nil {
+		return fmt.Errorf("research findings dest: %w", err)
+	}
+	// Refuse if destination path is already a non-symlink non-file we cannot
+	// safely replace (directory / FIFO). Symlinks are OK — Rename replaces the
+	// link node itself without following.
+	if st, err := os.Lstat(dest); err == nil {
+		if st.Mode()&os.ModeSymlink == 0 && !st.Mode().IsRegular() {
+			return fmt.Errorf("research findings dest is not a regular file or symlink (mode=%v)", st.Mode())
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("research findings dest lstat: %w", err)
+	}
+
+	// Create exclusive temp regular file inside worktree root (0600).
+	tmp, err := os.CreateTemp(wtAbs, ".findings-*.tmp")
+	if err != nil {
+		return fmt.Errorf("research findings temp create: %w", err)
+	}
+	tmpName := tmp.Name()
+	// Always clean temp on any failure path before successful rename.
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := requirePathUnderRoot(wtAbs, tmpName); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("research findings temp path: %w", err)
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("research findings temp chmod: %w", err)
+	}
+	if _, err := tmp.Write([]byte(body)); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("research findings temp write: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("research findings temp sync: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("research findings temp close: %w", err)
+	}
+	// Temp must be a regular non-symlink before rename.
+	if err := requireRegularNonSymlinkFile(tmpName); err != nil {
+		return fmt.Errorf("research findings temp: %w", err)
+	}
+
+	// Atomic replace of the directory entry (replaces symlink node, does not follow).
+	if err := os.Rename(tmpName, dest); err != nil {
+		return fmt.Errorf("research findings rename: %w", err)
+	}
+	cleanupTmp = false // renamed into place
+
+	// Post-conditions: still under worktree, regular file, not a symlink.
+	if err := requirePathUnderRoot(wtAbs, dest); err != nil {
+		return fmt.Errorf("research findings post path: %w", err)
+	}
+	if err := requireRegularNonSymlinkFile(dest); err != nil {
+		return fmt.Errorf("research findings post: %w", err)
+	}
+
+	// Stage so discoverProductFiles (git ls-files) sees it — errors are fatal.
+	cmd := exec.Command("git", "-C", wtAbs, "add", "--", "findings.md")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("research findings git add: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// requirePathUnderRoot ensures candidate resolves under root (no escape via ..).
+func requirePathUnderRoot(root, candidate string) error {
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
 		return err
 	}
-	// Stage so discoverProductFiles (git ls-files --others) sees it.
-	_ = exec.Command("git", "-C", wt, "add", "--", "findings.md").Run()
+	candAbs, err := filepath.Abs(candidate)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(rootAbs, candAbs)
+	if err != nil {
+		return err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("path %q escapes worktree root %q", candAbs, rootAbs)
+	}
+	return nil
+}
+
+// requireRegularNonSymlinkFile uses Lstat only — never follows symlinks.
+func requireRegularNonSymlinkFile(path string) error {
+	st, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if st.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a symlink (refused)", path)
+	}
+	if !st.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file (mode=%v)", path, st.Mode())
+	}
 	return nil
 }
 

@@ -2,6 +2,7 @@ package workflowrun
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -247,22 +248,28 @@ func hasAnyFindings(worktree string) bool {
 	if worktree == "" {
 		return false
 	}
+	wtAbs, err := filepath.Abs(worktree)
+	if err != nil {
+		return false
+	}
 	// findings.md or child-output with substantial body (not route-metadata stubs alone).
+	// Security: Lstat only — never follow symlinks (external file must not count).
 	for _, name := range []string{"findings.md", "FINDINGS.md"} {
-		if st, err := os.Stat(filepath.Join(worktree, name)); err == nil && st.Size() > 40 {
+		if raw, ok := readRegularFindingsFile(wtAbs, name); ok && len(raw) > 40 {
 			return true
 		}
 	}
-	entries, err := os.ReadDir(worktree)
+	entries, err := os.ReadDir(wtAbs)
 	if err != nil {
 		return false
 	}
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasPrefix(e.Name(), "child-output-") {
+		name := e.Name()
+		if !strings.HasPrefix(name, "child-output-") {
 			continue
 		}
-		raw, rerr := os.ReadFile(filepath.Join(worktree, e.Name()))
-		if rerr != nil || len(raw) < 200 {
+		raw, ok := readRegularFindingsFile(wtAbs, name)
+		if !ok || len(raw) < 200 {
 			continue
 		}
 		// Require survey body beyond the short writeChildEvidence route stub.
@@ -273,6 +280,47 @@ func hasAnyFindings(worktree string) bool {
 		}
 	}
 	return false
+}
+
+// readRegularFindingsFile Lstats then reads a leaf under worktree. Rejects
+// symlinks, directories, FIFOs, and any path escape. Re-Lstats after read to
+// refuse races that swap a regular file for a non-regular node.
+func readRegularFindingsFile(worktreeAbs, name string) ([]byte, bool) {
+	name = filepath.Base(strings.TrimSpace(name))
+	if name == "" || name == "." || name == ".." {
+		return nil, false
+	}
+	full := filepath.Join(worktreeAbs, name)
+	if err := requirePathUnderRoot(worktreeAbs, full); err != nil {
+		return nil, false
+	}
+	st, err := os.Lstat(full)
+	if err != nil {
+		return nil, false
+	}
+	if st.Mode()&os.ModeSymlink != 0 || !st.Mode().IsRegular() {
+		return nil, false
+	}
+	// Cap read size to avoid loading huge external-looking artifacts.
+	const maxFindings = 1 << 20
+	f, err := os.Open(full)
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+	// Post-open: still a regular non-symlink at the path (Lstat, not Stat).
+	if st2, err := os.Lstat(full); err != nil || st2.Mode()&os.ModeSymlink != 0 || !st2.Mode().IsRegular() {
+		return nil, false
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, maxFindings+1))
+	if err != nil || len(raw) > maxFindings {
+		return nil, false
+	}
+	// Final Lstat after read — refuse if node type flipped.
+	if st3, err := os.Lstat(full); err != nil || st3.Mode()&os.ModeSymlink != 0 || !st3.Mode().IsRegular() {
+		return nil, false
+	}
+	return raw, true
 }
 
 func hasVerifierVerdict(product []string, worktree, evidence string) bool {
