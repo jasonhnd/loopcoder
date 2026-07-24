@@ -2,7 +2,6 @@ package workflowrun
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -246,6 +245,8 @@ func hasSubstantialResearchFindings(worktree string, product []string) bool {
 }
 
 // anySecureLeaf evaluates check on secure-read product leaves (optional child-output).
+// Preserves clean relative paths (docs/findings.md stays nested); never collapses
+// to filepath.Base. Rejects abs/../empty and symlink root/parents via secure reader.
 func anySecureLeaf(worktree string, product []string, names []string, includeChildOutput bool, check func([]byte) bool) bool {
 	if worktree == "" {
 		return false
@@ -254,24 +255,35 @@ func anySecureLeaf(worktree string, product []string, names []string, includeChi
 	if err != nil {
 		return false
 	}
+	if err := requireNonSymlinkDir(wtAbs); err != nil {
+		return false
+	}
+	wantBase := map[string]bool{}
+	for _, n := range names {
+		if b := filepath.Base(strings.TrimSpace(n)); b != "" {
+			wantBase[b] = true
+		}
+	}
 	seen := map[string]bool{}
-	try := func(name string) bool {
-		name = filepath.Base(name)
-		if name == "" || seen[name] {
+	try := func(rel string) bool {
+		cleaned, err := cleanWorktreeRelPath(rel)
+		if err != nil || seen[cleaned] {
 			return false
 		}
-		seen[name] = true
-		raw, ok := readRegularFindingsFile(wtAbs, name)
+		seen[cleaned] = true
+		raw, ok := readRegularFindingsFile(wtAbs, cleaned)
 		return ok && check(raw)
 	}
 	for _, rel := range product {
-		base := filepath.Base(rel)
-		for _, n := range names {
-			if base == n && try(base) {
-				return true
-			}
+		cleaned, err := cleanWorktreeRelPath(rel)
+		if err != nil {
+			continue
 		}
-		if includeChildOutput && strings.HasPrefix(base, "child-output-") && try(base) {
+		base := filepath.Base(cleaned)
+		if wantBase[base] && try(cleaned) {
+			return true
+		}
+		if includeChildOutput && strings.HasPrefix(base, "child-output-") && try(cleaned) {
 			return true
 		}
 	}
@@ -321,88 +333,6 @@ func hasAnyFindings(worktree string) bool {
 	return false
 }
 
-// readRegularFindingsFile Lstats then reads a leaf under worktree. Rejects
-// symlinks, directories, FIFOs, and any path escape.
-//
-// Identity chain (fail closed on race):
-//  1. preLstat path — must be regular non-symlink under worktree
-//  2. Open path
-//  3. f.Stat() — must be regular; os.SameFile(preLstat, fdStat)
-//  4. read from fd
-//  5. postLstat path — must be regular non-symlink; os.SameFile(fdStat, postLstat)
-//
-// Without SameFile, Lstat→Open can follow a swapped symlink and leak external
-// content into acceptance while path Lstats still look clean.
-func readRegularFindingsFile(worktreeAbs, name string) ([]byte, bool) {
-	return readRegularFindingsFileChecked(worktreeAbs, name)
-}
-
-// readRegularFindingsFileChecked is the testable implementation. Returns
-// (nil, false) on any identity/safety failure.
-func readRegularFindingsFileChecked(worktreeAbs, name string) ([]byte, bool) {
-	raw, err := readRegularFindingsFileErr(worktreeAbs, name)
-	return raw, err == nil
-}
-
-// readRegularFindingsFileErr returns a non-nil error describing identity/safety
-// failures (used by unit tests). Callers that only need bool use Checked.
-func readRegularFindingsFileErr(worktreeAbs, name string) ([]byte, error) {
-	name = filepath.Base(strings.TrimSpace(name))
-	if name == "" || name == "." || name == ".." {
-		return nil, fmt.Errorf("findings leaf name invalid")
-	}
-	full := filepath.Join(worktreeAbs, name)
-	if err := requirePathUnderRoot(worktreeAbs, full); err != nil {
-		return nil, err
-	}
-	pre, err := os.Lstat(full)
-	if err != nil {
-		return nil, err
-	}
-	if pre.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("%s is a symlink", name)
-	}
-	if !pre.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s is not a regular file (mode=%v)", name, pre.Mode())
-	}
-	const maxFindings = 1 << 20
-	f, err := os.Open(full)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	fdStat, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !fdStat.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s fd is not a regular file", name)
-	}
-	// Opened fd must be the same inode as the pre-open Lstat (no symlink swap).
-	if !os.SameFile(pre, fdStat) {
-		return nil, fmt.Errorf("%s identity mismatch: pre-lstat vs open fd", name)
-	}
-	raw, err := io.ReadAll(io.LimitReader(f, maxFindings+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(raw) > maxFindings {
-		return nil, fmt.Errorf("%s exceeds max findings size", name)
-	}
-	post, err := os.Lstat(full)
-	if err != nil {
-		return nil, err
-	}
-	if post.Mode()&os.ModeSymlink != 0 || !post.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s post-read node is not a regular non-symlink file", name)
-	}
-	// Path node after read must still be the same file as the opened fd.
-	if !os.SameFile(fdStat, post) {
-		return nil, fmt.Errorf("%s identity mismatch: open fd vs post-lstat", name)
-	}
-	return raw, nil
-}
-
 func hasVerifierVerdict(product []string, worktree, evidence string) bool {
 	// Must have non-empty evidence digest and not be clarification.
 	if strings.TrimSpace(evidence) == "" || !strings.HasPrefix(evidence, "sha256:") {
@@ -428,12 +358,17 @@ func hasVerifierVerdict(product []string, worktree, evidence string) bool {
 	if anySecureLeaf(worktree, product, []string{"verdict.md"}, true, check) {
 		return true
 	}
-	// Filename hint on product list only if the leaf also securely reads as substantial.
-	for _, f := range product {
-		base := strings.ToLower(filepath.Base(f))
-		if strings.Contains(base, "verif") || strings.Contains(base, "verdict") || strings.Contains(base, "review") {
-			if worktree != "" {
-				if raw, ok := readRegularFindingsFile(worktree, filepath.Base(f)); ok && check(raw) {
+	// Filename hint on product list only if the nested leaf also securely reads as substantial.
+	// Preserve clean relative path (docs/review.md), never filepath.Base collapse.
+	if worktree != "" {
+		for _, f := range product {
+			cleaned, err := cleanWorktreeRelPath(f)
+			if err != nil {
+				continue
+			}
+			base := strings.ToLower(filepath.Base(cleaned))
+			if strings.Contains(base, "verif") || strings.Contains(base, "verdict") || strings.Contains(base, "review") {
+				if raw, ok := readRegularFindingsFile(worktree, cleaned); ok && check(raw) {
 					return true
 				}
 			}

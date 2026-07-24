@@ -1,6 +1,7 @@
 package workflowrun
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -94,7 +95,8 @@ func isExplicitClarificationOnly(text string) bool {
 	return b.Len() < 80
 }
 
-// collectSecureTextBlobs reads product/worktree text leaves via Lstat+SameFile only.
+// collectSecureTextBlobs reads product/worktree text leaves via secure relative
+// paths (preserves docs/foo.md). Never collapses to Base; never follows symlinks.
 func collectSecureTextBlobs(worktree string, product []string) []string {
 	var blobs []string
 	if worktree == "" {
@@ -104,49 +106,42 @@ func collectSecureTextBlobs(worktree string, product []string) []string {
 	if err != nil {
 		return blobs
 	}
+	if err := requireNonSymlinkDir(wtAbs); err != nil {
+		return blobs
+	}
 	seen := map[string]bool{}
-	add := func(name string) {
-		name = filepath.Base(name)
-		if name == "" || seen[name] {
+	add := func(rel string) {
+		cleaned, err := cleanWorktreeRelPath(rel)
+		if err != nil || seen[cleaned] {
 			return
 		}
-		seen[name] = true
-		raw, ok := readRegularFindingsFile(wtAbs, name)
+		seen[cleaned] = true
+		raw, ok := readRegularFindingsFile(wtAbs, cleaned)
 		if !ok || len(raw) == 0 || len(raw) > 32<<10 {
 			return
 		}
 		blobs = append(blobs, string(raw))
 	}
 	for _, rel := range product {
+		// Keep nested relative path; only filter by extension of the leaf name.
 		base := filepath.Base(rel)
-		if strings.HasSuffix(base, ".md") || strings.HasSuffix(base, ".txt") {
-			add(base)
+		if strings.HasSuffix(strings.ToLower(base), ".md") || strings.HasSuffix(strings.ToLower(base), ".txt") {
+			add(rel)
 		}
 	}
-	// Known materialize leaves + child-output stubs.
+	// Known materialize leaves at worktree root.
 	for _, name := range []string{"findings.md", "FINDINGS.md", "verdict.md", "docs-notes.md"} {
 		add(name)
 	}
-	entries, err := readDirSecureNames(wtAbs)
+	// Top-level child-output-* / *.md only (nested product paths come from product list).
+	entries, err := os.ReadDir(wtAbs)
 	if err == nil {
-		for _, name := range entries {
+		for _, e := range entries {
+			name := e.Name()
 			if strings.HasPrefix(name, "child-output-") || strings.HasSuffix(name, ".md") {
 				add(name)
 			}
 		}
 	}
 	return blobs
-}
-
-// readDirSecureNames returns base names under worktree (dirs included as names only).
-func readDirSecureNames(worktreeAbs string) ([]string, error) {
-	entries, err := filepath.Glob(filepath.Join(worktreeAbs, "*"))
-	if err != nil {
-		return nil, err
-	}
-	var names []string
-	for _, p := range entries {
-		names = append(names, filepath.Base(p))
-	}
-	return names, nil
 }
