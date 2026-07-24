@@ -34,6 +34,10 @@ const FailureClassResearchFindingsMaterialization = "research_findings_materiali
 // verdict.md (same safety contract as research findings).
 const FailureClassVerifierVerdictMaterialization = "verifier_verdict_materialization_failed"
 
+// FailureClassDocsMaterialization is returned when a docs child succeeded at the
+// provider layer but LoopCoder could not safely materialize docs-notes.md.
+const FailureClassDocsMaterialization = "docs_notes_materialization_failed"
+
 // ChildLifecycleKinds are event kinds that bind a child work item to an attempt.
 // Parent-level interrupt is the only interrupt form that may omit all child identity.
 var ChildLifecycleKinds = map[string]bool{

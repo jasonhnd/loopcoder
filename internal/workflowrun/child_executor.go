@@ -703,6 +703,9 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 		case RoleVerify:
 			fc = FailureClassVerifierVerdictMaterialization
 			merr = materializeVerifierVerdict(wt, res.Summary, in)
+		case RoleDocs:
+			fc = FailureClassDocsMaterialization
+			merr = materializeDocsNotes(wt, res.Summary, in)
 		}
 		if fc != "" {
 			if merr != nil {
@@ -1041,16 +1044,16 @@ func materializeResearchFindings(wt, summary string, in ChildExecInput) error {
 	if wt == "" || len(summary) < 80 {
 		return fmt.Errorf("research summary too short to materialize findings")
 	}
-	low := strings.ToLower(summary)
-	for _, p := range []string{"please clarify", "need clarification", "need more information", "what should i"} {
-		if strings.Contains(low, p) && len(summary) < 400 {
-			return fmt.Errorf("research summary looks like clarification-only")
-		}
+	if isExplicitClarificationOnly(summary) {
+		return fmt.Errorf("research summary looks like clarification-only")
 	}
 	body := "# Research findings\n\n" +
 		"Work item: " + strings.TrimSpace(in.WorkItemID) + "\n\n" +
 		"Intent: " + strings.TrimSpace(in.Intent) + "\n\n" +
 		"## Provider survey\n\n" + summary + "\n"
+	if isExplicitClarificationOnly(body) {
+		return fmt.Errorf("research summary looks like clarification-only")
+	}
 	return writeProductFileSecurely(wt, "findings.md", body, "research findings")
 }
 
@@ -1061,23 +1064,38 @@ func materializeVerifierVerdict(wt, summary string, in ChildExecInput) error {
 	if wt == "" || len(summary) < 80 {
 		return fmt.Errorf("verifier summary too short to materialize verdict")
 	}
-	low := strings.ToLower(summary)
-	for _, p := range []string{"please clarify", "need clarification", "need more information", "what should i"} {
-		if strings.Contains(low, p) && len(summary) < 400 {
-			return fmt.Errorf("verifier summary looks like clarification-only")
-		}
-	}
-	// Explicit reject empty-review shells that would fail hasVerifierVerdict.
-	if strings.Contains(low, "nothing to review") || strings.Contains(low, "no implementation") {
-		if len(summary) < 400 {
-			return fmt.Errorf("verifier summary is empty-review shell")
-		}
+	if isExplicitClarificationOnly(summary) {
+		return fmt.Errorf("verifier summary looks like clarification-only")
 	}
 	body := "# Verification verdict\n\n" +
 		"Work item: " + strings.TrimSpace(in.WorkItemID) + "\n\n" +
 		"Intent: " + strings.TrimSpace(in.Intent) + "\n\n" +
 		"## Adversarial review\n\n" + summary + "\n"
+	// Refuse if headers + body would still be clarification-only.
+	if isExplicitClarificationOnly(body) {
+		return fmt.Errorf("verifier summary looks like clarification-only")
+	}
 	return writeProductFileSecurely(wt, "verdict.md", body, "verifier verdict")
+}
+
+// materializeDocsNotes writes docs-notes.md from the provider Summary when docs
+// child left no product files (summary-only path).
+func materializeDocsNotes(wt, summary string, in ChildExecInput) error {
+	summary = strings.TrimSpace(summary)
+	if wt == "" || len(summary) < 80 {
+		return fmt.Errorf("docs summary too short to materialize notes")
+	}
+	if isExplicitClarificationOnly(summary) {
+		return fmt.Errorf("docs summary looks like clarification-only")
+	}
+	body := "# Documentation notes\n\n" +
+		"Work item: " + strings.TrimSpace(in.WorkItemID) + "\n\n" +
+		"Intent: " + strings.TrimSpace(in.Intent) + "\n\n" +
+		"## Documentation\n\n" + summary + "\n"
+	if isExplicitClarificationOnly(body) {
+		return fmt.Errorf("docs summary looks like clarification-only")
+	}
+	return writeProductFileSecurely(wt, "docs-notes.md", body, "docs notes")
 }
 
 // writeProductFileSecurely writes leafName under worktree via 0600 temp + Rename
@@ -1560,17 +1578,30 @@ func writeFakeProductFiles(wt string, in ChildExecInput, override map[string][]s
 			paths = list
 		}
 	}
+	role := ClassifyTaskRole(in.WorkItemID, in.Intent, "")
 	if len(paths) == 0 {
-		// Default product path per child — enough for integrate tests.
-		switch {
-		case strings.Contains(strings.ToLower(in.WorkItemID), "test") || strings.Contains(strings.ToLower(in.Intent), "test"):
+		// Default product path per child — enough for integrate + acceptance tests.
+		switch role {
+		case RoleTests:
 			paths = []string{"notes/notes_test.go", "notes/notes.go"}
-		case strings.Contains(strings.ToLower(in.WorkItemID), "implement") || strings.Contains(strings.ToLower(in.Intent), "implement"):
+		case RoleImplement:
 			paths = []string{"notes/notes.go"}
-		case strings.Contains(strings.ToLower(in.WorkItemID), "doc"):
-			paths = []string{"docs/notes.md"}
+		case RoleDocs:
+			paths = []string{"docs-notes.md"}
+		case RoleVerify:
+			paths = []string{"verdict.md"}
+		case RoleResearch:
+			paths = []string{"findings.md"}
 		default:
-			paths = []string{"notes/" + in.WorkItemID + ".md"}
+			if strings.Contains(strings.ToLower(in.WorkItemID), "test") || strings.Contains(strings.ToLower(in.Intent), "test") {
+				paths = []string{"notes/notes_test.go", "notes/notes.go"}
+			} else if strings.Contains(strings.ToLower(in.WorkItemID), "implement") || strings.Contains(strings.ToLower(in.Intent), "implement") {
+				paths = []string{"notes/notes.go"}
+			} else if strings.Contains(strings.ToLower(in.WorkItemID), "doc") {
+				paths = []string{"docs-notes.md"}
+			} else {
+				paths = []string{"notes/" + in.WorkItemID + ".md"}
+			}
 		}
 	}
 	written := make([]string, 0, len(paths))
@@ -1585,8 +1616,30 @@ func writeFakeProductFiles(wt string, in ChildExecInput, override map[string][]s
 		if strings.HasSuffix(rel, "_test.go") {
 			body = fmt.Sprintf("package notes\n\nimport \"testing\"\n\nfunc TestNotes_%s(t *testing.T) {\n\t// generated for attempt %s\n}\n",
 				strings.ReplaceAll(in.WorkItemID, "-", "_"), in.AttemptID)
+		} else if filepath.Base(rel) == "findings.md" || (role == RoleResearch && strings.HasSuffix(rel, ".md")) {
+			// Substantial survey body so AcceptSucceededChild RoleResearch passes.
+			body = fmt.Sprintf("# Research findings\n\nWork item: %s\n\n## Provider survey\n\n"+
+				"Survey scope and constraints for attempt %s.\n"+
+				"Intent: %s\n"+
+				"Fake fixture survey covers multi-provider notes package layout, capacity routing, and test plan.\n"+
+				"Residual risks: fixture-only path; production uses provider Summary materialization.\n",
+				in.WorkItemID, in.AttemptID, in.Intent)
+		} else if filepath.Base(rel) == "verdict.md" || (role == RoleVerify && strings.HasSuffix(rel, ".md")) {
+			body = fmt.Sprintf("# Verification verdict\n\nWork item: %s\n\n## Adversarial review\n\n"+
+				"Independent review of attempt %s for intent: %s\n"+
+				"Findings: fixture product is consistent with goal graph contracts; residual risk low for tests.\n"+
+				"Recommendation: proceed with integration under human gate.\n",
+				in.WorkItemID, in.AttemptID, in.Intent)
+		} else if filepath.Base(rel) == "docs-notes.md" || (role == RoleDocs && strings.HasSuffix(rel, ".md")) {
+			body = fmt.Sprintf("# Documentation notes\n\nWork item: %s\n\n## Documentation\n\n"+
+				"User-facing notes for attempt %s.\nIntent: %s\n"+
+				"Describe package API, configuration, and multi-provider selection for operators.\n",
+				in.WorkItemID, in.AttemptID, in.Intent)
 		} else if strings.HasSuffix(rel, ".md") {
-			body = fmt.Sprintf("# %s\n\nAttempt: %s\nIntent: %s\n", in.WorkItemID, in.AttemptID, in.Intent)
+			body = fmt.Sprintf("# %s\n\nAttempt: %s\nIntent: %s\n\n"+
+				"Substantial markdown product for fixture acceptance and integrate tests.\n"+
+				"Scope notes, constraints, and residual documentation risks are captured here.\n",
+				in.WorkItemID, in.AttemptID, in.Intent)
 		} else if strings.HasSuffix(rel, ".go") && !strings.HasSuffix(rel, "_test.go") {
 			body = fmt.Sprintf("package notes\n\n// WorkItem %s attempt %s\nfunc Notes() string { return %q }\n",
 				in.WorkItemID, in.AttemptID, in.Intent)
