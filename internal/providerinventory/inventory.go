@@ -790,6 +790,15 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 					probes = append(probes, quotaProbe)
 					adapterQuotaAttempted = true
 					adapterQuotaCollected = quotaProbe.Outcome == OutcomeInstalled && len(snapshots) > 0 && snapshots[0].Confidence == ConfidenceExact
+					// Official app-server model/list catalog (MR exact/fresh when granted).
+					// Separate bounded session from quota; same transport security class.
+					catSnap, catCaps, catalogProbe := inspectCodexCatalog(ctx, discovery, adapter, candidate, installation, now, deps)
+					modelCatalogSnapshots = append(modelCatalogSnapshots, catSnap)
+					modelCapabilities = append(modelCapabilities, catCaps...)
+					probes = append(probes, catalogProbe)
+					if catalogProbe.NetworkDeclared && catalogProbe.NetworkPermission == NetworkDenied {
+						gaps = append(gaps, "provider-codex-catalog-network-permission-denied")
+					}
 				}
 				if adapter.AdapterID == "claude" && !adapterQuotaAttempted {
 					source, snapshots, quotaProbe := inspectClaudeQuota(ctx, discovery, adapter, candidate, installation, now, deps)
