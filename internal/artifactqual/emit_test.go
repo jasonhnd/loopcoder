@@ -92,5 +92,11 @@ func emitChild(id, prov, depth string) artifactqual.CanaryChild {
 		DepthRequired: depth, DepthSelected: depth, DepthInvocation: depth,
 		Terminal: "succeeded", CapacityBefore: &b, CapacityReserved: &r, CapacityAfter: &a,
 		RealProviderExecuted: true, AfterSource: "cli", AfterFreshness: "fresh",
+		AccountRef: "acct-emit", InstallRef: "pinst_emit",
+		ActualSources: &artifactqual.CanaryRouteSources{
+			Model: "provider_stream", Effort: "accepted_invocation",
+			Permission: "accepted_invocation", Account: "auth_binding", Install: "install_binding",
+		},
+		ArgvDigest: "sha256:emit-argv-" + id,
 	}
 }

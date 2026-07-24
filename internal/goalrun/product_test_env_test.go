@@ -162,16 +162,6 @@ func (e productEnv) pinRequest(goal, issue string) goalrun.Request {
 	}
 }
 
-func (e productEnv) autoRequest(goal, issue string) goalrun.Request {
-	return goalrun.Request{
-		ProjectID: "proj-product-auto", Goal: goal, Issue: issue, Actor: "owner", Owner: "worker",
-		HomeDir: e.Home, Now: func() time.Time { return e.Now },
-		LoadInventory: e.loadInv(),
-		OpenLedger:    e.openLed(),
-		Executor:      workflowrun.FakeChildExecutor{HomeDir: e.Home, Now: func() time.Time { return e.Now }},
-	}
-}
-
 // ledgerFileEntries reopens the durable ledger JSON and returns raw entries.
 func ledgerFileEntries(t *testing.T, path string) []capacityledger.Entry {
 	t.Helper()
@@ -189,14 +179,4 @@ func ledgerFileEntries(t *testing.T, path string) []capacityledger.Entry {
 		t.Fatal(err)
 	}
 	return doc.Entries
-}
-
-func countLiveReserved(entries []capacityledger.Entry) int {
-	n := 0
-	for _, e := range entries {
-		if e.State == "reserved" {
-			n++
-		}
-	}
-	return n
 }

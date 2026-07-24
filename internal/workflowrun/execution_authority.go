@@ -879,15 +879,6 @@ func RecoverOpenLaunchInterruptsAuthoritative(elog *EventLog, opts RecoverOption
 	return n, nil
 }
 
-func hasKindForAttempt(events []Event, kind, workItemID, attemptID string) bool {
-	for _, ev := range events {
-		if ev.Kind == kind && ev.WorkItemID == workItemID && ev.AttemptID == attemptID {
-			return true
-		}
-	}
-	return false
-}
-
 func validateRecoverCandidates(
 	ctx context.Context,
 	events []Event,
@@ -983,6 +974,7 @@ func validateRecoverCandidates(
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
+	openLaunches := OpenLaunchesWithoutTerminal(events)
 
 	var out []recoverCandidate
 	for _, k := range keys {
@@ -1000,8 +992,21 @@ func validateRecoverCandidates(
 				if !errors.Is(lerr, sql.ErrNoRows) {
 					return nil, fmt.Errorf("workflowrun: recover validate %s/%s: authority load: %w", id, att, lerr)
 				}
-				// Durable launch/claim without authority is ambiguous corruption — not a Fake exemption.
-				// Fail closed before any mutation; never select gN+1 for this state.
+				// Open durable launch without authority is ambiguous corruption — fail closed.
+				if openAtt, isOpen := openLaunches[id]; isOpen && openAtt == att {
+					return nil, fmt.Errorf("workflowrun: recover validate %s/%s: missing authority for durable launch/claim (ambiguous; fail closed before mutation; diagnostic=no_authority)", id, att)
+				}
+				cEarly, hasClaimEarly := claimByAttempt[k]
+				claimOpenEarly := hasClaimEarly && cEarly.State != workclaim.StateClosed
+				if claimOpenEarly {
+					return nil, fmt.Errorf("workflowrun: recover validate %s/%s: missing authority for durable launch/claim (ambiguous; fail closed before mutation; diagnostic=no_authority)", id, att)
+				}
+				// Fully terminalized Fake/test path (terminal present, no open launch/claim):
+				// not a recovery mutation candidate — skip (do not invent authority).
+				if _, hasTermEarly := termByAttempt[k]; hasTermEarly {
+					continue
+				}
+				// Incomplete lifecycle without authority (e.g. interrupt without terminal) — fail closed.
 				return nil, fmt.Errorf("workflowrun: recover validate %s/%s: missing authority for durable launch/claim (ambiguous; fail closed before mutation; diagnostic=no_authority)", id, att)
 			}
 			auth = loaded

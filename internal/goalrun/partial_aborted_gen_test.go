@@ -76,7 +76,8 @@ func TestPartialOnlyAbortedG1ResumesAsExactG2(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "workflow-partial.json"), raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// Pre-seed event log launch for aborted g1 so recovery is consistent.
+	// Pre-seed only a marker run.start. Partial aborted_attempts alone drives g2
+	// selection — do not leave an open launch without authority (recover fail-closed).
 	elog, err := workflowrun.OpenEventLog(home, projectID, runID)
 	if err != nil {
 		t.Fatal(err)
@@ -88,8 +89,6 @@ func TestPartialOnlyAbortedG1ResumesAsExactG2(t *testing.T) {
 		}
 	}
 	must(workflowrun.Event{Kind: "run.start", Message: "prior process"})
-	must(workflowrun.Event{Kind: "launch", WorkItemID: "wi_only", AttemptID: abortedG1, Generation: 2})
-	must(workflowrun.Event{Kind: "interrupt", WorkItemID: "wi_only", AttemptID: abortedG1, Generation: 2, Message: "hard kill"})
 
 	calls := map[string]int{}
 	res, err := goalrun.Execute(context.Background(), goalrun.Request{
@@ -137,8 +136,9 @@ func TestPartialOnlyAbortedG1ResumesAsExactG2(t *testing.T) {
 			g2Launch++
 		}
 	}
-	if g1Launch != 1 {
-		t.Fatalf("g1 launch count=%d want 1 (seed only)", g1Launch)
+	// No seed launch for aborted g1 (would be no_authority corruption); only g2 launches.
+	if g1Launch != 0 {
+		t.Fatalf("g1 launch count=%d want 0 (aborted via partial only, never re-launched)", g1Launch)
 	}
 	if g2Launch != 1 {
 		t.Fatalf("g2 launch count=%d want 1", g2Launch)

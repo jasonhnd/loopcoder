@@ -25,6 +25,9 @@ func TestProviderRunnersSurfaceSupervisedHang(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.name == "codex stall" {
+				ensurePackageCodexAuth(t)
+			}
 			worktreePath := t.TempDir()
 			restore := stubRunSupervised(t, func(_ context.Context, _ *exec.Cmd, opts supervisedexec.Options) (supervisedexec.Result, error) {
 				if opts.HardCap != 123*time.Millisecond {
@@ -73,6 +76,7 @@ func TestProviderRunnersSurfaceSupervisedHang(t *testing.T) {
 }
 
 func TestProviderRunnerDoesNotMarkParentContextCancellationHung(t *testing.T) {
+	ensurePackageCodexAuth(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -96,6 +100,7 @@ func TestProviderRunnerDoesNotMarkParentContextCancellationHung(t *testing.T) {
 }
 
 func TestProviderRunnerRelaysLaunchBeforeIdentityCallback(t *testing.T) {
+	ensurePackageCodexAuth(t)
 	launched := false
 	started := false
 	restore := stubRunSupervised(t, func(_ context.Context, _ *exec.Cmd, opts supervisedexec.Options) (supervisedexec.Result, error) {

@@ -660,10 +660,6 @@ type StageReceipt struct {
 	Error               string `json:"error,omitempty"`
 }
 
-func processAlive(pid int) bool {
-	return processAliveWithBirth(pid, "")
-}
-
 // processAliveWithBirth refuses PID-reuse adoption when birth identity is known
 // and does not match the live process (best-effort: starttime via ps/proc).
 func processAliveWithBirth(pid int, birth string) bool {

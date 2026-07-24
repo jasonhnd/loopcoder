@@ -454,11 +454,13 @@ func releaseIntegrateWorktree(repoPath, tmpWT string) error {
 	var errs []string
 	if repoPath != "" {
 		if _, err := runGitRepo(context.Background(), repoPath, "worktree", "remove", "--force", tmpWT); err != nil {
-			// Plain child dirs are not git worktrees — only real remove failures count.
-			msg := err.Error()
+			// Plain child dirs / missing parent repo are soft — only real remove failures count.
+			msg := strings.ToLower(err.Error())
 			if !strings.Contains(msg, "is not a working tree") &&
 				!strings.Contains(msg, "not a valid path") &&
-				!strings.Contains(msg, "No such file") {
+				!strings.Contains(msg, "no such file") &&
+				!strings.Contains(msg, "cannot change to") &&
+				!strings.Contains(msg, "not a git repository") {
 				errs = append(errs, fmt.Sprintf("git worktree remove: %v", err))
 			}
 		}
@@ -468,8 +470,13 @@ func releaseIntegrateWorktree(repoPath, tmpWT string) error {
 	}
 	if repoPath != "" {
 		if _, err := runGitRepo(context.Background(), repoPath, "worktree", "prune"); err != nil {
-			// Prune failures after successful remove are still durable cleanup errors.
-			errs = append(errs, fmt.Sprintf("git worktree prune: %v", err))
+			msg := strings.ToLower(err.Error())
+			// Missing/non-git parent is soft (same as remove); real prune failures remain hard.
+			if !strings.Contains(msg, "no such file") &&
+				!strings.Contains(msg, "cannot change to") &&
+				!strings.Contains(msg, "not a git repository") {
+				errs = append(errs, fmt.Sprintf("git worktree prune: %v", err))
+			}
 		}
 	}
 	if len(errs) == 0 {

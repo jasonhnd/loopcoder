@@ -935,19 +935,6 @@ func mergePayloadStringMap(dst, src map[string]string) map[string]string {
 	return dst
 }
 
-// processStartFromResult rebuilds ProcessStart from ChildExecResult spawn fields.
-func processStartFromResult(out ChildExecResult) ProcessStart {
-	return ProcessStart{
-		PID:                   out.ProcessPID,
-		PGID:                  out.ProcessPGID,
-		ProcessBirthIdentity:  out.ProcessBirthIdentity,
-		ExecutableIdentity:    out.ExecutableIdentity,
-		ObservedAt:            out.ProcessObservedAt,
-		IdentityAmbiguous:     out.IdentityAmbiguous,
-		IdentityAmbiguityNote: out.IdentityAmbiguityNote,
-	}
-}
-
 // productOutputDigest hashes actual changed product paths/content under the
 // worktree (excluding .loopcoder audit stubs and ownership markers). Empty when
 // no useful product change exists — cannot become successful evidence.
@@ -1236,9 +1223,11 @@ func gitWorktreeListContains(repoPath, wtPath string) (bool, error) {
 	cmd := exec.Command("git", "-C", repoPath, "worktree", "list", "--porcelain")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		// No git repo / not a worktree parent — treat as not registered.
-		if strings.Contains(string(out), "not a git repository") ||
-			strings.Contains(err.Error(), "not a git repository") {
+		// No git repo / not a worktree parent / missing path — treat as not registered.
+		msg := strings.ToLower(string(out) + err.Error())
+		if strings.Contains(msg, "not a git repository") ||
+			strings.Contains(msg, "no such file") ||
+			strings.Contains(msg, "cannot change to") {
 			return false, nil
 		}
 		return false, fmt.Errorf("%v: %s", err, out)

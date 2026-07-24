@@ -165,14 +165,25 @@ func ensurePackageGrokAuth(t *testing.T) {
 	t.Helper()
 	// Prefer explicit GROK_HOME so hostile HOME isolation tests remain valid.
 	if gh := os.Getenv("GROK_HOME"); gh != "" {
-		if _, err := os.Stat(filepath.Join(gh, "auth.json")); err == nil {
-			return
+		if _, err := os.Stat(filepath.Join(gh, "auth.json")); err != nil {
+			dir := t.TempDir()
+			writeTestGrokAuthFile(t, filepath.Join(dir, "auth.json"), "xai-package-default-token", "prin-package-default")
+			t.Setenv("GROK_HOME", dir)
 		}
+	} else {
+		dir := t.TempDir()
+		// AuthPath(GROK_HOME) → GROK_HOME/auth.json (not .grok subdir).
+		writeTestGrokAuthFile(t, filepath.Join(dir, "auth.json"), "xai-package-default-token", "prin-package-default")
+		t.Setenv("GROK_HOME", dir)
 	}
-	dir := t.TempDir()
-	// AuthPath(GROK_HOME) → GROK_HOME/auth.json (not .grok subdir).
-	writeTestGrokAuthFile(t, filepath.Join(dir, "auth.json"), "xai-package-default-token", "prin-package-default")
-	t.Setenv("GROK_HOME", dir)
+	// Install identity requires a resolvable grok binary (CI runners may not have one).
+	// Prefer existing stub/absolute grokCommand; otherwise create a fake and stub.
+	if _, err := exec.LookPath(grokCommand); err != nil {
+		exe := filepath.Join(t.TempDir(), "grok")
+		writeFakeGrokExecutable(t, exe)
+		restore := stubGrokCommand(t, exe)
+		t.Cleanup(restore)
+	}
 }
 
 func writeTestGrokAuth(t *testing.T, home, token, principal string) {

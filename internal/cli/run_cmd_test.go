@@ -61,9 +61,6 @@ func (a affirmingRunner) Run(ctx context.Context, inv agent.Invocation) (agent.R
 	}, nil
 }
 
-// fixtureRunner remains as an alias for legacy tests that still inject it.
-type fixtureRunner = affirmingRunner
-
 // testDeliveryDeps injects explicit Fake* ports for black-box run tests.
 // Production never auto-wires these; tests must inject.
 func testDeliveryDeps(t *testing.T, now func() time.Time, baseSHA string) *directdelivery.Deps {

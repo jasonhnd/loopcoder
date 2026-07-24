@@ -65,7 +65,7 @@ func TestToRouteInventoryPermissionAwareAntigravity(t *testing.T) {
 	// Read-only resolve must not select antigravity.
 	resRO, err := autoroute.Resolve(autoroute.Input{
 		AutoRoute: true, Permission: "read-only", ProjectID: "p",
-		DecisionKey: "ro-1", Inventory: &inv, Now: now,
+		TaskClass: "luna", DecisionKey: "ro-1", Inventory: &inv, Now: now,
 	})
 	if err != nil {
 		t.Fatalf("read-only resolve: %v", err)
@@ -79,7 +79,7 @@ func TestToRouteInventoryPermissionAwareAntigravity(t *testing.T) {
 	// Write resolve must select account-affirmable provider (codex), not antigravity.
 	resW, err := autoroute.Resolve(autoroute.Input{
 		AutoRoute: true, Permission: "bounded_write", ProjectID: "p",
-		DecisionKey: "w-1", Inventory: &inv, Now: now,
+		TaskClass: "tera", DecisionKey: "w-1", Inventory: &inv, Now: now,
 	})
 	if err != nil {
 		t.Fatalf("write resolve: %v", err)
@@ -171,7 +171,7 @@ func TestToRouteInventoryExcludesExhaustedAndStaleRoutes(t *testing.T) {
 	}
 	res, err := autoroute.Resolve(autoroute.Input{
 		AutoRoute: true, Permission: "bounded_write", Effort: "medium",
-		ProjectID: "p", DecisionKey: "excl-1", Inventory: &inv, Now: now,
+		TaskClass: "tera", ProjectID: "p", DecisionKey: "excl-1", Inventory: &inv, Now: now,
 	})
 	// Exhausted codex + stale gemini + AG (no account affirm) → no eligible route.
 	if err == nil && res.Outcome == autoroute.OutcomeSelected {
@@ -237,7 +237,7 @@ func TestToRouteInventoryEmitsPerSupportedDepth(t *testing.T) {
 	for _, depth := range []string{"low", "high"} {
 		res, err := autoroute.Resolve(autoroute.Input{
 			AutoRoute: true, Permission: "read-only", Effort: depth,
-			ProjectID: "p", DecisionKey: "d-" + depth, Inventory: &inv, Now: now,
+			TaskClass: "luna", ProjectID: "p", DecisionKey: "d-" + depth, Inventory: &inv, Now: now,
 		})
 		if err != nil {
 			t.Fatalf("resolve depth=%s: %v", depth, err)
@@ -249,7 +249,7 @@ func TestToRouteInventoryEmitsPerSupportedDepth(t *testing.T) {
 	// Unsupported depth fails closed.
 	_, err = autoroute.Resolve(autoroute.Input{
 		AutoRoute: true, Permission: "read-only", Effort: "xhigh",
-		ProjectID: "p", DecisionKey: "d-xhigh", Inventory: &inv, Now: now,
+		TaskClass: "luna", ProjectID: "p", DecisionKey: "d-xhigh", Inventory: &inv, Now: now,
 	})
 	if err == nil {
 		t.Fatal("expected fail-closed for unsupported xhigh")
@@ -321,7 +321,7 @@ func TestToRouteInventorySoftBindsHighestRemainingWindow(t *testing.T) {
 	// for capacity-bound product routes (codex should win write instead).
 	res, err := autoroute.Resolve(autoroute.Input{
 		AutoRoute: true, Permission: "bounded_write", Effort: "medium",
-		ProjectID: "p", DecisionKey: "mp-soft-1", Inventory: &inv, Now: now,
+		TaskClass: "tera", ProjectID: "p", DecisionKey: "mp-soft-1", Inventory: &inv, Now: now,
 	})
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
