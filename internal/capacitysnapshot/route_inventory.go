@@ -174,6 +174,10 @@ func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 					winKind = bestKind
 				}
 			}
+			// One canonical route window identity for hard eligibility and soft
+			// ranking (RC34 #1397: fixed-week vs weekly identity split → no_route).
+			// Empty stays empty — never invent five_hour/weekly.
+			winKind = CanonicalRouteWindowKind(winKind)
 			accRef := strings.TrimSpace(a.AccountRef)
 			instRef := strings.TrimSpace(a.InstallRef)
 			// Runtime hard-eligibility: capacity reserve requires exact
@@ -247,7 +251,8 @@ func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 					cands = append(cands, rc)
 				}
 			}
-			// One soft row per account identity with exact window kind (never hardcode five_hour).
+			// One soft row per account identity. WindowKind already canonical —
+			// identical to hard candidates (never remap only on soft).
 			sc := quotapolicy.Candidate{
 				Provider: a.Provider, Model: m.ModelID,
 				AccountRef:          accRef,
@@ -257,29 +262,8 @@ func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 			}
 			if rem != nil {
 				rf := *rem
-				// Preserve exact observed kind — never invent five_hour for empty/unknown.
-				var wk quotapolicy.WindowKind
-				switch strings.ToLower(strings.TrimSpace(winKind)) {
-				case "weekly", "fixed-week", "fixed_week":
-					wk = quotapolicy.WindowWeekly
-				case "credit":
-					wk = quotapolicy.WindowCredit
-				case "five_hour", "fixed_hour", "fixed-hour", "5h":
-					wk = quotapolicy.WindowFiveHour
-				case "daily":
-					wk = quotapolicy.WindowOther
-				case "":
-					// Unknown/empty: leave sc.WindowKind empty; soft window Kind stays empty
-					// so production exact routing cannot treat it as five_hour.
-					wk = ""
-				default:
-					wk = quotapolicy.WindowKind(strings.ToLower(strings.TrimSpace(winKind)))
-				}
-				sc.WindowKind = string(wk)
-				if winKind != "" && sc.WindowKind == "" {
-					sc.WindowKind = strings.ToLower(strings.TrimSpace(winKind))
-					wk = quotapolicy.WindowKind(sc.WindowKind)
-				}
+				// winKind is already CanonicalRouteWindowKind; empty stays empty.
+				wk := quotapolicy.WindowKind(winKind)
 				win := quotapolicy.Window{
 					Kind: wk, RemainingFraction: &rf,
 					Evidence: confSoft,
@@ -318,6 +302,30 @@ func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 
 func capacitysnapshotRemainingOK(w Window) bool {
 	return RemainingFraction(w) != nil
+}
+
+// CanonicalRouteWindowKind maps an observed capacity window kind onto one
+// route-inventory identity token shared by hard eligibility candidates and
+// soft ranking candidates. Known aliases converge; empty stays empty (never
+// invent five_hour/weekly). Other nonempty kinds remain a normalized raw
+// token so hard and soft stay identical without inventing a fixed window.
+func CanonicalRouteWindowKind(raw string) string {
+	k := strings.ToLower(strings.TrimSpace(raw))
+	switch k {
+	case "":
+		return ""
+	case "weekly", "fixed-week", "fixed_week":
+		return "weekly"
+	case "five_hour", "fixed_hour", "fixed-hour", "5h":
+		return "five_hour"
+	case "credit":
+		return "credit"
+	case "daily":
+		// Preserve prior soft mapping (WindowOther) for daily buckets.
+		return "other"
+	default:
+		return k
+	}
 }
 
 // providerRuntimeAffirm is a thin alias of the single authoritative
