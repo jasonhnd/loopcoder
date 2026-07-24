@@ -104,6 +104,7 @@ func falseFact(id string) eligibility.Fact {
 func healthy(p, m string, cl capclass.Class) eligibility.Candidate {
 	return eligibility.Candidate{
 		Provider: p, Model: m, Effort: "high", Permission: "bounded_write", ModelClass: cl,
+		AccountRef: "acct-" + p, WindowKind: "five_hour",
 		Installed: okFact(p + "-i"), Authenticated: okFact(p + "-a"), ModelPresent: okFact(p + "-m"),
 		PermissionOK: okFact(p + "-p"), EffortOK: okFact(p + "-e"), Healthy: okFact(p + "-h"),
 		CooldownActive: falseFact(p + "-cd"), ResourceFit: okFact(p + "-r"), QuotaRemaining: 9999,
@@ -115,6 +116,7 @@ func soft(p, m string, rem float64, ttr time.Duration) quotapolicy.Candidate {
 	rel := 0.9
 	return quotapolicy.Candidate{
 		Provider: p, Model: m,
+		AccountRef: "acct-" + p, WindowKind: "five_hour",
 		Windows: []quotapolicy.Window{{
 			Kind: quotapolicy.WindowFiveHour, RemainingFraction: &rf,
 			Evidence: quotapolicy.EvidenceExact, TimeToReset: &d,

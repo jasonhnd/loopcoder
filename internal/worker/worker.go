@@ -95,8 +95,8 @@ type Result struct {
 	FallbackNeedsHuman bool   `json:"fallback_needs_human,omitempty"`
 	FallbackDecisionID string `json:"fallback_decision_id,omitempty"`
 	// FallbackCandidateID is the successor routing candidate when selected.
-	FallbackCandidateID string `json:"fallback_candidate_id,omitempty"`
-	DeliveryOutcome     string `json:"delivery_outcome,omitempty"`
+	FallbackCandidateID string                     `json:"fallback_candidate_id,omitempty"`
+	DeliveryOutcome     string                     `json:"delivery_outcome,omitempty"`
 	Evidence            []string                   `json:"evidence,omitempty"`
 	ExitCode            int                        `json:"exit_code"`
 	LogBytes            int64                      `json:"log_bytes"`
@@ -2311,6 +2311,12 @@ func persistProviderExecutionAuthority(ctx context.Context, dispatch *dispatchCo
 		OwnerID:         persisted.OwnerID,
 		ClaimGeneration: persisted.ClaimGeneration,
 	}
+	// Worker path has a live PID at Persist: advance spawn_phase to pid_event_persisted
+	// so normal Complete is legal (Persist alone leaves authority_persisted).
+	if err := storage.TransitionProviderExecutionSpawnPhase(ctx, dispatch.ownershipStore, *dispatch.providerAuthorityFence, startedAt, storage.SpawnPhasePIDEventPersisted); err != nil {
+		return fmt.Errorf("transition provider execution spawn_phase: %w", err)
+	}
+	persisted.SpawnPhase = storage.SpawnPhasePIDEventPersisted
 	dispatch.providerAuthority = persisted
 	return nil
 }

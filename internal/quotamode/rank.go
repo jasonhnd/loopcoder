@@ -38,9 +38,13 @@ type ModeRanking struct {
 }
 
 // AdjustedScore is one candidate after mode + reservation soft adjustment.
+// AccountRef/WindowKind are first-class scored identity.
 type AdjustedScore struct {
 	Provider         string   `json:"provider"`
 	Model            string   `json:"model"`
+	AccountRef       string   `json:"account_ref,omitempty"`
+	InstallRef       string   `json:"install_ref,omitempty"`
+	WindowKind       string   `json:"window_kind,omitempty"`
 	BaseSoftScore    float64  `json:"base_soft_score"`
 	AdjustedScore    float64  `json:"adjusted_score"`
 	ReservedFraction float64  `json:"reserved_fraction"`
@@ -98,6 +102,8 @@ func Rank(in RankInput) (ModeRanking, error) {
 		for _, sc := range base.Scores {
 			adj := AdjustedScore{
 				Provider: sc.Provider, Model: sc.Model,
+				AccountRef: sc.AccountRef, InstallRef: sc.InstallRef,
+				WindowKind:    firstNonEmpty(sc.WindowKind, string(sc.BindingWindow)),
 				BaseSoftScore: sc.SoftScore, AdjustedScore: sc.SoftScore,
 				SoftExcluded: sc.SoftExcluded, Reasons: append([]string{}, sc.Reasons...),
 			}
@@ -122,16 +128,22 @@ func Rank(in RankInput) (ModeRanking, error) {
 	}
 
 	for _, sc := range base.Scores {
+		winKind := firstNonEmpty(sc.WindowKind, string(sc.BindingWindow))
 		adj := AdjustedScore{
 			Provider: sc.Provider, Model: sc.Model,
+			AccountRef: sc.AccountRef, InstallRef: sc.InstallRef, WindowKind: winKind,
 			BaseSoftScore: sc.SoftScore, AdjustedScore: sc.SoftScore,
 			SoftExcluded: sc.SoftExcluded,
 			Reasons:      append([]string{}, sc.Reasons...),
 		}
-		wk := WindowKey{Provider: sc.Provider, Model: sc.Model, Window: sc.BindingWindow}
-		if wk.Window == "" {
-			wk.Window = quotapolicy.WindowFiveHour
+		wk := WindowKey{
+			Provider: sc.Provider, Model: sc.Model,
+			Account: sc.AccountRef, Window: sc.BindingWindow,
 		}
+		if wk.Window == "" && winKind != "" {
+			wk.Window = quotapolicy.WindowKind(winKind)
+		}
+		// Empty window stays empty — never invent five_hour for unknown/provider-defined.
 		var reserved float64
 		if in.Store != nil {
 			reserved = in.Store.ActiveFraction(wk)
@@ -168,7 +180,13 @@ func Rank(in RankInput) (ModeRanking, error) {
 		if out.Scores[i].Provider != out.Scores[j].Provider {
 			return out.Scores[i].Provider < out.Scores[j].Provider
 		}
-		return out.Scores[i].Model < out.Scores[j].Model
+		if out.Scores[i].Model != out.Scores[j].Model {
+			return out.Scores[i].Model < out.Scores[j].Model
+		}
+		if out.Scores[i].AccountRef != out.Scores[j].AccountRef {
+			return out.Scores[i].AccountRef < out.Scores[j].AccountRef
+		}
+		return out.Scores[i].WindowKind < out.Scores[j].WindowKind
 	})
 
 	out.Digest = digestJSON(struct {
@@ -177,4 +195,13 @@ func Rank(in RankInput) (ModeRanking, error) {
 		BaseDig string
 	}{out.Mode, out.Scores, base.Digest})
 	return out, nil
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }

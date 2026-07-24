@@ -1,6 +1,8 @@
 package capacitysnapshot
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"sort"
 	"strings"
 	"time"
@@ -9,33 +11,82 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 )
 
-// capabilityIsDynamicExactFresh reports a provider-machine-readable exact+fresh
-// observation. Adapter-declared static catalogs also use ConfidenceExact in
-// production — they must NOT match this predicate.
+// capabilityIsDynamicExactFresh reports a production-routable catalog row.
+// Fail closed: requires explicit source_kind=provider-machine-readable AND
+// confidence=exact AND freshness=fresh. Empty, unknown, estimated, stale, or
+// adapter-declared rows are never routable (no backward-compat empty fields).
 func capabilityIsDynamicExactFresh(m providerinventory.ModelCapability) bool {
-	if m.Confidence != providerinventory.ConfidenceExact {
-		return false
-	}
-	if m.FreshnessState == providerinventory.FreshnessStale ||
-		m.FreshnessState == providerinventory.FreshnessExpired ||
-		m.FreshnessState == providerinventory.FreshnessNotApplicable {
-		return false
-	}
-	// EntrySources is authoritative after catalog merge.
+	// EntrySources is the authoritative production-route gate when present.
 	for _, s := range m.EntrySources {
-		if s.SourceKind == providerinventory.CatalogSourceProviderMachineReadable &&
-			s.Confidence == providerinventory.ConfidenceExact &&
-			(s.FreshnessState == providerinventory.FreshnessFresh || s.FreshnessState == "") {
-			return true
+		if s.SourceKind != providerinventory.CatalogSourceProviderMachineReadable {
+			continue
 		}
+		if s.Confidence != providerinventory.ConfidenceExact {
+			continue
+		}
+		if s.FreshnessState != providerinventory.FreshnessFresh {
+			continue
+		}
+		return true
 	}
-	// Fallback: top-level Source.Kind when EntrySources empty (tests / partial rows).
+	// Partial rows with empty EntrySources: only when top-level Source.Kind,
+	// Confidence, and FreshnessState are all explicit machine-readable/exact/fresh.
 	if len(m.EntrySources) == 0 &&
 		(m.Source.Kind == string(providerinventory.CatalogSourceProviderMachineReadable) ||
-			m.Source.Kind == "provider-machine-readable") {
-		return m.FreshnessState == providerinventory.FreshnessFresh || m.FreshnessState == ""
+			m.Source.Kind == "provider-machine-readable") &&
+		m.Confidence == providerinventory.ConfidenceExact &&
+		m.FreshnessState == providerinventory.FreshnessFresh {
+		return true
 	}
 	return false
+}
+
+// opaqueAccountRef returns the exact opaque account binding for a full non-secret
+// account profile id. Never truncates. Empty → "" (unknown / non-routable).
+// Full "acct-"+64hex is preserved; otherwise SHA-256 of the full material.
+func opaqueAccountRef(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if strings.HasPrefix(raw, "acct-") && len(raw) == 5+64 && isHexLowerOrUpper(raw[5:]) {
+		return strings.ToLower(raw)
+	}
+	sum := sha256.Sum256([]byte("acct|" + raw))
+	return "acct-" + hex.EncodeToString(sum[:])
+}
+
+func isHexLowerOrUpper(s string) bool {
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
+			return false
+		}
+	}
+	return len(s) > 0
+}
+
+// exactInstallRef returns the full ProviderInstallationID with no truncation.
+func exactInstallRef(id string) string {
+	return strings.TrimSpace(id)
+}
+
+// accountSegmentFromScope extracts the exact "account:" segment from a ScopeKey
+// such as "provider:grok/account:X/detail:credits_usage". Never hashes the whole scope.
+func accountSegmentFromScope(scopeKey string) string {
+	scopeKey = strings.TrimSpace(scopeKey)
+	if scopeKey == "" {
+		return ""
+	}
+	for _, part := range strings.Split(scopeKey, "/") {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "account:") {
+			acc := strings.TrimSpace(strings.TrimPrefix(part, "account:"))
+			if acc != "" {
+				return opaqueAccountRef(acc)
+			}
+		}
+	}
+	return ""
 }
 
 // FromProviderInventoryReport maps a live providerinventory.Report into AccountObservations.
@@ -45,40 +96,63 @@ func capabilityIsDynamicExactFresh(m providerinventory.ModelCapability) bool {
 //   - auth-ready and live model catalog are not capacity evidence
 //   - static model seed is estimated catalog only and does not create unattended eligibility
 //   - unattended eligibility still requires a real fresh usable capacity window
+//   - NEVER invent "acct-"+provider / "install-"+provider / "account-unknown"
+//   - group by provider × account × install (not collapse all accounts of one provider)
+//   - Join only through explicit provider/account/install IDs; ScopeKey only as
+//     validated fallback extracting the exact account: segment (never whole scope)
+//   - No truncation of AccountRef / InstallRef / ProviderInstallationID
+//   - Deterministic joins (sorted keys); unknown joins stay unknown/non-routable
 func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []AccountObservation {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	// Group by adapter_id
 	type builder struct {
 		in AccountInput
 	}
 	by := map[string]*builder{}
-
-	ensure := func(provider string) *builder {
+	groupKey := func(provider, account, install string) string {
+		return strings.ToLower(strings.TrimSpace(provider)) + "|" +
+			strings.TrimSpace(account) + "|" + strings.TrimSpace(install)
+	}
+	ensure := func(provider, account, install string) *builder {
 		provider = strings.ToLower(strings.TrimSpace(provider))
+		account = strings.TrimSpace(account)
+		install = strings.TrimSpace(install)
 		if provider == "" {
 			provider = "unknown"
 		}
-		if b, ok := by[provider]; ok {
+		k := groupKey(provider, account, install)
+		if b, ok := by[k]; ok {
 			return b
 		}
 		b := &builder{in: AccountInput{
 			Provider:         provider,
-			AccountRef:       "acct-" + provider,
-			InstallRef:       "install-" + provider,
+			AccountRef:       account,
+			InstallRef:       install,
 			HealthConfidence: ConfidenceUnknown,
 			HealthFreshness:  FreshnessUnknown,
 			Source:           "providerinventory",
 			CapturedAt:       now,
 			Provenance:       "inventory_fingerprint=" + rep.InventoryFingerprint,
 		}}
-		by[provider] = b
+		by[k] = b
 		return b
 	}
+	// Full install identity — never shortRef / never invent install-+provider.
+	installRefOf := func(inst providerinventory.ProviderInstallation) string {
+		return exactInstallRef(inst.ProviderInstallationID)
+	}
+	// Explicit install-id → sorted list of group keys for deterministic rebind.
+	installKeys := map[string][]string{} // installRef -> group keys
 
-	for _, inst := range rep.Installations {
-		b := ensure(inst.AdapterID)
+	// Sort installations for deterministic processing.
+	installs := append([]providerinventory.ProviderInstallation(nil), rep.Installations...)
+	sort.SliceStable(installs, func(i, j int) bool {
+		return installs[i].ProviderInstallationID < installs[j].ProviderInstallationID
+	})
+	for _, inst := range installs {
+		iref := installRefOf(inst)
+		b := ensure(inst.AdapterID, "", iref)
 		if inst.InstallationState == providerinventory.InstallationInstalled {
 			b.in.Installed = true
 		}
@@ -93,10 +167,54 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 		if inst.UsableForInvocation == "yes" || inst.UsableForInvocation == "true" {
 			b.in.Healthy = true
 		}
+		if iref != "" {
+			b.in.InstallRef = iref
+			k := groupKey(b.in.Provider, b.in.AccountRef, iref)
+			installKeys[iref] = append(installKeys[iref], k)
+		}
 	}
 
-	for _, auth := range rep.AuthReadiness {
-		b := ensure(auth.AdapterID)
+	// Auth readiness: bind by explicit AccountProfileID only (full opaque, no truncate).
+	// Link to install only when Auth has explicit ProviderInstallationID.
+	auths := append([]providerinventory.AuthReadiness(nil), rep.AuthReadiness...)
+	sort.SliceStable(auths, func(i, j int) bool {
+		ai, aj := "", ""
+		if auths[i].AccountProfileID != nil {
+			ai = *auths[i].AccountProfileID
+		}
+		if auths[j].AccountProfileID != nil {
+			aj = *auths[j].AccountProfileID
+		}
+		if ai != aj {
+			return ai < aj
+		}
+		return auths[i].AdapterID < auths[j].AdapterID
+	})
+	// account → install explicit links from auth when present.
+	accountToInstalls := map[string][]string{} // accountRef -> installRefs
+	for _, auth := range auths {
+		acc := ""
+		if auth.AccountProfileID != nil {
+			acc = opaqueAccountRef(*auth.AccountProfileID)
+		}
+		iref := ""
+		if auth.ProviderInstallationID != nil {
+			iref = exactInstallRef(*auth.ProviderInstallationID)
+		}
+		// Only join through explicit install ID. Never first-map-iteration merge.
+		b := ensure(auth.AdapterID, acc, iref)
+		if acc != "" && iref != "" {
+			// Re-key install-only row into account+install if present.
+			emptyKey := groupKey(strings.ToLower(strings.TrimSpace(auth.AdapterID)), "", iref)
+			if existing, ok := by[emptyKey]; ok && emptyKey != groupKey(b.in.Provider, acc, iref) {
+				existing.in.AccountRef = acc
+				delete(by, emptyKey)
+				nk := groupKey(existing.in.Provider, acc, iref)
+				by[nk] = existing
+				b = existing
+			}
+			accountToInstalls[acc] = appendUniqueSorted(accountToInstalls[acc], iref)
+		}
 		if auth.ReadinessState == providerinventory.ReadinessReady {
 			b.in.Authenticated = true
 			b.in.Healthy = true
@@ -107,51 +225,94 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 				b.in.HealthConfidence = ConfidenceEstimated
 			}
 		}
-		if auth.AccountProfileID != nil && strings.TrimSpace(*auth.AccountProfileID) != "" {
-			// Redacted account profile id only (no secrets).
-			b.in.AccountRef = "acct-" + shortRef(*auth.AccountProfileID)
+		if acc != "" {
+			b.in.AccountRef = acc
+		}
+		if iref != "" {
+			b.in.InstallRef = iref
 		}
 	}
 
-	// Production routes prefer provider-machine-readable exact+fresh catalog
-	// rows (EntrySources / Source.Kind). Adapter-declared static catalogs also
-	// carry ConfidenceExact+FreshnessFresh in production — Confidence alone is
-	// not enough to distinguish them.
+	// Dynamic catalog: bind by installation/account scope when ModelCapability
+	// carries explicit IDs; otherwise replicate only to explicitly linked accounts.
 	liveModels := map[string]bool{}
-	// Adapters that have at least one machine-readable exact+fresh capability.
 	dynamicExactAdapters := map[string]bool{}
 	for _, m := range rep.ModelCapabilities {
 		if capabilityIsDynamicExactFresh(m) {
 			dynamicExactAdapters[strings.ToLower(strings.TrimSpace(m.AdapterID))] = true
 		}
 	}
-	// Also mark from ModelCatalogSnapshots when present (stronger source of truth).
 	for _, snap := range rep.ModelCatalogSnapshots {
 		if snap.CatalogSourceKind == providerinventory.CatalogSourceProviderMachineReadable &&
 			snap.Confidence == providerinventory.ConfidenceExact &&
-			(snap.FreshnessState == providerinventory.FreshnessFresh || snap.FreshnessState == "") {
+			snap.FreshnessState == providerinventory.FreshnessFresh {
 			dynamicExactAdapters[strings.ToLower(strings.TrimSpace(snap.AdapterID))] = true
 		}
 	}
+	// modelIdx is per-builder (provider|account|install|model), not provider-global.
 	modelIdx := map[string]int{}
-	// Prefer dynamic machine-readable rows first, then static-only adapters.
 	caps := append([]providerinventory.ModelCapability(nil), rep.ModelCapabilities...)
 	sort.SliceStable(caps, func(i, j int) bool {
 		di, dj := capabilityIsDynamicExactFresh(caps[i]), capabilityIsDynamicExactFresh(caps[j])
 		if di != dj {
 			return di && !dj
 		}
-		return false
+		if caps[i].AdapterID != caps[j].AdapterID {
+			return caps[i].AdapterID < caps[j].AdapterID
+		}
+		return caps[i].CanonicalModelID < caps[j].CanonicalModelID
 	})
+	// Collect builder keys sorted for deterministic replication targets.
+	builderKeysForProvider := func(adapter string) []string {
+		adapter = strings.ToLower(strings.TrimSpace(adapter))
+		var keys []string
+		for k, b := range by {
+			if strings.EqualFold(b.in.Provider, adapter) && strings.TrimSpace(b.in.AccountRef) != "" {
+				keys = append(keys, k)
+			}
+		}
+		sort.Strings(keys)
+		return keys
+	}
+	attachModel := func(b *builder, m providerinventory.ModelCapability, dynamic, hintOnly bool, spec modelDepthSpec) {
+		if b == nil {
+			return
+		}
+		key := groupKey(b.in.Provider, b.in.AccountRef, b.in.InstallRef) + "|" + strings.ToLower(spec.ModelID)
+		if idx, ok := modelIdx[key]; ok && idx >= 0 && idx < len(b.in.Models) {
+			mergeModelSpec(&b.in.Models[idx], spec)
+			if hintOnly {
+				b.in.Models[idx].CatalogHintOnly = true
+			}
+		} else {
+			modelIdx[key] = len(b.in.Models)
+			b.in.Models = append(b.in.Models, ModelSpec{
+				ModelID: spec.ModelID, Present: true,
+				SupportedDepths: append([]string(nil), spec.SupportedDepths...),
+				DefaultDepth:    spec.DefaultDepth,
+				CatalogHintOnly: hintOnly,
+			})
+		}
+		if !hintOnly {
+			liveKey := strings.ToLower(m.AdapterID) + "|" + strings.ToLower(spec.ModelID)
+			liveModels[liveKey] = true
+			liveModels[strings.ToLower(m.AdapterID)+"|"+strings.ToLower(m.CanonicalModelID)] = true
+			if slug := slugifyModelName(spec.ModelID); slug != "" {
+				liveModels[strings.ToLower(m.AdapterID)+"|"+slug] = true
+			}
+		}
+	}
 	for _, m := range caps {
-		b := ensure(m.AdapterID)
 		adapterKey := strings.ToLower(strings.TrimSpace(m.AdapterID))
 		dynamic := capabilityIsDynamicExactFresh(m)
-		// When this adapter has dynamic exact catalog, only route those rows —
-		// adapter-declared static (even ConfidenceExact) is not observed live.
 		if dynamicExactAdapters[adapterKey] && !dynamic {
-			b.in.Provenance = strings.TrimSpace(b.in.Provenance +
-				"; adapter_declared_static_suppressed=dynamic_machine_readable_present")
+			// Suppress static for adapters with dynamic catalog (record on any linked row).
+			for _, k := range builderKeysForProvider(m.AdapterID) {
+				if b := by[k]; b != nil {
+					b.in.Provenance = strings.TrimSpace(b.in.Provenance +
+						"; adapter_declared_static_suppressed=dynamic_machine_readable_present")
+				}
+			}
 			continue
 		}
 		present := m.CanonicalModelID != "" &&
@@ -162,62 +323,108 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 			m.FreshnessState == providerinventory.FreshnessStale {
 			present = false
 		}
-		// Static-only path: still present but not "fresh observed" for production
-		// multi-provider acceptance when no dynamic catalog exists — estimated seed
-		// may fill later via seedStaticModelsEstimated.
-		if !dynamic && dynamicExactAdapters[adapterKey] {
-			present = false
-		}
-		spec := modelSpecFromCapability(m.AdapterID, m)
+		hintOnly := !dynamic
+		spec := modelSpecFromCapability(m.AdapterID, m, dynamic)
 		if present && strings.EqualFold(m.AdapterID, "codex") &&
 			(strings.EqualFold(m.CanonicalModelID, "gpt-5.3-codex") || strings.EqualFold(spec.ModelID, "gpt-5.3-codex")) {
 			present = false
-			b.in.Provenance = strings.TrimSpace(b.in.Provenance +
+			// Provenance recorded on all builders for this adapter after loop via
+			// targets; mark here on a temporary provider row so tests observe it.
+			tmp := ensure(m.AdapterID, "", "")
+			tmp.in.Provenance = strings.TrimSpace(tmp.in.Provenance +
 				"; model_excluded=gpt-5.3-codex reason=chatgpt_account_incompatible")
 		}
 		if !present || strings.TrimSpace(spec.ModelID) == "" {
 			continue
 		}
-		key := strings.ToLower(m.AdapterID) + "|" + strings.ToLower(spec.ModelID)
-		if idx, ok := modelIdx[key]; ok && idx >= 0 && idx < len(b.in.Models) {
-			mergeModelSpec(&b.in.Models[idx], spec)
+		// ModelCapability has no install/account fields; bind via catalog snapshot
+		// when ModelCatalogSnapshotID is known, else replicate only to explicitly
+		// linked accounts for this adapter (deterministic sorted keys).
+		var targets []*builder
+		var snapInstall, snapAccount string
+		for _, snap := range rep.ModelCatalogSnapshots {
+			if snap.ModelCatalogSnapshotID != m.ModelCatalogSnapshotID {
+				continue
+			}
+			if snap.ProviderInstallationID != nil {
+				snapInstall = exactInstallRef(*snap.ProviderInstallationID)
+			}
+			if snap.AccountProfileID != nil {
+				snapAccount = opaqueAccountRef(*snap.AccountProfileID)
+			}
+			break
+		}
+		if snapInstall != "" || snapAccount != "" {
+			if snapAccount != "" && snapInstall != "" {
+				targets = append(targets, ensure(m.AdapterID, snapAccount, snapInstall))
+			} else if snapAccount != "" {
+				if irefs := accountToInstalls[snapAccount]; len(irefs) > 0 {
+					for _, ir := range irefs {
+						targets = append(targets, ensure(m.AdapterID, snapAccount, ir))
+					}
+				} else {
+					targets = append(targets, ensure(m.AdapterID, snapAccount, ""))
+				}
+			} else {
+				// Install-scoped: only accounts explicitly linked to this install.
+				for accRef, irefs := range accountToInstalls {
+					for _, ir := range irefs {
+						if ir == snapInstall {
+							targets = append(targets, ensure(m.AdapterID, accRef, snapInstall))
+						}
+					}
+				}
+				if len(targets) == 0 {
+					targets = append(targets, ensure(m.AdapterID, "", snapInstall))
+				}
+			}
 		} else {
-			modelIdx[key] = len(b.in.Models)
-			b.in.Models = append(b.in.Models, ModelSpec{
-				ModelID: spec.ModelID, Present: true,
-				SupportedDepths: append([]string(nil), spec.SupportedDepths...),
-				DefaultDepth:    spec.DefaultDepth,
-			})
+			for _, k := range builderKeysForProvider(m.AdapterID) {
+				targets = append(targets, by[k])
+			}
+			if len(targets) == 0 {
+				targets = append(targets, ensure(m.AdapterID, "", ""))
+			}
 		}
-		liveModels[key] = true
-		liveModels[strings.ToLower(m.AdapterID)+"|"+strings.ToLower(m.CanonicalModelID)] = true
-		if slug := slugifyModelName(spec.ModelID); slug != "" {
-			liveModels[strings.ToLower(m.AdapterID)+"|"+slug] = true
-		}
-		if peel := peelBaseName(spec.ModelID); peel != "" {
-			liveModels[strings.ToLower(m.AdapterID)+"|"+strings.ToLower(peel)] = true
-			liveModels[strings.ToLower(m.AdapterID)+"|"+slugifyModelName(peel)] = true
+		for _, b := range targets {
+			if b == nil {
+				continue
+			}
+			if hintOnly {
+				b.in.Provenance = strings.TrimSpace(b.in.Provenance +
+					"; catalog_hint_only=non_machine_readable model=" + spec.ModelID)
+			}
+			attachModel(b, m, dynamic, hintOnly, spec)
 		}
 	}
 
-	// Quota windows — only real observations with known confidence/freshness.
-	// Unavailable/unsupported snapshots must not become finite/unlimited windows.
-	for _, q := range rep.QuotaSnapshots {
+	// Quota: join via AccountProfileID + ProviderInstallationID only.
+	// ScopeKey fallback extracts exact account: segment — never whole-scope hash.
+	quotas := append([]providerinventory.QuotaSnapshot(nil), rep.QuotaSnapshots...)
+	sort.SliceStable(quotas, func(i, j int) bool {
+		return quotas[i].QuotaSnapshotID < quotas[j].QuotaSnapshotID
+	})
+	for _, q := range quotas {
 		provider := strings.ToLower(strings.TrimSpace(q.AdapterID))
-		if provider == "" {
-			// try scope key
-			provider = strings.ToLower(strings.TrimSpace(q.ScopeKey))
+		acc := ""
+		if q.AccountProfileID != nil {
+			acc = opaqueAccountRef(*q.AccountProfileID)
 		}
-		b := ensure(provider)
-		// Explicitly refuse unavailable/not-applicable snapshots as usable capacity.
+		if acc == "" {
+			acc = accountSegmentFromScope(q.ScopeKey)
+		}
+		iref := ""
+		if q.ProviderInstallationID != nil {
+			iref = exactInstallRef(*q.ProviderInstallationID)
+		}
+		// Unknown join stays unknown/non-routable — do not first-map-pick another account.
+		b := ensure(provider, acc, iref)
 		if q.Confidence == providerinventory.ConfidenceUnavailable ||
 			q.FreshnessState == providerinventory.FreshnessNotApplicable {
 			b.in.Provenance = strings.TrimSpace(b.in.Provenance +
 				"; quota_observation=unsupported_or_unavailable")
 			continue
 		}
-		// Require at least one of remaining/used/limit to be observed; pure empty
-		// snapshots with unknown confidence are not capacity evidence.
 		if q.RemainingValue == nil && q.UsedValue == nil && q.LimitValue == nil {
 			b.in.Provenance = strings.TrimSpace(b.in.Provenance +
 				"; quota_observation=no_numeric_fields")
@@ -227,12 +434,18 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 		if unit == UnitUnknown {
 			unit = unitFromQuantityKind(string(q.QuantityKind))
 		}
+		// Apply ValueScale before typed quantities (e.g. Grok scale=2 stores
+		// hundredths of a percent: 6900 → 69.00, never 6900%).
+		scale := q.ValueScale
+		if scale < 0 {
+			scale = 0
+		}
 		w := Window{
 			Kind:       string(q.WindowKind),
 			Unit:       unit,
-			Used:       qtyFromPtr(q.UsedValue, unit),
-			Remaining:  qtyFromPtr(q.RemainingValue, unit),
-			Limit:      qtyFromPtr(q.LimitValue, unit),
+			Used:       qtyFromPtrScaled(q.UsedValue, scale, unit),
+			Remaining:  qtyFromPtrScaled(q.RemainingValue, scale, unit),
+			Limit:      qtyFromPtrScaled(q.LimitValue, scale, unit),
 			Confidence: mapPIConfidence(q.Confidence),
 			Freshness:  mapPIFreshness(q.FreshnessState),
 			Source:     string(q.SourceKind),
@@ -244,39 +457,70 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 				w.ResetAt = &tt
 			}
 		}
+		// StaleAfter must not outlive an earlier ResetAt: if provider reports
+		// StaleAfter after ResetAt, clamp freshness via reset boundary.
+		if q.StaleAfter != "" && w.ResetAt != nil {
+			if st, err := time.Parse(time.RFC3339, q.StaleAfter); err == nil {
+				st = st.UTC()
+				if st.After(*w.ResetAt) {
+					// Observation cannot remain "fresh" past reset.
+					if w.Freshness == FreshnessFresh && now.After(*w.ResetAt) {
+						w.Freshness = FreshnessStale
+					}
+					// Provenance note only — Window has no StaleAfter field.
+					b.in.Provenance = strings.TrimSpace(b.in.Provenance +
+						"; stale_after_clamped_to_reset_at")
+				}
+			}
+		}
 		b.in.Windows = append(b.in.Windows, w)
 	}
 
-	out := make([]AccountObservation, 0, len(by))
-	for _, b := range by {
-		// Health freshness fill is not capacity.
+	// Deterministic output order: sort keys.
+	keys := make([]string, 0, len(by))
+	for k := range by {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]AccountObservation, 0, len(keys))
+	for _, k := range keys {
+		b := by[k]
 		if b.in.Installed && b.in.Authenticated && b.in.Healthy && b.in.HealthFreshness == FreshnessUnknown {
 			b.in.HealthFreshness = FreshnessFresh
 			if b.in.HealthConfidence == ConfidenceUnknown {
 				b.in.HealthConfidence = ConfidenceEstimated
 			}
 		}
-		// Static model seed: estimated catalog only when live catalog has zero
-		// present models. Never creates capacity windows and never bypasses the
-		// requirement for fresh live catalog on final multi-provider acceptance
-		// (callers must still require live capability rows for RC acceptance).
-		if !hasPresentModel(b.in.Models) {
+		if !hasProductionRoutableModel(b.in.Models) {
 			seedStaticModelsEstimated(&b.in, liveModels)
 		}
-		// Prefer gpt-5.5 ordering among present models (capability preference).
 		if b.in.Provider == "codex" && len(b.in.Models) > 1 {
 			preferCodexDefaultModel(&b.in)
 		}
-		// CRITICAL: do NOT inject unlimited/full/zero remaining when windows empty.
-		// Missing/unsupported quota ⇒ empty windows ⇒ unattended ineligible.
 		out = append(out, FromAccountInput(b.in))
 	}
 	return out
 }
 
-func hasPresentModel(models []ModelSpec) bool {
+func appendUniqueSorted(ss []string, v string) []string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return ss
+	}
+	for _, s := range ss {
+		if s == v {
+			return ss
+		}
+	}
+	ss = append(ss, v)
+	sort.Strings(ss)
+	return ss
+}
+
+// hasProductionRoutableModel reports a present, non-hint catalog model.
+func hasProductionRoutableModel(models []ModelSpec) bool {
 	for _, m := range models {
-		if m.Present && strings.TrimSpace(m.ModelID) != "" {
+		if m.Present && !m.CatalogHintOnly && strings.TrimSpace(m.ModelID) != "" {
 			return true
 		}
 	}
@@ -305,7 +549,9 @@ func preferCodexDefaultModel(in *AccountInput) {
 }
 
 // seedStaticModelsEstimated adds static registry models as estimated catalog
-// hints only. Does not invent capacity. Does not claim live freshness.
+// hints only (CatalogHintOnly=true). Does not invent capacity, does not claim
+// live freshness, and must never enter production auto-route — even when the
+// account has real quota windows.
 func seedStaticModelsEstimated(in *AccountInput, live map[string]bool) {
 	if in == nil {
 		return
@@ -350,9 +596,11 @@ func seedStaticModelsEstimated(in *AccountInput, live map[string]bool) {
 		in.Models = append(in.Models, ModelSpec{
 			ModelID: m.Name, Present: true,
 			SupportedDepths: depths, DefaultDepth: def,
+			CatalogHintOnly: true,
 		})
 	}
-	in.Provenance = strings.TrimSpace(in.Provenance + "; models_source=static_registry_estimated")
+	in.Provenance = strings.TrimSpace(in.Provenance +
+		"; models_source=static_registry_estimated; catalog_hint_only=static_seed_non_routable")
 }
 
 func mapPIConfidence(c providerinventory.Confidence) Confidence {
@@ -379,14 +627,26 @@ func mapPIFreshness(f providerinventory.FreshnessState) Freshness {
 	}
 }
 
-func qtyFromPtr(v *int64, unit CapacityUnit) Quantity {
+// qtyFromPtrScaled converts a scaled integer quantity into a typed Quantity.
+// scale N means the integer stores units of 10^-N (ValueScale=2 → divide by 100).
+// Never rounds to a fixed two-decimal presentation; the float64 holds the exact
+// decimal that the scaled integer represents (exact for scales used by providers).
+func qtyFromPtrScaled(v *int64, scale int, unit CapacityUnit) Quantity {
 	if v == nil {
 		return Quantity{Class: QtyUnknown, Unit: unit}
 	}
 	if *v == 0 {
 		return Quantity{Class: QtyZero, Value: 0, Unit: unit}
 	}
-	return Quantity{Class: QtyFinite, Value: float64(*v), Unit: unit}
+	val := float64(*v)
+	if scale > 0 {
+		denom := 1.0
+		for i := 0; i < scale; i++ {
+			denom *= 10
+		}
+		val = val / denom
+	}
+	return Quantity{Class: QtyFinite, Value: val, Unit: unit}
 }
 
 func unitFromQuantityKind(k string) CapacityUnit {
@@ -409,12 +669,4 @@ func parseTimeOr(s string, fallback time.Time) time.Time {
 		return t.UTC()
 	}
 	return fallback
-}
-
-func shortRef(id string) string {
-	id = strings.TrimSpace(id)
-	if len(id) <= 12 {
-		return id
-	}
-	return id[:12]
 }

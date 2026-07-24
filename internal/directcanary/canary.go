@@ -277,6 +277,7 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 		_, _ = eng.TryLaunch(ctx, directattempt.LaunchBundle{
 			AttemptID: attemptID, Route: fields, RouteDigest: pin.Digest,
 			WorktreePath: wtPath, BaseSHA: baseSHA, IdempotencyKey: "idem-worker-1",
+			Prompt:       "canary: implement bounded issue work",
 			StartEventID: env.EventID, StartDigest: env.ContentDigest, RequiredClient: "term",
 		})
 		// force cleanup terminal
@@ -321,6 +322,7 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 	a, err := eng.TryLaunch(ctx, directattempt.LaunchBundle{
 		AttemptID: attemptID, Route: fields, RouteDigest: pin.Digest,
 		WorktreePath: wtPath, BaseSHA: baseSHA, IdempotencyKey: "idem-worker-1",
+		Prompt:       "canary: implement bounded issue work",
 		StartEventID: env.EventID, StartDigest: env.ContentDigest, RequiredClient: "term",
 	})
 	if err != nil {

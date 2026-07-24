@@ -3,8 +3,8 @@ package goalrun_test
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -15,8 +15,99 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/capacitysnapshot"
 	"github.com/jasonhnd/loopcoder/internal/goalpr"
 	"github.com/jasonhnd/loopcoder/internal/goalrun"
+	"github.com/jasonhnd/loopcoder/internal/routecontract"
+	"github.com/jasonhnd/loopcoder/internal/workflowdef"
 	"github.com/jasonhnd/loopcoder/internal/workflowrun"
+	"github.com/jasonhnd/loopcoder/internal/workflowrun/testspawn"
+	"github.com/jasonhnd/loopcoder/internal/workgraph"
 )
+
+// initDisposableGitRepo creates a real git worktree parent for product/PR tests.
+// Fake /tmp path strings must not stand in for a registered git repo.
+func initDisposableGitRepo(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+	run("init")
+	run("checkout", "-b", "main")
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("disp\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "README.md")
+	run("commit", "-m", "init")
+	return dir
+}
+
+// childContractForGoal computes the canonical plan/graph/class/CCD/graphID that
+// goalrun will materialize for the same goal/issue/actor/project — used to seed
+// resume priors without rewriting historical identity at runtime.
+func childContractForGoal(t *testing.T, goal, issue, actor, projectID, workItemID string, now time.Time) (planDig, graphDig, class, ccd, outputContract, graphID string) {
+	t.Helper()
+	g, err := workgraph.DecomposeGoal(workgraph.DecomposeOptions{
+		Goal: goal, Issue: issue, Actor: actor, Now: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	def, err := workflowdef.FromGraph(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := workflowdef.Normalize(def)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ap, err := workflowdef.Approve(plan.Digest, actor, "test seed", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mat, err := workflowdef.NewRegistry().Materialize(projectID, def, ap, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	graphDig = workgraph.DigestGraph(mat.Graph)
+	graphID = mat.Graph.GraphID
+	var item workgraph.WorkItem
+	found := false
+	for _, it := range mat.Graph.Items {
+		if it.ID == workItemID {
+			item = it
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("work item %s not in graph", workItemID)
+	}
+	pr, err := routecontract.ParseRouteRequirement(item.RouteRequirement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	class = string(pr.Class)
+	ccd, err = routecontract.ChildContractDigest(routecontract.ChildAssignment{
+		ExecutionPlanDigest: plan.Digest,
+		WorkItemID:          workItemID,
+		TaskClass:           class,
+		Depth:               pr.Depth,
+		Permission:          pr.Permission,
+		OutputContract:      item.OutputContract,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plan.Digest, graphDig, class, ccd, item.OutputContract, graphID
+}
 
 func testHome(t *testing.T) string {
 	t.Helper()
@@ -31,17 +122,13 @@ func testHome(t *testing.T) string {
 }
 
 func TestExecuteDecomposesAndReportsChildren(t *testing.T) {
-	home := testHome(t)
+	now := time.Date(2026, 7, 22, 22, 0, 0, 0, time.UTC)
+	env := newProductEnv(t, now, "codex")
 	var reports bytes.Buffer
-	res, err := goalrun.Execute(context.Background(), goalrun.Request{
-		ProjectID: "proj", Goal: "implement transparent multi-child routing",
-		Issue: "1342", Actor: "owner", Owner: "worker",
-		Provider: "fixture", Model: "fixture-model",
-		ReportOut: &reports,
-		HomeDir:   home,
-		Executor:  workflowrun.FakeChildExecutor{HomeDir: home},
-		Now:       func() time.Time { return time.Date(2026, 7, 22, 22, 0, 0, 0, time.UTC) },
-	})
+	req := env.pinRequest("implement transparent multi-child routing", "1342")
+	req.ProjectID = "proj"
+	req.ReportOut = &reports
+	res, err := goalrun.Execute(context.Background(), req)
 	if res.GraphID == "" || res.PlanDigest == "" {
 		t.Fatalf("missing graph: %+v err=%v", res, err)
 	}
@@ -58,6 +145,9 @@ func TestExecuteDecomposesAndReportsChildren(t *testing.T) {
 		if strings.Contains(strings.ToLower(c.Intent), "provider_native") {
 			t.Fatal("provider-native intent leak")
 		}
+		if strings.EqualFold(c.Provider, "fixture") {
+			t.Fatalf("fixture provider forbidden: %+v", c)
+		}
 		if c.OutputEvidence == "" {
 			t.Fatalf("missing output evidence after real executor path: %+v", c)
 		}
@@ -71,6 +161,46 @@ func TestExecuteDecomposesAndReportsChildren(t *testing.T) {
 	if res.Workflow.LaunchCount < 4 {
 		t.Fatalf("workflow launches=%d", res.Workflow.LaunchCount)
 	}
+}
+
+func TestFixturePinFailsClosedBeforeAnyProductState(t *testing.T) {
+	// Forbidden product route must not touch Decompose / inventory / ledger / executor.
+	home := testHome(t)
+	decompN, invN, ledN, execN := 0, 0, 0, 0
+	_, err := goalrun.Execute(context.Background(), goalrun.Request{
+		ProjectID: "proj-fix", Goal: "should not run", Issue: "1", Actor: "owner",
+		Provider: "fixture", Model: "fixture-model",
+		HomeDir: home,
+		Now:     func() time.Time { return time.Date(2026, 7, 22, 22, 0, 0, 0, time.UTC) },
+		Decompose: func(opts workgraph.DecomposeOptions) (workgraph.Graph, error) {
+			decompN++
+			panic("Decompose must not run for fixture pin")
+		},
+		LoadInventory: func(ctx context.Context, repo string, at time.Time) (autoroute.Inventory, capacitysnapshot.Snapshot, error) {
+			invN++
+			panic("LoadInventory must not run for fixture pin")
+		},
+		OpenLedger: func(nowFn func() time.Time) (*capacityledger.Ledger, error) {
+			ledN++
+			panic("OpenLedger must not run for fixture pin")
+		},
+		Executor: countingPanicExecutor{n: &execN},
+	})
+	if err == nil || !strings.Contains(err.Error(), "fixture") {
+		t.Fatalf("fixture must fail closed before decompose: %v", err)
+	}
+	if decompN != 0 || invN != 0 || ledN != 0 || execN != 0 {
+		t.Fatalf("fixture must create zero product state: decomp=%d inv=%d led=%d exec=%d", decompN, invN, ledN, execN)
+	}
+}
+
+type countingPanicExecutor struct{ n *int }
+
+func (c countingPanicExecutor) Execute(ctx context.Context, in workflowrun.ChildExecInput) (workflowrun.ChildExecResult, error) {
+	if c.n != nil {
+		*c.n++
+	}
+	panic("Executor must not run")
 }
 
 func TestExecuteAutoRoutesChildrenWithCapacityAccounting(t *testing.T) {
@@ -94,9 +224,10 @@ func TestExecuteAutoRoutesChildrenWithCapacityAccounting(t *testing.T) {
 		}},
 		Source: "test", CapturedAt: now,
 	})
-	// Prefer Antigravity/Gemini as second company (not Claude-only).
-	gemini := capacitysnapshot.FromAccountInput(capacitysnapshot.AccountInput{
-		Provider: "gemini", AccountRef: "acct-gemini", InstallRef: "i-gemini",
+	// Second company must be account-affirmable (grok). Gemini/AG cannot affirm
+	// exact AccountRef and are hard-excluded from capacity-bound product routes.
+	grok := capacitysnapshot.FromAccountInput(capacitysnapshot.AccountInput{
+		Provider: "grok", AccountRef: "acct-grok", InstallRef: "i-grok",
 		Installed: true, Authenticated: true, Healthy: true,
 		HealthConfidence: capacitysnapshot.ConfidenceExact, HealthFreshness: capacitysnapshot.FreshnessFresh,
 		Windows: []capacitysnapshot.Window{{
@@ -108,11 +239,11 @@ func TestExecuteAutoRoutesChildrenWithCapacityAccounting(t *testing.T) {
 			ResetAt: ptrTime(now.Add(30 * time.Minute)), CapturedAt: now, Source: "test",
 		}},
 		Models: []capacitysnapshot.ModelSpec{{
-			ModelID: "gemini-2.5-pro", SupportedDepths: []string{"low", "medium", "high"}, DefaultDepth: "medium", Present: true,
+			ModelID: "grok-4.5", SupportedDepths: []string{"low", "medium", "high"}, DefaultDepth: "medium", Present: true,
 		}},
 		Source: "test", CapturedAt: now,
 	})
-	snap, err := capacitysnapshot.Build([]capacitysnapshot.AccountObservation{codex, gemini}, now)
+	snap, err := capacitysnapshot.Build([]capacitysnapshot.AccountObservation{codex, grok}, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,16 +341,12 @@ func TestUniqueProjectIDNeverLocalProject(t *testing.T) {
 
 func TestExecuteUsesUniqueProjectAndRunNotSharedLocal(t *testing.T) {
 	now := time.Date(2026, 7, 22, 21, 0, 0, 0, time.UTC)
-	home := testHome(t)
+	env := newProductEnv(t, now, "codex")
 	// Default ProjectID empty → UniqueProjectID, not local-project.
-	res, err := goalrun.Execute(context.Background(), goalrun.Request{
-		// ProjectID empty
-		Goal: "unique namespace canary", Issue: "1343", Actor: "owner",
-		Provider: "fixture", Model: "fixture-model",
-		HomeDir: home, RepoPath: "/tmp/disposable-repo-a",
-		Executor: workflowrun.FakeChildExecutor{HomeDir: home},
-		Now:      func() time.Time { return now },
-	})
+	req := env.pinRequest("unique namespace canary", "1343")
+	req.ProjectID = ""
+	req.RepoPath = initDisposableGitRepo(t)
+	res, err := goalrun.Execute(context.Background(), req)
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -403,31 +530,29 @@ func TestDryRunPreviewReleasesWithoutExecute(t *testing.T) {
 func ptrTime(t time.Time) *time.Time { return &t }
 
 func TestExecuteOpenPRFillsRealPREvidence(t *testing.T) {
-	home := testHome(t)
 	now := time.Date(2026, 7, 23, 7, 30, 0, 0, time.UTC)
+	env := newProductEnv(t, now, "codex")
 	var got goalpr.Request
-	res, err := goalrun.Execute(context.Background(), goalrun.Request{
-		ProjectID: "proj-pr", RunID: "run_pr_goal",
-		Goal: "implement transparent multi-child routing", Issue: "1343",
-		Actor: "owner", Owner: "worker",
-		Provider: "fixture", Model: "fixture-model",
-		HomeDir: home, RepoPath: "/tmp/disp-repo",
-		OpenPR: true, IndependentVerifier: "claude", VerifierEvidence: "sha256:v1",
-		RequiredCheckNames: []string{"verify", "test"},
-		Executor:           workflowrun.FakeChildExecutor{HomeDir: home, Now: func() time.Time { return now }},
-		Now:                func() time.Time { return now },
-		GoalPR: func(ctx context.Context, req goalpr.Request) (goalpr.Result, error) {
-			got = req
-			return goalpr.Result{
-				OK: true, Status: goalpr.StatusHumanGate,
-				URL: "https://github.com/owner/disp/pull/99", Number: 99,
-				Branch: "loopcoder/goal-run_pr_goal", BaseRef: "main",
-				RequiredChecks: req.RequiredCheckNames, RequiredChecksGreen: true,
-				IndependentVerifier: req.IndependentVerifier, VerifierEvidenceRef: req.VerifierEvidence,
-				CreatedByLoopCoder: true, HumanMergeGate: true, AutoMerge: false,
-			}, nil
-		},
-	})
+	req := env.pinRequest("implement transparent multi-child routing", "1343")
+	req.ProjectID = "proj-pr"
+	req.RunID = "run_pr_goal"
+	req.RepoPath = initDisposableGitRepo(t)
+	req.OpenPR = true
+	req.IndependentVerifier = "claude"
+	req.VerifierEvidence = "sha256:v1"
+	req.RequiredCheckNames = []string{"verify", "test"}
+	req.GoalPR = func(ctx context.Context, r goalpr.Request) (goalpr.Result, error) {
+		got = r
+		return goalpr.Result{
+			OK: true, Status: goalpr.StatusHumanGate,
+			URL: "https://github.com/owner/disp/pull/99", Number: 99,
+			Branch: "loopcoder/goal-run_pr_goal", BaseRef: "main",
+			RequiredChecks: r.RequiredCheckNames, RequiredChecksGreen: true,
+			IndependentVerifier: r.IndependentVerifier, VerifierEvidenceRef: r.VerifierEvidence,
+			CreatedByLoopCoder: true, HumanMergeGate: true, AutoMerge: false,
+		}, nil
+	}
+	res, err := goalrun.Execute(context.Background(), req)
 	if err != nil {
 		t.Fatalf("%v %+v", err, res)
 	}
@@ -443,7 +568,7 @@ func TestExecuteOpenPRFillsRealPREvidence(t *testing.T) {
 	if len(got.Children) < 4 {
 		t.Fatalf("children passed to goalpr: %d", len(got.Children))
 	}
-	// Independent verifier is bound from the succeeded verify child (fixture in this test).
+	// Independent verifier is bound from the succeeded verify child.
 	if got.IndependentVerifier == "" || !strings.HasPrefix(got.VerifierEvidence, "sha256:") {
 		t.Fatalf("verifier bind provider=%q evidence=%q", got.IndependentVerifier, got.VerifierEvidence)
 	}
@@ -462,21 +587,47 @@ var _ = goalpr.StatusHumanGate
 // same project/run from checkpoint, same attempt/evidence, no second provider call
 // for already-succeeded children, ceilings recorded, no worktree leak for reuse.
 func TestForcedInterruptRestartFromDurableCheckpoint(t *testing.T) {
-	home := testHome(t)
 	now := time.Date(2026, 7, 23, 6, 0, 0, 0, time.UTC)
+	env := newProductEnv(t, now, "codex")
+	home := env.Home
 	projectID := "proj-restart-goal"
 	runID := "run_goal_restart_1"
 	calls1 := map[string]int{}
-	// Fail the second child in graph order to force partial durable state.
-	// DecomposeGoal yields wi_research, wi_implement, wi_tests, wi_verify, wi_docs
-	// for multi-child goals — fail wi_implement after research succeeds.
+	// Two-child graph: research succeeds, implement fails — avoids released-but-
+	// not-aborted later siblings blocking resume reserve (same attempt_id).
+	twoChild := func(opts workgraph.DecomposeOptions) (workgraph.Graph, error) {
+		g := workgraph.Graph{
+			Schema: workgraph.SchemaGraph, ContractVersion: workgraph.ContractVersion,
+			GraphID: "g_restart_two", Version: 1,
+			Source: workgraph.SourceGoalDecompose, ExplicitOptIn: true, ApprovedBy: "owner",
+			Items: []workgraph.WorkItem{
+				{Schema: workgraph.SchemaItem, ID: "wi_research", Status: workgraph.ItemRequired,
+					Intent: "research", Owner: "research", Ownership: workgraph.OwnLoopCoderWorkItem,
+					IntegrationOrder: 1, OutputContract: "findings",
+					RouteRequirement: "class=luna,depth=low,permission=read-only"},
+				{Schema: workgraph.SchemaItem, ID: "wi_implement", Status: workgraph.ItemRequired,
+					Intent: "implement", Owner: "worker", Ownership: workgraph.OwnLoopCoderWorkItem,
+					IntegrationOrder: 2, OutputContract: "diff",
+					RouteRequirement: "class=tera,depth=medium,permission=bounded_write"},
+			},
+			Dependencies: []workgraph.Dependency{{
+				Schema: workgraph.SchemaDep, From: "wi_research", To: "wi_implement", Kind: workgraph.DepFinishToStart,
+			}},
+			Limits: workgraph.DefaultLimits(), CreatedAt: now,
+		}
+		g.PlanDigest = workgraph.DigestGraph(g)
+		return g, nil
+	}
+	// Authoritative interrupt/restart: real spawn identity + authority + PID.
 	res1, err1 := goalrun.Execute(context.Background(), goalrun.Request{
 		ProjectID: projectID, RunID: runID,
 		Goal: "implement transparent multi-child routing", Issue: "1343",
 		Actor: "owner", Owner: "worker",
-		Provider: "fixture", Model: "fixture-model",
+		Provider: "codex", Model: "gpt-5.5",
 		HomeDir: home, Now: func() time.Time { return now },
-		Executor: workflowrun.FakeChildExecutor{
+		Decompose:     twoChild,
+		LoadInventory: env.loadInv(), OpenLedger: env.openLed(),
+		Executor: testspawn.Executor{
 			HomeDir: home, Now: func() time.Time { return now },
 			Calls:   calls1,
 			FailIDs: map[string]bool{"wi_implement": true},
@@ -528,9 +679,11 @@ func TestForcedInterruptRestartFromDurableCheckpoint(t *testing.T) {
 		ProjectID: projectID, RunID: runID, Resume: true,
 		Goal: "implement transparent multi-child routing", Issue: "1343",
 		Actor: "owner", Owner: "worker",
-		Provider: "fixture", Model: "fixture-model",
+		Provider: "codex", Model: "gpt-5.5",
 		HomeDir: home, Now: func() time.Time { return now.Add(time.Minute) },
-		Executor: workflowrun.FakeChildExecutor{
+		Decompose:     twoChild,
+		LoadInventory: env.loadInv(), OpenLedger: env.openLed(),
+		Executor: testspawn.Executor{
 			HomeDir: home, Now: func() time.Time { return now.Add(time.Minute) },
 			Calls: calls2,
 		},
@@ -579,9 +732,9 @@ func TestForcedInterruptRestartFromDurableCheckpoint(t *testing.T) {
 	if res2.WorktreePeak < 1 && res2.Workflow.WorktreePeak < 1 {
 		t.Fatalf("worktree peak missing: %+v", res2)
 	}
+	// testspawn produces real OnProcessStart → ProcessPeak must be truthful ≥1.
 	if res2.ProcessPeak < 1 && res2.Workflow.ProcessPeak < 1 {
-		// resume may only launch remaining; peaks still ≥1 if any remaining
-		if res2.Workflow.LaunchCount > 0 && res2.Workflow.ProcessPeak < 1 {
+		if res2.Workflow.LaunchCount > 0 {
 			t.Fatalf("process peak missing with launches: %+v", res2.Workflow)
 		}
 	}
@@ -613,92 +766,132 @@ func TestCheckpointRefuseReuseWithoutEvidence(t *testing.T) {
 }
 
 func TestResumeBumpsGenerationWhenInterruptAlreadyInLedger(t *testing.T) {
-	// SIGTERM path often writes a generic interrupt before RecoverOpenLaunch
-	// returns n=0; open launches must still get gen+1 so attempt IDs change.
-	home := testHome(t)
+	// Authoritative path: first pass spawns real implement process, Service cancels
+	// mid-flight (typed interrupt pair + authority), resume must gen-bump implement
+	// and reuse research. Not a Fake ledger fixture.
 	now := time.Date(2026, 7, 23, 7, 0, 0, 0, time.UTC)
+	env := newProductEnv(t, now, "codex")
+	home := env.Home
 	projectID := "proj-gen-bump"
 	runID := "run_gen_bump_1"
-	elog, err := workflowrun.OpenEventLog(home, projectID, runID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Simulated first pass: research done, implement launched, hard kill.
-	must := func(e workflowrun.Event) {
-		e.ProjectID, e.RunID = projectID, runID
-		if err := elog.Append(e); err != nil {
-			t.Fatal(err)
+	resumeGoal := "implement gen bump multi-child routing with tests"
+	twoChild := func(opts workgraph.DecomposeOptions) (workgraph.Graph, error) {
+		g := workgraph.Graph{
+			Schema: workgraph.SchemaGraph, ContractVersion: workgraph.ContractVersion,
+			GraphID: "g_gen_bump", Version: 1,
+			Source: workgraph.SourceGoalDecompose, ExplicitOptIn: true, ApprovedBy: "owner",
+			Items: []workgraph.WorkItem{
+				{Schema: workgraph.SchemaItem, ID: "wi_research", Status: workgraph.ItemRequired,
+					Intent: "research", Owner: "research", Ownership: workgraph.OwnLoopCoderWorkItem,
+					IntegrationOrder: 1, OutputContract: "findings",
+					RouteRequirement: "class=luna,depth=low,permission=read-only"},
+				{Schema: workgraph.SchemaItem, ID: "wi_implement", Status: workgraph.ItemRequired,
+					Intent: "implement", Owner: "worker", Ownership: workgraph.OwnLoopCoderWorkItem,
+					IntegrationOrder: 2, OutputContract: "diff",
+					RouteRequirement: "class=tera,depth=medium,permission=bounded_write"},
+			},
+			Dependencies: []workgraph.Dependency{{
+				Schema: workgraph.SchemaDep, From: "wi_research", To: "wi_implement", Kind: workgraph.DepFinishToStart,
+			}},
+			Limits: workgraph.DefaultLimits(), CreatedAt: now,
 		}
+		g.PlanDigest = workgraph.DigestGraph(g)
+		return g, nil
 	}
-	must(workflowrun.Event{Kind: "run.start", Message: "workflow execute"})
-	must(workflowrun.Event{Kind: "launch", WorkItemID: "wi_research", AttemptID: "att-wi_research-deadbeef-g0"})
-	must(workflowrun.Event{Kind: "terminal", WorkItemID: "wi_research", AttemptID: "att-wi_research-deadbeef-g0", Terminal: "succeeded"})
-	must(workflowrun.Event{Kind: "integrate", WorkItemID: "wi_research", AttemptID: "att-wi_research-deadbeef-g0"})
-	must(workflowrun.Event{Kind: "launch", WorkItemID: "wi_implement", AttemptID: "att-wi_implement-deadbeef-g0"})
-	// Generic interrupt already present (graceful SIGTERM) — RecoverOpen returns 0.
-	must(workflowrun.Event{Kind: "interrupt", Message: "cancelled mid-wave (forced process interrupt)"})
-
-	// Durable prior for research only.
-	cp := goalrun.Checkpoint{
-		Schema: goalrun.CheckpointSchema, ProjectID: projectID, RunID: runID,
-		GraphID: "g1", PlanDigest: "sha256:deadbeef", Goal: "implement gen bump", Issue: "1343", Actor: "owner",
-		Status: "blocked", Interrupted: true,
-		PriorSucceeded: map[string]workflowrun.ChildOutcome{
-			"wi_research": {
-				WorkItemID: "wi_research", Terminal: "succeeded",
-				AttemptID: "att-wi_research-deadbeef-g0", OutputEvidence: "sha256:abc",
-				Provider: "fixture", Model: "fixture-model", Depth: "low",
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	calls1 := map[string]int{}
+	var implG0 string
+	res1, err1 := goalrun.Execute(ctx1, goalrun.Request{
+		ProjectID: projectID, RunID: runID,
+		Goal: resumeGoal, Issue: "1343",
+		Actor: "owner", Owner: "worker",
+		Provider: "codex", Model: "gpt-5.5",
+		HomeDir: home, Now: func() time.Time { return now },
+		Decompose:     twoChild,
+		LoadInventory: env.loadInv(), OpenLedger: env.openLed(),
+		Executor: testspawn.Executor{
+			HomeDir: home, Now: func() time.Time { return now },
+			Calls: calls1, HangIDs: map[string]bool{"wi_implement": true},
+			OnHangEntry: func(workItemID string, pid int) {
+				if workItemID == "wi_implement" {
+					cancel1()
+				}
 			},
 		},
-		AbortedAttempts: map[string]string{"wi_implement": "att-wi_implement-deadbeef-g0"},
-		SavedAt:         now,
+	})
+	if err1 == nil && res1.Status == workflowrun.StatusHumanGate {
+		t.Fatalf("expected interrupted first pass: %+v", res1)
 	}
-	if _, err := goalrun.SaveCheckpoint(home, cp); err != nil {
-		t.Fatal(err)
+	for _, c := range res1.Workflow.Children {
+		if c.WorkItemID == "wi_implement" && c.AttemptID != "" {
+			implG0 = c.AttemptID
+		}
+	}
+	if implG0 == "" {
+		// Attempt id may only be on event log if outcome incomplete.
+		elog, _ := workflowrun.OpenEventLog(home, projectID, runID)
+		evs, _ := elog.ReadAll()
+		for _, e := range evs {
+			if e.Kind == "launch" && e.WorkItemID == "wi_implement" {
+				implG0 = e.AttemptID
+			}
+		}
+	}
+	if implG0 == "" {
+		t.Fatalf("implement g0 attempt missing after interrupt: %+v", res1)
+	}
+	if !strings.HasSuffix(implG0, "-g0") {
+		t.Fatalf("implement first attempt want g0 got %s", implG0)
+	}
+	cp, _, err := goalrun.LoadCheckpoint(home, projectID, runID)
+	if err != nil {
+		t.Fatalf("checkpoint: %v status=%s", err, res1.Status)
+	}
+	if _, ok := cp.PriorSucceeded["wi_research"]; !ok {
+		t.Fatalf("research must be prior succeeded: %+v", cp.PriorSucceeded)
 	}
 
-	calls := map[string]int{}
-	res, err := goalrun.Execute(context.Background(), goalrun.Request{
+	calls2 := map[string]int{}
+	res2, err2 := goalrun.Execute(context.Background(), goalrun.Request{
 		ProjectID: projectID, RunID: runID, Resume: true,
-		Goal: "implement gen bump multi-child routing with tests", Issue: "1343",
+		Goal: resumeGoal, Issue: "1343",
 		Actor: "owner", Owner: "worker",
-		Provider: "fixture", Model: "fixture-model",
+		Provider: "codex", Model: "gpt-5.5",
 		HomeDir: home, Now: func() time.Time { return now.Add(time.Minute) },
-		Executor: workflowrun.FakeChildExecutor{
+		Decompose:     twoChild,
+		LoadInventory: env.loadInv(), OpenLedger: env.openLed(),
+		Executor: testspawn.Executor{
 			HomeDir: home, Now: func() time.Time { return now.Add(time.Minute) },
-			Calls: calls,
+			Calls: calls2,
 		},
 	})
-	if err != nil {
-		t.Fatalf("resume: %v status=%s msg=%s", err, res.Status, res.Message)
+	if err2 != nil {
+		t.Fatalf("resume: %v status=%s msg=%s", err2, res2.Status, res2.Message)
 	}
-	// Research must reuse, not re-exec.
-	if calls["wi_research"] != 0 {
-		t.Fatalf("research re-exec on resume: %+v", calls)
+	if calls2["wi_research"] != 0 {
+		t.Fatalf("research re-exec on resume: %+v", calls2)
 	}
-	// Implement must use a new generation attempt id (g1+), not g0.
-	for _, c := range res.Workflow.Children {
+	for _, c := range res2.Workflow.Children {
 		if c.WorkItemID == "wi_implement" {
-			if c.AttemptID == "att-wi_implement-deadbeef-g0" {
+			if c.AttemptID == implG0 {
 				t.Fatalf("implement re-used aborted attempt id %s", c.AttemptID)
-			}
-			if !strings.Contains(c.AttemptID, "-g1") && !strings.Contains(c.AttemptID, "-g2") {
-				// gen may be 1 from aborted map
-				t.Logf("implement attempt=%s", c.AttemptID)
 			}
 			if strings.HasSuffix(c.AttemptID, "-g0") {
 				t.Fatalf("implement still g0: %s", c.AttemptID)
 			}
 		}
 	}
-	// Event ledger must not re-launch the same implement g0 attempt.
+	elog, err := workflowrun.OpenEventLog(home, projectID, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	events, err := elog.ReadAll()
 	if err != nil {
 		t.Fatal(err)
 	}
 	g0Launch := 0
 	for _, e := range events {
-		if e.Kind == "launch" && e.AttemptID == "att-wi_implement-deadbeef-g0" {
+		if e.Kind == "launch" && e.AttemptID == implG0 {
 			g0Launch++
 		}
 	}
@@ -708,98 +901,126 @@ func TestResumeBumpsGenerationWhenInterruptAlreadyInLedger(t *testing.T) {
 }
 
 func TestResumeWithoutGoalCheckpointUsesPartialAndGenBump(t *testing.T) {
-	// Hard kill mid-workflow exits before saveRunCheckpoint. Only partial prior
-	// + event ledger exist. Resume must still reuse succeeded children and
-	// gen-bump aborted launches (exactly_once: no g0 re-launch).
-	home := testHome(t)
+	// Authoritative hard-interrupt: real spawn + authority. After first pass,
+	// drop goal-checkpoint so only partial + event ledger remain; resume must
+	// still reuse research and gen-bump implement (exactly_once: no g0 re-launch).
 	now := time.Date(2026, 7, 23, 8, 0, 0, 0, time.UTC)
+	env := newProductEnv(t, now, "codex")
+	home := env.Home
 	projectID := "proj-no-checkpoint"
 	runID := "run_no_checkpoint_1"
+	resumeGoal := "implement multi-child routing with tests and docs"
+	twoChild := func(opts workgraph.DecomposeOptions) (workgraph.Graph, error) {
+		g := workgraph.Graph{
+			Schema: workgraph.SchemaGraph, ContractVersion: workgraph.ContractVersion,
+			GraphID: "g_no_cp", Version: 1,
+			Source: workgraph.SourceGoalDecompose, ExplicitOptIn: true, ApprovedBy: "owner",
+			Items: []workgraph.WorkItem{
+				{Schema: workgraph.SchemaItem, ID: "wi_research", Status: workgraph.ItemRequired,
+					Intent: "research", Owner: "research", Ownership: workgraph.OwnLoopCoderWorkItem,
+					IntegrationOrder: 1, OutputContract: "findings",
+					RouteRequirement: "class=luna,depth=low,permission=read-only"},
+				{Schema: workgraph.SchemaItem, ID: "wi_implement", Status: workgraph.ItemRequired,
+					Intent: "implement", Owner: "worker", Ownership: workgraph.OwnLoopCoderWorkItem,
+					IntegrationOrder: 2, OutputContract: "diff",
+					RouteRequirement: "class=tera,depth=medium,permission=bounded_write"},
+			},
+			Dependencies: []workgraph.Dependency{{
+				Schema: workgraph.SchemaDep, From: "wi_research", To: "wi_implement", Kind: workgraph.DepFinishToStart,
+			}},
+			Limits: workgraph.DefaultLimits(), CreatedAt: now,
+		}
+		g.PlanDigest = workgraph.DigestGraph(g)
+		return g, nil
+	}
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	calls1 := map[string]int{}
+	var implG0, researchAtt string
+	res1, err1 := goalrun.Execute(ctx1, goalrun.Request{
+		ProjectID: projectID, RunID: runID,
+		Goal: resumeGoal, Issue: "1343",
+		Actor: "owner", Owner: "worker",
+		Provider: "codex", Model: "gpt-5.5",
+		HomeDir: home, Now: func() time.Time { return now },
+		Decompose:     twoChild,
+		LoadInventory: env.loadInv(), OpenLedger: env.openLed(),
+		Executor: testspawn.Executor{
+			HomeDir: home, Now: func() time.Time { return now },
+			Calls: calls1, HangIDs: map[string]bool{"wi_implement": true},
+			OnHangEntry: func(workItemID string, pid int) {
+				if workItemID == "wi_implement" {
+					cancel1()
+				}
+			},
+		},
+	})
+	if err1 == nil && res1.Status == workflowrun.StatusHumanGate {
+		t.Fatalf("expected interrupted first pass: %+v", res1)
+	}
+	for _, c := range res1.Workflow.Children {
+		if c.WorkItemID == "wi_implement" {
+			implG0 = c.AttemptID
+		}
+		if c.WorkItemID == "wi_research" {
+			researchAtt = c.AttemptID
+		}
+	}
 	elog, err := workflowrun.OpenEventLog(home, projectID, runID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	must := func(e workflowrun.Event) {
-		e.ProjectID, e.RunID = projectID, runID
-		if err := elog.Append(e); err != nil {
-			t.Fatal(err)
+	if implG0 == "" {
+		evs, _ := elog.ReadAll()
+		for _, e := range evs {
+			if e.Kind == "launch" && e.WorkItemID == "wi_implement" {
+				implG0 = e.AttemptID
+			}
+			if e.Kind == "launch" && e.WorkItemID == "wi_research" && researchAtt == "" {
+				researchAtt = e.AttemptID
+			}
 		}
 	}
-	must(workflowrun.Event{Kind: "run.start", Message: "workflow execute"})
-	must(workflowrun.Event{Kind: "launch", WorkItemID: "wi_research", AttemptID: "att-wi_research-cafebabe-g0"})
-	must(workflowrun.Event{Kind: "terminal", WorkItemID: "wi_research", AttemptID: "att-wi_research-cafebabe-g0", Terminal: "succeeded", Evidence: "sha256:research"})
-	must(workflowrun.Event{Kind: "integrate", WorkItemID: "wi_research", AttemptID: "att-wi_research-cafebabe-g0"})
-	must(workflowrun.Event{Kind: "launch", WorkItemID: "wi_implement", AttemptID: "att-wi_implement-cafebabe-g0"})
-	// No interrupt line yet (true hard kill). No goal-checkpoint.json.
-
-	// Mid-run partial snapshot (written after each child terminal in production).
-	partialPath := filepath.Join(filepath.Dir(elog.Path()), "workflow-partial.json")
-	partialBody, err := json.Marshal(map[string]any{
-		"schema":      "loopcoder.workflow.partial.v1",
-		"project_id":  projectID,
-		"run_id":      runID,
-		"saved_at":    now.Format(time.RFC3339),
-		"interrupted": true,
-		"prior_succeeded": map[string]any{
-			"wi_research": map[string]any{
-				"work_item_id":    "wi_research",
-				"provider":        "fixture",
-				"model":           "fixture-model",
-				"depth":           "low",
-				"terminal":        "succeeded",
-				"output_evidence": "sha256:research",
-				"attempt_id":      "att-wi_research-cafebabe-g0",
-			},
-		},
-		"aborted_attempts": map[string]string{
-			"wi_implement": "att-wi_implement-cafebabe-g0",
-		},
-		"event_log_path": elog.Path(),
-	})
-	if err != nil {
-		t.Fatal(err)
+	if implG0 == "" {
+		t.Fatalf("implement g0 missing: %+v", res1)
 	}
-	if err := os.WriteFile(partialPath, partialBody, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	// Confirm goal-checkpoint is absent.
+	// Drop goal-checkpoint; keep partial if present (or rely on event ledger).
+	cpPath := filepath.Join(home, "projects", projectID, "runs", runID, "goal-checkpoint.json")
+	_ = os.Remove(cpPath)
 	if _, _, err := goalrun.LoadCheckpoint(home, projectID, runID); err == nil {
 		t.Fatal("expected no goal-checkpoint for this scenario")
 	}
 
-	calls := map[string]int{}
-	res, err := goalrun.Execute(context.Background(), goalrun.Request{
+	calls2 := map[string]int{}
+	res2, err2 := goalrun.Execute(context.Background(), goalrun.Request{
 		ProjectID: projectID, RunID: runID, Resume: true,
-		Goal: "implement multi-child routing with tests and docs", Issue: "1343",
+		Goal: resumeGoal, Issue: "1343",
 		Actor: "owner", Owner: "worker",
-		Provider: "fixture", Model: "fixture-model",
+		Provider: "codex", Model: "gpt-5.5",
 		HomeDir: home, Now: func() time.Time { return now.Add(time.Minute) },
-		Executor: workflowrun.FakeChildExecutor{
+		Decompose:     twoChild,
+		LoadInventory: env.loadInv(), OpenLedger: env.openLed(),
+		Executor: testspawn.Executor{
 			HomeDir: home, Now: func() time.Time { return now.Add(time.Minute) },
-			Calls: calls,
+			Calls: calls2,
 		},
 	})
-	if err != nil {
-		t.Fatalf("resume without checkpoint: %v status=%s msg=%s", err, res.Status, res.Message)
+	if err2 != nil {
+		t.Fatalf("resume without checkpoint: %v status=%s msg=%s", err2, res2.Status, res2.Message)
 	}
-	if !res.Resumed {
-		t.Fatalf("expected resumed=true from partial prior, got %+v", res)
+	if !res2.Resumed {
+		t.Fatalf("expected resumed=true from partial/events prior, got %+v", res2)
 	}
-	if calls["wi_research"] != 0 {
-		t.Fatalf("research re-exec without checkpoint: calls=%+v", calls)
+	if calls2["wi_research"] != 0 {
+		t.Fatalf("research re-exec without checkpoint: calls=%+v", calls2)
 	}
-	for _, c := range res.Workflow.Children {
+	for _, c := range res2.Workflow.Children {
 		if c.WorkItemID == "wi_implement" {
-			if strings.HasSuffix(c.AttemptID, "-g0") {
+			if c.AttemptID == implG0 || strings.HasSuffix(c.AttemptID, "-g0") {
 				t.Fatalf("implement still g0 without checkpoint recovery: %s", c.AttemptID)
 			}
-			if !strings.Contains(c.AttemptID, "-g1") && !strings.Contains(c.AttemptID, "-g2") {
-				t.Logf("implement attempt=%s (gen bump expected)", c.AttemptID)
-			}
 		}
-		if c.WorkItemID == "wi_research" && c.AttemptID != "att-wi_research-cafebabe-g0" {
-			// reuse keeps original attempt id
-			t.Logf("research attempt=%s", c.AttemptID)
+		if c.WorkItemID == "wi_research" && researchAtt != "" && c.AttemptID != researchAtt {
+			t.Logf("research attempt=%s prior=%s", c.AttemptID, researchAtt)
 		}
 	}
 	events, err := elog.ReadAll()
@@ -809,7 +1030,7 @@ func TestResumeWithoutGoalCheckpointUsesPartialAndGenBump(t *testing.T) {
 	g0Impl := 0
 	reuseResearch := 0
 	for _, e := range events {
-		if e.Kind == "launch" && e.AttemptID == "att-wi_implement-cafebabe-g0" {
+		if e.Kind == "launch" && e.AttemptID == implG0 {
 			g0Impl++
 		}
 		if e.Kind == "reuse" && e.WorkItemID == "wi_research" {

@@ -1,6 +1,7 @@
 package workflowrun
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -95,15 +96,15 @@ func (g GitBranchIntegrator) EnsureGoalBranch(ctx context.Context, repoPath, bas
 }
 
 // IntegrateChild implements BranchIntegrator.
-func (g GitBranchIntegrator) IntegrateChild(ctx context.Context, req IntegrateRequest) (IntegrateCommit, error) {
-	out := IntegrateCommit{WorkItemID: req.WorkItemID, AttemptID: req.AttemptID}
+func (g GitBranchIntegrator) IntegrateChild(ctx context.Context, req IntegrateRequest) (out IntegrateCommit, err error) {
+	out = IntegrateCommit{WorkItemID: req.WorkItemID, AttemptID: req.AttemptID}
 	if strings.TrimSpace(req.RepoPath) == "" || strings.TrimSpace(req.GoalBranch) == "" ||
 		strings.TrimSpace(req.AttemptID) == "" || strings.TrimSpace(req.ChildWorktree) == "" {
 		return out, fmt.Errorf("%w: missing fields", ErrIntegrateInvalid)
 	}
 	// Exactly-once ledger.
-	if prev, ok, err := g.loadLedger(req.RepoPath, req.AttemptID); err != nil {
-		return out, err
+	if prev, ok, lerr := g.loadLedger(req.RepoPath, req.AttemptID); lerr != nil {
+		return out, lerr
 	} else if ok {
 		out.CommitSHA = prev.CommitSHA
 		out.Files = prev.Files
@@ -133,9 +134,15 @@ func (g GitBranchIntegrator) IntegrateChild(ctx context.Context, req IntegrateRe
 	}
 	// Must git-worktree-remove (not only RemoveAll): deleting the directory
 	// leaves the goal branch registered to a missing worktree, so later PR
-	// checkout fails with "already used by worktree".
+	// checkout fails with "already used by worktree". Surface cleanup failures.
 	defer func() {
-		releaseIntegrateWorktree(req.RepoPath, tmpWT)
+		if cerr := releaseIntegrateWorktree(req.RepoPath, tmpWT); cerr != nil {
+			if err != nil {
+				err = fmt.Errorf("%w; integrate worktree cleanup: %v", err, cerr)
+			} else {
+				err = fmt.Errorf("integrate worktree cleanup: %w", cerr)
+			}
+		}
 	}()
 
 	// Prefer git worktree add for the goal branch.
@@ -342,60 +349,145 @@ func (g GitBranchIntegrator) detectPathConflict(repo, workItemID, attemptID, int
 }
 
 func discoverProductFiles(childWT string) ([]string, error) {
-	// Only git-status changes count as product (added/modified/untracked).
-	// Full worktree walk would treat base notes.go as "product" and let
-	// implement accept without writing real source (RC.16 false green).
-	st, err := runGitRepo(context.Background(), childWT, "status", "--porcelain")
-	if err == nil {
-		var files []string
-		for _, line := range strings.Split(st, "\n") {
-			// Do NOT TrimSpace the whole line: porcelain " M notes.go" must keep
-			// the leading status space or path becomes "otes.go" (RC.17 false miss).
-			if strings.TrimSpace(line) == "" {
+	// File-level product discovery via structured NUL-safe git commands.
+	// Never rely on porcelain directory-only untracked lines (?? notes/) —
+	// those are not hashable product files. Full worktree walk is forbidden
+	// (would treat base notes.go as product; RC.16 false green).
+	//
+	// Sources (Git-config-independent for untracked):
+	//   - ls-files --others --exclude-standard: untracked files (recursive)
+	//   - diff --name-only: unstaged tracked modifications
+	//   - diff --cached --name-only: staged tracked changes
+	ctx := context.Background()
+	seen := map[string]bool{}
+	var files []string
+	add := func(paths []string) {
+		for _, p := range paths {
+			p = filepath.ToSlash(strings.TrimSpace(p))
+			if p == "" || seen[p] {
 				continue
 			}
-			// porcelain: XY<path> or XY <path> or XY ORIG -> PATH (rename)
-			if len(line) < 3 {
-				continue
-			}
-			// XY is two status bytes; path may be " path" or "path".
-			path := strings.TrimSpace(strings.TrimPrefix(line[2:], " "))
-			if i := strings.Index(path, " -> "); i >= 0 {
-				path = strings.TrimSpace(path[i+4:])
-			}
-			path = strings.Trim(path, "\"")
-			if path != "" {
-				files = append(files, path)
-			}
+			seen[p] = true
+			files = append(files, p)
 		}
-		return files, nil
 	}
-	// No walk fallback: listing the whole tree falsely treats base product files
-	// as child output. Prefer empty + acceptance failure over false green.
-	return nil, err
+	// Untracked files (file-level even under new directories).
+	u, uerr := runGitRepoBytes(ctx, childWT, "ls-files", "-z", "--others", "--exclude-standard")
+	if uerr != nil {
+		return nil, uerr
+	}
+	add(splitGitNULPaths(u))
+	// Unstaged tracked modifications (renames appear as new name when rename detection on).
+	d, derr := runGitRepoBytes(ctx, childWT, "diff", "--name-only", "-z")
+	if derr != nil {
+		return nil, derr
+	}
+	add(splitGitNULPaths(d))
+	// Staged tracked changes.
+	c, cerr := runGitRepoBytes(ctx, childWT, "diff", "--cached", "--name-only", "-z")
+	if cerr != nil {
+		return nil, cerr
+	}
+	add(splitGitNULPaths(c))
+	return files, nil
+}
+
+// runGitRepoBytes runs git and returns raw stdout (no TrimSpace) for -z parsers.
+func runGitRepoBytes(ctx context.Context, dir string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=loopcoder",
+		"GIT_AUTHOR_EMAIL=loopcoder@local",
+		"GIT_COMMITTER_NAME=loopcoder",
+		"GIT_COMMITTER_EMAIL=loopcoder@local",
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		msg := ""
+		if ee, ok := err.(*exec.ExitError); ok {
+			msg = strings.TrimSpace(string(ee.Stderr))
+		}
+		if msg == "" {
+			msg = err.Error()
+		}
+		return nil, fmt.Errorf("git %v: %w: %s", args, err, msg)
+	}
+	return out, nil
+}
+
+// splitGitNULPaths splits git -z path lists into path strings.
+func splitGitNULPaths(raw []byte) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	// Drop a single trailing NUL so Split does not yield a trailing empty.
+	if raw[len(raw)-1] == 0 {
+		raw = raw[:len(raw)-1]
+	}
+	if len(raw) == 0 {
+		return nil
+	}
+	parts := bytes.Split(raw, []byte{0})
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if len(p) == 0 {
+			continue
+		}
+		out = append(out, string(p))
+	}
+	return out
 }
 
 // releaseIntegrateWorktree deregisters a temporary integrate worktree from the
 // parent repo and removes its directory. RemoveAll alone leaves git still
 // believing the goal branch is checked out in the vanished path.
 //
-// Always attempts `git worktree remove --force <path>` even when the directory
-// is already gone, then prunes; failures are ignored so cleanup is best-effort
-// and never masks the integrate result.
-func releaseIntegrateWorktree(repoPath, tmpWT string) {
+// Returns combined errors from git remove, RemoveAll, and prune. Callers that
+// own child leases must not swallow the result.
+func releaseIntegrateWorktree(repoPath, tmpWT string) error {
 	tmpWT = strings.TrimSpace(tmpWT)
 	repoPath = strings.TrimSpace(repoPath)
 	if tmpWT == "" {
-		return
+		return nil
 	}
+	var errs []string
+	// Soft-skip git deregistration only when parent path is absent (plain child
+	// directory / never-a-repo). When the parent path exists, git failures are
+	// fail-closed except known "not a working tree" / worktree-path-missing cases.
+	parentAbsent := false
 	if repoPath != "" {
-		// Force-remove registration even if the dir is missing or half-deleted.
-		_, _ = runGitRepo(context.Background(), repoPath, "worktree", "remove", "--force", tmpWT)
+		if _, serr := os.Stat(repoPath); os.IsNotExist(serr) {
+			parentAbsent = true
+		} else if serr != nil {
+			errs = append(errs, fmt.Sprintf("stat repo: %v", serr))
+		}
 	}
-	_ = os.RemoveAll(tmpWT)
-	if repoPath != "" {
-		_, _ = runGitRepo(context.Background(), repoPath, "worktree", "prune")
+	if repoPath != "" && !parentAbsent && len(errs) == 0 {
+		if _, err := runGitRepo(context.Background(), repoPath, "worktree", "remove", "--force", tmpWT); err != nil {
+			msg := strings.ToLower(err.Error())
+			// Plain child dirs are not git worktrees — only real remove failures count.
+			if !strings.Contains(msg, "is not a working tree") &&
+				!strings.Contains(msg, "not a valid path") &&
+				// Worktree path itself already gone is soft; parent still exists.
+				!(strings.Contains(msg, "no such file") && strings.Contains(msg, strings.ToLower(tmpWT))) {
+				errs = append(errs, fmt.Sprintf("git worktree remove: %v", err))
+			}
+		}
 	}
+	if err := os.RemoveAll(tmpWT); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, fmt.Sprintf("RemoveAll: %v", err))
+	}
+	if repoPath != "" && !parentAbsent {
+		if _, err := runGitRepo(context.Background(), repoPath, "worktree", "prune"); err != nil {
+			// Parent exists: prune failure is durable cleanup error (fail closed).
+			errs = append(errs, fmt.Sprintf("git worktree prune: %v", err))
+		}
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("releaseIntegrateWorktree %s: %s", tmpWT, strings.Join(errs, "; "))
 }
 
 func filterProductFiles(files []string) []string {

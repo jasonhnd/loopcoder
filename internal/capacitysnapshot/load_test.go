@@ -31,6 +31,13 @@ func TestLoadRouteInventoryRehydratesDurableQuotaWithoutSnapshotFlag(t *testing.
 			AvailabilityState: providerinventory.AvailabilityAvailable,
 			LifecycleState:    providerinventory.LifecycleAvailable,
 			FreshnessState:    providerinventory.FreshnessFresh,
+			Confidence:        providerinventory.ConfidenceExact,
+			EntrySources: []providerinventory.CatalogEntrySource{{
+				SourceKind: providerinventory.CatalogSourceProviderMachineReadable,
+				Confidence: providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
+				SourceReference: "provider-machine-readable:codex:test",
+			}},
+			Source: providerinventory.SourceDescriptor{Kind: string(providerinventory.CatalogSourceProviderMachineReadable)},
 		}},
 		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
 			AdapterID: "codex", QuotaSnapshotID: "live-denied",
@@ -98,6 +105,13 @@ func TestLoadRouteInventoryFailClosedWithoutDurableOrUsableQuota(t *testing.T) {
 			AvailabilityState: providerinventory.AvailabilityAvailable,
 			LifecycleState:    providerinventory.LifecycleAvailable,
 			FreshnessState:    providerinventory.FreshnessFresh,
+			Confidence:        providerinventory.ConfidenceExact,
+			EntrySources: []providerinventory.CatalogEntrySource{{
+				SourceKind: providerinventory.CatalogSourceProviderMachineReadable,
+				Confidence: providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
+				SourceReference: "provider-machine-readable:codex:test",
+			}},
+			Source: providerinventory.SourceDescriptor{Kind: string(providerinventory.CatalogSourceProviderMachineReadable)},
 		}},
 		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
 			AdapterID: "codex", Confidence: providerinventory.ConfidenceUnavailable,

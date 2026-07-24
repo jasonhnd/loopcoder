@@ -164,7 +164,75 @@ func (r GrokRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 		return Result{ExitCode: -1}, grokError(GrokErrUnsupportedCapability, "schema-enforced JSON output is not advertised by Grok headless", nil)
 	}
 
-	profile, err := prepareGrokExecutionProfile(inv, os.Environ())
+	// Exact account routing: always parse/affirm the active auth account at
+	// execution (not only when request is nonempty). Pre-set XAI_API_KEY alone
+	// never satisfies exact account verification.
+	var verifiedAccount string
+	var selectedToken string
+	bind, aerr := ParseActiveGrokAuth()
+	if aerr != nil {
+		if want := strings.TrimSpace(inv.AccountRef); want != "" {
+			return Result{
+				ExitCode: -1, FailureClass: "auth_refusal",
+				ActualProvider: "grok",
+			}, aerr
+		}
+		// No account pin and no auth: fail closed rather than launch unbound.
+		return Result{
+			ExitCode: -1, FailureClass: "auth_refusal",
+			ActualProvider: "grok",
+		}, fmt.Errorf("grok: active auth required at execution: %w", aerr)
+	}
+	if !bind.ExactRoutable || bind.AccountProfileID == "" {
+		return Result{
+			ExitCode: -1, FailureClass: "auth_refusal", ActualProvider: "grok",
+		}, fmt.Errorf("grok: active auth has no exact-routable account identity")
+	}
+	verifiedAccount = bind.AccountProfileID
+	if want := strings.TrimSpace(inv.AccountRef); want != "" {
+		if !strings.EqualFold(want, verifiedAccount) {
+			return Result{
+				ExitCode: -1, FailureClass: "auth_refusal",
+				ActualProvider: "grok", ActualAccountRef: verifiedAccount,
+			}, fmt.Errorf("grok: account mismatch requested=%s active=%s", want, verifiedAccount)
+		}
+	}
+	// Load the exact selected account token — this is the credential that must
+	// be launched (overwrite any unrelated XAI_API_KEY).
+	tok, tokBind, terr := loadGrokSelectedToken()
+	if terr != nil || tok == "" {
+		return Result{
+			ExitCode: -1, FailureClass: "auth_refusal",
+			ActualProvider: "grok", ActualAccountRef: verifiedAccount,
+		}, fmt.Errorf("grok: cannot load selected account token: %v", terr)
+	}
+	if tokBind.AccountProfileID != "" && !strings.EqualFold(tokBind.AccountProfileID, verifiedAccount) {
+		return Result{
+			ExitCode: -1, FailureClass: "auth_refusal",
+			ActualProvider: "grok", ActualAccountRef: verifiedAccount,
+		}, fmt.Errorf("grok: token account ambiguity")
+	}
+	selectedToken = tok
+	// Install: compute same pinst_* as inventory from the exact executable launched.
+	// No basename/path/substring allowances — exact pinst equality only.
+	pinst, absExe, redactedExe, ierr := resolveGrokInstallID()
+	if ierr != nil {
+		return Result{
+			ExitCode: -1, FailureClass: "route_mismatch", ActualProvider: "grok",
+		}, fmt.Errorf("grok: cannot bind install identity: %w", ierr)
+	}
+	if wantInstall := strings.TrimSpace(inv.InstallRef); wantInstall != "" {
+		if wantInstall != pinst {
+			return Result{
+				ExitCode: -1, FailureClass: "route_mismatch",
+				ActualProvider: "grok", ExecutableIdentity: redactedExe,
+				ActualInstallRef: pinst, ActualAccountRef: verifiedAccount,
+			}, fmt.Errorf("grok: install_ref mismatch requested=%s actual=%s", wantInstall, pinst)
+		}
+	}
+	_ = absExe
+
+	profile, err := prepareGrokExecutionProfile(inv, os.Environ(), selectedToken)
 	if err != nil {
 		return Result{ExitCode: -1}, err
 	}
@@ -207,29 +275,85 @@ func (r GrokRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	sink.close()
 	_ = logFile.Sync()
 
-	metadata := sink.metadata(inv)
+	// metadata() must not fall back to inv request fields.
+	metadata := sink.metadata()
 	metadata.AdapterVersion = capability.Version
 	result := resultWithSupervision(supervisedExitCode(supervision, runErr), sink.summary(), metadata.invocationMetadata, startedAt, endedAt, supervision, runErr, ctx)
 	result.AdapterVersion = capability.Version
 	result.ExternalSessionRef = metadata.ExternalSessionRef
+	// Independently verified partial route (never silent request copy).
+	// Stream model/effort only when present; account/install are local bindings.
+	// accepted_invocation is applied ONLY after full success validation below.
+	result.ActualProvider = "grok"
+	result.ActualModel = strings.TrimSpace(result.Model)
+	result.ActualEffort = strings.TrimSpace(result.Effort)
+	if result.ActualModel != "" {
+		result.ActualSourceModel = ActualSourceProviderStream
+	}
+	if result.ActualEffort != "" {
+		result.ActualSourceEffort = ActualSourceProviderStream
+	}
+	result.ActualAccountRef = verifiedAccount
+	if verifiedAccount != "" {
+		result.ActualSourceAccount = ActualSourceAuthBinding // local grokauth, not stream
+	}
+	result.ExecutableIdentity = redactedExe
+	result.ActualInstallRef = pinst
+	if pinst != "" {
+		result.ActualSourceInstall = ActualSourceInstallBinding
+	}
+	argv := append([]string{grokCommand}, BuildGrokArgs(inv)...)
 
 	if err := sink.err(); err != nil {
 		result.Hung = false
 		result.HungReason = ""
+		ClearAcceptedActual(&result)
 		return result, err
 	}
 	if err := grokSupervisionError(supervision, runErr, ctx); err != nil {
+		ClearAcceptedActual(&result)
 		return result, err
 	}
 	if result.ExitCode != 0 {
+		ClearAcceptedActual(&result)
 		return result, grokError(GrokErrNonzeroExit, fmt.Sprintf("process exited with code %d", result.ExitCode), nil)
 	}
 	if !sink.terminalSeen() {
 		// Grok Build CLI streaming-json may end with progress/usage frames only
 		// (no typed result/final event) while still exiting 0 with usable output.
 		if !sink.acceptCleanExitAsTerminal(result) {
+			ClearAcceptedActual(&result)
 			return result, grokError(GrokErrTransportLoss, "stream ended before a terminal result frame", nil)
 		}
+	}
+	// FULL success only: exact -m/--effort/--sandbox option positions may affirm.
+	AffirmAcceptedInvocation(&result, inv, argv, true, AcceptedInvocationOpts{
+		PermissionNoFallback: true,
+		ModelNoFallback:      true,
+		EffortNoFallback:     true,
+	})
+	// Exact depth/model requirement: fail closed when still unobserved after success proof.
+	if want := strings.TrimSpace(inv.Effort); want != "" && result.ActualEffort == "" {
+		result.FailureClass = "route_mismatch"
+		ClearAcceptedActual(&result)
+		return result, fmt.Errorf("grok: depth %q requested but not reported by provider (actual effort unknown)", want)
+	}
+	if want := strings.TrimSpace(inv.Model); want != "" && result.ActualModel == "" {
+		result.FailureClass = "route_mismatch"
+		ClearAcceptedActual(&result)
+		return result, fmt.Errorf("grok: model %q requested but not reported by provider (actual model unknown)", want)
+	}
+	if want := strings.TrimSpace(inv.Effort); want != "" && result.ActualEffort != "" &&
+		!strings.EqualFold(want, result.ActualEffort) {
+		result.FailureClass = "route_mismatch"
+		ClearAcceptedActual(&result)
+		return result, fmt.Errorf("grok: effort mismatch requested=%s actual=%s", want, result.ActualEffort)
+	}
+	if want := strings.TrimSpace(inv.Model); want != "" && result.ActualModel != "" &&
+		!strings.EqualFold(want, result.ActualModel) {
+		result.FailureClass = "route_mismatch"
+		ClearAcceptedActual(&result)
+		return result, fmt.Errorf("grok: model mismatch requested=%s actual=%s", want, result.ActualModel)
 	}
 	if strings.TrimSpace(result.Model) == "" {
 		// Prefer provider-reported model; fall back to the requested pin when the
@@ -292,7 +416,10 @@ func (r GrokRunner) negotiateCapability(ctx context.Context, inv Invocation, env
 	return grokCapability{Version: version}, nil
 }
 
-func prepareGrokExecutionProfile(inv Invocation, environ []string) (grokExecutionProfile, error) {
+// prepareGrokExecutionProfile builds the isolated execution env. selectedToken
+// is the exact auth token for the selected AccountProfileID and ALWAYS wins
+// over any pre-existing XAI_API_KEY in environ (unrelated keys are stripped).
+func prepareGrokExecutionProfile(inv Invocation, environ []string, selectedToken string) (grokExecutionProfile, error) {
 	workspace, err := canonicalGrokWorkspace(inv.WorktreePath)
 	if err != nil {
 		return grokExecutionProfile{}, err
@@ -309,9 +436,13 @@ func prepareGrokExecutionProfile(inv Invocation, environ []string) (grokExecutio
 	}
 	bounded := inv
 	bounded.WorktreePath = workspace.Identity
-	// Prefer explicit XAI_API_KEY; otherwise map official CLI login into the
-	// only documented credential passthrough so isolated HOME workers can auth.
-	environ = injectGrokCLIAuthAsAPIKey(environ)
+	selectedToken = strings.TrimSpace(selectedToken)
+	if selectedToken == "" {
+		return grokExecutionProfile{}, grokError(GrokErrUnsupportedCapability, "selected account token required", nil)
+	}
+	// Force the selected account credential: strip any pre-set XAI_API_KEY and
+	// inject the exact selected token. Never preserve an unrelated explicit key.
+	environ = forceGrokAPIKey(environ, selectedToken)
 	return grokExecutionProfile{
 		Invocation: bounded,
 		Env:        grokBoundedEnv(environ, bounded, runtimeRoot),
@@ -630,17 +761,12 @@ func (s *grokStreamSink) summary() string {
 	return strings.TrimSpace(s.summaryText.value)
 }
 
-func (s *grokStreamSink) metadata(inv Invocation) grokMetadata {
+// metadata returns provider-stream-observed fields only. Never falls back to
+// requested inv.Model/inv.Effort (those are not actual evidence).
+func (s *grokStreamSink) metadata() grokMetadata {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	metadata := s.meta
-	if metadata.Model == "" {
-		metadata.Model = strings.TrimSpace(inv.Model)
-	}
-	if metadata.Effort == "" {
-		metadata.Effort = strings.TrimSpace(inv.Effort)
-	}
-	return metadata
+	return s.meta
 }
 
 type grokStreamWriter struct {

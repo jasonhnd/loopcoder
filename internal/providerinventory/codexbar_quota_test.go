@@ -177,8 +177,9 @@ func TestCodexBarCollectsConfiguredProvidersIndependently(t *testing.T) {
 		}
 	}
 	codex := codexBarQuotaSnapshot(t, report, "codex")
-	if codex.Confidence != ConfidenceExact || codex.RemainingValue == nil || *codex.RemainingValue != 75 || codex.AccountProfileID != nil || codex.ModelCapabilityID != nil {
-		t.Fatalf("codex snapshot = %#v, want exact sanitized scope", codex)
+	// Third-party bridge max confidence is estimated (never exact/official).
+	if codex.Confidence != ConfidenceEstimated || codex.RemainingValue == nil || *codex.RemainingValue != 75 || codex.AccountProfileID != nil || codex.ModelCapabilityID != nil {
+		t.Fatalf("codex snapshot = %#v, want estimated sanitized scope", codex)
 	}
 	if !strings.Contains(codex.RedactedDiagnostics, "codexbar 1.2.3") || !strings.Contains(codex.RedactedDiagnostics, "cmdfp_") || strings.Contains(codex.RedactedDiagnostics, "jane@example.com") {
 		t.Fatalf("diagnostics missing provenance or leaked identity: %#v", codex.RedactedDiagnostics)
@@ -365,7 +366,7 @@ func TestCodexBarMalformedProviderPayloadsFailClosedAndRemainIsolated(t *testing
 				t.Fatalf("malformed codex snapshot retained values: %#v", bad)
 			}
 			good := codexBarQuotaSnapshot(t, report, "claude")
-			if good.TerminalErrorCode != "" || good.Confidence != ConfidenceExact || good.RemainingValue == nil || *good.RemainingValue != 7 {
+			if good.TerminalErrorCode != "" || good.Confidence != ConfidenceEstimated || good.RemainingValue == nil || *good.RemainingValue != 7 {
 				t.Fatalf("claude success snapshot = %#v", good)
 			}
 
@@ -420,7 +421,7 @@ func TestCodexBarValidZeroValuesRemainValid(t *testing.T) {
 	}
 	source := codexBarQuotaSourceFor(t, report, "codex")
 	snapshot := codexBarQuotaSnapshot(t, report, "codex")
-	if snapshot.TerminalErrorCode != "" || snapshot.ValueScale != 0 || snapshot.Confidence != ConfidenceExact {
+	if snapshot.TerminalErrorCode != "" || snapshot.ValueScale != 0 || snapshot.Confidence != ConfidenceEstimated {
 		t.Fatalf("zero-value snapshot = %#v", snapshot)
 	}
 	for field, value := range map[string]*int64{

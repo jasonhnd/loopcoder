@@ -113,11 +113,18 @@ type MachineAdmission struct {
 
 // Candidate is one route option with pre-captured hard evidence.
 // Quota remaining is deliberately NOT a hard-eligibility input.
+// AccountRef/WindowKind are first-class capacity identity (exact equality).
 type Candidate struct {
 	Provider   string `json:"provider"`
 	Model      string `json:"model"`
 	Effort     string `json:"effort,omitempty"`
 	Permission string `json:"permission,omitempty"`
+	// AccountRef is the canonical redacted capacity account for this candidate.
+	AccountRef string `json:"account_ref,omitempty"`
+	// InstallRef is the exact provider installation identity for this candidate.
+	InstallRef string `json:"install_ref,omitempty"`
+	// WindowKind is the capacity window bound to this candidate.
+	WindowKind string `json:"window_kind,omitempty"`
 	// ModelClass is the capability class of this model (from capclass map data).
 	ModelClass capclass.Class `json:"model_class"`
 
@@ -174,6 +181,9 @@ type CandidateView struct {
 	Model      string          `json:"model"`
 	Effort     string          `json:"effort,omitempty"`
 	Permission string          `json:"permission,omitempty"`
+	AccountRef string          `json:"account_ref,omitempty"`
+	InstallRef string          `json:"install_ref,omitempty"`
+	WindowKind string          `json:"window_kind,omitempty"`
 	ModelClass capclass.Class  `json:"model_class"`
 	Eligible   bool            `json:"eligible"`
 	Reasons    []string        `json:"reasons"`

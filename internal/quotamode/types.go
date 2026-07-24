@@ -239,6 +239,56 @@ func (s *Store) ActiveFraction(key WindowKey) float64 {
 	return s.activeFractionLocked(key)
 }
 
+// SeedSeq raises the reservation ID sequence high-water mark so reopened
+// ledgers never recycle sres_N IDs already present on durable entries.
+func (s *Store) SeedSeq(n int64) {
+	if s == nil || n <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n > s.seq {
+		s.seq = n
+	}
+}
+
+// RestoreActive injects a durable active reservation into pressure accounting
+// without headroom checks (ledger reopen / process restart). Idempotent by ID.
+// expiresAt must be the original persisted expiry (not an arbitrary 24h reset).
+// When expiresAt is zero or already past now, the reservation is not restored as active.
+func (s *Store) RestoreActive(id string, key WindowKey, fraction float64, projectID, attemptID string, expiresAt time.Time) error {
+	if s == nil {
+		return fmt.Errorf("%w: nil store", ErrInvalid)
+	}
+	id = strings.TrimSpace(id)
+	if id == "" || fraction <= 0 {
+		return fmt.Errorf("%w: restore id/fraction", ErrInvalid)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if prev, ok := s.byID[id]; ok && prev != nil {
+		return nil // already restored
+	}
+	now := s.now().UTC()
+	if expiresAt.IsZero() {
+		return fmt.Errorf("%w: restore requires original expiry", ErrInvalid)
+	}
+	if !expiresAt.After(now) {
+		// Expired: do not restore pressure.
+		return nil
+	}
+	r := &Reservation{
+		Schema: SchemaReservation, ID: id,
+		ProjectID: projectID, AttemptID: attemptID,
+		Key: key, Fraction: clamp01(fraction), State: StateActive,
+		CreatedAt: now, ExpiresAt: expiresAt.UTC(),
+	}
+	s.byID[id] = r
+	k := key.String()
+	s.activeByKey[k] = append(s.activeByKey[k], id)
+	return nil
+}
+
 func (s *Store) activeFractionLocked(key WindowKey) float64 {
 	ids := s.activeByKey[key.String()]
 	var sum float64

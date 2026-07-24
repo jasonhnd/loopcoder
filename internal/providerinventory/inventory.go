@@ -25,8 +25,10 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/grokauth"
 	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/models"
+	"github.com/jasonhnd/loopcoder/internal/providerinstall"
 	"github.com/jasonhnd/loopcoder/internal/runtimecap"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
@@ -1823,6 +1825,23 @@ func parseGrokModelsAuthStatus(output string, exitCode int) []parsedAuthStatus {
 	if !recognized {
 		return parseTextAuthStatus("grok", output)
 	}
+	// Prefer shared grokauth AccountProfileID (same as quota + runner).
+	// Never invent account from "grok models ready" display text alone.
+	if bind, berr := grokauth.ParseActive("", os.Getenv, time.Now().UTC()); berr == nil && bind.ExactRoutable {
+		return []parsedAuthStatus{{
+			ReferenceHash: bind.AccountProfileID, // already "acct-"+64hex; accountProfileID pass-through
+			Display:       "grok-auth",
+			EvidenceKind:  EvidenceStatusCommand,
+			State:         state,
+			ScopeState:    scope,
+			ScopeSummary:  summary,
+			Refresh:       refresh,
+			Gaps:          gaps,
+			AccountKind:   "grokauth-shared",
+		}}
+	}
+	// No exact auth identity: ready for catalog but non-routable account.
+	gaps = append(gaps, "missing-exact-account-identity")
 	return []parsedAuthStatus{{
 		ReferenceHash: "sha256:" + hashHex("grok", "models-status", string(state), strings.Join(gaps, ",")),
 		Display:       "grok-profile",
@@ -2177,6 +2196,10 @@ func readinessConfidence(state ReadinessState) Confidence {
 }
 
 func accountProfileID(adapterID, source, referenceHash string) string {
+	// Shared Grok auth already produces exact-routable "acct-"+64hex — pass through.
+	if strings.HasPrefix(referenceHash, "acct-") && len(referenceHash) == 5+64 {
+		return strings.ToLower(referenceHash)
+	}
 	return "acct_" + hashBase32(adapterID, source, referenceHash)[:32]
 }
 
@@ -3187,7 +3210,16 @@ func canonicalPath(path string, deps Deps) string {
 }
 
 func installationID(adapterID string, identity ExecutableIdentity, path, platform string) string {
-	return "pinst_" + hashBase32(adapterID, identity.Basename, identity.PathHash, hashHex(path), platform)[:32]
+	// Delegate to shared algorithm so runners can affirm the same pinst_*.
+	// identity + platform kept for call-site compatibility; path drives the hash.
+	_ = identity
+	_ = platform
+	id, err := providerinstall.ComputeInstallationID(adapterID, path)
+	if err != nil || id == "" {
+		// Fallback identical formula (should not hit when path is valid).
+		return "pinst_" + hashBase32(adapterID, identity.Basename, identity.PathHash, hashHex(path), platform)[:32]
+	}
+	return id
 }
 
 func adapterDeclarationID(adapter AdapterDeclaration) string {

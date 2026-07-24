@@ -11,6 +11,7 @@ type RouteCandidate struct {
 	Provider     string
 	Model        string
 	Effort       string // required: observed/supported depth for this candidate
+	Permission   string // required permission lane (read-only|bounded_write|…)
 	HardEligible bool
 	SoftExcluded bool
 }
@@ -24,18 +25,27 @@ type AlternateRoutePick struct {
 }
 
 // PickAlternateRouteSameDepth selects another HardEligible, non-SoftExcluded
-// candidate whose Effort matches reqDepth exactly. It never rewrites a
-// candidate's depth to satisfy the request (no silent low→medium or model/depth
-// mismatch). Zero value = fail closed.
+// candidate whose Effort matches reqDepth exactly and Permission matches
+// reqPermission when both are set. It never rewrites a candidate's depth to
+// satisfy the request (no silent low→medium or model/depth mismatch).
+// Zero value = fail closed.
 //
-// Production note: generation-safe retry (new attempt id, reconcile reservation)
-// is a follow-up wiring on #1397 when model_unavailable is observed after claim.
-// This helper only picks; it does not execute or re-claim.
+// Production wiring claims a distinct AttemptID (generation bump) with explicit
+// SupersedesAttemptID — never reopens the closed failed attempt.
 func PickAlternateRouteSameDepth(
 	cands []RouteCandidate,
 	failedProvider, failedModel, reqDepth string,
 ) AlternateRoutePick {
+	return PickAlternateRouteSameDepthPerm(cands, failedProvider, failedModel, reqDepth, "")
+}
+
+// PickAlternateRouteSameDepthPerm is the permission-aware alternate picker.
+func PickAlternateRouteSameDepthPerm(
+	cands []RouteCandidate,
+	failedProvider, failedModel, reqDepth, reqPermission string,
+) AlternateRoutePick {
 	reqDepth = normalizeDepth(reqDepth)
+	reqPermission = normalizePermission(reqPermission)
 	failedProvider = strings.TrimSpace(failedProvider)
 	failedModel = strings.TrimSpace(failedModel)
 	if reqDepth == "" || len(cands) == 0 {
@@ -55,6 +65,13 @@ func PickAlternateRouteSameDepth(
 		if candDepth == "" || candDepth != reqDepth {
 			continue
 		}
+		if reqPermission != "" {
+			candPerm := normalizePermission(cv.Permission)
+			// Empty observed permission never satisfies a required permission.
+			if candPerm == "" || candPerm != reqPermission {
+				continue
+			}
+		}
 		return AlternateRoutePick{
 			Provider: cv.Provider,
 			Model:    cv.Model,
@@ -62,4 +79,16 @@ func PickAlternateRouteSameDepth(
 		}
 	}
 	return AlternateRoutePick{}
+}
+
+func normalizePermission(p string) string {
+	p = strings.ToLower(strings.TrimSpace(p))
+	switch p {
+	case "ro", "readonly", "read_only", "read-only":
+		return "read-only"
+	case "write", "bounded-write", "bounded_write", "boundedwrite":
+		return "bounded_write"
+	default:
+		return p
+	}
 }

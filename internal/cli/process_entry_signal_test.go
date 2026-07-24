@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -12,7 +13,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/autoroute"
+	"github.com/jasonhnd/loopcoder/internal/capacityledger"
+	"github.com/jasonhnd/loopcoder/internal/capacitysnapshot"
+	"github.com/jasonhnd/loopcoder/internal/capclass"
+	"github.com/jasonhnd/loopcoder/internal/eligibility"
 	"github.com/jasonhnd/loopcoder/internal/goalrun"
+	"github.com/jasonhnd/loopcoder/internal/quotapolicy"
 	"github.com/jasonhnd/loopcoder/internal/workflowrun"
 )
 
@@ -53,15 +60,25 @@ func TestMain(m *testing.M) {
 			os.Stderr.WriteString("workflow-hang probe: missing LOOPCODER_HOME/project/run\n")
 			os.Exit(2)
 		}
+		// Product pin + frozen inventory (fixture is never production-eligible).
+		now := time.Date(2026, 7, 23, 18, 0, 0, 0, time.UTC)
+		inv, snap := hangProbeInventory(now)
+		ledgerPath := filepath.Join(home, "hang-cap.json")
 		res, err := goalrun.Execute(CommandContext(), goalrun.Request{
 			ProjectID: projectID,
 			RunID:     runID,
 			Goal:      "implement hang probe for durable signal interrupt ledger",
 			Issue:     "1397",
 			Actor:     "owner",
-			Provider:  "fixture",
-			Model:     "fixture-model",
+			Provider:  "codex",
+			Model:     "gpt-5.5",
 			HomeDir:   home,
+			LoadInventory: func(ctx context.Context, repo string, at time.Time) (autoroute.Inventory, capacitysnapshot.Snapshot, error) {
+				return inv, snap, nil
+			},
+			OpenLedger: func(nowFn func() time.Time) (*capacityledger.Ledger, error) {
+				return capacityledger.OpenPath(ledgerPath, nowFn)
+			},
 			// Hang first graph child until CommandContext is cancelled by SIGTERM.
 			Executor: workflowrun.FakeChildExecutor{
 				HomeDir: home,
@@ -277,3 +294,67 @@ func signalProbeNonEmptyLines(s string) []string {
 	}
 	return out
 }
+
+// hangProbeInventory freezes codex product inventory for the SIGTERM hang probe
+// (fixture is never a production route).
+func hangProbeInventory(now time.Time) (autoroute.Inventory, capacitysnapshot.Snapshot) {
+	ok := func(id string) eligibility.Fact {
+		return eligibility.Fact{State: eligibility.FactTrue, EvidenceID: id, Freshness: eligibility.FreshFresh}
+	}
+	ff := func(id string) eligibility.Fact {
+		return eligibility.Fact{State: eligibility.FactFalse, EvidenceID: id, Freshness: eligibility.FreshFresh}
+	}
+	acct := "acct-codex-" + strings.Repeat("h", 48)
+	var cands []eligibility.Candidate
+	for _, effort := range []string{"low", "medium", "high"} {
+		for _, perm := range []string{"read-only", "bounded_write"} {
+			cands = append(cands, eligibility.Candidate{
+				Provider: "codex", Model: "gpt-5.5", Effort: effort, Permission: perm,
+				ModelClass: capclass.ClassSoul, AccountRef: acct, InstallRef: "install-codex", WindowKind: "five_hour",
+				Installed: ok("i"), Authenticated: ok("a"), ModelPresent: ok("m"),
+				PermissionOK: ok("p"), EffortOK: ok("e"), Healthy: ok("h"),
+				CooldownActive: ff("cd"), ResourceFit: ok("r"), QuotaRemaining: 9999,
+			})
+		}
+	}
+	rf, ttr, rel := 0.9, 2*time.Hour, 0.95
+	inv := autoroute.Inventory{
+		EvidenceDigest: "hang-probe-codex",
+		Candidates:     cands,
+		Soft: []quotapolicy.Candidate{{
+			Provider: "codex", Model: "gpt-5.5", AccountRef: acct, InstallRef: "install-codex", WindowKind: "five_hour",
+			Windows: []quotapolicy.Window{{
+				Kind: quotapolicy.WindowFiveHour, RemainingFraction: &rf,
+				Evidence: quotapolicy.EvidenceExact, TimeToReset: &ttr,
+			}},
+			Reliability: &rel, ReliabilityEvidence: quotapolicy.EvidenceExact,
+		}},
+		Machine: eligibility.MachineAdmission{CapacityOK: ok("mach"), ConcurrentSlots: 4},
+	}
+	acc := capacitysnapshot.FromAccountInput(capacitysnapshot.AccountInput{
+		Provider: "codex", AccountRef: acct, InstallRef: "install-codex",
+		Installed: true, Authenticated: true, Healthy: true,
+		HealthConfidence: capacitysnapshot.ConfidenceExact, HealthFreshness: capacitysnapshot.FreshnessFresh,
+		Windows: []capacitysnapshot.Window{{
+			Kind: "five_hour", Unit: capacitysnapshot.UnitPercentage,
+			Used:       capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: 10, Unit: capacitysnapshot.UnitPercentage},
+			Remaining:  capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: 90, Unit: capacitysnapshot.UnitPercentage},
+			Limit:      capacitysnapshot.Quantity{Class: capacitysnapshot.QtyFinite, Value: 100, Unit: capacitysnapshot.UnitPercentage},
+			Confidence: capacitysnapshot.ConfidenceExact, Freshness: capacitysnapshot.FreshnessFresh,
+			ResetAt: func() *time.Time { tt := now.Add(time.Hour); return &tt }(), CapturedAt: now, Source: "test",
+		}},
+		Models: []capacitysnapshot.ModelSpec{{
+			ModelID: "gpt-5.5", SupportedDepths: []string{"low", "medium", "high"}, DefaultDepth: "medium", Present: true,
+		}},
+		Source: "test", CapturedAt: now,
+	})
+	snap, err := capacitysnapshot.Build([]capacitysnapshot.AccountObservation{acc}, now)
+	if err != nil {
+		// Probe path: empty snap forces fail-closed rather than invent capacity.
+		return inv, capacitysnapshot.Snapshot{}
+	}
+	return inv, snap
+}
+
+// silence unused import when build tags differ
+var _ = context.Background

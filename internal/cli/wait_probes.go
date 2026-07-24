@@ -168,7 +168,7 @@ func detachedWorkerProbe(store storage.Store, runID string, now func() time.Time
 			if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "missing") {
 				return waitstate.Observation{
 					EventID: "worker-missing", State: waitstate.StateTerminal, Code: "worker-missing",
-					References: []waitstate.Reference{{Kind: "detached-run", ID: runID}},
+					References:    []waitstate.Reference{{Kind: "detached-run", ID: runID}},
 					Consequential: true, Terminal: true,
 				}, nil
 			}

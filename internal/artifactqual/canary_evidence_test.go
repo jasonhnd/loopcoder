@@ -106,6 +106,12 @@ func child(id, att, prov, model, depth, term string, before, reserved, after flo
 		Terminal: term, CapacityBefore: &b, CapacityReserved: &r, CapacityAfter: &a,
 		ActualSource: "unknown", AfterSource: "codexbar", AfterFreshness: "fresh",
 		RealProviderExecuted: true, WorktreePath: "/tmp/wt/" + id,
+		AccountRef: "acct-test", InstallRef: "pinst_test",
+		ActualSources: &artifactqual.CanaryRouteSources{
+			Model: "provider_stream", Effort: "accepted_invocation",
+			Permission: "accepted_invocation", Account: "auth_binding", Install: "install_binding",
+		},
+		ArgvDigest: "sha256:fixture-argv-" + id,
 	}
 }
 

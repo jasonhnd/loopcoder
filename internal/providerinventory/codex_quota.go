@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/codexauth"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
@@ -611,6 +612,7 @@ func validateCodexInitializeResponse(result json.RawMessage) error {
 
 func snapshotsFromCodexRateLimits(source QuotaTelemetrySource, installationID *string, cliVersion string, account, limits map[string]any, frames []json.RawMessage, now time.Time) ([]QuotaSnapshot, error) {
 	accountScope := codexAccountScope(account)
+	acctProfile := codexCanonicalAccountProfileID(account)
 	raw := bytes.Join(rawJSONFrames(frames), []byte("\n"))
 	if credentialMaterialLike(string(raw)) {
 		return nil, ErrQuotaCredentialMaterial
@@ -630,6 +632,13 @@ func snapshotsFromCodexRateLimits(source QuotaTelemetrySource, installationID *s
 	}
 	if len(snapshots) == 0 {
 		return nil, fmt.Errorf("%w: no supported quota fields", ErrCodexQuotaMalformed)
+	}
+	// Stamp shared opaque AccountProfileID on every snapshot for exact route binding.
+	if acctProfile != "" {
+		for i := range snapshots {
+			id := acctProfile
+			snapshots[i].AccountProfileID = &id
+		}
 	}
 	sort.Slice(snapshots, func(i, j int) bool {
 		return snapshots[i].QuotaSnapshotID < snapshots[j].QuotaSnapshotID
@@ -1151,6 +1160,30 @@ func codexAccountScope(account map[string]any) string {
 		}
 	}
 	return "unknown"
+}
+
+// codexCanonicalAccountProfileID returns the shared opaque acct- binding used by
+// inventory and agent execution (internal/codexauth). Empty when not exact-routable.
+//
+// Only account/read RPC-affirmed identity is accepted. Never falls back to a
+// local auth.json (that would stamp RPC quota under a different process identity).
+// Canonical hash is provider+stable principal only (plan is separate evidence).
+func codexCanonicalAccountProfileID(account map[string]any) string {
+	for _, container := range []map[string]any{account, codexMapField(account, "account"), codexMapField(account, "profile")} {
+		if container == nil {
+			continue
+		}
+		id := codexStringField(container, "id", "account_id", "accountID", "chatgpt_account_id")
+		if id == "" || strings.Contains(id, "@") {
+			continue
+		}
+		// plan ignored for identity; codexauth.CanonicalAccountProfileID is principal-only.
+		if acct := codexauth.CanonicalAccountProfileID(id, "", ""); acct != "" {
+			return acct
+		}
+	}
+	// Fail unknown — do not invent from local auth file.
+	return ""
 }
 
 func codexStringField(fields map[string]any, keys ...string) string {

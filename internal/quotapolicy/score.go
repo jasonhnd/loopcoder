@@ -63,15 +63,22 @@ func Rank(in Input) (Ranking, error) {
 
 func scoreOne(c Candidate, pol Policy, task capclass.Class, now time.Time) Score {
 	sc := Score{
-		Schema:   SchemaScore,
-		Provider: c.Provider,
-		Model:    c.Model,
-		Reasons:  []string{},
+		Schema:     SchemaScore,
+		Provider:   c.Provider,
+		Model:      c.Model,
+		AccountRef: strings.TrimSpace(c.AccountRef),
+		InstallRef: strings.TrimSpace(c.InstallRef),
+		WindowKind: strings.TrimSpace(c.WindowKind),
+		Reasons:    []string{},
 	}
 
 	// --- soft exclude: exhausted binding window, rate limit, cooldown ---
-	binding, bindRem, bindEv, bindTTR, exhausted, rateLimited, noTelemetry := bindingWindow(c.Windows)
+	// Prefer exact candidate WindowKind when set; never invent five_hour over weekly.
+	binding, bindRem, bindEv, bindTTR, exhausted, rateLimited, noTelemetry := bindingWindow(c.Windows, c.WindowKind)
 	sc.BindingWindow = binding
+	if sc.WindowKind == "" && binding != "" {
+		sc.WindowKind = string(binding)
+	}
 
 	if rateLimited {
 		sc.SoftExcluded = true
@@ -221,17 +228,26 @@ func scoreOne(c Candidate, pol Policy, task capclass.Class, now time.Time) Score
 	return sc
 }
 
-// bindingWindow picks the most scarce known window as the route bound.
+// bindingWindow picks the route-bound window. When preferKind is set, only that
+// kind is considered (exact selected window identity). Otherwise pick most scarce.
 // Rate-limit windows with RateLimited force exclusion signal.
-func bindingWindow(windows []Window) (kind WindowKind, rem *float64, ev EvidenceClass, ttr *time.Duration, exhausted, rateLimited, noTelemetry bool) {
+func bindingWindow(windows []Window, preferKind string) (kind WindowKind, rem *float64, ev EvidenceClass, ttr *time.Duration, exhausted, rateLimited, noTelemetry bool) {
 	if len(windows) == 0 {
 		return "", nil, EvidenceMissing, nil, false, false, true
 	}
+	preferKind = strings.TrimSpace(preferKind)
 	noTelemetry = true
 	// Prefer known finite windows; pick lowest remaining fraction among exact/estimated.
 	bestScore := 2.0 // remaining fraction; lower = more scarce
 	found := false
 	for _, w := range windows {
+		if preferKind != "" && string(w.Kind) != preferKind && !windowKindAliasEqual(string(w.Kind), preferKind) {
+			// Still detect rate-limit on sibling windows.
+			if w.RateLimited {
+				rateLimited = true
+			}
+			continue
+		}
 		if w.RateLimited || w.Kind == WindowRateLimit && w.RateLimited {
 			rateLimited = true
 		}
@@ -288,6 +304,26 @@ func bindingWindow(windows []Window) (kind WindowKind, rem *float64, ev Evidence
 		noTelemetry = true
 	}
 	return
+}
+
+func windowKindAliasEqual(a, b string) bool {
+	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	if a == b {
+		return true
+	}
+	norm := func(k string) string {
+		switch strings.ToLower(k) {
+		case "weekly", "fixed-week", "fixed_week":
+			return "weekly"
+		case "credit":
+			return "credit"
+		case "five_hour", "fixed_hour", "fixed-hour", "5h":
+			return "five_hour"
+		default:
+			return strings.ToLower(k)
+		}
+	}
+	return norm(a) == norm(b)
 }
 
 func reserveFor(task capclass.Class, pol Policy) float64 {

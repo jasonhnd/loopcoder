@@ -82,6 +82,11 @@ type ModelEntry struct {
 	DefaultDepth     string   `json:"default_depth,omitempty"`
 	ClassHint        string   `json:"class_hint,omitempty"` // optional capclass hint
 	PresentInCatalog bool     `json:"present_in_catalog"`
+	// CatalogHintOnly marks static seed, adapter-declared static, or source-less
+	// capability rows. They may appear for display/planning but MUST NOT enter
+	// production auto-route inventory (fail closed; only fresh machine-readable
+	// provenance is production-routable).
+	CatalogHintOnly bool `json:"catalog_hint_only,omitempty"`
 }
 
 // AccountObservation is one provider company × account/install profile.

@@ -39,7 +39,11 @@ const (
 	QuotaSourceProviderExportFile   QuotaSourceKind = "provider-export-file"
 	QuotaSourceLoopcoderLocalLedger QuotaSourceKind = "loopcoder-local-ledger"
 	QuotaSourceOperatorOverlay      QuotaSourceKind = "operator-configured-policy-overlay"
-	QuotaSourceFixture              QuotaSourceKind = "fixture"
+	// QuotaSourceTrustedThirdPartyBridge is a third-party trusted bridge
+	// (e.g. CodexBar) with explicit trust class/version/fingerprint.
+	// Distinct from operator policy overlay — never exact confidence.
+	QuotaSourceTrustedThirdPartyBridge QuotaSourceKind = "trusted-third-party-bridge"
+	QuotaSourceFixture                 QuotaSourceKind = "fixture"
 )
 
 type QuantityKind string
@@ -171,7 +175,7 @@ func (k *QuotaSourceKind) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	switch QuotaSourceKind(value) {
-	case QuotaSourceOfficialAPI, QuotaSourceOfficialCLICommand, QuotaSourceOfficialCLIError, QuotaSourceProviderExportFile, QuotaSourceLoopcoderLocalLedger, QuotaSourceOperatorOverlay, QuotaSourceFixture:
+	case QuotaSourceOfficialAPI, QuotaSourceOfficialCLICommand, QuotaSourceOfficialCLIError, QuotaSourceProviderExportFile, QuotaSourceLoopcoderLocalLedger, QuotaSourceOperatorOverlay, QuotaSourceTrustedThirdPartyBridge, QuotaSourceFixture:
 		*k = QuotaSourceKind(value)
 		return nil
 	default:
@@ -646,7 +650,7 @@ func quotaExpired(value string, now time.Time) bool {
 
 func knownQuotaSourceKind(kind QuotaSourceKind) bool {
 	switch kind {
-	case QuotaSourceOfficialAPI, QuotaSourceOfficialCLICommand, QuotaSourceOfficialCLIError, QuotaSourceProviderExportFile, QuotaSourceLoopcoderLocalLedger, QuotaSourceOperatorOverlay, QuotaSourceFixture:
+	case QuotaSourceOfficialAPI, QuotaSourceOfficialCLICommand, QuotaSourceOfficialCLIError, QuotaSourceProviderExportFile, QuotaSourceLoopcoderLocalLedger, QuotaSourceOperatorOverlay, QuotaSourceTrustedThirdPartyBridge, QuotaSourceFixture:
 		return true
 	default:
 		return false
@@ -674,12 +678,27 @@ func knownWindowKind(kind WindowKind) bool {
 func confidenceAllowedForSource(kind QuotaSourceKind, confidence Confidence) bool {
 	switch confidence {
 	case ConfidenceExact:
-		return kind != QuotaSourceOperatorOverlay
+		// Exact is reserved for official machine-readable sources — never
+		// third-party bridges or operator policy overlays.
+		return kind != QuotaSourceOperatorOverlay && kind != QuotaSourceTrustedThirdPartyBridge
 	case ConfidenceEstimated, ConfidenceUnknown, ConfidenceUnavailable, ConfidenceStale:
 		return true
 	default:
 		return false
 	}
+}
+
+// capConfidenceForSource downgrades confidence that exceeds a source kind's contract
+// (e.g. third-party CodexBar bridge cannot claim exact).
+func capConfidenceForSource(kind QuotaSourceKind, confidence Confidence) Confidence {
+	if confidenceAllowedForSource(kind, confidence) {
+		return confidence
+	}
+	// Exact → estimated for operator overlay / fixture; other illegal values → unknown.
+	if confidence == ConfidenceExact {
+		return ConfidenceEstimated
+	}
+	return ConfidenceUnknown
 }
 
 func unitForQuantity(kind QuantityKind, providerName string) string {

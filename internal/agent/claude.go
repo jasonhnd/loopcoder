@@ -96,8 +96,43 @@ func (ClaudeRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	summary := parseClaudeSummary(stdout.Bytes())
 	metadata := parseClaudeInvocation(stdout.Bytes(), inv)
 	result := resultWithSupervision(supervisedExitCode(supervision, runErr), summary, metadata, startedAt, endedAt, supervision, runErr, ctx)
+	exe := ""
+	if p, err := exec.LookPath("claude"); err == nil {
+		exe = p
+	}
+	AffirmBasicActual(&result, "claude", exe, inv)
+	if strings.TrimSpace(result.ActualInstallRef) != "" {
+		result.ActualSourceInstall = ActualSourceInstallBinding
+	}
+	if strings.TrimSpace(result.Effort) == "" {
+		result.ActualEffort = ""
+	}
+	argv := append([]string{"claude"}, BuildClaudeArgs(inv)...)
+	// Failures first — never accepted_invocation before full success.
 	if runErr != nil {
+		ClearAcceptedActual(&result)
 		return result, runErr
+	}
+	if result.ExitCode != 0 {
+		ClearAcceptedActual(&result)
+		return result, nil
+	}
+	// Claude has no exact login-account binding shared with inventory.
+	if want := strings.TrimSpace(inv.AccountRef); want != "" && strings.TrimSpace(result.ActualAccountRef) == "" {
+		result.FailureClass = "auth_refusal"
+		ClearAcceptedActual(&result)
+		return result, fmt.Errorf("claude: exact AccountRef %q required but runner cannot affirm login-account identity", want)
+	}
+	// FULL success: exact --effort/--model/permission option positions only.
+	AffirmAcceptedInvocation(&result, inv, argv, true, AcceptedInvocationOpts{
+		PermissionNoFallback: true,
+		ModelNoFallback:      true,
+		EffortNoFallback:     true,
+	})
+	if want := strings.TrimSpace(inv.Effort); want != "" && strings.TrimSpace(result.ActualEffort) == "" {
+		result.FailureClass = "route_mismatch"
+		ClearAcceptedActual(&result)
+		return result, fmt.Errorf("claude: depth %q requested but not reported by provider stream (actual effort unknown)", want)
 	}
 	return result, nil
 }
@@ -198,9 +233,9 @@ func parseClaudeSummary(output []byte) string {
 }
 
 func parseClaudeInvocation(output []byte, inv Invocation) invocationMetadata {
-	metadata := invocationMetadata{
-		Effort: strings.TrimSpace(inv.Effort),
-	}
+	// Never seed Effort/Model from request — only stream-parsed fields.
+	metadata := invocationMetadata{}
+	_ = inv
 
 	resultEvent := extractClaudeResultEvent(output)
 	if len(resultEvent) == 0 {
@@ -220,11 +255,6 @@ func parseClaudeInvocation(output []byte, inv Invocation) invocationMetadata {
 	}
 
 	metadata.Model = claudePrimaryModel(payload.ModelUsage)
-	if inv.Model != "" {
-		if _, ok := payload.ModelUsage[inv.Model]; ok {
-			metadata.Model = inv.Model
-		}
-	}
 	if inputTokens, ok := parseRawInt64(payload.Usage.InputTokens); ok {
 		metadata.Usage.InputTokens = inputTokens
 	}

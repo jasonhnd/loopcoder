@@ -77,9 +77,8 @@ func normalizeAccount(a AccountObservation, now time.Time) (AccountObservation, 
 	if a.Provider == "" {
 		return AccountObservation{}, fmt.Errorf("%w: provider required", ErrInvalidSnapshot)
 	}
-	if a.AccountRef == "" {
-		a.AccountRef = "account-unknown"
-	}
+	// Empty AccountRef stays empty (unknown / non-routable). Never invent
+	// "account-unknown" — that becomes hash-shaped and can be routed as exact.
 	if err := rejectCredentialMaterial(a.AccountRef, a.InstallRef, a.Source, a.Provenance); err != nil {
 		return AccountObservation{}, err
 	}

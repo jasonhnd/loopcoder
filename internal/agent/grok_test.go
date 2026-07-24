@@ -107,6 +107,7 @@ func TestBuildGrokArgs(t *testing.T) {
 }
 
 func TestGrokRunnerReadOnlyStreamingSuccess(t *testing.T) {
+	ensurePackageGrokAuth(t)
 	restoreRun := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, opts supervisedexec.Options) (supervisedexec.Result, error) {
 		if opts.HardCap != 123*time.Millisecond {
 			t.Fatalf("HardCap = %s, want 123ms", opts.HardCap)
@@ -160,14 +161,94 @@ func TestGrokRunnerReadOnlyStreamingSuccess(t *testing.T) {
 	}
 }
 
+// ensurePackageGrokAuth installs deterministic package auth fixtures for positive
+// runner tests. Does not mutate production grokCommand (stays "grok").
+// Also installs a test-only fake executable named "grok" at the front of PATH so
+// install identity / LookPath are host-independent. Hostile-HOME tests that only
+// need auth may call ensurePackageGrokAuthFile; install-only uses ensurePackageGrokOnPATH.
+func ensurePackageGrokAuth(t *testing.T) {
+	t.Helper()
+	ensurePackageGrokAuthFile(t)
+	ensurePackageGrokOnPATH(t)
+}
+
+// ensurePackageGrokAuthFile seeds GROK_HOME/auth.json without touching PATH.
+func ensurePackageGrokAuthFile(t *testing.T) {
+	t.Helper()
+	// Prefer explicit GROK_HOME so hostile HOME isolation tests remain valid.
+	if gh := os.Getenv("GROK_HOME"); gh != "" {
+		if _, err := os.Stat(filepath.Join(gh, "auth.json")); err == nil {
+			return
+		}
+	}
+	dir := t.TempDir()
+	// AuthPath(GROK_HOME) → GROK_HOME/auth.json (not .grok subdir).
+	writeTestGrokAuthFile(t, filepath.Join(dir, "auth.json"), "xai-package-default-token", "prin-package-default")
+	t.Setenv("GROK_HOME", dir)
+}
+
+// ensurePackageGrokOnPATH places a deterministic fake executable named "grok"
+// first on PATH. Does NOT mutate package-global grokCommand — stub tests own
+// that mutation and must clean it up. Requires grokCommand == "grok" so probe
+// argv remains []string{"grok","version"|"--help"} and package leakage fails
+// the test instead of being silently repaired.
+func ensurePackageGrokOnPATH(t *testing.T) {
+	t.Helper()
+	if grokCommand != "grok" {
+		t.Fatalf("package-global grokCommand=%q want %q (prior stub leaked; do not repair here)", grokCommand, "grok")
+	}
+	bin := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFakeGrokExecutable(t, filepath.Join(bin, "grok"))
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if _, err := exec.LookPath("grok"); err != nil {
+		t.Fatalf("test fixture LookPath(grok) after PATH prepend: %v", err)
+	}
+}
+
+func writeTestGrokAuth(t *testing.T, home, token, principal string) {
+	t.Helper()
+	// Official path when HOME is set: ~/.grok/auth.json
+	dir := filepath.Join(home, ".grok")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTestGrokAuthFile(t, filepath.Join(dir, "auth.json"), token, principal)
+}
+
+func writeTestGrokAuthFile(t *testing.T, path, token, principal string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339)
+	doc := map[string]any{
+		"https://auth.x.ai/oidc::client-test": map[string]any{
+			"key": token, "principal_id": principal, "oidc_issuer": "https://auth.x.ai/oidc",
+			"expires_at": now,
+		},
+	}
+	raw, _ := json.Marshal(doc)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestGrokRunnerWriteModeReceivesApprovedWorkspaceAndBoundedEnv(t *testing.T) {
+	// Install identity + probes need a host-independent grok on PATH; auth is
+	// hostile-HOME selected account (not GROK_HOME package default).
+	ensurePackageGrokOnPATH(t)
 	t.Setenv("LOOPCODER_SECRET_CANARY", "should-not-pass")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "should-not-pass")
-	t.Setenv("XAI_API_KEY", "xai-runtime-test-value")
+	// Unrelated pre-set key must NOT win over selected auth.json token.
+	t.Setenv("XAI_API_KEY", "xai-unrelated-pre-set-must-not-win")
 	hostileHome := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(hostileHome, ".grok", "hooks"), 0o755); err != nil {
 		t.Fatalf("mkdir hostile home: %v", err)
 	}
+	writeTestGrokAuth(t, hostileHome, "xai-selected-account-token", "prin-test-write")
 	t.Setenv("HOME", hostileHome)
 	t.Setenv("USERPROFILE", hostileHome)
 	worktree := t.TempDir()
@@ -199,8 +280,11 @@ func TestGrokRunnerWriteModeReceivesApprovedWorkspaceAndBoundedEnv(t *testing.T)
 		if strings.Contains(env, hostileHome) {
 			t.Fatalf("bounded env inherited hostile home path %q in:\n%s", hostileHome, env)
 		}
-		if !strings.Contains(env, "XAI_API_KEY=xai-runtime-test-value") {
-			t.Fatalf("bounded env missing canonical XAI key:\n%s", env)
+		if !strings.Contains(env, "XAI_API_KEY=xai-selected-account-token") {
+			t.Fatalf("bounded env missing selected-account XAI key:\n%s", env)
+		}
+		if strings.Contains(env, "xai-unrelated-pre-set-must-not-win") {
+			t.Fatalf("unrelated pre-set XAI_API_KEY must not win:\n%s", env)
 		}
 		runtimeRoot := filepath.Join(logDir, "grok.grok-runtime")
 		for _, want := range []string{
@@ -236,6 +320,7 @@ func TestGrokRunnerWriteModeReceivesApprovedWorkspaceAndBoundedEnv(t *testing.T)
 }
 
 func TestGrokRunnerCapabilityNegotiationFailsClosed(t *testing.T) {
+	ensurePackageGrokAuth(t)
 	tests := []struct {
 		name  string
 		probe func(context.Context, []string, string, []string, time.Duration, int64) (grokProbeResult, error)
@@ -288,6 +373,7 @@ func TestGrokRunnerCapabilityNegotiationFailsClosed(t *testing.T) {
 }
 
 func TestGrokCapabilityAcceptsHelpWithoutNoAutoUpdateOrProfileNames(t *testing.T) {
+	ensurePackageGrokAuth(t)
 	// Grok Build CLI v0.2.111 advertises --sandbox but not always profile names
 	// or --no-auto-update in --help; negotiation must still succeed.
 	probe := func(_ context.Context, argv []string, _ string, _ []string, _ time.Duration, _ int64) (grokProbeResult, error) {
@@ -306,6 +392,7 @@ func TestGrokCapabilityAcceptsHelpWithoutNoAutoUpdateOrProfileNames(t *testing.T
 }
 
 func TestGrokRunnerRejectsInheritedProjectConfiguration(t *testing.T) {
+	ensurePackageGrokAuth(t)
 	tests := []string{
 		"CLAUDE.md",
 		filepath.Join(".claude", "settings.json"),
@@ -346,6 +433,7 @@ func TestGrokRunnerRejectsInheritedProjectConfiguration(t *testing.T) {
 }
 
 func TestGrokRunnerCanonicalizesWorkspaceAlias(t *testing.T) {
+	ensurePackageGrokAuth(t)
 	root := t.TempDir()
 	physical := filepath.Join(root, "physical", "repo")
 	if err := os.MkdirAll(physical, 0o755); err != nil {
@@ -421,6 +509,7 @@ func TestGrokWorkspacePathIdentityAcceptsWindowsCaseOnlyNotWrongDirectory(t *tes
 }
 
 func TestGrokRunnerRejectsWorkspaceSymlinkEscape(t *testing.T) {
+	ensurePackageGrokAuth(t)
 	worktree := t.TempDir()
 	outside := t.TempDir()
 	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("secret"), 0o644); err != nil {
@@ -480,6 +569,7 @@ func TestPrepareGrokRuntimeRootIsPerLogPathAndRejectsSymlink(t *testing.T) {
 }
 
 func TestGrokRunnerTypedFailures(t *testing.T) {
+	ensurePackageGrokAuth(t)
 	tests := []struct {
 		name     string
 		run      func(*exec.Cmd) (supervisedexec.Result, error)
@@ -613,6 +703,7 @@ func TestRedactGrokOutputAuthorizationCredentials(t *testing.T) {
 }
 
 func TestGrokRunnerRedactsBeforePersisting(t *testing.T) {
+	ensurePackageGrokAuth(t)
 	xaiCanary := "xai-" + strings.Repeat("A", 24)
 	canaries := append([]string{xaiCanary}, runtimeGrokSecretCanaries()...)
 	jwt := canaries[1]
@@ -645,6 +736,7 @@ func TestGrokRunnerRedactsBeforePersisting(t *testing.T) {
 }
 
 func TestGrokRunnerRedactsBeforeEveryCapBoundary(t *testing.T) {
+	ensurePackageGrokAuth(t)
 	xaiCanary := "xai-" + strings.Repeat("B", 24)
 	canaries := append([]string{xaiCanary}, runtimeGrokSecretCanaries()...)
 	jwt := canaries[1]
@@ -680,6 +772,7 @@ func TestGrokRunnerRedactsBeforeEveryCapBoundary(t *testing.T) {
 }
 
 func TestGrokRunnerRedactsAuthorizationCredentialsFromMalformedFrame(t *testing.T) {
+	ensurePackageGrokAuth(t)
 	canaries := runtimeGrokSecretCanaries()
 	jwt := canaries[0]
 	basic := canaries[1]
@@ -703,6 +796,7 @@ func TestGrokRunnerRedactsAuthorizationCredentialsFromMalformedFrame(t *testing.
 }
 
 func TestGrokRunnerCancelsProviderOnTerminalStreamError(t *testing.T) {
+	ensurePackageGrokAuth(t)
 	var sawCancel atomic.Bool
 	restoreRun := stubRunSupervised(t, func(ctx context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
 		_, _ = io.WriteString(cmd.Stdout, "not-json\n")
@@ -730,6 +824,7 @@ func TestGrokRunnerCancelsProviderOnTerminalStreamError(t *testing.T) {
 }
 
 func TestGrokRunnerCapsStructuredSummaryAndRejectsMalformedCost(t *testing.T) {
+	ensurePackageGrokAuth(t)
 	t.Run("structured summary cap", func(t *testing.T) {
 		xaiCanary := "xai-" + strings.Repeat("C", 24)
 		canaries := append([]string{xaiCanary}, runtimeGrokSecretCanaries()...)
@@ -789,6 +884,7 @@ func TestGrokRunnerCapsStructuredSummaryAndRejectsMalformedCost(t *testing.T) {
 }
 
 func TestGrokRunnerNativeFakeProcessFixture(t *testing.T) {
+	ensurePackageGrokAuth(t)
 	dir := t.TempDir()
 	exe := filepath.Join(dir, executableNameForTest("grok"))
 	writeFakeGrokExecutable(t, exe)
@@ -811,6 +907,7 @@ func TestGrokRunnerNativeFakeProcessFixture(t *testing.T) {
 }
 
 func TestGrokRunnerCancellationKillsNativeProcessTree(t *testing.T) {
+	ensurePackageGrokAuth(t)
 	dir := t.TempDir()
 	exe := filepath.Join(dir, executableNameForTest("grok"))
 	marker := filepath.Join(dir, "leaked-child.txt")
@@ -838,8 +935,11 @@ func TestGrokRunnerCancellationKillsNativeProcessTree(t *testing.T) {
 }
 
 func TestGrokOrdinaryWorkerConformanceSuite(t *testing.T) {
+	// Host-independent install identity; auth is hostile-HOME selected account.
+	ensurePackageGrokOnPATH(t)
 	secretCanaries := append(runtimeGrokSecretCanaries(), "AKIA"+strings.Repeat("A", 16), "xai-"+strings.Repeat("Z", 24))
 	hostileHome := t.TempDir()
+	writeTestGrokAuth(t, hostileHome, "xai-selected-conformance-token", "prin-conformance")
 	t.Setenv("HOME", hostileHome)
 	t.Setenv("USERPROFILE", hostileHome)
 	t.Setenv("AWS_ACCESS_KEY_ID", secretCanaries[2])
@@ -909,6 +1009,11 @@ func TestGrokOrdinaryWorkerConformanceSuite(t *testing.T) {
 }
 
 func TestGrokOrdinaryWorkerRestartRecoveryConformance(t *testing.T) {
+	ensurePackageGrokOnPATH(t)
+	authHome := t.TempDir()
+	writeTestGrokAuth(t, authHome, "xai-restart-token", "prin-restart")
+	t.Setenv("HOME", authHome)
+	t.Setenv("USERPROFILE", authHome)
 	var attempt atomic.Int32
 	restoreRun := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
 		if attempt.Add(1) == 1 {
@@ -950,6 +1055,7 @@ func TestGrokOrdinaryWorkerRestartRecoveryConformance(t *testing.T) {
 }
 
 func TestGrokLiveSmokeRequiresExplicitOptIn(t *testing.T) {
+	ensurePackageGrokAuth(t)
 	if os.Getenv("LOOPCODER_GROK_LIVE_SMOKE") != "1" || os.Getenv("LOOPCODER_ALLOW_LIVE_PROVIDER") != "1" {
 		t.Skip("live Grok smoke is disabled by default; set LOOPCODER_GROK_LIVE_SMOKE=1 and LOOPCODER_ALLOW_LIVE_PROVIDER=1 to opt in")
 	}

@@ -1,6 +1,7 @@
 package capacitysnapshot_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -64,7 +65,7 @@ func TestToRouteInventoryPermissionAwareAntigravity(t *testing.T) {
 	// Read-only resolve must not select antigravity.
 	resRO, err := autoroute.Resolve(autoroute.Input{
 		AutoRoute: true, Permission: "read-only", ProjectID: "p",
-		DecisionKey: "ro-1", Inventory: &inv, Now: now,
+		TaskClass: "luna", DecisionKey: "ro-1", Inventory: &inv, Now: now,
 	})
 	if err != nil {
 		t.Fatalf("read-only resolve: %v", err)
@@ -75,18 +76,20 @@ func TestToRouteInventoryPermissionAwareAntigravity(t *testing.T) {
 	if resRO.Provider != "codex" {
 		t.Fatalf("read-only want codex, got %+v", resRO)
 	}
-	// Write resolve may select antigravity.
+	// Write resolve must select account-affirmable provider (codex), not antigravity.
 	resW, err := autoroute.Resolve(autoroute.Input{
 		AutoRoute: true, Permission: "bounded_write", ProjectID: "p",
-		DecisionKey: "w-1", Inventory: &inv, Now: now,
+		TaskClass: "tera", DecisionKey: "w-1", Inventory: &inv, Now: now,
 	})
 	if err != nil {
 		t.Fatalf("write resolve: %v", err)
 	}
-	if resW.Provider == "" {
-		t.Fatalf("write resolve empty: %+v", resW)
+	if resW.Provider == "antigravity" {
+		t.Fatalf("write must not select antigravity (no account affirm): %+v", resW)
 	}
-	// At least one of the two modes used antigravity or codex with real capacity.
+	if resW.Provider != "codex" {
+		t.Fatalf("write want codex, got %+v", resW)
+	}
 	t.Logf("ro=%s/%s write=%s/%s", resRO.Provider, resRO.Model, resW.Provider, resW.Model)
 }
 
@@ -168,19 +171,26 @@ func TestToRouteInventoryExcludesExhaustedAndStaleRoutes(t *testing.T) {
 	}
 	res, err := autoroute.Resolve(autoroute.Input{
 		AutoRoute: true, Permission: "bounded_write", Effort: "medium",
-		ProjectID: "p", DecisionKey: "excl-1", Inventory: &inv, Now: now,
+		TaskClass: "tera", ProjectID: "p", DecisionKey: "excl-1", Inventory: &inv, Now: now,
 	})
-	if err != nil {
+	// Exhausted codex + stale gemini + AG (no account affirm) → no eligible route.
+	if err == nil && res.Outcome == autoroute.OutcomeSelected {
+		if res.Provider == "codex" {
+			t.Fatalf("exhausted codex must not win: %+v", res)
+		}
+		if res.Provider == "gemini" {
+			t.Fatalf("stale gemini must not win: %+v", res)
+		}
+		if res.Provider == "antigravity" {
+			t.Fatalf("antigravity must not win (no account affirm): %+v", res)
+		}
+	}
+	// Prefer fail-closed no_route over selecting non-affirmable AG.
+	if err != nil && !strings.Contains(err.Error(), "no route") {
 		t.Fatalf("resolve: %v", err)
 	}
-	if res.Provider == "codex" {
-		t.Fatalf("exhausted codex must not win: %+v", res)
-	}
-	if res.Provider == "gemini" {
-		t.Fatalf("stale gemini must not win: %+v", res)
-	}
-	if res.Provider != "antigravity" {
-		t.Fatalf("want antigravity write winner, got %+v", res)
+	if res.Provider == "antigravity" {
+		t.Fatalf("antigravity must not be hard-eligible write winner: %+v", res)
 	}
 }
 
@@ -227,7 +237,7 @@ func TestToRouteInventoryEmitsPerSupportedDepth(t *testing.T) {
 	for _, depth := range []string{"low", "high"} {
 		res, err := autoroute.Resolve(autoroute.Input{
 			AutoRoute: true, Permission: "read-only", Effort: depth,
-			ProjectID: "p", DecisionKey: "d-" + depth, Inventory: &inv, Now: now,
+			TaskClass: "luna", ProjectID: "p", DecisionKey: "d-" + depth, Inventory: &inv, Now: now,
 		})
 		if err != nil {
 			t.Fatalf("resolve depth=%s: %v", depth, err)
@@ -239,7 +249,7 @@ func TestToRouteInventoryEmitsPerSupportedDepth(t *testing.T) {
 	// Unsupported depth fails closed.
 	_, err = autoroute.Resolve(autoroute.Input{
 		AutoRoute: true, Permission: "read-only", Effort: "xhigh",
-		ProjectID: "p", DecisionKey: "d-xhigh", Inventory: &inv, Now: now,
+		TaskClass: "luna", ProjectID: "p", DecisionKey: "d-xhigh", Inventory: &inv, Now: now,
 	})
 	if err == nil {
 		t.Fatal("expected fail-closed for unsupported xhigh")
@@ -306,10 +316,12 @@ func TestToRouteInventorySoftBindsHighestRemainingWindow(t *testing.T) {
 	if agSoftRem < 0.9 {
 		t.Fatalf("soft remaining bound to scarce window: rem=%v want ~0.98", agSoftRem)
 	}
-	// Write route: antigravity must not be soft-excluded solely due to secondary scarcity.
+	// Soft bind still uses highest remaining for AG display/ranking.
+	// Runtime hard-eligibility: AG cannot affirm AccountRef → not hard-eligible
+	// for capacity-bound product routes (codex should win write instead).
 	res, err := autoroute.Resolve(autoroute.Input{
 		AutoRoute: true, Permission: "bounded_write", Effort: "medium",
-		ProjectID: "p", DecisionKey: "mp-soft-1", Inventory: &inv, Now: now,
+		TaskClass: "tera", ProjectID: "p", DecisionKey: "mp-soft-1", Inventory: &inv, Now: now,
 	})
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
@@ -317,20 +329,19 @@ func TestToRouteInventorySoftBindsHighestRemainingWindow(t *testing.T) {
 	if res.Decision == nil {
 		t.Fatal("nil decision")
 	}
-	foundAGHard := false
-	agSoftEx := true
 	for _, cv := range res.Decision.Candidates {
 		if cv.Provider != "antigravity" {
 			continue
 		}
-		foundAGHard = cv.HardEligible
-		agSoftEx = cv.SoftExcluded
+		if cv.HardEligible {
+			t.Fatalf("antigravity must not be hard-eligible (no account affirm): %+v", cv)
+		}
 		break
 	}
-	if !foundAGHard {
-		t.Fatalf("antigravity not hard-eligible: candidates=%+v", res.Decision.Candidates)
+	if res.Outcome == autoroute.OutcomeSelected && res.Provider == "antigravity" {
+		t.Fatalf("antigravity must not win capacity-bound write route: %+v", res)
 	}
-	if agSoftEx {
-		t.Fatalf("antigravity soft-excluded after highest-remaining soft bind: candidates=%+v", res.Decision.Candidates)
+	if res.Outcome == autoroute.OutcomeSelected && res.Provider != "codex" {
+		t.Fatalf("want codex write winner (account-affirmable), got %+v", res)
 	}
 }

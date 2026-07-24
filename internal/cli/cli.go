@@ -27,6 +27,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/detachedrun"
+	"github.com/jasonhnd/loopcoder/internal/directdelivery"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
 	"github.com/jasonhnd/loopcoder/internal/eventstream"
 	"github.com/jasonhnd/loopcoder/internal/home"
@@ -40,6 +41,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/orchestrationcost"
 	"github.com/jasonhnd/loopcoder/internal/perception"
 	"github.com/jasonhnd/loopcoder/internal/platform"
+	"github.com/jasonhnd/loopcoder/internal/preflight"
 	"github.com/jasonhnd/loopcoder/internal/process"
 	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
@@ -92,25 +94,35 @@ type Deps struct {
 	// LoadAutoRouteInventory optionally overrides production capacity loading.
 	// Default discovers provider inventory → capacitysnapshot → autoroute.Inventory.
 	LoadAutoRouteInventory func(ctx context.Context, repo string, now time.Time) (*autoroute.Inventory, error)
+	// RouteResolve optionally overrides autoroute.Resolve (tests only).
+	// Production default is autoroute.Resolve. Tests may wrap to capture Input.
+	RouteResolve func(in autoroute.Input) (autoroute.Result, error)
 	// LastCapacitySnapshot is the capacity truth used for soft reserve (CRO-007).
 	// Production loader sets this; tests may inject.
 	LastCapacitySnapshot *capacitysnapshot.Snapshot
 	// CapacityLedgerPath overrides durable ledger path (tests only).
 	CapacityLedgerPath string
+	// PreflightEvaluate optionally overrides production preflight.Evaluate (tests).
+	// When set, run path uses this instead of preflight.DefaultDeps probes.
+	PreflightEvaluate func(ctx context.Context, in preflight.Input) (preflight.Snapshot, error)
 	// WaitClock optionally overrides the provider-free wait clock for tests.
-	WaitClock                waitstate.Clock
-	RuntimeGOOS              string
-	RuntimeGOARCH            string
-	IsTerminal               func(w io.Writer) bool
-	TerminalWidth            func(w io.Writer) int
-	Stdin                    io.Reader
-	BuildInfo                BuildInfo
-	ComputeReadySet          func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
-	Tick                     func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
-	Discover                 func(ctx context.Context, opts perception.Options) (perception.Report, error)
-	Compile                  func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
-	Dispatch                 func(ctx context.Context, opts worker.Options) (worker.Result, error)
-	AgentLookup              func(provider string) (agent.Runner, error)
+	WaitClock       waitstate.Clock
+	RuntimeGOOS     string
+	RuntimeGOARCH   string
+	IsTerminal      func(w io.Writer) bool
+	TerminalWidth   func(w io.Writer) int
+	Stdin           io.Reader
+	BuildInfo       BuildInfo
+	ComputeReadySet func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
+	Tick            func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
+	Discover        func(ctx context.Context, opts perception.Options) (perception.Report, error)
+	Compile         func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
+	Dispatch        func(ctx context.Context, opts worker.Options) (worker.Result, error)
+	AgentLookup     func(provider string) (agent.Runner, error)
+	// Delivery optionally overrides production directdelivery ports.
+	// Production leaves this nil → real LocalGit/LocalRemote/GHClient/ObserveCI.
+	// Tests must inject Fake* ports explicitly (never silent production Fake defaults).
+	Delivery                 *directdelivery.Deps
 	Loopreview               func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
 	Promote                  func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
 	Recover                  func(ctx context.Context, opts recovery.Options) (recovery.Result, error)

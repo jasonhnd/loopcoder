@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,20 +42,34 @@ var (
 
 // Attempt is durable attempt state.
 type Attempt struct {
-	Schema              string    `json:"schema"`
-	AttemptID           string    `json:"attempt_id"`
-	Generation          int64     `json:"generation"`
-	RunID               string    `json:"run_id"`
-	ProjectID           string    `json:"project_id"`
-	State               State     `json:"state"`
-	RouteDigest         string    `json:"route_digest"`
-	WorktreePath        string    `json:"worktree_path"`
-	BaseSHA             string    `json:"base_sha"`
-	IdempotencyKey      string    `json:"idempotency_key"`
-	StartEventID        string    `json:"start_event_id,omitempty"`
-	StartDigest         string    `json:"start_digest,omitempty"`
-	ProviderLaunched    bool      `json:"provider_launched"`
-	ProviderExitCode    *int      `json:"provider_exit_code,omitempty"`
+	Schema           string `json:"schema"`
+	AttemptID        string `json:"attempt_id"`
+	Generation       int64  `json:"generation"`
+	RunID            string `json:"run_id"`
+	ProjectID        string `json:"project_id"`
+	State            State  `json:"state"`
+	RouteDigest      string `json:"route_digest"`
+	WorktreePath     string `json:"worktree_path"`
+	BaseSHA          string `json:"base_sha"`
+	IdempotencyKey   string `json:"idempotency_key"`
+	StartEventID     string `json:"start_event_id,omitempty"`
+	StartDigest      string `json:"start_digest,omitempty"`
+	ProviderLaunched bool   `json:"provider_launched"`
+	ProviderExitCode *int   `json:"provider_exit_code,omitempty"`
+	// Full provider outcome (independently affirmed) — never discarded.
+	ProviderFailure     string    `json:"provider_failure,omitempty"`
+	ProviderMessage     string    `json:"provider_message,omitempty"`
+	ActualProvider      string    `json:"actual_provider,omitempty"`
+	ActualModel         string    `json:"actual_model,omitempty"`
+	ActualEffort        string    `json:"actual_effort,omitempty"`
+	ActualPermission    string    `json:"actual_permission,omitempty"`
+	ActualAccountRef    string    `json:"actual_account_ref,omitempty"`
+	ActualInstallRef    string    `json:"actual_install_ref,omitempty"`
+	ActualWindowKind    string    `json:"actual_window_kind,omitempty"`
+	ActualReservationID string    `json:"actual_reservation_id,omitempty"`
+	OutputDigest        string    `json:"output_digest,omitempty"`
+	UsageIn             int64     `json:"usage_input_tokens,omitempty"`
+	UsageOut            int64     `json:"usage_output_tokens,omitempty"`
 	OutputFlushed       bool      `json:"output_flushed"`
 	ChildrenJoined      bool      `json:"children_joined"`
 	ReservationReleased bool      `json:"reservation_released"`
@@ -70,6 +85,8 @@ type LaunchBundle struct {
 	WorktreePath   string
 	BaseSHA        string
 	IdempotencyKey string
+	// Prompt is the bounded useful objective (issue title/body). Never empty in production.
+	Prompt string
 	// Start report must be rendered by required client first.
 	StartEventID   string
 	StartDigest    string
@@ -185,6 +202,11 @@ func (s *Store) RecordLaunch(attemptID string, generation int64) (Attempt, error
 
 // NoteProviderExit records process exit without completing attempt.
 func (s *Store) NoteProviderExit(attemptID string, code int) (Attempt, error) {
+	return s.NoteProviderOutcome(attemptID, code, "", "", providerexec.Route{}, providerexec.UsageEvidence{}, "")
+}
+
+// NoteProviderOutcome records the full provider outcome (exit + failure + actual route + usage).
+func (s *Store) NoteProviderOutcome(attemptID string, code int, failure, message string, actual providerexec.Route, usage providerexec.UsageEvidence, outputDigest string) (Attempt, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	a, ok := s.byID[attemptID]
@@ -195,6 +217,19 @@ func (s *Store) NoteProviderExit(attemptID string, code int) (Attempt, error) {
 		return Attempt{}, ErrNotReady
 	}
 	a.ProviderExitCode = &code
+	a.ProviderFailure = string(failure)
+	a.ProviderMessage = message
+	a.ActualProvider = actual.Provider
+	a.ActualModel = actual.Model
+	a.ActualEffort = actual.Effort
+	a.ActualPermission = actual.Permission
+	a.ActualAccountRef = actual.AccountRef
+	a.ActualInstallRef = actual.InstallRef
+	a.ActualWindowKind = actual.WindowKind
+	a.ActualReservationID = actual.ReservationID
+	a.UsageIn = usage.InputTokens
+	a.UsageOut = usage.OutputTokens
+	a.OutputDigest = outputDigest
 	a.State = StateProcessTerminal
 	a.UpdatedAt = s.now().UTC()
 	return *a, nil
@@ -328,10 +363,15 @@ func (e *Engine) TryLaunch(ctx context.Context, b LaunchBundle) (Attempt, error)
 			return Attempt{}, err
 		}
 	}
-	// build exec request from frozen pin only
+	prompt := strings.TrimSpace(b.Prompt)
+	if prompt == "" {
+		_, _ = e.Attempts.Fail(b.AttemptID)
+		return Attempt{}, fmt.Errorf("%w: empty prompt (production requires useful issue objective)", ErrInvalid)
+	}
+	// build exec request from frozen pin + useful prompt
 	req, err := providerexec.NewRequest(providerexec.Request{
 		RequestID: b.IdempotencyKey, ProjectID: pin.ProjectID, AttemptID: b.AttemptID,
-		WorkDir: b.WorktreePath, Route: b.Route.ToExecRoute(),
+		WorkDir: b.WorktreePath, PromptRef: prompt, Route: b.Route.ToExecRoute(),
 	})
 	if err != nil {
 		_, _ = e.Attempts.Fail(b.AttemptID)
@@ -342,7 +382,6 @@ func (e *Engine) TryLaunch(ctx context.Context, b LaunchBundle) (Attempt, error)
 		_, _ = e.Attempts.Fail(b.AttemptID)
 		return Attempt{}, ErrDigestMismatch
 	}
-	_ = req
 
 	a, err = e.Attempts.RecordLaunch(b.AttemptID, a.Generation)
 	if err != nil {
@@ -351,10 +390,12 @@ func (e *Engine) TryLaunch(ctx context.Context, b LaunchBundle) (Attempt, error)
 	if e.Provider != nil {
 		out, perr := e.Provider(ctx, req)
 		code := out.ExitCode
-		if perr != nil {
+		if perr != nil && code == 0 {
 			code = 1
 		}
-		_, _ = e.Attempts.NoteProviderExit(b.AttemptID, code)
+		// Persist complete outcome — never exit-code only.
+		_, _ = e.Attempts.NoteProviderOutcome(b.AttemptID, code, string(out.Failure), out.Message,
+			out.ActualRoute, out.Usage, out.OutputDigest)
 	}
 	return e.Attempts.Get(b.AttemptID)
 }

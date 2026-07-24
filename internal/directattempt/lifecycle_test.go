@@ -54,7 +54,7 @@ func TestLaunchOnceAfterStartRendered(t *testing.T) {
 	// without rendered
 	_, err = eng.TryLaunch(context.Background(), directattempt.LaunchBundle{
 		AttemptID: "att1", Route: fields, RouteDigest: digest,
-		WorktreePath: "/wt/att1", BaseSHA: "deadbeef", IdempotencyKey: "idem-1",
+		Prompt: "do useful work", WorktreePath: "/wt/att1", BaseSHA: "deadbeef", IdempotencyKey: "idem-1",
 		StartEventID: env.EventID, StartDigest: env.ContentDigest, RequiredClient: "term",
 	})
 	if !errors.Is(err, directattempt.ErrNotReady) {
@@ -66,7 +66,7 @@ func TestLaunchOnceAfterStartRendered(t *testing.T) {
 	})
 	a, err := eng.TryLaunch(context.Background(), directattempt.LaunchBundle{
 		AttemptID: "att1", Route: fields, RouteDigest: digest,
-		WorktreePath: "/wt/att1", BaseSHA: "deadbeef", IdempotencyKey: "idem-1",
+		Prompt: "do useful work", WorktreePath: "/wt/att1", BaseSHA: "deadbeef", IdempotencyKey: "idem-1",
 		StartEventID: env.EventID, StartDigest: env.ContentDigest, RequiredClient: "term",
 	})
 	if err != nil {
@@ -81,7 +81,7 @@ func TestLaunchOnceAfterStartRendered(t *testing.T) {
 	// second launch blocked
 	_, err = eng.TryLaunch(context.Background(), directattempt.LaunchBundle{
 		AttemptID: "att1", Route: fields, RouteDigest: digest,
-		WorktreePath: "/wt/att1", BaseSHA: "deadbeef", IdempotencyKey: "idem-1",
+		Prompt: "do useful work", WorktreePath: "/wt/att1", BaseSHA: "deadbeef", IdempotencyKey: "idem-1",
 		StartEventID: env.EventID, StartDigest: env.ContentDigest, RequiredClient: "term",
 	})
 	if !errors.Is(err, directattempt.ErrDuplicateLaunch) && !errors.Is(err, directattempt.ErrNotReady) {
@@ -97,7 +97,7 @@ func TestExitNotCompletionWithoutCleanup(t *testing.T) {
 	})
 	_, err := eng.TryLaunch(context.Background(), directattempt.LaunchBundle{
 		AttemptID: "att1", Route: fields, RouteDigest: digest,
-		WorktreePath: "/wt/att1", BaseSHA: "deadbeef", IdempotencyKey: "idem-1",
+		Prompt: "do useful work", WorktreePath: "/wt/att1", BaseSHA: "deadbeef", IdempotencyKey: "idem-1",
 		StartEventID: env.EventID, StartDigest: env.ContentDigest, RequiredClient: "term",
 	})
 	if err != nil {
@@ -125,7 +125,7 @@ func TestDigestMismatchBlocks(t *testing.T) {
 	})
 	_, err := eng.TryLaunch(context.Background(), directattempt.LaunchBundle{
 		AttemptID: "att1", Route: fields, RouteDigest: digest,
-		WorktreePath: "/wt/WRONG", BaseSHA: "deadbeef", IdempotencyKey: "idem-1",
+		Prompt: "do useful work", WorktreePath: "/wt/WRONG", BaseSHA: "deadbeef", IdempotencyKey: "idem-1",
 		StartEventID: env.EventID, StartDigest: env.ContentDigest, RequiredClient: "term",
 	})
 	if !errors.Is(err, directattempt.ErrDigestMismatch) {

@@ -73,21 +73,33 @@ type Decision struct {
 	PinFailClosed bool `json:"pin_fail_closed,omitempty"`
 }
 
-// Winner is the selected route identity.
+// Winner is the selected route identity including capacity account/install/window.
 type Winner struct {
 	Provider   string   `json:"provider"`
 	Model      string   `json:"model"`
 	Effort     string   `json:"effort,omitempty"`
 	Permission string   `json:"permission,omitempty"`
+	AccountRef string   `json:"account_ref,omitempty"`
+	InstallRef string   `json:"install_ref,omitempty"`
+	WindowKind string   `json:"window_kind,omitempty"`
 	SoftScore  float64  `json:"soft_score,omitempty"`
 	TieBreak   string   `json:"tie_break,omitempty"`
 	Reasons    []string `json:"reasons"`
 }
 
 // CandidateView is one ordered candidate in the decision.
+// Effort and Permission are the observed eligibility fields for this row —
+// never synthesized from the request. Distinct depth/permission lanes must
+// not collapse into a single provider/model identity.
+// AccountRef/InstallRef/WindowKind are first-class capacity identity.
 type CandidateView struct {
 	Provider      string   `json:"provider"`
 	Model         string   `json:"model"`
+	Effort        string   `json:"effort,omitempty"`
+	Permission    string   `json:"permission,omitempty"`
+	AccountRef    string   `json:"account_ref,omitempty"`
+	InstallRef    string   `json:"install_ref,omitempty"`
+	WindowKind    string   `json:"window_kind,omitempty"`
 	HardEligible  bool     `json:"hard_eligible"`
 	SoftExcluded  bool     `json:"soft_excluded"`
 	SoftScore     float64  `json:"soft_score,omitempty"`
@@ -235,23 +247,51 @@ func Evaluate(req Request) (Decision, error) {
 	}
 
 	// Soft rank only hard-eligible candidates (filter SoftCandidates by hard set).
+	// Identity includes effort+permission+account+window so accounts never collapse.
 	eligibleKeys := map[string]eligibility.CandidateView{}
+	eligiblePM := map[string]bool{}  // provider/model — soft filter
+	eligibleAcc := map[string]bool{} // provider/model/account for exact soft bind
 	for _, e := range hard.Eligible {
-		eligibleKeys[norm(e.Provider, e.Model)] = e
+		eligibleKeys[candIdentity(e.Provider, e.Model, e.Effort, e.Permission, e.AccountRef, e.InstallRef, e.WindowKind)] = e
+		eligiblePM[norm(e.Provider, e.Model)] = true
+		if e.AccountRef != "" {
+			eligibleAcc[norm(e.Provider, e.Model)+"|"+strings.TrimSpace(e.AccountRef)] = true
+		}
 	}
 	softIn := make([]quotapolicy.Candidate, 0, len(req.SoftCandidates))
 	for _, c := range req.SoftCandidates {
-		if _, ok := eligibleKeys[norm(c.Provider, c.Model)]; ok {
-			softIn = append(softIn, c)
+		if !eligiblePM[norm(c.Provider, c.Model)] {
+			continue
 		}
+		// When soft row has account, require that account is hard-eligible.
+		if c.AccountRef != "" && len(eligibleAcc) > 0 {
+			if !eligibleAcc[norm(c.Provider, c.Model)+"|"+strings.TrimSpace(c.AccountRef)] {
+				continue
+			}
+		}
+		softIn = append(softIn, c)
 	}
-	// If no soft candidates provided, synthesize neutral ones from hard eligible.
+	// If no soft candidates provided, synthesize neutral ones from hard eligible
+	// (one soft row per unique provider/model/account/window).
+	// Empty WindowKind stays empty — never invent five_hour.
+	// Unknown/provider-defined may be reported but is not a reservable fixed window.
 	if len(softIn) == 0 {
+		seenID := map[string]bool{}
 		for _, e := range hard.Eligible {
+			k := candIdentity(e.Provider, e.Model, e.Effort, e.Permission, e.AccountRef, e.InstallRef, e.WindowKind)
+			if seenID[k] {
+				continue
+			}
+			seenID[k] = true
+			var wk quotapolicy.WindowKind
+			if e.WindowKind != "" {
+				wk = quotapolicy.WindowKind(e.WindowKind)
+			}
 			softIn = append(softIn, quotapolicy.Candidate{
 				Provider: e.Provider, Model: e.Model,
+				AccountRef: e.AccountRef, WindowKind: e.WindowKind,
 				Windows: []quotapolicy.Window{{
-					Kind: quotapolicy.WindowFiveHour, Evidence: quotapolicy.EvidenceMissing,
+					Kind: wk, Evidence: quotapolicy.EvidenceMissing,
 				}},
 				ReliabilityEvidence: quotapolicy.EvidenceMissing,
 			})
@@ -280,26 +320,81 @@ func Evaluate(req Request) (Decision, error) {
 	// Build candidate views ordered by mode ranking.
 	d.Candidates = candidateViewsFromHard(hard, &modeRank, eligibleKeys)
 
-	// Winner selection: first non-soft-excluded adjusted score.
+	// Winner selection: first non-soft-excluded adjusted score whose AccountRef
+	// and WindowKind are first-class on the score row (no post-hoc fill from
+	// first provider/model CandidateView — that is the forbidden PM fallback).
 	var winner *Winner
 	for _, sc := range modeRank.Scores {
 		if sc.SoftExcluded {
 			d.SoftExcluded = append(d.SoftExcluded, norm(sc.Provider, sc.Model))
 			continue
 		}
-		// must also be hard eligible
-		if _, ok := eligibleKeys[norm(sc.Provider, sc.Model)]; !ok {
+		if !eligiblePM[norm(sc.Provider, sc.Model)] {
+			continue
+		}
+		// Production auto-route requires exact account+window on the scored row.
+		// Empty account/window cannot qualify (never fill from another bound row).
+		if strings.TrimSpace(sc.AccountRef) == "" || strings.TrimSpace(sc.WindowKind) == "" {
+			d.SoftExcluded = append(d.SoftExcluded, norm(sc.Provider, sc.Model)+"|missing_score_identity")
+			continue
+		}
+		// Match effort/permission/install only from exact account/window candidate rows.
+		var effort, perm, install string
+		matched := false
+		for _, cv := range d.Candidates {
+			if !cv.HardEligible || cv.SoftExcluded {
+				continue
+			}
+			if strings.TrimSpace(cv.Provider) != strings.TrimSpace(sc.Provider) ||
+				strings.TrimSpace(cv.Model) != strings.TrimSpace(sc.Model) {
+				continue
+			}
+			if strings.TrimSpace(cv.AccountRef) != strings.TrimSpace(sc.AccountRef) {
+				continue
+			}
+			if strings.TrimSpace(cv.InstallRef) != strings.TrimSpace(sc.InstallRef) {
+				continue
+			}
+			if strings.TrimSpace(cv.WindowKind) != strings.TrimSpace(sc.WindowKind) {
+				continue
+			}
+			effort = cv.Effort
+			perm = cv.Permission
+			install = cv.InstallRef
+			matched = true
+			break
+		}
+		if !matched {
+			for _, e := range hard.Eligible {
+				if strings.TrimSpace(e.Provider) != strings.TrimSpace(sc.Provider) || e.Model != sc.Model {
+					continue
+				}
+				if strings.TrimSpace(e.AccountRef) != strings.TrimSpace(sc.AccountRef) {
+					continue
+				}
+				if strings.TrimSpace(e.InstallRef) != strings.TrimSpace(sc.InstallRef) {
+					continue
+				}
+				if strings.TrimSpace(e.WindowKind) != strings.TrimSpace(sc.WindowKind) {
+					continue
+				}
+				effort = e.Effort
+				perm = e.Permission
+				install = e.InstallRef
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			// Score has account/window but no hard-eligible exact row → skip.
 			continue
 		}
 		winner = &Winner{
 			Provider: sc.Provider, Model: sc.Model,
+			AccountRef: sc.AccountRef, InstallRef: install, WindowKind: sc.WindowKind,
+			Effort: effort, Permission: perm,
 			SoftScore: sc.AdjustedScore,
 			Reasons:   append([]string{"winner"}, sc.Reasons...),
-		}
-		// attach effort/permission from hard view if present
-		if hv, ok := eligibleKeys[norm(sc.Provider, sc.Model)]; ok {
-			winner.Effort = hv.Effort
-			winner.Permission = hv.Permission
 		}
 		break
 	}
@@ -399,62 +494,91 @@ func ExplainJSON(d Decision) ([]byte, error) {
 }
 
 func candidateViewsFromHard(hard eligibility.Decision, mode *quotamode.ModeRanking, eligible map[string]eligibility.CandidateView) []CandidateView {
-	scoreIdx := map[string]quotamode.AdjustedScore{}
-	order := []string{}
+	// Index scores by exact account when present, else provider/model.
+	scoreByID := map[string]quotamode.AdjustedScore{}
+	scoreByPM := map[string]quotamode.AdjustedScore{}
 	if mode != nil {
 		for _, sc := range mode.Scores {
-			k := norm(sc.Provider, sc.Model)
-			scoreIdx[k] = sc
-			order = append(order, k)
+			scoreByPM[norm(sc.Provider, sc.Model)] = sc
+			if sc.AccountRef != "" {
+				scoreByID[norm(sc.Provider, sc.Model)+"|"+strings.TrimSpace(sc.AccountRef)+"|"+strings.TrimSpace(sc.InstallRef)+"|"+strings.TrimSpace(sc.WindowKind)] = sc
+			}
 		}
 	}
-	// ensure all hard eligible appear
-	for k := range eligible {
-		if _, ok := scoreIdx[k]; !ok {
-			order = append(order, k)
-		}
-	}
-	// hard excluded
-	for _, ex := range hard.Excluded {
-		k := norm(ex.Provider, ex.Model)
-		if _, ok := scoreIdx[k]; !ok {
-			order = append(order, k)
-		}
-	}
-	// unique preserve
-	seen := map[string]struct{}{}
 	var views []CandidateView
-	for _, k := range order {
-		if _, ok := seen[k]; ok {
+	// One view per hard-eligible identity (provider+model+effort+permission+account+window).
+	seenID := map[string]struct{}{}
+	for _, e := range hard.Eligible {
+		id := candIdentity(e.Provider, e.Model, e.Effort, e.Permission, e.AccountRef, e.InstallRef, e.WindowKind)
+		if _, ok := seenID[id]; ok {
 			continue
 		}
-		seen[k] = struct{}{}
-		parts := strings.SplitN(k, "/", 2)
-		p, m := parts[0], ""
-		if len(parts) > 1 {
-			m = parts[1]
+		seenID[id] = struct{}{}
+		v := CandidateView{
+			Provider: e.Provider, Model: e.Model,
+			Effort: e.Effort, Permission: e.Permission,
+			AccountRef: e.AccountRef, InstallRef: e.InstallRef, WindowKind: e.WindowKind,
+			HardEligible: true,
 		}
-		v := CandidateView{Provider: p, Model: m}
-		if _, ok := eligible[k]; ok {
-			v.HardEligible = true
-		}
-		if sc, ok := scoreIdx[k]; ok {
+		// Account/window-bound hard rows MUST use exact score identity only.
+		// Never borrow another account's provider/model score (cross-wire).
+		// PM fallback only for explicitly unbound legacy rows (empty AccountRef
+		// AND empty WindowKind) — never qualifies production auto-route identity.
+		bound := strings.TrimSpace(e.AccountRef) != "" || strings.TrimSpace(e.WindowKind) != ""
+		if sc, ok := scoreByID[norm(e.Provider, e.Model)+"|"+strings.TrimSpace(e.AccountRef)+"|"+strings.TrimSpace(e.InstallRef)+"|"+strings.TrimSpace(e.WindowKind)]; ok {
 			v.SoftExcluded = sc.SoftExcluded
 			v.SoftScore = sc.BaseSoftScore
 			v.AdjustedScore = sc.AdjustedScore
-			v.Reasons = sc.Reasons
-		} else if !v.HardEligible {
-			// hard excluded
-			for _, ex := range hard.Excluded {
-				if norm(ex.Provider, ex.Model) == k {
-					v.Reasons = ex.Reasons
-					break
-				}
+			v.Reasons = append([]string(nil), sc.Reasons...)
+		} else if bound {
+			// Missing exact score for a bound row → soft-exclude (fail closed).
+			v.SoftExcluded = true
+			v.Reasons = append(v.Reasons, "missing_exact_account_window_score")
+		} else if sc, ok := scoreByPM[norm(e.Provider, e.Model)]; ok {
+			// Legacy unbound only.
+			v.SoftExcluded = sc.SoftExcluded
+			v.SoftScore = sc.BaseSoftScore
+			v.AdjustedScore = sc.AdjustedScore
+			v.Reasons = append([]string(nil), sc.Reasons...)
+			v.Reasons = append(v.Reasons, "legacy_unbound_pm_score")
+		}
+		// Prefer eligibility map when provided (same identity).
+		if eligible != nil {
+			if hv, ok := eligible[id]; ok {
+				v.Effort = hv.Effort
+				v.Permission = hv.Permission
+				v.AccountRef = firstNonEmptyStr(hv.AccountRef, v.AccountRef)
+				v.InstallRef = firstNonEmptyStr(hv.InstallRef, v.InstallRef)
+				v.WindowKind = firstNonEmptyStr(hv.WindowKind, v.WindowKind)
 			}
 		}
 		views = append(views, v)
 	}
-	// stable sort: hard eligible & not soft excluded first, then by adjusted score
+	// Hard excluded rows (no effort on Exclusion — provider/model only).
+	for _, ex := range hard.Excluded {
+		k := norm(ex.Provider, ex.Model)
+		hasEligiblePM := false
+		for _, v := range views {
+			if norm(v.Provider, v.Model) == k && v.HardEligible {
+				hasEligiblePM = true
+				break
+			}
+		}
+		if hasEligiblePM {
+			continue
+		}
+		id := "ex|" + k
+		if _, ok := seenID[id]; ok {
+			continue
+		}
+		seenID[id] = struct{}{}
+		views = append(views, CandidateView{
+			Provider: ex.Provider, Model: ex.Model,
+			HardEligible: false, Reasons: append([]string(nil), ex.Reasons...),
+		})
+	}
+	// stable sort: hard eligible & not soft excluded first, then by adjusted score,
+	// then by full identity (effort/permission) so depths never collapse.
 	sort.SliceStable(views, func(i, j int) bool {
 		iOK := views[i].HardEligible && !views[i].SoftExcluded
 		jOK := views[j].HardEligible && !views[j].SoftExcluded
@@ -467,13 +591,40 @@ func candidateViewsFromHard(hard eligibility.Decision, mode *quotamode.ModeRanki
 		if views[i].Provider != views[j].Provider {
 			return views[i].Provider < views[j].Provider
 		}
-		return views[i].Model < views[j].Model
+		if views[i].Model != views[j].Model {
+			return views[i].Model < views[j].Model
+		}
+		if views[i].Effort != views[j].Effort {
+			return views[i].Effort < views[j].Effort
+		}
+		return views[i].Permission < views[j].Permission
 	})
 	return views
 }
 
 func norm(provider, model string) string {
 	return strings.ToLower(strings.TrimSpace(provider)) + "/" + strings.TrimSpace(model)
+}
+
+// candIdentity is the durable decision-set identity including observed depth,
+// permission, account, install, and window. Two installs of the same account
+// must never collapse.
+func candIdentity(provider, model, effort, permission, accountRef, installRef, windowKind string) string {
+	return strings.ToLower(strings.TrimSpace(provider)) + "/" + strings.TrimSpace(model) +
+		"|" + strings.ToLower(strings.TrimSpace(effort)) +
+		"|" + strings.ToLower(strings.TrimSpace(permission)) +
+		"|" + strings.TrimSpace(accountRef) +
+		"|" + strings.TrimSpace(installRef) +
+		"|" + strings.TrimSpace(windowKind)
+}
+
+func firstNonEmptyStr(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 func digestDecision(d Decision) string {
