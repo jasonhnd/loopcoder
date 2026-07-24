@@ -161,28 +161,50 @@ func TestGrokRunnerReadOnlyStreamingSuccess(t *testing.T) {
 	}
 }
 
+// ensurePackageGrokAuth installs deterministic package auth fixtures for positive
+// runner tests. Does not mutate production grokCommand (stays "grok").
+// Also installs a test-only fake executable named "grok" at the front of PATH so
+// install identity / LookPath are host-independent. Hostile-HOME tests that only
+// need auth may call ensurePackageGrokAuthFile; install-only uses ensurePackageGrokOnPATH.
 func ensurePackageGrokAuth(t *testing.T) {
+	t.Helper()
+	ensurePackageGrokAuthFile(t)
+	ensurePackageGrokOnPATH(t)
+}
+
+// ensurePackageGrokAuthFile seeds GROK_HOME/auth.json without touching PATH.
+func ensurePackageGrokAuthFile(t *testing.T) {
 	t.Helper()
 	// Prefer explicit GROK_HOME so hostile HOME isolation tests remain valid.
 	if gh := os.Getenv("GROK_HOME"); gh != "" {
-		if _, err := os.Stat(filepath.Join(gh, "auth.json")); err != nil {
-			dir := t.TempDir()
-			writeTestGrokAuthFile(t, filepath.Join(dir, "auth.json"), "xai-package-default-token", "prin-package-default")
-			t.Setenv("GROK_HOME", dir)
+		if _, err := os.Stat(filepath.Join(gh, "auth.json")); err == nil {
+			return
 		}
-	} else {
-		dir := t.TempDir()
-		// AuthPath(GROK_HOME) → GROK_HOME/auth.json (not .grok subdir).
-		writeTestGrokAuthFile(t, filepath.Join(dir, "auth.json"), "xai-package-default-token", "prin-package-default")
-		t.Setenv("GROK_HOME", dir)
 	}
-	// Install identity requires a resolvable grok binary (CI runners may not have one).
-	// Prefer existing stub/absolute grokCommand; otherwise create a fake and stub.
-	if _, err := exec.LookPath(grokCommand); err != nil {
-		exe := filepath.Join(t.TempDir(), "grok")
-		writeFakeGrokExecutable(t, exe)
-		restore := stubGrokCommand(t, exe)
-		t.Cleanup(restore)
+	dir := t.TempDir()
+	// AuthPath(GROK_HOME) → GROK_HOME/auth.json (not .grok subdir).
+	writeTestGrokAuthFile(t, filepath.Join(dir, "auth.json"), "xai-package-default-token", "prin-package-default")
+	t.Setenv("GROK_HOME", dir)
+}
+
+// ensurePackageGrokOnPATH places a deterministic fake executable named "grok"
+// first on PATH. Does NOT mutate package-global grokCommand — stub tests own
+// that mutation and must clean it up. Requires grokCommand == "grok" so probe
+// argv remains []string{"grok","version"|"--help"} and package leakage fails
+// the test instead of being silently repaired.
+func ensurePackageGrokOnPATH(t *testing.T) {
+	t.Helper()
+	if grokCommand != "grok" {
+		t.Fatalf("package-global grokCommand=%q want %q (prior stub leaked; do not repair here)", grokCommand, "grok")
+	}
+	bin := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFakeGrokExecutable(t, filepath.Join(bin, "grok"))
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if _, err := exec.LookPath("grok"); err != nil {
+		t.Fatalf("test fixture LookPath(grok) after PATH prepend: %v", err)
 	}
 }
 
@@ -215,6 +237,9 @@ func writeTestGrokAuthFile(t *testing.T, path, token, principal string) {
 }
 
 func TestGrokRunnerWriteModeReceivesApprovedWorkspaceAndBoundedEnv(t *testing.T) {
+	// Install identity + probes need a host-independent grok on PATH; auth is
+	// hostile-HOME selected account (not GROK_HOME package default).
+	ensurePackageGrokOnPATH(t)
 	t.Setenv("LOOPCODER_SECRET_CANARY", "should-not-pass")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "should-not-pass")
 	// Unrelated pre-set key must NOT win over selected auth.json token.
@@ -910,6 +935,8 @@ func TestGrokRunnerCancellationKillsNativeProcessTree(t *testing.T) {
 }
 
 func TestGrokOrdinaryWorkerConformanceSuite(t *testing.T) {
+	// Host-independent install identity; auth is hostile-HOME selected account.
+	ensurePackageGrokOnPATH(t)
 	secretCanaries := append(runtimeGrokSecretCanaries(), "AKIA"+strings.Repeat("A", 16), "xai-"+strings.Repeat("Z", 24))
 	hostileHome := t.TempDir()
 	writeTestGrokAuth(t, hostileHome, "xai-selected-conformance-token", "prin-conformance")
@@ -982,6 +1009,7 @@ func TestGrokOrdinaryWorkerConformanceSuite(t *testing.T) {
 }
 
 func TestGrokOrdinaryWorkerRestartRecoveryConformance(t *testing.T) {
+	ensurePackageGrokOnPATH(t)
 	authHome := t.TempDir()
 	writeTestGrokAuth(t, authHome, "xai-restart-token", "prin-restart")
 	t.Setenv("HOME", authHome)

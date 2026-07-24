@@ -1,6 +1,7 @@
 package pushstage_test
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,8 +15,16 @@ func initBareAndClone(t *testing.T) (remote, worktree string) {
 	t.Helper()
 	root := t.TempDir()
 	remote = filepath.Join(root, "remote.git")
-	if err := exec.Command("git", "init", "--bare", remote).Run(); err != nil {
-		t.Fatal(err)
+	// Explicit main: do not depend on init.defaultBranch / bare HEAD (CI may be master).
+	if out, err := exec.Command("git", "init", "--bare", "--initial-branch=main", remote).CombinedOutput(); err != nil {
+		// Older git without --initial-branch: bare init + symbolic-ref.
+		if err2 := exec.Command("git", "init", "--bare", remote).Run(); err2 != nil {
+			t.Fatalf("git init bare: %v %s", err, out)
+		}
+	}
+	// Pin bare HEAD before any commits so later clones default to main.
+	if out, err := exec.Command("git", "-C", remote, "symbolic-ref", "HEAD", "refs/heads/main").CombinedOutput(); err != nil {
+		t.Fatalf("symbolic-ref HEAD main: %v %s", err, out)
 	}
 	worktree = filepath.Join(root, "wt")
 	run := func(dir string, args ...string) {
@@ -30,13 +39,19 @@ func initBareAndClone(t *testing.T) (remote, worktree string) {
 			t.Fatalf("git %v: %v %s", args, err, out)
 		}
 	}
+	// Empty bare: clone without --branch, then force branch name main for the seed.
 	run(root, "clone", remote, worktree)
+	run(worktree, "checkout", "-B", "main")
 	if err := os.WriteFile(filepath.Join(worktree, "f.txt"), []byte("v1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	run(worktree, "add", "f.txt")
 	run(worktree, "commit", "-m", "c1")
-	run(worktree, "push", "-u", "origin", "HEAD:main")
+	run(worktree, "push", "-u", "origin", "main")
+	// Re-pin bare HEAD after first push (some git versions leave HEAD unset until first ref).
+	if out, err := exec.Command("git", "-C", remote, "symbolic-ref", "HEAD", "refs/heads/main").CombinedOutput(); err != nil {
+		t.Fatalf("pin bare HEAD after push: %v %s", err, out)
+	}
 	return remote, worktree
 }
 
@@ -46,11 +61,21 @@ func TestLocalRemote_PushNonForce_NeverForceWithLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Adversarial: remote moved (second clone push) then non-force push must conflict.
-	// Create divergent remote tip.
+	// Adversarial topology (independent of init.defaultBranch):
+	//   c1 on main → remote and both clones share c1.
+	//   wt2 advances to c2-remote and pushes main.
+	//   wt independently advances to c2-local from c1 (non-FF vs remote).
+	//   PushNonForce(expectedOld=c1, newOID=c2-local) → ErrConflict, never force/lease.
 	root := filepath.Dir(wt)
+	// Capture c1 tip BEFORE remote moves (stale expectedOld for PushNonForce).
+	c1Bytes, err := exec.Command("git", "-C", wt, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedOld := strings.TrimSpace(string(c1Bytes))
+
 	wt2 := filepath.Join(root, "wt2")
-	if out, err := exec.Command("git", "clone", filepath.Join(root, "remote.git"), wt2).CombinedOutput(); err != nil {
+	if out, err := exec.Command("git", "clone", "--branch", "main", filepath.Join(root, "remote.git"), wt2).CombinedOutput(); err != nil {
 		t.Fatalf("clone2: %v %s", err, out)
 	}
 	run2 := func(args ...string) {
@@ -69,14 +94,9 @@ func TestLocalRemote_PushNonForce_NeverForceWithLease(t *testing.T) {
 	}
 	run2("add", "f.txt")
 	run2("commit", "-m", "c2-remote")
-	run2("push", "origin", "HEAD:main")
+	run2("push", "origin", "main")
 
-	// Local wt is now behind; get old OID and try to push a new local commit with expectedOld=stale.
-	oldOID, exists, err := rem.ReadRef("origin", "main")
-	if err != nil || !exists {
-		t.Fatalf("read: %v exists=%v", err, exists)
-	}
-	// Local create another commit from old base (non-FF vs remote).
+	// Local wt still at c1; create independent c2-local from c1 (non-FF vs remote).
 	if err := os.WriteFile(filepath.Join(wt, "f.txt"), []byte("v2-local\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -88,30 +108,18 @@ func TestLocalRemote_PushNonForce_NeverForceWithLease(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("commit local: %v %s", err, out)
 	}
-	newOIDBytes, _ := exec.Command("git", "-C", wt, "rev-parse", "HEAD").Output()
-	newOID := string(newOIDBytes)
-	newOID = newOID[:len(newOID)-1] // trim newline via strings
-	// Use remote tip as expectedOld incorrectly? Use pre-move tip stored earlier.
-	// We overwrote oldOID after remote move — re-read shows new tip.
-	// expectedOld must be the tip BEFORE local's parent... Use first commit.
-	baseOID, _ := exec.Command("git", "-C", wt, "rev-parse", "HEAD^").Output()
-	expectedOld := string(baseOID)
-	if len(expectedOld) > 0 && expectedOld[len(expectedOld)-1] == '\n' {
-		expectedOld = expectedOld[:len(expectedOld)-1]
+	newOIDBytes, err := exec.Command("git", "-C", wt, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(newOID) > 0 && newOID[len(newOID)-1] == '\n' {
-		newOID = newOID[:len(newOID)-1]
-	}
-	// Remote tip is c2-remote, not expectedOld (parent of local). PushNonForce must conflict.
+	newOID := strings.TrimSpace(string(newOIDBytes))
+	// Remote tip is c2-remote; expectedOld is c1. PushNonForce must conflict.
 	err = rem.PushNonForce("origin", "main", expectedOld, newOID)
 	if err == nil {
 		t.Fatal("expected conflict when remote moved")
 	}
-	if err != pushstage.ErrConflict {
-		// Accept wrapped conflict
-		if err.Error() == "" {
-			t.Fatalf("want conflict got %v", err)
-		}
+	if !errors.Is(err, pushstage.ErrConflict) {
+		t.Fatalf("want errors.Is(err, pushstage.ErrConflict), got %v", err)
 	}
 	// Ensure argv construction never passes force flags (comments may mention them).
 	src, _ := os.ReadFile("local_remote.go")
@@ -120,5 +128,4 @@ func TestLocalRemote_PushNonForce_NeverForceWithLease(t *testing.T) {
 			t.Fatalf("local_remote.go must not use force push argv: %s", bad)
 		}
 	}
-	_ = oldOID
 }
