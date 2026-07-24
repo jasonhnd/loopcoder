@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/codexauth"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	"github.com/jasonhnd/loopcoder/internal/grokauth"
 	"github.com/jasonhnd/loopcoder/internal/home"
@@ -1742,6 +1743,8 @@ func parseAuthStatus(adapter AdapterDeclaration, output string, exitCode int) []
 	switch adapter.AuthProbeParser {
 	case "claude-auth-status-json":
 		return parseClaudeAuthStatus(output, exitCode)
+	case "codex-login-status":
+		return parseCodexLoginStatus(output, exitCode)
 	case "grok-models":
 		return parseGrokModelsAuthStatus(output, exitCode)
 	case "agy-models":
@@ -1749,6 +1752,75 @@ func parseAuthStatus(adapter AdapterDeclaration, output string, exitCode int) []
 	default:
 		return parseTextAuthStatus(adapter.AdapterID, output)
 	}
+}
+
+// parseCodexLoginStatus classifies `codex login status` and binds AccountProfileID
+// through shared codexauth (same opaque acct-+64hex as agent preflight).
+//
+// RC38 root cause: the codex-login-status parser name was declared but not wired,
+// so status text fell through to parseTextAuthStatus → acct_<base32>. Capacity
+// then hashed that via opaqueAccountRef into a second acct-<sha256> that never
+// equals codexauth.CanonicalAccountProfileID(principal), so preflight refused
+// with account mismatch before OnProviderStart (no authority row).
+func parseCodexLoginStatus(output string, exitCode int) []parsedAuthStatus {
+	state, scope, summary, refresh, gaps, recognized := classifyAuthLine(output)
+	if !recognized {
+		// Known Codex login-status phrases when classifyAuthLine is conservative.
+		lower := strings.ToLower(output)
+		switch {
+		case strings.Contains(lower, "logged in"):
+			state = ReadinessReady
+			scope = AuthorizationUnknown
+			summary = "model authorization unknown"
+			gaps = []string{"authorization-scope-unknown"}
+			recognized = true
+		case strings.Contains(lower, "not logged") || strings.Contains(lower, "not authenticated"):
+			state = ReadinessNotAuthenticated
+			scope = AuthorizationNotApplicable
+			summary = "provider reports not authenticated"
+			gaps = []string{"provider-reports-not-authenticated"}
+			recognized = true
+		case strings.Contains(lower, "expired") || strings.Contains(lower, "refresh required"):
+			state = ReadinessExpired
+			scope = AuthorizationUnknown
+			summary = "provider reports expired credentials"
+			refresh = true
+			gaps = []string{"provider-reports-expired"}
+			recognized = true
+		}
+	}
+	if !recognized {
+		return parseTextAuthStatus("codex", output)
+	}
+	// Prefer shared codexauth AccountProfileID (same as agent preflight / ExactRouteAffirm).
+	// Never invent from status display text alone. Never use ambient OPENAI_API_KEY.
+	if bind, berr := codexauth.ParseActive("", os.Getenv, time.Now().UTC()); berr == nil && bind.ExactRoutable {
+		return []parsedAuthStatus{{
+			ReferenceHash: bind.AccountProfileID, // acct-+64hex; accountProfileID pass-through
+			Display:       "codex-auth",
+			EvidenceKind:  EvidenceStatusCommand,
+			State:         state,
+			ScopeState:    scope,
+			ScopeSummary:  summary,
+			Refresh:       refresh,
+			Gaps:          gaps,
+			AccountKind:   "codexauth-shared",
+		}}
+	}
+	// Status classified but no exact identity → ready/unknown is non-routable.
+	if state == ReadinessReady {
+		gaps = append(append([]string(nil), gaps...), "missing-exact-account-identity")
+	}
+	return []parsedAuthStatus{{
+		ReferenceHash: "sha256:" + hashHex("codex", "login-status", string(state), strings.Join(gaps, ",")),
+		Display:       "codex-profile",
+		EvidenceKind:  EvidenceStatusCommand,
+		State:         state,
+		ScopeState:    scope,
+		ScopeSummary:  summary,
+		Refresh:       refresh,
+		Gaps:          gaps,
+	}}
 }
 
 // parseAgyModelsAuthStatus treats a successful `agy models` listing as auth-ready
@@ -2208,7 +2280,8 @@ func readinessConfidence(state ReadinessState) Confidence {
 }
 
 func accountProfileID(adapterID, source, referenceHash string) string {
-	// Shared Grok auth already produces exact-routable "acct-"+64hex — pass through.
+	// Shared Grok/Codex auth already produces exact-routable "acct-"+64hex — pass through.
+	// Never re-hash these into acct_<base32> (RC38 split inventory vs agent preflight).
 	if strings.HasPrefix(referenceHash, "acct-") && len(referenceHash) == 5+64 {
 		return strings.ToLower(referenceHash)
 	}

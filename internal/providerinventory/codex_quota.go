@@ -623,13 +623,12 @@ func validateCodexInitializeResponse(result json.RawMessage) error {
 }
 
 func snapshotsFromCodexRateLimits(source QuotaTelemetrySource, installationID *string, cliVersion string, account, limits map[string]any, frames []json.RawMessage, now time.Time) ([]QuotaSnapshot, error) {
-	// Account scope intentionally empty for capacity join. Codex AuthReadiness uses
-	// providerinventory status IDs (acct_<base32>) while codexauth.CanonicalAccountProfileID
-	// emits acct-<sha256> from account/read principals — stamping the latter invents a
-	// second AccountProfileID that never equals status auth and splits capacity.
-	// Empty-account rate-limit rows rebind only to the sole Ready AuthReadiness
-	// AccountProfileID on the same live installation (capacitysnapshot). Nonempty
-	// conflicting principals are never overwritten or treated as equivalent.
+	// Account scope intentionally empty for capacity join. Codex AuthReadiness stamps
+	// shared codexauth acct-+64hex (parseCodexLoginStatus). Rate-limit RPC must not
+	// invent a second principal-derived ID from account/read — empty-account rows
+	// rebind only to the sole Ready AuthReadiness AccountProfileID on the same live
+	// installation (capacitysnapshot). Nonempty conflicting principals are never
+	// overwritten or treated as equivalent.
 	// Never emit account:unknown. Never stamp an unrelated opaque hash as AccountProfileID.
 	accountScope := codexAccountScope(account)
 	// codexCanonicalAccountProfileID remains available for catalog/tests; quota does not stamp it.
@@ -1166,11 +1165,10 @@ func codexProtocolSummary(output string) string {
 
 func codexAccountScope(account map[string]any) string {
 	// Capacity ScopeKey must not invent an account segment from account/read.
-	// Status AuthReadiness uses acct_<base32>; codexauth uses acct-<sha256>. Putting
-	// either (or a raw principal) into ScopeKey creates a join key that does not
-	// match AuthReadiness and splits rate-limit windows from the authenticated
-	// install account. Empty is correct; capacity rebinds to sole AuthReadiness
-	// AccountProfileID on the same installation when unambiguous.
+	// AuthReadiness already carries the shared codexauth AccountProfileID; putting a
+	// raw principal or alternate hash into ScopeKey can split rate-limit windows from
+	// the authenticated install account. Empty is correct; capacity rebinds to sole
+	// AuthReadiness AccountProfileID on the same installation when unambiguous.
 	// Never emit account:unknown.
 	_ = account
 	return ""

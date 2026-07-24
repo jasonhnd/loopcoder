@@ -68,10 +68,10 @@ func associateIdentityEvidence(accounts []AccountObservation, installs []provide
 	// AccountRef on that same canonical install. Multiple ready accounts or zero
 	// stay unmerged (fail closed).
 	//
-	// Nonempty conflicting AccountRef (e.g. codexauth acct-<sha256> on quota while
-	// AuthReadiness is status acct_<base32>) must NOT be overwritten or treated as
-	// equivalent — leave both rows and fail closed. No proven principal mapping
-	// across opaque schemes.
+	// Nonempty conflicting AccountRef values must NOT be overwritten or treated as
+	// equivalent — leave both rows and fail closed. Codex AuthReadiness now stamps
+	// shared codexauth acct-+64hex (same as agent preflight); quota stays empty-account
+	// and rebinds only to the sole Ready account on the install.
 	type pi struct{ provider, install string }
 	authAccountsByPI := map[pi][]string{}
 	for _, b := range by {
