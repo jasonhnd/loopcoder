@@ -452,15 +452,25 @@ func releaseIntegrateWorktree(repoPath, tmpWT string) error {
 		return nil
 	}
 	var errs []string
+	// Soft-skip git deregistration only when parent path is absent (plain child
+	// directory / never-a-repo). When the parent path exists, git failures are
+	// fail-closed except known "not a working tree" / worktree-path-missing cases.
+	parentAbsent := false
 	if repoPath != "" {
+		if _, serr := os.Stat(repoPath); os.IsNotExist(serr) {
+			parentAbsent = true
+		} else if serr != nil {
+			errs = append(errs, fmt.Sprintf("stat repo: %v", serr))
+		}
+	}
+	if repoPath != "" && !parentAbsent && len(errs) == 0 {
 		if _, err := runGitRepo(context.Background(), repoPath, "worktree", "remove", "--force", tmpWT); err != nil {
-			// Plain child dirs / missing parent repo are soft — only real remove failures count.
 			msg := strings.ToLower(err.Error())
+			// Plain child dirs are not git worktrees — only real remove failures count.
 			if !strings.Contains(msg, "is not a working tree") &&
 				!strings.Contains(msg, "not a valid path") &&
-				!strings.Contains(msg, "no such file") &&
-				!strings.Contains(msg, "cannot change to") &&
-				!strings.Contains(msg, "not a git repository") {
+				// Worktree path itself already gone is soft; parent still exists.
+				!(strings.Contains(msg, "no such file") && strings.Contains(msg, strings.ToLower(tmpWT))) {
 				errs = append(errs, fmt.Sprintf("git worktree remove: %v", err))
 			}
 		}
@@ -468,15 +478,10 @@ func releaseIntegrateWorktree(repoPath, tmpWT string) error {
 	if err := os.RemoveAll(tmpWT); err != nil && !os.IsNotExist(err) {
 		errs = append(errs, fmt.Sprintf("RemoveAll: %v", err))
 	}
-	if repoPath != "" {
+	if repoPath != "" && !parentAbsent {
 		if _, err := runGitRepo(context.Background(), repoPath, "worktree", "prune"); err != nil {
-			msg := strings.ToLower(err.Error())
-			// Missing/non-git parent is soft (same as remove); real prune failures remain hard.
-			if !strings.Contains(msg, "no such file") &&
-				!strings.Contains(msg, "cannot change to") &&
-				!strings.Contains(msg, "not a git repository") {
-				errs = append(errs, fmt.Sprintf("git worktree prune: %v", err))
-			}
+			// Parent exists: prune failure is durable cleanup error (fail closed).
+			errs = append(errs, fmt.Sprintf("git worktree prune: %v", err))
 		}
 	}
 	if len(errs) == 0 {

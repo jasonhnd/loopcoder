@@ -1203,10 +1203,16 @@ func releaseChildWorktree(repoPath, wtPath string) error {
 	} else if !os.IsNotExist(err) {
 		errs = append(errs, fmt.Sprintf("stat: %v", err))
 	}
-	// Git registration agreement when repo is known.
+	// Git registration agreement when parent repo path exists. Absent parent is
+	// plain-child only (not a registered worktree parent). Existing parent that
+	// cannot be inspected fails closed.
 	repoPath = strings.TrimSpace(repoPath)
 	if repoPath != "" {
-		if listed, lerr := gitWorktreeListContains(repoPath, wtPath); lerr != nil {
+		if _, serr := os.Stat(repoPath); os.IsNotExist(serr) {
+			// Parent path absent — nothing to list.
+		} else if serr != nil {
+			errs = append(errs, fmt.Sprintf("stat repo for list: %v", serr))
+		} else if listed, lerr := gitWorktreeListContains(repoPath, wtPath); lerr != nil {
 			errs = append(errs, fmt.Sprintf("worktree list: %v", lerr))
 		} else if listed {
 			errs = append(errs, fmt.Sprintf("worktree still registered: %s", wtPath))
@@ -1223,11 +1229,11 @@ func gitWorktreeListContains(repoPath, wtPath string) (bool, error) {
 	cmd := exec.Command("git", "-C", repoPath, "worktree", "list", "--porcelain")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		// No git repo / not a worktree parent / missing path — treat as not registered.
+		// Caller ensures parent path exists. "Not a git repository" means path is
+		// not a worktree parent (plain dir) — treat as not registered. Other errors
+		// fail closed so a real registered parent cannot be silently skipped.
 		msg := strings.ToLower(string(out) + err.Error())
-		if strings.Contains(msg, "not a git repository") ||
-			strings.Contains(msg, "no such file") ||
-			strings.Contains(msg, "cannot change to") {
+		if strings.Contains(msg, "not a git repository") {
 			return false, nil
 		}
 		return false, fmt.Errorf("%v: %s", err, out)

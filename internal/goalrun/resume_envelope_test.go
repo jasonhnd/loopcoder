@@ -12,6 +12,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/capacityledger"
 	"github.com/jasonhnd/loopcoder/internal/goalrun"
 	"github.com/jasonhnd/loopcoder/internal/workflowrun"
+	"github.com/jasonhnd/loopcoder/internal/workflowrun/testspawn"
 	"github.com/jasonhnd/loopcoder/internal/workgraph"
 )
 
@@ -495,6 +496,7 @@ func TestSuccessfulRestartExactlyOnce(t *testing.T) {
 		g.PlanDigest = workgraph.DigestGraph(g)
 		return g, nil
 	}
+	// Authoritative restart: real process identity + authority + PID (not Fake).
 	res1, err1 := goalrun.Execute(context.Background(), goalrun.Request{
 		ProjectID: projectID, RunID: runID,
 		Goal: "implement transparent multi-child routing", Issue: "1397",
@@ -503,7 +505,7 @@ func TestSuccessfulRestartExactlyOnce(t *testing.T) {
 		HomeDir: home, Now: func() time.Time { return now },
 		Decompose:     twoChild,
 		LoadInventory: env.loadInv(), OpenLedger: env.openLed(),
-		Executor: workflowrun.FakeChildExecutor{
+		Executor: testspawn.Executor{
 			HomeDir: home, Now: func() time.Time { return now },
 			Calls: calls1, FailIDs: map[string]bool{"wi_implement": true},
 		},
@@ -529,7 +531,7 @@ func TestSuccessfulRestartExactlyOnce(t *testing.T) {
 		HomeDir: home, Now: func() time.Time { return now.Add(time.Minute) },
 		Decompose:     twoChild,
 		LoadInventory: env.loadInv(), OpenLedger: env.openLed(),
-		Executor: workflowrun.FakeChildExecutor{
+		Executor: testspawn.Executor{
 			HomeDir: home, Now: func() time.Time { return now.Add(time.Minute) },
 			Calls: calls2,
 		},

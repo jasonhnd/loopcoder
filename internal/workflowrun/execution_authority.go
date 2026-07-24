@@ -974,7 +974,6 @@ func validateRecoverCandidates(
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	openLaunches := OpenLaunchesWithoutTerminal(events)
 
 	var out []recoverCandidate
 	for _, k := range keys {
@@ -992,21 +991,9 @@ func validateRecoverCandidates(
 				if !errors.Is(lerr, sql.ErrNoRows) {
 					return nil, fmt.Errorf("workflowrun: recover validate %s/%s: authority load: %w", id, att, lerr)
 				}
-				// Open durable launch without authority is ambiguous corruption — fail closed.
-				if openAtt, isOpen := openLaunches[id]; isOpen && openAtt == att {
-					return nil, fmt.Errorf("workflowrun: recover validate %s/%s: missing authority for durable launch/claim (ambiguous; fail closed before mutation; diagnostic=no_authority)", id, att)
-				}
-				cEarly, hasClaimEarly := claimByAttempt[k]
-				claimOpenEarly := hasClaimEarly && cEarly.State != workclaim.StateClosed
-				if claimOpenEarly {
-					return nil, fmt.Errorf("workflowrun: recover validate %s/%s: missing authority for durable launch/claim (ambiguous; fail closed before mutation; diagnostic=no_authority)", id, att)
-				}
-				// Fully terminalized Fake/test path (terminal present, no open launch/claim):
-				// not a recovery mutation candidate — skip (do not invent authority).
-				if _, hasTermEarly := termByAttempt[k]; hasTermEarly {
-					continue
-				}
-				// Incomplete lifecycle without authority (e.g. interrupt without terminal) — fail closed.
+				// Durable launch/claim without authority is ambiguous corruption — not a Fake
+				// exemption and not selected from "completed without evidence". Fail closed
+				// before any mutation; never select gN+1 for this state.
 				return nil, fmt.Errorf("workflowrun: recover validate %s/%s: missing authority for durable launch/claim (ambiguous; fail closed before mutation; diagnostic=no_authority)", id, att)
 			}
 			auth = loaded
