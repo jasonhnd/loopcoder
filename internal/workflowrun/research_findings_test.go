@@ -375,3 +375,46 @@ func TestResearchFindingsMaterialization_ResultShapePreservesObservedRoute(t *te
 		t.Fatalf("message must retain dest reason: %q", out.Message)
 	}
 }
+
+// TestAcceptResearch_GreenfieldSurveyNotClarification: substantial findings.md
+// that mentions "no existing tests/implementation" is legitimate survey scope,
+// not empty clarification.
+func TestAcceptResearch_GreenfieldSurveyNotClarification(t *testing.T) {
+	wt := t.TempDir()
+	body := "# Research findings\n\nWork item: wi_research\n\n## Provider survey\n\n" +
+		"This checkout does not contain an existing multi-provider notes implementation.\n" +
+		"Constraints are strict:\n" +
+		"- no existing behavior to preserve\n" +
+		"- no existing tests to focus or extend\n" +
+		"- no provider-specific code to compare\n" +
+		"A sensible implementation would need package API and provider abstraction.\n" +
+		strings.Repeat("More survey detail for substance. ", 20)
+	if err := os.WriteFile(filepath.Join(wt, "findings.md"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !hasSubstantialResearchFindings(wt, []string{"findings.md"}) {
+		t.Fatal("expected substantial research findings")
+	}
+	// Even if looksLikeClarification would trip on loose phrases, accept must pass.
+	if err := AcceptSucceededChild("wi_research", "research/read-only: survey scope", "research",
+		[]string{"findings.md"}, wt, "sha256:"+strings.Repeat("ab", 32)); err != nil {
+		t.Fatalf("greenfield research survey must accept: %v", err)
+	}
+}
+
+// TestAcceptResearch_PureClarificationStillRefused without substantial findings.
+func TestAcceptResearch_PureClarificationStillRefused(t *testing.T) {
+	wt := t.TempDir()
+	// Short file with only clarification language, no survey section.
+	body := "please clarify requirements. need more information before any work.\n"
+	if err := os.WriteFile(filepath.Join(wt, "findings.md"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if hasSubstantialResearchFindings(wt, []string{"findings.md"}) {
+		t.Fatal("short clarification must not count as substantial")
+	}
+	if err := AcceptSucceededChild("wi_research", "research/read-only: survey", "research",
+		[]string{"findings.md"}, wt, "sha256:"+strings.Repeat("cd", 32)); err == nil {
+		t.Fatal("pure clarification research must fail closed")
+	}
+}

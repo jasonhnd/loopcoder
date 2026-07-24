@@ -61,6 +61,22 @@ func ClassifyTaskRole(workItemID, intent, owner string) TaskRole {
 func AcceptSucceededChild(workItemID, intent, owner string, files []string, worktree, evidence string) error {
 	role := ClassifyTaskRole(workItemID, intent, owner)
 	product := filterProductFiles(files)
+	// Greenfield research surveys often say "no existing tests/implementation" —
+	// that is legitimate scope finding, not empty clarification. Only apply the
+	// clarification gate to research when there is no substantial findings product
+	// (## Provider survey / findings.md body). Implement/tests/verify stay strict.
+	if role == RoleResearch {
+		if len(product) == 0 && !hasAnyFindings(worktree) {
+			return fmt.Errorf("workflowrun: research child %s produced no findings product", workItemID)
+		}
+		if hasSubstantialResearchFindings(worktree, product) {
+			return nil
+		}
+		if looksLikeClarification(evidence, worktree, product) {
+			return fmt.Errorf("workflowrun: acceptance refused for %s: clarification/empty work is not success", workItemID)
+		}
+		return nil
+	}
 	if looksLikeClarification(evidence, worktree, product) {
 		return fmt.Errorf("workflowrun: acceptance refused for %s: clarification/empty work is not success", workItemID)
 	}
@@ -82,10 +98,6 @@ func AcceptSucceededChild(workItemID, intent, owner string, files []string, work
 	case RoleVerify:
 		if !hasVerifierVerdict(product, worktree, evidence) {
 			return fmt.Errorf("workflowrun: verify child %s must produce independent verdict with digest over integrated head; clarification refused", workItemID)
-		}
-	case RoleResearch:
-		if len(product) == 0 && !hasAnyFindings(worktree) {
-			return fmt.Errorf("workflowrun: research child %s produced no findings product", workItemID)
 		}
 	case RoleDocs:
 		if !hasDocsProduct(product) && len(product) == 0 {
@@ -238,6 +250,47 @@ func hasDocsProduct(product []string) bool {
 			return true
 		}
 		if strings.HasPrefix(f, "docs/") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasSubstantialResearchFindings is true when durable research product has a
+// real survey body (materializeResearchFindings "## Provider survey" section or
+// equivalent lengthy findings). Used so greenfield "no existing tests" language
+// in a survey does not trip looksLikeClarification.
+func hasSubstantialResearchFindings(worktree string, product []string) bool {
+	check := func(raw []byte) bool {
+		if len(raw) < 200 {
+			return false
+		}
+		low := strings.ToLower(string(raw))
+		if strings.Contains(low, "## provider survey") {
+			return true
+		}
+		// Long structured findings without the exact header still count.
+		return strings.Count(low, "\n") >= 10 && len(raw) >= 400 &&
+			(strings.Contains(low, "scope") || strings.Contains(low, "constraint") ||
+				strings.Contains(low, "survey") || strings.Contains(low, "findings"))
+	}
+	for _, rel := range product {
+		base := filepath.Base(rel)
+		if base != "findings.md" && base != "FINDINGS.md" && !strings.HasPrefix(base, "child-output-") {
+			continue
+		}
+		if worktree == "" {
+			continue
+		}
+		if raw, ok := readRegularFindingsFile(worktree, base); ok && check(raw) {
+			return true
+		}
+	}
+	if worktree == "" {
+		return false
+	}
+	for _, name := range []string{"findings.md", "FINDINGS.md"} {
+		if raw, ok := readRegularFindingsFile(worktree, name); ok && check(raw) {
 			return true
 		}
 	}
