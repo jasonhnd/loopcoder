@@ -38,6 +38,12 @@ const FailureClassVerifierVerdictMaterialization = "verifier_verdict_materializa
 // provider layer but LoopCoder could not safely materialize docs-notes.md.
 const FailureClassDocsMaterialization = "docs_notes_materialization_failed"
 
+// FailureClassProductDigest is returned when product discovery found candidate
+// paths but secure hashing failed (symlink root/parent/leaf, non-regular,
+// missing, escape, size, or identity mismatch). Distinct from missing_evidence
+// so operators see path-safety causes instead of a silent empty digest.
+const FailureClassProductDigest = "product_digest_failed"
+
 // ChildLifecycleKinds are event kinds that bind a child work item to an attempt.
 // Parent-level interrupt is the only interrupt form that may omit all child identity.
 var ChildLifecycleKinds = map[string]bool{

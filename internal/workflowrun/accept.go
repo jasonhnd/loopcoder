@@ -99,22 +99,31 @@ func AcceptSucceededChild(workItemID, intent, owner string, files []string, work
 	}
 	switch role {
 	case RoleTests:
-		// Require test files in the child's FilesTouched list — do not count
-		// pre-existing base *_test.go via full worktree walk (false green).
-		if !hasTestProductInList(product) {
-			return fmt.Errorf("workflowrun: tests child %s must add/adjust real test files (*_test.go or tests/); got %v", workItemID, product)
+		// Role-specific: matching test paths only; must be secure regular leaves
+		// (not filename-only, not worktree walk of pre-existing base tests).
+		if !hasSecureTestProduct(worktree, product) {
+			if !hasTestProductInList(product) {
+				return fmt.Errorf("workflowrun: tests child %s must add/adjust real test files (*_test.go or tests/); got %v", workItemID, product)
+			}
+			return fmt.Errorf("workflowrun: tests child %s test product is not securely readable regular files (symlink/unreadable refused); got %v", workItemID, product)
 		}
 	case RoleImplement:
-		if !hasSourceProduct(product) {
-			return fmt.Errorf("workflowrun: implement child %s must produce product source (not meta/clarification only); got %v", workItemID, product)
-		}
 		// child-output-*.md alone is never enough even if worktree has base sources.
 		if onlyChildOutputStubs(product) {
 			return fmt.Errorf("workflowrun: implement child %s produced only child-output stubs, not product source; got %v", workItemID, product)
 		}
+		if !hasSecureSourceProduct(worktree, product) {
+			if !hasSourceProduct(product) {
+				return fmt.Errorf("workflowrun: implement child %s must produce product source (not meta/clarification only); got %v", workItemID, product)
+			}
+			return fmt.Errorf("workflowrun: implement child %s source product is not securely readable regular files (symlink/unreadable refused); got %v", workItemID, product)
+		}
 	default:
-		if len(product) == 0 {
-			return fmt.Errorf("workflowrun: child %s success requires product files", workItemID)
+		if !hasSecureAnyProduct(worktree, product) {
+			if len(product) == 0 {
+				return fmt.Errorf("workflowrun: child %s success requires product files", workItemID)
+			}
+			return fmt.Errorf("workflowrun: child %s product is not securely readable regular files (symlink/unreadable refused); got %v", workItemID, product)
 		}
 	}
 	return nil
@@ -126,8 +135,9 @@ func AcceptSucceededChild(workItemID, intent, owner string, files []string, work
 // before evaluation so long scaffolding cannot wash clarification-only bodies.
 func looksLikeClarification(evidence, worktree string, product []string) bool {
 	_ = evidence // digest is not prose; ignore for phrase matching
-	// Real tests/source product exempts implement/test paths from phrase gates.
-	if hasTestProduct(product, worktree) || hasSourceProduct(product) {
+	// Real secure source/test product exempts implement/test paths from phrase gates.
+	// Filename-only or symlink leaves do not exempt.
+	if hasSecureTestProduct(worktree, product) || hasSecureSourceProduct(worktree, product) {
 		return false
 	}
 	for _, blob := range collectSecureTextBlobs(worktree, product) {
@@ -138,16 +148,52 @@ func looksLikeClarification(evidence, worktree string, product []string) bool {
 	return false
 }
 
+func isTestProductRel(rel string) bool {
+	cleaned, err := cleanWorktreeRelPath(rel)
+	if err != nil {
+		// Fall back to raw slash form for list-only classification.
+		cleaned = filepath.ToSlash(strings.TrimSpace(rel))
+	}
+	base := filepath.Base(cleaned)
+	if strings.HasPrefix(base, "child-output-") {
+		return false
+	}
+	slash := filepath.ToSlash(cleaned)
+	if strings.HasSuffix(base, "_test.go") || strings.HasSuffix(base, "_test.py") ||
+		strings.HasSuffix(base, ".test.ts") || strings.HasSuffix(base, ".spec.ts") ||
+		strings.Contains(slash, "/tests/") || strings.HasPrefix(slash, "tests/") ||
+		strings.Contains(slash, "/testdata/") {
+		return true
+	}
+	return false
+}
+
+func isSourceProductRel(rel string) bool {
+	cleaned, err := cleanWorktreeRelPath(rel)
+	if err != nil {
+		cleaned = filepath.ToSlash(strings.TrimSpace(rel))
+	}
+	base := filepath.Base(cleaned)
+	if strings.HasPrefix(base, "child-output-") {
+		return false
+	}
+	if strings.HasSuffix(base, "_test.go") || strings.HasSuffix(base, "_test.py") {
+		return false
+	}
+	switch {
+	case strings.HasSuffix(base, ".go"), strings.HasSuffix(base, ".py"),
+		strings.HasSuffix(base, ".ts"), strings.HasSuffix(base, ".tsx"),
+		strings.HasSuffix(base, ".js"), strings.HasSuffix(base, ".rs"),
+		strings.HasSuffix(base, ".java"), strings.HasSuffix(base, ".c"),
+		strings.HasSuffix(base, ".h"), strings.HasSuffix(base, ".cpp"):
+		return true
+	}
+	return false
+}
+
 func hasTestProductInList(product []string) bool {
 	for _, f := range product {
-		base := filepath.Base(f)
-		if strings.HasPrefix(base, "child-output-") {
-			continue
-		}
-		if strings.HasSuffix(base, "_test.go") || strings.HasSuffix(base, "_test.py") ||
-			strings.HasSuffix(base, ".test.ts") || strings.HasSuffix(base, ".spec.ts") ||
-			strings.Contains(f, "/tests/") || strings.HasPrefix(f, "tests/") ||
-			strings.Contains(f, "/testdata/") {
+		if isTestProductRel(f) {
 			return true
 		}
 	}
@@ -155,49 +201,61 @@ func hasTestProductInList(product []string) bool {
 }
 
 func hasTestProduct(product []string, worktree string) bool {
-	if hasTestProductInList(product) {
-		return true
-	}
-	if worktree == "" {
-		return false
-	}
-	found := false
-	_ = filepath.Walk(worktree, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info == nil || info.IsDir() {
-			if info != nil && info.IsDir() && (filepath.Base(path) == ".git" || filepath.Base(path) == ".loopcoder") {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		base := filepath.Base(path)
-		if strings.HasSuffix(base, "_test.go") || strings.HasSuffix(base, "_test.py") {
-			found = true
-			return filepath.SkipAll
-		}
-		return nil
-	})
-	return found
+	// Secure-only: never treat symlink or walk-discovered pre-existing tests as product.
+	return hasSecureTestProduct(worktree, product)
 }
 
 func hasSourceProduct(product []string) bool {
 	for _, f := range product {
-		base := filepath.Base(f)
-		if strings.HasPrefix(base, "child-output-") {
-			continue
-		}
-		if strings.HasSuffix(base, "_test.go") {
-			continue
-		}
-		switch {
-		case strings.HasSuffix(base, ".go"), strings.HasSuffix(base, ".py"),
-			strings.HasSuffix(base, ".ts"), strings.HasSuffix(base, ".tsx"),
-			strings.HasSuffix(base, ".js"), strings.HasSuffix(base, ".rs"),
-			strings.HasSuffix(base, ".java"), strings.HasSuffix(base, ".c"),
-			strings.HasSuffix(base, ".h"), strings.HasSuffix(base, ".cpp"):
+		if isSourceProductRel(f) {
 			return true
 		}
 	}
 	return false
+}
+
+// hasSecureRegularMatchingProduct is true when at least one product path both
+// matches role classification and proves as a secure regular leaf under worktree.
+func hasSecureRegularMatchingProduct(worktree string, product []string, match func(string) bool) bool {
+	if worktree == "" || len(product) == 0 {
+		return false
+	}
+	wtAbs, err := filepath.Abs(worktree)
+	if err != nil {
+		return false
+	}
+	if err := requireNonSymlinkDir(wtAbs); err != nil {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, rel := range product {
+		cleaned, cerr := cleanWorktreeRelPath(rel)
+		if cerr != nil || seen[cleaned] {
+			continue
+		}
+		seen[cleaned] = true
+		if !match(cleaned) {
+			continue
+		}
+		if err := proveSecureRegularProduct(wtAbs, cleaned); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSecureSourceProduct(worktree string, product []string) bool {
+	return hasSecureRegularMatchingProduct(worktree, product, isSourceProductRel)
+}
+
+func hasSecureTestProduct(worktree string, product []string) bool {
+	return hasSecureRegularMatchingProduct(worktree, product, isTestProductRel)
+}
+
+// hasSecureAnyProduct requires at least one listed product path that is a
+// secure regular leaf (generic role — no suffix specialization).
+func hasSecureAnyProduct(worktree string, product []string) bool {
+	return hasSecureRegularMatchingProduct(worktree, product, func(string) bool { return true })
 }
 
 // onlyChildOutputStubs is true when every product path is a child-output-*.md stub.

@@ -474,7 +474,13 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 			}, werr
 		}
 		// Still hash product files when present; stub-only is allowed only in AllowFixture.
-		if productDig, productFiles, perr := productOutputDigest(wt); perr == nil && productDig != "" {
+		// Never ignore digest errors (symlink/non-regular product must fail closed).
+		if productDig, productFiles, perr := productOutputDigest(wt); perr != nil {
+			return ChildExecResult{
+				Terminal: workgraph.TermFailed, FailureClass: FailureClassProductDigest, Message: perr.Error(),
+				WorktreePath: wt, Provider: prov, Model: model, Depth: depth, ActualSource: "unknown",
+			}, perr
+		} else if productDig != "" {
 			digest = productDig
 			files = mergeUniquePaths(files, productFiles)
 		}
@@ -617,7 +623,12 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 		out.IdentityAmbiguityNote = spawnStart.IdentityAmbiguityNote
 	}
 	// Product evidence digest from actual worktree changes (not stub evidence file).
-	digest, files, _ := productOutputDigest(wt)
+	// On already-failed process paths, preserve real FailureClass/route/spawn/usage:
+	// digest errors only clear product evidence (do not overwrite process FC).
+	digest, files, digErr := productOutputDigest(wt)
+	if digErr != nil {
+		digest, files = "", nil
+	}
 	files = mergeUniquePaths(files, auditFiles)
 	if rerr != nil {
 		term := workgraph.TermFailed
@@ -691,7 +702,27 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	//
 	// If materialize is attempted and fails, surface the real typed failure —
 	// never swallow into generic missing_evidence (RC39 Stage D diagnostics).
-	digest, files, _ = productOutputDigest(wt)
+	// Digest errors on the success path are fail-closed (never discard).
+	failProductDigest := func(perr error) (ChildExecResult, error) {
+		out := ChildExecResult{
+			Terminal: workgraph.TermFailed, WorktreePath: wt,
+			FailureClass: FailureClassProductDigest, Message: perr.Error(),
+			Provider: actualProv, Model: actualModel, Depth: actualDepth,
+			ActualSource: "unknown",
+			InvokedRoute: ChildRoute{
+				Provider: actualProv, Model: actualModel, Depth: actualDepth,
+				Permission: actualPerm, AccountRef: actualAcct, InstallRef: actualInstall,
+			},
+		}
+		bindSources(&out)
+		bindSpawn(&out)
+		out = attachUsage(out, res)
+		return out, perr
+	}
+	digest, files, digErr = productOutputDigest(wt)
+	if digErr != nil {
+		return failProductDigest(digErr)
+	}
 	if strings.TrimSpace(digest) == "" {
 		role := ClassifyTaskRole(in.WorkItemID, in.Intent, "")
 		var merr error
@@ -724,7 +755,10 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 				out = attachUsage(out, res)
 				return out, merr
 			}
-			digest, files, _ = productOutputDigest(wt)
+			digest, files, digErr = productOutputDigest(wt)
+			if digErr != nil {
+				return failProductDigest(digErr)
+			}
 		}
 	}
 	if strings.TrimSpace(digest) == "" {
@@ -980,11 +1014,26 @@ func mergePayloadStringMap(dst, src map[string]string) map[string]string {
 // productOutputDigest hashes actual changed product paths/content under the
 // worktree (excluding .loopcoder audit stubs, ownership markers, and provider
 // runtime logs/summaries). Empty when no useful product change exists — cannot
-// become successful evidence. Directory entries from discovery are hard failures
-// (must not silently skip). Align exclusions with filterProductFiles so success
-// digests cannot be built from files acceptance will discard (RC39 research).
+// become successful evidence.
+//
+// Security: never os.Stat/os.ReadFile (those follow symlinks). Every leaf is
+// hashed via the secure regular product chain (non-symlink root + parents,
+// pre-Lstat / Open / SameFile / stream / post-Lstat). Any invalid product
+// returns a non-nil error — callers must not discard it on success paths.
+// Align exclusions with filterProductFiles so success digests cannot be built
+// from files acceptance will discard (RC39 research).
 func productOutputDigest(wt string) (digest string, files []string, err error) {
-	discovered, derr := discoverProductFiles(wt)
+	if strings.TrimSpace(wt) == "" {
+		return "", nil, nil
+	}
+	wtAbs, aerr := filepath.Abs(wt)
+	if aerr != nil {
+		return "", nil, fmt.Errorf("workflowrun: product digest worktree: %w", aerr)
+	}
+	if rerr := requireNonSymlinkDir(wtAbs); rerr != nil {
+		return "", nil, fmt.Errorf("workflowrun: product digest worktree root: %w", rerr)
+	}
+	discovered, derr := discoverProductFiles(wtAbs)
 	if derr != nil {
 		return "", nil, derr
 	}
@@ -1006,29 +1055,31 @@ func productOutputDigest(wt string) (digest string, files []string, err error) {
 			strings.HasPrefix(base, ".loopcoder-child") || base == "loopcoder-child-provider.log" {
 			continue
 		}
-		product = append(product, rel)
+		// Reject unclean paths early with typed error (no silent skip).
+		cleaned, cerr := cleanWorktreeRelPath(rel)
+		if cerr != nil {
+			return "", nil, fmt.Errorf("workflowrun: product path %s: %w", rel, cerr)
+		}
+		product = append(product, filepath.ToSlash(cleaned))
 	}
 	if len(product) == 0 {
 		return "", nil, nil
 	}
 	h := sha256.New()
 	for _, rel := range product {
-		full := filepath.Join(wt, filepath.FromSlash(rel))
-		st, serr := os.Stat(full)
-		if serr != nil {
-			return "", nil, fmt.Errorf("workflowrun: product path %s: %w", rel, serr)
+		// Canonical digest input: slash-rel + NUL + secure stream + NUL.
+		if _, werr := h.Write([]byte(rel)); werr != nil {
+			return "", nil, werr
 		}
-		if st.IsDir() {
-			return "", nil, fmt.Errorf("workflowrun: product path %s is a directory (file-level discovery required)", rel)
+		if _, werr := h.Write([]byte{0}); werr != nil {
+			return "", nil, werr
 		}
-		raw, rerr := os.ReadFile(full)
-		if rerr != nil {
-			return "", nil, fmt.Errorf("workflowrun: product path %s: %w", rel, rerr)
+		if _, herr := streamSecureRegularProduct(wtAbs, rel, h, maxProductHashBytes); herr != nil {
+			return "", nil, fmt.Errorf("workflowrun: product path %s: %w", rel, herr)
 		}
-		h.Write([]byte(rel))
-		h.Write([]byte{0})
-		h.Write(raw)
-		h.Write([]byte{0})
+		if _, werr := h.Write([]byte{0}); werr != nil {
+			return "", nil, werr
+		}
 		files = append(files, rel)
 	}
 	if len(files) == 0 {

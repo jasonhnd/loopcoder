@@ -8,6 +8,14 @@ import (
 	"strings"
 )
 
+// Size bounds for secure product IO.
+// Text acceptance (findings/docs/clarification) stays small; product digest
+// streams without loading whole sources into memory, with a hard per-leaf cap.
+const (
+	maxTextProductRead  = 1 << 20   // 1 MiB — research/docs/verdict prose
+	maxProductHashBytes = 256 << 20 // 256 MiB — streaming hash per product leaf
+)
+
 // cleanWorktreeRelPath returns a Clean relative path under a worktree.
 // Rejects empty, absolute, scheme-like, and any ".." escape components.
 // Preserves nested paths such as docs/foo.md (does NOT collapse to Base).
@@ -95,16 +103,123 @@ func resolveSecureUnderWorktree(worktreeAbs, rel string) (full string, err error
 	return "", fmt.Errorf("empty path after split")
 }
 
-// readRegularFindingsFile Lstats then reads a leaf under worktree. rel may be
-// nested (docs/foo.md). Rejects abs/../symlink-root/symlink-parent paths.
+// secureReadAfterPreLstat is nil in production. Tests may set it to swap the
+// leaf between pre-Lstat and Open, asserting the SameFile identity mismatch path.
+var secureReadAfterPreLstat func(fullPath string)
+
+// withSecureRegularProduct opens a clean relative leaf under worktreeAbs with:
 //
-// Identity chain (fail closed on race):
-//  1. secure resolve (root + parents non-symlink dirs)
-//  2. preLstat leaf — must be regular non-symlink
-//  3. Open path
-//  4. f.Stat() regular + os.SameFile(pre, fd)
-//  5. read from fd
-//  6. postLstat + os.SameFile(fd, post)
+//	secure resolve (root + parents non-symlink dirs) →
+//	pre-Lstat regular non-symlink → Open → fd.Stat regular + SameFile(pre, fd) →
+//	fn(fd) → post-Lstat regular non-symlink + SameFile(fd, post)
+//
+// Never follows root/parent/leaf symlinks. fn should read from the fd only.
+func withSecureRegularProduct(worktreeAbs, rel string, fn func(f *os.File) error) error {
+	full, err := resolveSecureUnderWorktree(worktreeAbs, rel)
+	if err != nil {
+		return err
+	}
+	pre, err := os.Lstat(full)
+	if err != nil {
+		return err
+	}
+	if pre.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a symlink", rel)
+	}
+	if !pre.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file (mode=%v)", rel, pre.Mode())
+	}
+	if secureReadAfterPreLstat != nil {
+		secureReadAfterPreLstat(full)
+	}
+	f, err := os.Open(full)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fdStat, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !fdStat.Mode().IsRegular() {
+		return fmt.Errorf("%s fd is not a regular file", rel)
+	}
+	if !os.SameFile(pre, fdStat) {
+		return fmt.Errorf("%s identity mismatch: pre-lstat vs open fd", rel)
+	}
+	if err := fn(f); err != nil {
+		return err
+	}
+	post, err := os.Lstat(full)
+	if err != nil {
+		return err
+	}
+	if post.Mode()&os.ModeSymlink != 0 || !post.Mode().IsRegular() {
+		return fmt.Errorf("%s post-read node is not a regular non-symlink file", rel)
+	}
+	if !os.SameFile(fdStat, post) {
+		return fmt.Errorf("%s identity mismatch: open fd vs post-lstat", rel)
+	}
+	return nil
+}
+
+// streamSecureRegularProduct streams a secure regular leaf into w, capping at
+// maxBytes (exclusive of overflow probe). Used for product digests so large
+// sources are not fully buffered.
+func streamSecureRegularProduct(worktreeAbs, rel string, w io.Writer, maxBytes int64) (n int64, err error) {
+	if maxBytes <= 0 {
+		return 0, fmt.Errorf("%s invalid maxBytes", rel)
+	}
+	err = withSecureRegularProduct(worktreeAbs, rel, func(f *os.File) error {
+		nn, cerr := io.Copy(w, io.LimitReader(f, maxBytes+1))
+		n = nn
+		if cerr != nil {
+			return cerr
+		}
+		if nn > maxBytes {
+			return fmt.Errorf("%s exceeds max product size (%d bytes)", rel, maxBytes)
+		}
+		return nil
+	})
+	return n, err
+}
+
+// readSecureRegularProductBytes reads a secure regular leaf up to maxBytes.
+// Used for text gates (findings/docs/clarification), not bulk source hashing.
+func readSecureRegularProductBytes(worktreeAbs, rel string, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		return nil, fmt.Errorf("%s invalid maxBytes", rel)
+	}
+	var raw []byte
+	err := withSecureRegularProduct(worktreeAbs, rel, func(f *os.File) error {
+		b, rerr := io.ReadAll(io.LimitReader(f, maxBytes+1))
+		if rerr != nil {
+			return rerr
+		}
+		if int64(len(b)) > maxBytes {
+			return fmt.Errorf("%s exceeds max findings size", rel)
+		}
+		raw = b
+		return nil
+	})
+	return raw, err
+}
+
+// proveSecureRegularProduct is true when the leaf is a secure regular file
+// (full identity chain). Streams at most 0 payload beyond open/SameFile/post
+// by reading through a discard with max 0... use 1-byte max to exercise read.
+func proveSecureRegularProduct(worktreeAbs, rel string) error {
+	// Open + SameFile + post is enough; stream zero bytes via LimitReader(0).
+	return withSecureRegularProduct(worktreeAbs, rel, func(f *os.File) error {
+		// Touch the fd so post-chain runs after a real open; do not require content.
+		_, err := io.Copy(io.Discard, io.LimitReader(f, 0))
+		return err
+	})
+}
+
+// readRegularFindingsFile Lstats then reads a text leaf under worktree. rel may
+// be nested (docs/foo.md). Rejects abs/../symlink-root/symlink-parent paths.
+// Caps at maxTextProductRead (1 MiB) for acceptance prose.
 func readRegularFindingsFile(worktreeAbs, rel string) ([]byte, bool) {
 	return readRegularFindingsFileChecked(worktreeAbs, rel)
 }
@@ -114,60 +229,6 @@ func readRegularFindingsFileChecked(worktreeAbs, rel string) ([]byte, bool) {
 	return raw, err == nil
 }
 
-// secureReadAfterPreLstat is nil in production. Tests may set it to swap the
-// leaf between pre-Lstat and Open, asserting the SameFile identity mismatch path.
-var secureReadAfterPreLstat func(fullPath string)
-
 func readRegularFindingsFileErr(worktreeAbs, rel string) ([]byte, error) {
-	full, err := resolveSecureUnderWorktree(worktreeAbs, rel)
-	if err != nil {
-		return nil, err
-	}
-	pre, err := os.Lstat(full)
-	if err != nil {
-		return nil, err
-	}
-	if pre.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("%s is a symlink", rel)
-	}
-	if !pre.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s is not a regular file (mode=%v)", rel, pre.Mode())
-	}
-	if secureReadAfterPreLstat != nil {
-		secureReadAfterPreLstat(full)
-	}
-	const maxFindings = 1 << 20
-	f, err := os.Open(full)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	fdStat, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !fdStat.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s fd is not a regular file", rel)
-	}
-	if !os.SameFile(pre, fdStat) {
-		return nil, fmt.Errorf("%s identity mismatch: pre-lstat vs open fd", rel)
-	}
-	raw, err := io.ReadAll(io.LimitReader(f, maxFindings+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(raw) > maxFindings {
-		return nil, fmt.Errorf("%s exceeds max findings size", rel)
-	}
-	post, err := os.Lstat(full)
-	if err != nil {
-		return nil, err
-	}
-	if post.Mode()&os.ModeSymlink != 0 || !post.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s post-read node is not a regular non-symlink file", rel)
-	}
-	if !os.SameFile(fdStat, post) {
-		return nil, fmt.Errorf("%s identity mismatch: open fd vs post-lstat", rel)
-	}
-	return raw, nil
+	return readSecureRegularProductBytes(worktreeAbs, rel, maxTextProductRead)
 }
