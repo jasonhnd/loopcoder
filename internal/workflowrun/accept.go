@@ -247,9 +247,28 @@ func hasAnyFindings(worktree string) bool {
 	if worktree == "" {
 		return false
 	}
-	// findings.md or child-output with substantial body
+	// findings.md or child-output with substantial body (not route-metadata stubs alone).
 	for _, name := range []string{"findings.md", "FINDINGS.md"} {
 		if st, err := os.Stat(filepath.Join(worktree, name)); err == nil && st.Size() > 40 {
+			return true
+		}
+	}
+	entries, err := os.ReadDir(worktree)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), "child-output-") {
+			continue
+		}
+		raw, rerr := os.ReadFile(filepath.Join(worktree, e.Name()))
+		if rerr != nil || len(raw) < 200 {
+			continue
+		}
+		// Require survey body beyond the short writeChildEvidence route stub.
+		low := strings.ToLower(string(raw))
+		if strings.Contains(low, "## provider survey") || strings.Contains(low, "findings") ||
+			(strings.Count(low, "\n") >= 8 && len(raw) > 400) {
 			return true
 		}
 	}

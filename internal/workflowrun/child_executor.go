@@ -684,7 +684,16 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 		}
 	}
 	// Re-hash product after isolation check; mutation must invalidate acceptance.
+	// Provider logs/summaries alone are not product (see productOutputDigest).
+	// Research is read-only in the provider sandbox but must still leave a durable
+	// findings product for acceptance — materialize from independently observed
+	// provider Summary after process exit (LoopCoder-owned write, not Actual* echo).
 	digest, files, _ = productOutputDigest(wt)
+	if strings.TrimSpace(digest) == "" && isResearchWorkItem(in.WorkItemID, in.Intent) {
+		if merr := materializeResearchFindings(wt, res.Summary, in); merr == nil {
+			digest, files, _ = productOutputDigest(wt)
+		}
+	}
 	if strings.TrimSpace(digest) == "" {
 		out := ChildExecResult{
 			Terminal: workgraph.TermFailed, WorktreePath: wt, FailureClass: "missing_evidence",
@@ -936,9 +945,11 @@ func mergePayloadStringMap(dst, src map[string]string) map[string]string {
 }
 
 // productOutputDigest hashes actual changed product paths/content under the
-// worktree (excluding .loopcoder audit stubs and ownership markers). Empty when
-// no useful product change exists — cannot become successful evidence.
-// Directory entries from discovery are hard failures (must not silently skip).
+// worktree (excluding .loopcoder audit stubs, ownership markers, and provider
+// runtime logs/summaries). Empty when no useful product change exists — cannot
+// become successful evidence. Directory entries from discovery are hard failures
+// (must not silently skip). Align exclusions with filterProductFiles so success
+// digests cannot be built from files acceptance will discard (RC39 research).
 func productOutputDigest(wt string) (digest string, files []string, err error) {
 	discovered, derr := discoverProductFiles(wt)
 	if derr != nil {
@@ -954,6 +965,12 @@ func productOutputDigest(wt string) (digest string, files []string, err error) {
 			continue
 		}
 		if strings.HasPrefix(rel, "child-output-") {
+			continue
+		}
+		base := filepath.Base(rel)
+		// Provider runtime artifacts are not product (same list as filterProductFiles).
+		if strings.HasSuffix(base, ".log") || base == "prompt.txt" || base == "summary.txt" ||
+			strings.HasPrefix(base, ".loopcoder-child") || base == "loopcoder-child-provider.log" {
 			continue
 		}
 		product = append(product, rel)
@@ -985,6 +1002,40 @@ func productOutputDigest(wt string) (digest string, files []string, err error) {
 		return "", nil, nil
 	}
 	return "sha256:" + hex.EncodeToString(h.Sum(nil)), files, nil
+}
+
+// isResearchWorkItem reports whether this child is the research role (must leave findings).
+func isResearchWorkItem(workItemID, intent string) bool {
+	return ClassifyTaskRole(workItemID, intent, "") == RoleResearch
+}
+
+// materializeResearchFindings writes findings.md from the provider Summary after a
+// successful research run when the sandbox left no product files. The write is
+// LoopCoder-owned (post-process), never used to invent ActualModel/ActualAccount.
+// Requires substantial summary content so empty/error shells cannot pass.
+func materializeResearchFindings(wt, summary string, in ChildExecInput) error {
+	summary = strings.TrimSpace(summary)
+	if wt == "" || len(summary) < 80 {
+		return fmt.Errorf("research summary too short to materialize findings")
+	}
+	// Refuse pure clarification shells (acceptance will also re-check).
+	low := strings.ToLower(summary)
+	for _, p := range []string{"please clarify", "need clarification", "need more information", "what should i"} {
+		if strings.Contains(low, p) && len(summary) < 400 {
+			return fmt.Errorf("research summary looks like clarification-only")
+		}
+	}
+	body := "# Research findings\n\n" +
+		"Work item: " + strings.TrimSpace(in.WorkItemID) + "\n\n" +
+		"Intent: " + strings.TrimSpace(in.Intent) + "\n\n" +
+		"## Provider survey\n\n" + summary + "\n"
+	path := filepath.Join(wt, "findings.md")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		return err
+	}
+	// Stage so discoverProductFiles (git ls-files --others) sees it.
+	_ = exec.Command("git", "-C", wt, "add", "--", "findings.md").Run()
+	return nil
 }
 
 func mergeUniquePaths(base, extra []string) []string {
