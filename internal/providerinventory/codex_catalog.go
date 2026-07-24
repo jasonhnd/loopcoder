@@ -387,20 +387,11 @@ func parseCodexModelListResult(result json.RawMessage) ([]codexModelListEntry, [
 	if len(result) == 0 {
 		return nil, nil, fmt.Errorf("%w: empty model/list result", ErrCodexQuotaMalformed)
 	}
+	// Per-row raw JSON so we can require exact field presence and reject
+	// non-object effort items without partially accepting a model.
 	var page struct {
-		Data []struct {
-			ID                       string `json:"id"`
-			Model                    string `json:"model"`
-			DisplayName              string `json:"displayName"`
-			Hidden                   *bool  `json:"hidden"`
-			IsDefault                *bool  `json:"isDefault"`
-			DefaultReasoningEffort   string `json:"defaultReasoningEffort"`
-			SupportedReasoningEffort []struct {
-				ReasoningEffort string `json:"reasoningEffort"`
-				Description     string `json:"description"`
-			} `json:"supportedReasoningEfforts"`
-		} `json:"data"`
-		NextCursor string `json:"nextCursor"`
+		Data       []json.RawMessage `json:"data"`
+		NextCursor string            `json:"nextCursor"`
 	}
 	if err := json.Unmarshal(result, &page); err != nil {
 		return nil, nil, fmt.Errorf("%w: model/list decode: %v", ErrCodexQuotaMalformed, err)
@@ -410,59 +401,172 @@ func parseCodexModelListResult(result json.RawMessage) ([]codexModelListEntry, [
 	}
 	var gaps []string
 	out := make([]codexModelListEntry, 0, len(page.Data))
-	for _, raw := range page.Data {
-		id := strings.TrimSpace(firstNonEmpty(raw.ID, raw.Model))
-		if id == "" || secretLike(id) || !safeCatalogModelID(id) {
-			gaps = append(gaps, "catalog-entry-invalid-id")
+	for _, rowRaw := range page.Data {
+		entry, gap, ok := parseCodexModelListRow(rowRaw)
+		if gap != "" {
+			gaps = append(gaps, gap)
+		}
+		if !ok {
+			// Entire model skipped (malformed or intentionally hidden).
 			continue
 		}
-		hidden := false
-		if raw.Hidden != nil {
-			hidden = *raw.Hidden
-		}
-		if hidden {
-			// Hidden models are not production-routable.
-			continue
-		}
-		isDefault := false
-		if raw.IsDefault != nil {
-			isDefault = *raw.IsDefault
-		}
-		efforts := make([]string, 0, len(raw.SupportedReasoningEffort))
-		for _, e := range raw.SupportedReasoningEffort {
-			tok := strings.TrimSpace(e.ReasoningEffort)
-			if tok == "" {
-				gaps = append(gaps, "catalog-effort-malformed")
-				continue
-			}
-			if secretLike(tok) {
-				gaps = append(gaps, "catalog-effort-rejected")
-				continue
-			}
-			// Normalize known product tokens; retain exact observed token when
-			// policy can represent it (ultra stays ultra; max→xhigh via NormalizeDepth later).
-			n := depthpolicy.NormalizeDepth(tok)
-			if n == "" {
-				gaps = append(gaps, "catalog-effort-empty")
-				continue
-			}
-			efforts = append(efforts, n)
-		}
-		efforts = uniqueSortedStrings(efforts)
-		defEffort := strings.TrimSpace(raw.DefaultReasoningEffort)
-		if defEffort != "" {
-			defEffort = depthpolicy.NormalizeDepth(defEffort)
-		}
-		out = append(out, codexModelListEntry{
-			ID:                       id,
-			DisplayName:              firstNonEmpty(strings.TrimSpace(raw.DisplayName), id),
-			Hidden:                   false,
-			IsDefault:                isDefault,
-			DefaultReasoningEffort:   defEffort,
-			SupportedReasoningEffort: efforts,
-		})
+		out = append(out, entry)
 	}
 	return out, gaps, nil
+}
+
+// parseCodexModelListRow applies the fail-closed per-model schema gate for an
+// exact/fresh MR catalog row. On any violation the entire model is skipped
+// (never emit a partial exact model that would later invent medium-only).
+// hidden=true is intentionally skipped without a malformation gap.
+// ok=false means do not emit; gap may be empty for intentional hidden skips.
+func parseCodexModelListRow(rowRaw json.RawMessage) (entry codexModelListEntry, gap string, ok bool) {
+	if len(rowRaw) == 0 || !json.Valid(rowRaw) {
+		return codexModelListEntry{}, "catalog-entry-invalid-row", false
+	}
+	// Reject non-object rows.
+	if trimmed := strings.TrimSpace(string(rowRaw)); !strings.HasPrefix(trimmed, "{") {
+		return codexModelListEntry{}, "catalog-entry-invalid-row", false
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(rowRaw, &raw); err != nil {
+		return codexModelListEntry{}, "catalog-entry-invalid-row", false
+	}
+
+	// --- id / model (required safe nonempty) ---
+	id := strings.TrimSpace(codexRawString(raw["id"]))
+	if id == "" {
+		id = strings.TrimSpace(codexRawString(raw["model"]))
+	}
+	if id == "" || secretLike(id) || !safeCatalogModelID(id) {
+		return codexModelListEntry{}, "catalog-entry-invalid-id", false
+	}
+
+	// --- hidden (required present) ---
+	hiddenRaw, hasHidden := raw["hidden"]
+	if !hasHidden || len(hiddenRaw) == 0 || string(hiddenRaw) == "null" {
+		return codexModelListEntry{}, "catalog-entry-missing-hidden", false
+	}
+	var hidden bool
+	if err := json.Unmarshal(hiddenRaw, &hidden); err != nil {
+		return codexModelListEntry{}, "catalog-entry-invalid-hidden", false
+	}
+	if hidden {
+		// Intentionally non-routable; not a malformation.
+		return codexModelListEntry{}, "", false
+	}
+
+	// --- isDefault (required present) ---
+	defFlagRaw, hasDefFlag := raw["isDefault"]
+	if !hasDefFlag || len(defFlagRaw) == 0 || string(defFlagRaw) == "null" {
+		return codexModelListEntry{}, "catalog-entry-missing-isDefault", false
+	}
+	var isDefault bool
+	if err := json.Unmarshal(defFlagRaw, &isDefault); err != nil {
+		return codexModelListEntry{}, "catalog-entry-invalid-isDefault", false
+	}
+
+	// --- defaultReasoningEffort (required nonempty) ---
+	defEffortRaw, hasDefEffort := raw["defaultReasoningEffort"]
+	if !hasDefEffort || len(defEffortRaw) == 0 || string(defEffortRaw) == "null" {
+		return codexModelListEntry{}, "catalog-entry-missing-default-effort", false
+	}
+	defEffort := strings.TrimSpace(codexRawString(defEffortRaw))
+	if defEffort == "" || secretLike(defEffort) {
+		return codexModelListEntry{}, "catalog-entry-missing-default-effort", false
+	}
+	defNorm := depthpolicy.NormalizeDepth(defEffort)
+	if defNorm == "" {
+		return codexModelListEntry{}, "catalog-entry-invalid-default-effort", false
+	}
+
+	// --- supportedReasoningEfforts (required nonempty array of objects) ---
+	effRaw, hasEfforts := raw["supportedReasoningEfforts"]
+	if !hasEfforts || len(effRaw) == 0 || string(effRaw) == "null" {
+		return codexModelListEntry{}, "catalog-entry-missing-efforts", false
+	}
+	var effortItems []json.RawMessage
+	if err := json.Unmarshal(effRaw, &effortItems); err != nil {
+		return codexModelListEntry{}, "catalog-entry-invalid-efforts", false
+	}
+	if len(effortItems) == 0 {
+		return codexModelListEntry{}, "catalog-entry-empty-efforts", false
+	}
+	efforts := make([]string, 0, len(effortItems))
+	for _, item := range effortItems {
+		tok, tokOK := parseCodexEffortItem(item)
+		if !tokOK {
+			// One bad effort object invalidates the entire model.
+			return codexModelListEntry{}, "catalog-entry-malformed-effort", false
+		}
+		efforts = append(efforts, tok)
+	}
+	efforts = uniqueSortedStrings(efforts)
+	if len(efforts) == 0 {
+		return codexModelListEntry{}, "catalog-entry-empty-efforts", false
+	}
+	// Default must be a member of the normalized supported set.
+	defInSupported := false
+	for _, e := range efforts {
+		if e == defNorm {
+			defInSupported = true
+			break
+		}
+	}
+	if !defInSupported {
+		return codexModelListEntry{}, "catalog-entry-default-not-in-supported", false
+	}
+
+	display := strings.TrimSpace(codexRawString(raw["displayName"]))
+	return codexModelListEntry{
+		ID:                       id,
+		DisplayName:              firstNonEmpty(display, id),
+		Hidden:                   false,
+		IsDefault:                isDefault,
+		DefaultReasoningEffort:   defNorm,
+		SupportedReasoningEffort: efforts,
+	}, "", true
+}
+
+// parseCodexEffortItem requires a JSON object with a safe nonempty reasoningEffort.
+// Returns normalized depth token. Fail closed on non-object or bad token.
+func parseCodexEffortItem(item json.RawMessage) (string, bool) {
+	if len(item) == 0 || string(item) == "null" {
+		return "", false
+	}
+	trimmed := strings.TrimSpace(string(item))
+	if !strings.HasPrefix(trimmed, "{") {
+		return "", false
+	}
+	var obj struct {
+		ReasoningEffort string `json:"reasoningEffort"`
+	}
+	if err := json.Unmarshal(item, &obj); err != nil {
+		return "", false
+	}
+	tok := strings.TrimSpace(obj.ReasoningEffort)
+	if tok == "" || secretLike(tok) {
+		return "", false
+	}
+	// max→xhigh via depthpolicy; ultra retained as exact observed token when
+	// NormalizeDepth passes it through unchanged.
+	n := depthpolicy.NormalizeDepth(tok)
+	if n == "" {
+		return "", false
+	}
+	return n, true
+}
+
+func codexRawString(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	// Non-string JSON values are not accepted as model ids / effort strings.
+	return ""
 }
 
 func catalogSourcesFromCodexModelList(adapter AdapterDeclaration, cliVersion string, entries []codexModelListEntry) ([]CatalogSourceInput, []string) {

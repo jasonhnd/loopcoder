@@ -27,11 +27,9 @@ func TestParseCodexModelListResult_ObjectShapedEfforts(t *testing.T) {
 					map[string]any{"reasoningEffort": "max", "description": "maps to xhigh"},
 				},
 			},
+			// hidden=true intentionally skipped even without full schema peers.
 			map[string]any{
 				"id": "hidden-model", "hidden": true,
-				"supportedReasoningEfforts": []any{
-					map[string]any{"reasoningEffort": "low"},
-				},
 			},
 		},
 		"nextCursor": nil,
@@ -64,28 +62,183 @@ func TestParseCodexModelListResult_MalformedAndEmpty(t *testing.T) {
 	if _, _, err := parseCodexModelListResult(json.RawMessage(`{`)); err == nil {
 		t.Fatal("malformed json must fail")
 	}
-	// Invalid id skipped via gap
+
+	// Mixed valid sibling + models that must be skipped entirely (never partial exact).
 	raw := mustRawJSON(t, map[string]any{
 		"data": []any{
-			map[string]any{"id": "", "supportedReasoningEfforts": []any{}},
-			map[string]any{"id": "sk-secret-looking-token-xx", "supportedReasoningEfforts": []any{
-				map[string]any{"reasoningEffort": "low"},
-			}},
-			map[string]any{"id": "ok-model", "hidden": false, "supportedReasoningEfforts": []any{
-				map[string]any{"reasoningEffort": "low"},
-				map[string]any{"reasoningEffort": ""}, // malformed effort object
-			}},
+			// valid sibling may still emit
+			map[string]any{
+				"id": "valid-sibling", "displayName": "Valid",
+				"hidden": false, "isDefault": false,
+				"defaultReasoningEffort": "low",
+				"supportedReasoningEfforts": []any{
+					map[string]any{"reasoningEffort": "low"},
+					map[string]any{"reasoningEffort": "high"},
+				},
+			},
+			// empty id
+			map[string]any{"id": "", "hidden": false, "isDefault": false,
+				"defaultReasoningEffort":    "low",
+				"supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "low"}},
+			},
+			// secret-like id
+			map[string]any{"id": "sk-secret-looking-token-xx", "hidden": false, "isDefault": false,
+				"defaultReasoningEffort":    "low",
+				"supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "low"}},
+			},
+			// mixed valid+malformed effort object → skip ENTIRE model (no partial)
+			map[string]any{
+				"id": "partial-effort-model", "hidden": false, "isDefault": false,
+				"defaultReasoningEffort": "low",
+				"supportedReasoningEfforts": []any{
+					map[string]any{"reasoningEffort": "low"},
+					map[string]any{"reasoningEffort": ""}, // malformed
+				},
+			},
+			// empty efforts array
+			map[string]any{
+				"id": "empty-efforts", "hidden": false, "isDefault": false,
+				"defaultReasoningEffort":    "medium",
+				"supportedReasoningEfforts": []any{},
+			},
+			// missing hidden
+			map[string]any{
+				"id": "missing-hidden", "isDefault": false,
+				"defaultReasoningEffort":    "low",
+				"supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "low"}},
+			},
+			// missing isDefault
+			map[string]any{
+				"id": "missing-isDefault", "hidden": false,
+				"defaultReasoningEffort":    "low",
+				"supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "low"}},
+			},
+			// missing defaultReasoningEffort
+			map[string]any{
+				"id": "missing-default", "hidden": false, "isDefault": false,
+				"supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "low"}},
+			},
+			// default not in supported set
+			map[string]any{
+				"id": "default-not-supported", "hidden": false, "isDefault": false,
+				"defaultReasoningEffort": "xhigh",
+				"supportedReasoningEfforts": []any{
+					map[string]any{"reasoningEffort": "low"},
+					map[string]any{"reasoningEffort": "medium"},
+				},
+			},
+			// non-object effort item
+			map[string]any{
+				"id": "string-effort", "hidden": false, "isDefault": false,
+				"defaultReasoningEffort":    "low",
+				"supportedReasoningEfforts": []any{"low"},
+			},
 		},
 	})
 	entries, gaps, err := parseCodexModelListResult(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 1 || entries[0].ID != "ok-model" {
-		t.Fatalf("entries=%#v gaps=%v", entries, gaps)
+	// Only the fully-valid sibling may emit — no partial models.
+	if len(entries) != 1 || entries[0].ID != "valid-sibling" {
+		t.Fatalf("entries=%#v gaps=%v want only valid-sibling", entries, gaps)
 	}
-	if len(gaps) == 0 {
-		t.Fatal("want gaps for invalid id/effort")
+	if len(entries[0].SupportedReasoningEffort) != 2 {
+		t.Fatalf("valid sibling efforts=%v", entries[0].SupportedReasoningEffort)
+	}
+	// Every malformed row must produce gap evidence (hidden intentional skips do not).
+	needGaps := []string{
+		"catalog-entry-invalid-id",
+		"catalog-entry-malformed-effort",
+		"catalog-entry-empty-efforts",
+		"catalog-entry-missing-hidden",
+		"catalog-entry-missing-isDefault",
+		"catalog-entry-missing-default-effort",
+		"catalog-entry-default-not-in-supported",
+	}
+	joined := strings.Join(gaps, ";")
+	for _, g := range needGaps {
+		if !strings.Contains(joined, g) {
+			t.Fatalf("gaps missing %q: %v", g, gaps)
+		}
+	}
+	// Ensure partial-effort-model never emitted (would invent medium-only later).
+	for _, e := range entries {
+		if e.ID == "partial-effort-model" || e.ID == "empty-efforts" || e.ID == "default-not-supported" {
+			t.Fatalf("malformed model must not emit: %#v", e)
+		}
+	}
+}
+
+// TestParseCodexModelListRow_NoMediumOnlyInvention proves skipped models do not
+// produce empty-depth entries that modelSpecFromCapability would medium-only fill.
+func TestParseCodexModelListRow_NoMediumOnlyInvention(t *testing.T) {
+	cases := []struct {
+		name string
+		row  map[string]any
+		gap  string
+	}{
+		{
+			name: "mixed_malformed_effort",
+			row: map[string]any{
+				"id": "m1", "hidden": false, "isDefault": false,
+				"defaultReasoningEffort": "low",
+				"supportedReasoningEfforts": []any{
+					map[string]any{"reasoningEffort": "low"},
+					map[string]any{"reasoningEffort": ""},
+				},
+			},
+			gap: "catalog-entry-malformed-effort",
+		},
+		{
+			name: "empty_efforts",
+			row: map[string]any{
+				"id": "m2", "hidden": false, "isDefault": false,
+				"defaultReasoningEffort":    "medium",
+				"supportedReasoningEfforts": []any{},
+			},
+			gap: "catalog-entry-empty-efforts",
+		},
+		{
+			name: "missing_hidden",
+			row: map[string]any{
+				"id": "m3", "isDefault": false,
+				"defaultReasoningEffort":    "low",
+				"supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "low"}},
+			},
+			gap: "catalog-entry-missing-hidden",
+		},
+		{
+			name: "default_not_in_supported",
+			row: map[string]any{
+				"id": "m4", "hidden": false, "isDefault": true,
+				"defaultReasoningEffort": "high",
+				"supportedReasoningEfforts": []any{
+					map[string]any{"reasoningEffort": "low"},
+				},
+			},
+			gap: "catalog-entry-default-not-in-supported",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			entry, gap, ok := parseCodexModelListRow(mustRawJSON(t, tc.row))
+			if ok {
+				t.Fatalf("must not emit MR entry: %#v", entry)
+			}
+			if gap != tc.gap {
+				t.Fatalf("gap=%q want %q", gap, tc.gap)
+			}
+			if entry.ID != "" || len(entry.SupportedReasoningEffort) != 0 {
+				t.Fatalf("skipped row must be empty entry, got %#v", entry)
+			}
+			// catalogSourcesFromCodexModelList on empty must not invent models
+			sources, sgaps := catalogSourcesFromCodexModelList(
+				AdapterDeclaration{AdapterID: "codex"}, "0.145.0", nil)
+			if len(sources) != 0 {
+				t.Fatalf("no entries → no sources, got %#v gaps=%v", sources, sgaps)
+			}
+		})
 	}
 }
 
@@ -126,7 +279,7 @@ func TestDecodeCodexCatalogRPC_MultiPageAndNoRawRetention(t *testing.T) {
 	page1 := map[string]any{
 		"data": []any{
 			map[string]any{
-				"id": "gpt-5.5", "displayName": "GPT-5.5", "hidden": false,
+				"id": "gpt-5.5", "displayName": "GPT-5.5", "hidden": false, "isDefault": false,
 				"defaultReasoningEffort": "medium",
 				"supportedReasoningEfforts": []any{
 					map[string]any{"reasoningEffort": "low"},
@@ -141,10 +294,11 @@ func TestDecodeCodexCatalogRPC_MultiPageAndNoRawRetention(t *testing.T) {
 	page2 := map[string]any{
 		"data": []any{
 			map[string]any{
-				"id": "gpt-5.4", "displayName": "GPT-5.4", "hidden": false,
+				"id": "gpt-5.4", "displayName": "GPT-5.4", "hidden": false, "isDefault": false,
 				"defaultReasoningEffort": "medium",
 				"supportedReasoningEfforts": []any{
 					map[string]any{"reasoningEffort": "low"},
+					map[string]any{"reasoningEffort": "medium"},
 					map[string]any{"reasoningEffort": "high"},
 				},
 			},
@@ -225,11 +379,12 @@ func TestDriveCodexCatalog_PageCeilingAndCursorCycle(t *testing.T) {
 			"account": map[string]any{"id": "acct_fixture"},
 		})}),
 	}
-	// One page with too many items
+	// One page with too many fully-valid models (schema gate must pass to count).
 	data := make([]any, 0, codexCatalogMaxItems+1)
 	for i := 0; i < codexCatalogMaxItems+1; i++ {
 		data = append(data, map[string]any{
-			"id": fmt.Sprintf("model-%d", i), "hidden": false,
+			"id": fmt.Sprintf("model-%d", i), "hidden": false, "isDefault": false,
+			"defaultReasoningEffort":    "medium",
 			"supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "medium"}},
 		})
 	}
