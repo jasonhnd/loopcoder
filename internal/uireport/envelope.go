@@ -27,11 +27,31 @@ const (
 	KindTerminal    Kind = "terminal"
 )
 
-// Route is a redacted route snapshot.
+// Route is a redacted route snapshot including account/install/window binding.
 type Route struct {
-	Provider string `json:"provider,omitempty"`
-	Model    string `json:"model,omitempty"`
-	Effort   string `json:"effort,omitempty"`
+	Provider      string `json:"provider,omitempty"`
+	Model         string `json:"model,omitempty"`
+	Effort        string `json:"effort,omitempty"`
+	Permission    string `json:"permission,omitempty"`
+	AccountRef    string `json:"account_ref,omitempty"`
+	InstallRef    string `json:"install_ref,omitempty"`
+	WindowKind    string `json:"window_kind,omitempty"`
+	ReservationID string `json:"reservation_id,omitempty"`
+	RouteReason   string `json:"route_reason,omitempty"`
+	// ActualSources is per-dimension proof class (provider_stream|accepted_invocation|
+	// auth_binding|install_binding|unknown). Never collapsed; reports must expose it.
+	ActualSources *RouteActualSources `json:"actual_sources,omitempty"`
+	// ArgvDigest is redacted exact launched argv fingerprint when known.
+	ArgvDigest string `json:"argv_digest,omitempty"`
+}
+
+// RouteActualSources is honest evidence class per Actual* dimension.
+type RouteActualSources struct {
+	Model      string `json:"model,omitempty"`
+	Effort     string `json:"effort,omitempty"`
+	Permission string `json:"permission,omitempty"`
+	Account    string `json:"account,omitempty"`
+	Install    string `json:"install,omitempty"`
 }
 
 // ResourceState is compact resource view (never secrets).

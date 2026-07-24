@@ -448,10 +448,14 @@ func TestGrokCreditsBillingParsesWeeklyUsageAndProduct(t *testing.T) {
 		t.Fatal(err)
 	}
 	auth := map[string]any{
-		"https://auth.x.ai::acct-fixture": map[string]any{
-			"key":        "secret-test-token-not-for-logs",
-			"auth_mode":  "oidc",
-			"expires_at": fixedInventoryNow().Add(time.Hour).Format(time.RFC3339Nano),
+		"https://auth.x.ai::client-not-account": map[string]any{
+			"key":            "secret-test-token-not-for-logs",
+			"user_id":        "acct-fixture",
+			"oidc_issuer":    "https://auth.x.ai",
+			"oidc_client_id": "client-not-account",
+			"auth_mode":      "oidc",
+			// Must be non-expired relative to real wall clock used by grokauth.LoadToken.
+			"expires_at": time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339Nano),
 		},
 	}
 	raw, _ := json.Marshal(auth)
@@ -484,12 +488,16 @@ func TestGrokCreditsBillingParsesWeeklyUsageAndProduct(t *testing.T) {
 	if len(sources) != 1 || sources[0].SourceSchemaVersion != grokCreditsBillingSourceSchema {
 		t.Fatalf("sources = %#v", sources)
 	}
-	primary := quotaSnapshotByKey(t, report, "credit_usage_percent", WindowFixedWeek, "provider:grok/account:acct-fixture/detail:credits_usage")
-	if primary.UsedValue == nil || *primary.UsedValue != 31 || primary.RemainingValue == nil || *primary.RemainingValue != 69 {
+	primary := findGrokCreditPrimary(t, report)
+	// ValueScale=2 stores hundredths of percent: 31% → 3100, 69% → 6900, limit 10000.
+	if primary.UsedValue == nil || *primary.UsedValue != 3100 || primary.RemainingValue == nil || *primary.RemainingValue != 6900 {
 		t.Fatalf("primary = %#v", primary)
 	}
-	if primary.LimitValue == nil || *primary.LimitValue != 100 || primary.Unit != "percent" || primary.Confidence != ConfidenceExact {
+	if primary.LimitValue == nil || *primary.LimitValue != 10000 || primary.Unit != "percent" || primary.Confidence != ConfidenceExact || primary.ValueScale != 2 {
 		t.Fatalf("primary flags = %#v", primary)
+	}
+	if primary.AccountProfileID == nil || !strings.HasPrefix(*primary.AccountProfileID, "acct-") || len(*primary.AccountProfileID) != 5+64 {
+		t.Fatalf("want exact AccountProfileID got %#v", primary.AccountProfileID)
 	}
 	if primary.ResetAt == "" || primary.FieldConfidences["reset_at"] != ConfidenceExact {
 		t.Fatalf("reset = %#v", primary)
@@ -503,8 +511,8 @@ func TestGrokCreditsBillingParsesWeeklyUsageAndProduct(t *testing.T) {
 	if strings.Contains(primary.RedactedDiagnostics, "secret-test-token") {
 		t.Fatalf("diagnostics retained token: %#v", primary.RedactedDiagnostics)
 	}
-	product := quotaSnapshotByKey(t, report, "product_usage_percent", WindowFixedWeek, "provider:grok/account:acct-fixture/detail:product_grokbuild")
-	if product.RemainingValue == nil || *product.RemainingValue != 69 {
+	product := findGrokProduct(t, report)
+	if product.RemainingValue == nil || *product.RemainingValue != 6900 {
 		t.Fatalf("product = %#v", product)
 	}
 	if product.WindowStart == "" || product.WindowEnd == "" {
@@ -548,18 +556,18 @@ func TestGrokCreditsBillingAuthShapesAndRedaction(t *testing.T) {
 	home := t.TempDir()
 	authDir := filepath.Join(home, ".grok")
 	_ = os.MkdirAll(authDir, 0o700)
-	_ = os.WriteFile(filepath.Join(authDir, "auth.json"), []byte(`{"https://auth.x.ai::u1":{"key":"tok-a","refresh_token":"ref-should-not-be-used"}}`), 0o600)
+	_ = os.WriteFile(filepath.Join(authDir, "auth.json"), []byte(`{"https://auth.x.ai::u1":{"key":"tok-a","user_id":"user-a","oidc_issuer":"https://auth.x.ai","refresh_token":"ref-should-not-be-used"}}`), 0o600)
 	tok, ref, err := loadGrokCLIAuthToken(home, nil)
-	if err != nil || tok != "tok-a" || ref == "" {
+	if err != nil || tok != "tok-a" || ref == "" || !strings.HasPrefix(ref, "acct-") {
 		t.Fatalf("account-keyed: tok=%q ref=%q err=%v", tok, ref, err)
 	}
-	// Root access_token compatible shape.
+	// Root access_token without principal: may authenticate but not exact-routable (ref empty).
 	home2 := t.TempDir()
 	_ = os.MkdirAll(filepath.Join(home2, ".grok"), 0o700)
 	_ = os.WriteFile(filepath.Join(home2, ".grok", "auth.json"), []byte(`{"access_token":"tok-root"}`), 0o600)
 	tok, ref, err = loadGrokCLIAuthToken(home2, nil)
-	if err != nil || tok != "tok-root" || ref != "root" {
-		t.Fatalf("root access_token: tok=%q ref=%q err=%v", tok, ref, err)
+	if err != nil || tok != "tok-root" || ref != "" {
+		t.Fatalf("root access_token identity-less: tok=%q ref=%q err=%v", tok, ref, err)
 	}
 	// Missing auth.
 	home3 := t.TempDir()
@@ -600,4 +608,26 @@ func TestGrokCreditsBillingRequiresNetworkGrant(t *testing.T) {
 	if !containsString(got.GapReasons, "quota-collection-not-granted") {
 		t.Fatalf("grant snapshot = %#v", got)
 	}
+}
+
+func findGrokCreditPrimary(t *testing.T, report Report) QuotaSnapshot {
+	t.Helper()
+	for _, s := range report.QuotaSnapshots {
+		if s.AdapterID == "grok" && s.ProviderQuantityName == "credit_usage_percent" {
+			return s
+		}
+	}
+	t.Fatalf("credit_usage_percent missing")
+	return QuotaSnapshot{}
+}
+
+func findGrokProduct(t *testing.T, report Report) QuotaSnapshot {
+	t.Helper()
+	for _, s := range report.QuotaSnapshots {
+		if s.AdapterID == "grok" && s.ProviderQuantityName == "product_usage_percent" {
+			return s
+		}
+	}
+	t.Fatalf("product_usage_percent missing")
+	return QuotaSnapshot{}
 }

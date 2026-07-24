@@ -9,11 +9,12 @@ import (
 	"math"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/grokauth"
 )
 
 // Official Grok Build CLI-owned billing endpoint (not ACP agent stdio).
@@ -52,117 +53,27 @@ type GrokCreditsBillingResult struct {
 	Duration time.Duration
 }
 
-// loadGrokCLIAuthToken reads the official CLI auth file.
-// Current shape (truthful): account-keyed map with nested "key".
-// Compatible prior shapes (only when present): root "access_token" or root "key".
-// Never returns refresh_token as the bearer; never logs secrets.
+// loadGrokCLIAuthToken uses the shared grokauth parser (same as agent + auth readiness).
+// Returns bearer token for Authorization only and the canonical AccountProfileID
+// (acct-+64hex) when exact-routable. Identity-less tokens return empty accountRef
+// (never "root"/"cli") so they cannot invent a routable account.
 func loadGrokCLIAuthToken(home string, getenv func(string) string) (token string, accountRef string, err error) {
 	if getenv == nil {
 		getenv = os.Getenv
 	}
-	authPath := ""
-	if gh := strings.TrimSpace(getenv("GROK_HOME")); gh != "" {
-		authPath = filepath.Join(gh, "auth.json")
-	} else {
-		home = strings.TrimSpace(home)
-		if home == "" {
-			return "", "", fmt.Errorf("%w: home empty", ErrGrokCreditsAuthMissing)
-		}
-		authPath = filepath.Join(home, ".grok", "auth.json")
+	tok, bind, lerr := grokauth.LoadToken(home, getenv, time.Now().UTC())
+	if lerr != nil {
+		return "", "", fmt.Errorf("%w: %v", ErrGrokCreditsAuthMissing, lerr)
 	}
-	raw, rerr := os.ReadFile(authPath)
-	if rerr != nil {
-		return "", "", fmt.Errorf("%w: auth.json inaccessible", ErrGrokCreditsAuthMissing)
+	if tok == "" {
+		return "", "", fmt.Errorf("%w: no bearer key in auth.json", ErrGrokCreditsAuthMissing)
 	}
-	if credentialMaterialLike(string(raw)) && len(raw) > 0 {
-		// File contains credentials by design; we extract then drop raw.
+	// Exact-routable only; identity-less may still bill under network identity
+	// but cannot join capacity account routing.
+	if bind.ExactRoutable {
+		accountRef = bind.AccountProfileID
 	}
-	var root any
-	if jerr := json.Unmarshal(raw, &root); jerr != nil {
-		return "", "", fmt.Errorf("%w: auth.json malformed", ErrGrokCreditsAuthMissing)
-	}
-	// Prefer account-keyed map with nested .key (current official shape).
-	if m, ok := root.(map[string]any); ok {
-		// Root key / access_token (legacy flat shape).
-		if tok := firstJSONText(m, "key", "access_token"); tok != "" {
-			return tok, "root", nil
-		}
-		// Account-keyed entries.
-		type cand struct {
-			ref string
-			tok string
-			exp time.Time
-		}
-		var best *cand
-		for k, v := range m {
-			vm, ok := v.(map[string]any)
-			if !ok {
-				continue
-			}
-			tok := firstJSONText(vm, "key")
-			if tok == "" {
-				// Do not fall back to refresh_token as bearer.
-				tok = firstJSONText(vm, "access_token")
-			}
-			if tok == "" {
-				continue
-			}
-			c := cand{ref: sanitizeGrokAccountRef(k), tok: tok}
-			if exp := firstJSONText(vm, "expires_at", "expiresAt"); exp != "" {
-				if t, perr := time.Parse(time.RFC3339Nano, exp); perr == nil {
-					c.exp = t
-				} else if t, perr := time.Parse(time.RFC3339, exp); perr == nil {
-					c.exp = t
-				}
-			}
-			if best == nil {
-				best = &c
-				continue
-			}
-			// Prefer non-expired; then latest expires_at.
-			now := time.Now().UTC()
-			bestExpired := !best.exp.IsZero() && best.exp.Before(now)
-			cExpired := !c.exp.IsZero() && c.exp.Before(now)
-			if bestExpired && !cExpired {
-				best = &c
-				continue
-			}
-			if !bestExpired && cExpired {
-				continue
-			}
-			if c.exp.After(best.exp) {
-				best = &c
-			}
-		}
-		if best != nil {
-			return best.tok, best.ref, nil
-		}
-	}
-	return "", "", fmt.Errorf("%w: no bearer key in auth.json", ErrGrokCreditsAuthMissing)
-}
-
-func sanitizeGrokAccountRef(ref string) string {
-	ref = strings.TrimSpace(ref)
-	if ref == "" {
-		return "unknown"
-	}
-	// Collapse OIDC issuer::uuid style to a short stable token.
-	if i := strings.LastIndex(ref, "::"); i >= 0 && i+2 < len(ref) {
-		ref = ref[i+2:]
-	}
-	ref = strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
-			return r
-		}
-		return '-'
-	}, ref)
-	if len(ref) > 48 {
-		ref = ref[:48]
-	}
-	if !safeScopeToken(ref) {
-		return "account"
-	}
-	return ref
+	return tok, accountRef, nil
 }
 
 // runGrokCreditsBilling performs the bounded official billing HTTP GET.
@@ -452,12 +363,17 @@ func snapshotsFromGrokCreditsBilling(
 	}
 	cfg := env.Config
 	rawHash := rawSourceHash(body)
+	// accountRef is already the shared grokauth AccountProfileID (acct-+64hex)
+	// or empty when identity-less. Never invent "cli"/"root".
 	account := strings.TrimSpace(accountRef)
-	if account == "" {
-		account = "cli"
-	}
-	if !safeScopeToken(account) {
-		account = "cli"
+	var accountProfileIDPtr *string
+	if account != "" && strings.HasPrefix(account, "acct-") && len(account) == 5+64 {
+		accountProfileIDPtr = &account
+	} else {
+		// Identity-less token: may still emit quota observations but without
+		// exact AccountProfileID so capacity routing cannot bind them.
+		account = ""
+		accountProfileIDPtr = nil
 	}
 
 	periodType := strings.TrimSpace(cfg.CurrentPeriod.Type)
@@ -483,13 +399,16 @@ func snapshotsFromGrokCreditsBilling(
 	}
 
 	var snaps []QuotaSnapshot
-	// Primary: creditUsagePercent → used/remaining percent (limit=100).
+	// Primary: creditUsagePercent with preserved scale (ValueScale=2).
 	if cfg.CreditUsagePercent != nil {
-		usedPct := clampPercent(*cfg.CreditUsagePercent)
-		remainingPct := 100 - usedPct
-		usedI := int64(math.Round(usedPct))
-		remI := int64(math.Round(remainingPct))
-		limI := int64(100)
+		usedF, remF, okPct := validatePercentPair(*cfg.CreditUsagePercent)
+		if !okPct {
+			return nil, fmt.Errorf("%w: creditUsagePercent out of range", ErrGrokCreditsMalformed)
+		}
+		// ValueScale=2 → store hundredths of a percent (100.00% → 10000).
+		usedI := int64(math.Round(usedF * 100))
+		remI := int64(math.Round(remF * 100))
+		limI := int64(10000)
 		scope := grokScope(account, "", "credits_usage")
 		fieldConf := map[string]Confidence{
 			"limit_value":     ConfidenceExact,
@@ -507,17 +426,23 @@ func snapshotsFromGrokCreditsBilling(
 		if windowKind == WindowFixedWeek && (windowStart == "" || resetNorm == "") {
 			gaps = append(gaps, "missing-fixed-window-bounds")
 		}
+		if accountProfileIDPtr == nil {
+			gaps = append(gaps, "missing-exact-account-identity")
+		}
 		terminal := ""
 		if remI <= 0 {
 			terminal = "ErrQuotaExhausted"
 			gaps = append(gaps, "quota-exhausted")
 		}
+		// Interactive freshness TTL (30m); ResetAt preserved separately (not as StaleAfter alone).
+		staleAfter := formatTime(now.Add(30 * time.Minute))
 		snaps = append(snaps, normalizeQuotaSnapshot(QuotaSnapshot{
 			QuotaSnapshotID:        quotaSnapshotID("grok", source.QuotaSourceID, scope, "credit_usage_percent", formatTime(now)),
 			QuotaSourceID:          source.QuotaSourceID,
 			SourceKind:             source.SourceKind,
 			AdapterID:              "grok",
 			ProviderInstallationID: installationID,
+			AccountProfileID:       accountProfileIDPtr,
 			ScopeKey:               scope,
 			QuantityKind:           QuantityProviderDefined,
 			ProviderQuantityName:   "credit_usage_percent",
@@ -530,13 +455,13 @@ func snapshotsFromGrokCreditsBilling(
 			LimitValue:             &limI,
 			UsedValue:              &usedI,
 			RemainingValue:         &remI,
-			ValueScale:             0,
+			ValueScale:             2,
 			Confidence:             ConfidenceExact,
 			FieldConfidences:       fieldConf,
 			FreshnessState:         FreshnessFresh,
 			CapturedAt:             formatTime(now),
 			ValidUntil:             resetNorm,
-			StaleAfter:             firstNonEmpty(resetNorm, formatTime(now.Add(30*time.Minute))),
+			StaleAfter:             staleAfter,
 			RawSourceHash:          rawHash,
 			// Avoid key=value forms that trip secretLike generic patterns
 			// (e.g. period=USAGE_PERIOD_TYPE_WEEKLY) and block Refresh.
@@ -559,11 +484,13 @@ func snapshotsFromGrokCreditsBilling(
 		if product == "" || !safeScopeToken(product) {
 			product = "product"
 		}
-		usedPct := clampPercent(*pu.UsagePercent)
-		remainingPct := 100 - usedPct
-		usedI := int64(math.Round(usedPct))
-		remI := int64(math.Round(remainingPct))
-		limI := int64(100)
+		usedF, remF, okPct := validatePercentPair(*pu.UsagePercent)
+		if !okPct {
+			continue // reject malformed product percent; do not invent exact values
+		}
+		usedI := int64(math.Round(usedF * 100))
+		remI := int64(math.Round(remF * 100))
+		limI := int64(10000)
 		scope := grokScope(account, "", "product_"+strings.ToLower(product))
 		fieldConf := map[string]Confidence{
 			"limit_value":     ConfidenceExact,
@@ -580,6 +507,7 @@ func snapshotsFromGrokCreditsBilling(
 			SourceKind:             source.SourceKind,
 			AdapterID:              "grok",
 			ProviderInstallationID: installationID,
+			AccountProfileID:       accountProfileIDPtr,
 			ScopeKey:               scope,
 			QuantityKind:           QuantityProviderDefined,
 			ProviderQuantityName:   "product_usage_percent",
@@ -592,13 +520,13 @@ func snapshotsFromGrokCreditsBilling(
 			LimitValue:             &limI,
 			UsedValue:              &usedI,
 			RemainingValue:         &remI,
-			ValueScale:             0,
+			ValueScale:             2,
 			Confidence:             ConfidenceExact,
 			FieldConfidences:       fieldConf,
 			FreshnessState:         FreshnessFresh,
 			CapturedAt:             formatTime(now),
 			ValidUntil:             resetNorm,
-			StaleAfter:             firstNonEmpty(resetNorm, formatTime(now.Add(30*time.Minute))),
+			StaleAfter:             formatTime(now.Add(30 * time.Minute)),
 			RawSourceHash:          rawHash,
 			RedactedDiagnostics:    fmt.Sprintf("grok official CLI credits billing product %s parser %s", safeSummary(product), grokCreditsBillingSourceSchema),
 			ConflictSet:            []string{},
@@ -618,6 +546,7 @@ func snapshotsFromGrokCreditsBilling(
 			SourceKind:             source.SourceKind,
 			AdapterID:              "grok",
 			ProviderInstallationID: installationID,
+			AccountProfileID:       accountProfileIDPtr,
 			ScopeKey:               scope,
 			QuantityKind:           QuantityProviderDefined,
 			ProviderQuantityName:   "billing_period",
@@ -677,17 +606,16 @@ func normalizeGrokRFC3339(value string) string {
 	return value
 }
 
-func clampPercent(v float64) float64 {
-	if math.IsNaN(v) || math.IsInf(v, 0) {
-		return 0
+// validatePercentPair rejects NaN/Inf and out-of-range [0,100] values.
+// Does not invent clamped exact values.
+func validatePercentPair(used float64) (usedOut, remaining float64, ok bool) {
+	if math.IsNaN(used) || math.IsInf(used, 0) {
+		return 0, 0, false
 	}
-	if v < 0 {
-		return 0
+	if used < 0 || used > 100 {
+		return 0, 0, false
 	}
-	if v > 100 {
-		return 100
-	}
-	return v
+	return used, 100 - used, true
 }
 
 func boolPtrString(b *bool) string {

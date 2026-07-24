@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/jasonhnd/loopcoder/internal/goalrun"
+	"github.com/jasonhnd/loopcoder/internal/workflowrun"
 )
 
 func TestBuildUnavailableRetryRequiresUnclaimedExclude(t *testing.T) {
@@ -114,6 +115,27 @@ func TestHardEligibleNonWinnerExcludesIncludesNotChosen(t *testing.T) {
 	}
 }
 
+func TestClaimedModelUnavailableTakesPrecedenceOverUnclaimed(t *testing.T) {
+	// Claimed MU + unclaimed exhausted → must not satisfy via unclaimed path when proof nil.
+	ex := []goalrun.RouteExclude{
+		{ChildID: "wi_x", Provider: "antigravity", Reason: "model_unavailable", Claimed: true},
+		{ChildID: "wi_x", Provider: "codex", Reason: "exhausted", Claimed: false},
+	}
+	if got := goalrun.BuildUnavailableRetryEvidenceWithProof(ex, "att-g1", nil); got != nil {
+		t.Fatalf("claimed MU without proof must nil (not unclaimed fallback): %+v", got)
+	}
+	// Two claimed MU → fail (exactly one required).
+	ex2 := []goalrun.RouteExclude{
+		{ChildID: "a", Provider: "antigravity", Reason: "model_unavailable", Claimed: true},
+		{ChildID: "b", Provider: "codex", Reason: "model_unavailable", Claimed: true},
+	}
+	if got := goalrun.BuildUnavailableRetryEvidenceWithProof(ex2, "att", &goalrun.UnavailableRetryProof{
+		FailedAttemptID: "x", RetryAttemptID: "y", WorkItemID: "a", FailedProvider: "antigravity",
+	}); got != nil {
+		t.Fatalf("two claimed MU must nil: %+v", got)
+	}
+}
+
 func TestBuildUnavailableRetryFromClaimedModelUnavailableRequiresProof(t *testing.T) {
 	// Claimed-only prose/event_ref → nil (must not invent no_dup flags).
 	if got := goalrun.BuildUnavailableRetryEvidence([]goalrun.RouteExclude{
@@ -125,12 +147,34 @@ func TestBuildUnavailableRetryFromClaimedModelUnavailableRequiresProof(t *testin
 	// Concrete proof required.
 	proof := &goalrun.UnavailableRetryProof{
 		FailedAttemptID: "att-g0", RetryAttemptID: "att-g1",
+		WorkItemID: "wi_x", FailedProvider: "antigravity",
+		FailedClaimCount: 1, RetryClaimCount: 1,
+		FailedLaunchCount: 1, RetryLaunchCount: 1,
+		FailedIntegrateCount: 0, RetryIntegrateCount: 1,
+		FailedTerminalCount: 1, RetryTerminalCount: 1,
 		FailedClaimClosed: true, RetryClaimClosed: true,
 		FailedIntegrated: false, RetryIntegrated: true,
 		FailedProductFiles: []string{"notes/bad.md"},
 		RetryProductFiles:  []string{"notes/good.md"},
-		PriorCapacityState: "released", AltCapacityState: "reserved",
-		EventIDs: []string{"wev_1", "wev_2"},
+		PriorTransition: workflowrun.CapacityTransition{
+			AttemptID: "att-g0", Role: "prior", State: "released",
+			Provider: "antigravity", Model: "bad", Depth: "medium",
+			AccountRef: "acct-ag", WindowKind: "five_hour",
+			ReservationID: "res-prior", Actual: nil, Source: "",
+		},
+		AlternateTransition: workflowrun.CapacityTransition{
+			AttemptID: "att-g1", Role: "alternate", State: "released",
+			Provider: "codex", Model: "gpt-5.5", Depth: "medium",
+			AccountRef: "acct-codex", WindowKind: "five_hour",
+			ReservationID: "res-alt", Actual: nil, Source: "",
+		},
+		ModelUnavailableEvent: goalrun.EventSnapshot{EventID: "wev_1", Kind: "model_unavailable", AttemptID: "att-g0"},
+		FailedTerminalEvent:   goalrun.EventSnapshot{EventID: "wev_0", Kind: "terminal", AttemptID: "att-g0"},
+		ClaimEvent:            goalrun.EventSnapshot{EventID: "wev_2", Kind: "claim", AttemptID: "att-g1"},
+		RerouteEvent:          goalrun.EventSnapshot{EventID: "wev_3", Kind: "reroute", AttemptID: "att-g1"},
+		LaunchEvent:           goalrun.EventSnapshot{EventID: "wev_4", Kind: "launch", AttemptID: "att-g1"},
+		RetryTerminalEvent:    goalrun.EventSnapshot{EventID: "wev_5", Kind: "terminal", AttemptID: "att-g1"},
+		IntegrateEvent:        goalrun.EventSnapshot{EventID: "wev_6", Kind: "integrate", AttemptID: "att-g1"},
 	}
 	got := goalrun.BuildUnavailableRetryEvidenceWithProof([]goalrun.RouteExclude{
 		{ChildID: "wi_x", Provider: "antigravity", Reason: "model_unavailable", Claimed: true, Message: "typed failure"},

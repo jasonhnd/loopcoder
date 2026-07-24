@@ -1,6 +1,7 @@
 package goalrun
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -20,43 +21,43 @@ type CanaryEmitOptions struct {
 	PreProdSHA    string
 	BinaryVersion string
 	BinaryCommit  string
-	// HomeDir for event log discovery.
+	// HomeDir for event log discovery when Workflow.EventLogPath is empty.
 	HomeDir string
 }
 
 // EmitCanaryFromResult builds and writes canary_evidence.v1 from a completed goal Result.
 // Requires interrupt events for restart section; fails closed otherwise when
 // RequireRestart is implied by Resumed||Interrupted in workflow.
+//
+// Event log loading is one authoritative path: prefer exact Workflow.EventLogPath
+// (strict JSONL readback). Only when that path is empty, resolve via HomeDir.
+// Unavailable retry proof receives those same read-back events; on readback
+// failure for claimed model_unavailable, unavailable_retry stays nil (not_run).
 func EmitCanaryFromResult(res Result, opts CanaryEmitOptions) (artifactqual.CanaryEvidence, error) {
 	if strings.TrimSpace(opts.OutPath) == "" {
 		return artifactqual.CanaryEvidence{}, fmt.Errorf("goalrun: canary out path required")
 	}
-	// Load append-only events from workflow path or home layout.
-	var events []workflowrun.Event
-	evPath := res.Workflow.EventLogPath
-	if evPath == "" && opts.HomeDir != "" && res.ProjectID != "" && res.RunID != "" {
-		if el, err := workflowrun.OpenEventLog(opts.HomeDir, res.ProjectID, res.RunID); err == nil {
-			evPath = el.Path()
+
+	events, evPath, loadErr := loadWorkflowEvents(res, opts.HomeDir)
+	// Other canary metrics may still emit; claimed model_unavailable proof needs events.
+	var unavail *artifactqual.CanaryUnavailableRetry
+	if loadErr != nil {
+		// If any claimed model_unavailable exclude exists, unavailable_retry MUST
+		// stay nil/not_run — never fall back to a different unclaimed exclude.
+		if hasClaimedModelUnavailableExclude(res.RouteExcludes) {
+			unavail = nil
+		} else {
+			// Unclaimed-only path does not require EventLog readback.
+			unavail = BuildUnavailableRetryEvidence(res.RouteExcludes, firstRetryAttempt(res))
 		}
-	}
-	if opts.HomeDir != "" && res.ProjectID != "" && res.RunID != "" {
-		if elog, err := workflowrun.OpenEventLog(opts.HomeDir, res.ProjectID, res.RunID); err == nil {
-			if evs, rerr := elog.ReadAll(); rerr == nil {
-				events = evs
-				evPath = elog.Path()
-			}
-		}
-	} else if evPath != "" {
-		// Path known from workflow but home empty — still try open from path parent.
-		if raw, err := os.ReadFile(evPath); err == nil && len(raw) > 0 {
-			_ = raw
-			// Parse lines lightly via OpenEventLog when possible is preferred.
-		}
+	} else {
+		unavail = BuildUnavailableRetryEvidenceWithProof(
+			res.RouteExcludes, firstRetryAttempt(res), proofFromResult(res, events),
+		)
 	}
 
 	children := canaryChildrenFromReports(res)
 	obs := canaryProviderObsFromReports(res)
-	unavail := BuildUnavailableRetryEvidenceWithProof(res.RouteExcludes, firstRetryAttempt(res), proofFromResult(res))
 
 	var prURL, prBranch, prVer, prVerRef string
 	var prNum int
@@ -73,7 +74,6 @@ func EmitCanaryFromResult(res Result, opts CanaryEmitOptions) (artifactqual.Cana
 		prOwned = res.PR.CreatedByLoopCoder
 	}
 
-	// Binary identity defaults from env or empty — caller should set from --version.
 	in := artifactqual.EmitInput{
 		ArchiveDigest: opts.ArchiveDigest, PreProdSHA: opts.PreProdSHA,
 		BinaryVersion: opts.BinaryVersion, BinaryCommit: opts.BinaryCommit,
@@ -98,13 +98,60 @@ func EmitCanaryFromResult(res Result, opts CanaryEmitOptions) (artifactqual.Cana
 	return ev, nil
 }
 
+// LoadWorkflowEventsForTest exposes loadWorkflowEvents for package tests.
+func LoadWorkflowEventsForTest(res Result, homeDir string) ([]workflowrun.Event, string, error) {
+	return loadWorkflowEvents(res, homeDir)
+}
+
+// ProofFromResultForTest exposes proofFromResult for package tests.
+func ProofFromResultForTest(res Result, events []workflowrun.Event) *UnavailableRetryProof {
+	return proofFromResult(res, events)
+}
+
+// loadWorkflowEvents is the single authoritative EventLog load for canary emission.
+// Prefer exact res.Workflow.EventLogPath (do not reopen a different home-derived path
+// when that file exists). Strict JSONL: every non-empty line must parse as Event;
+// when project/run are known, every event must match or load fails.
+func loadWorkflowEvents(res Result, homeDir string) (events []workflowrun.Event, path string, err error) {
+	path = strings.TrimSpace(res.Workflow.EventLogPath)
+	if path == "" {
+		// Resolve only when exact path is absent.
+		homeDir = strings.TrimSpace(homeDir)
+		if homeDir != "" && res.ProjectID != "" && res.RunID != "" {
+			if el, oerr := workflowrun.OpenEventLog(homeDir, res.ProjectID, res.RunID); oerr == nil {
+				path = el.Path()
+			}
+		}
+	}
+	if path == "" {
+		return nil, "", fmt.Errorf("goalrun: event log path unavailable")
+	}
+	// When the exact path exists, read it directly — never substitute a different OpenEventLog path.
+	if _, serr := os.Stat(path); serr != nil {
+		return nil, path, fmt.Errorf("goalrun: event log path: %w", serr)
+	}
+	events, err = readEventLogJSONLStrict(path, res.ProjectID, res.RunID)
+	if err != nil {
+		return nil, path, err
+	}
+	return events, path, nil
+}
+
+// readEventLogJSONLStrict uses the single authoritative workflowrun parser.
+func readEventLogJSONLStrict(path, expectProject, expectRun string) ([]workflowrun.Event, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return workflowrun.ParseEventJSONLStrict(string(raw), expectProject, expectRun)
+}
+
 func canaryChildrenFromReports(res Result) []artifactqual.CanaryChild {
 	out := make([]artifactqual.CanaryChild, 0, len(res.Children))
 	for _, c := range res.Children {
 		if c.Unavailable || c.Provider == "" {
 			continue
 		}
-		// Parse depth bind from route reason when present.
 		depth := c.Depth
 		req, sel, inv := depth, depth, depth
 		if strings.Contains(c.RouteReason, "requirement=") {
@@ -124,15 +171,26 @@ func canaryChildrenFromReports(res Result) []artifactqual.CanaryChild {
 		cc := artifactqual.CanaryChild{
 			ChildID: c.ChildID, AttemptID: c.AttemptID, Provider: c.Provider, Model: c.Model,
 			DepthRequired: req, DepthSelected: sel, DepthInvocation: inv,
+			Permission: c.Permission, AccountRef: c.AccountRef, InstallRef: c.InstallRef,
 			Terminal: c.Terminal, WorktreePath: c.WorktreePath,
 			CapacityBefore: c.CapacityBefore, CapacityReserved: c.CapacityReserved,
 			CapacityActual: c.CapacityActual, CapacityAfter: c.CapacityAfter,
-			ActualSource: c.ActualSource,
+			ActualSource: c.ActualSource, // capacity fraction source only
+			ArgvDigest:   c.ArgvDigest,
 			RealProviderExecuted: c.AttemptID != "" && c.OutputEvidence != "" &&
 				c.Provider != "fixture" && c.Terminal != "",
 		}
+		// Propagate per-dimension route sources (never collapse into ActualSource).
+		if c.ActualSources.Model != "" || c.ActualSources.Effort != "" ||
+			c.ActualSources.Permission != "" || c.ActualSources.Account != "" ||
+			c.ActualSources.Install != "" {
+			cc.ActualSources = &artifactqual.CanaryRouteSources{
+				Model: c.ActualSources.Model, Effort: c.ActualSources.Effort,
+				Permission: c.ActualSources.Permission, Account: c.ActualSources.Account,
+				Install: c.ActualSources.Install,
+			}
+		}
 		if c.CapacityAfter != nil {
-			// after_source tags from capacity note when present
 			if strings.Contains(c.CapacityNote, "after_source=") {
 				cc.AfterSource = extractAfter(c.CapacityNote, "after_source=")
 			} else {
@@ -192,82 +250,433 @@ func firstRetryAttempt(res Result) string {
 	return ""
 }
 
-// proofFromResult derives concrete UnavailableRetryProof from workflow children
-// and capacity notes — never invents no_duplicate flags from prose alone.
-func proofFromResult(res Result) *UnavailableRetryProof {
-	var failed, retry *workflowrun.ChildOutcome
+// hasClaimedModelUnavailableExclude reports any Claimed model_unavailable exclude.
+func hasClaimedModelUnavailableExclude(excludes []RouteExclude) bool {
+	for _, e := range excludes {
+		if e.Claimed && strings.EqualFold(strings.TrimSpace(e.Reason), "model_unavailable") {
+			return true
+		}
+	}
+	return false
+}
+
+// idExact is case-sensitive identity after TrimSpace (project/run/attempt/work_item).
+func idExact(a, b string) bool {
+	return strings.TrimSpace(a) == strings.TrimSpace(b)
+}
+
+// proofFromResult derives concrete UnavailableRetryProof from pre-loaded EventLog
+// events, IntegrateCommits, and CapacityTransitions — never CapacityNote prose
+// or Terminal==succeeded alone. events must be the authoritative readback; empty
+// or incomplete events yield nil (unavailable_retry not_run).
+func proofFromResult(res Result, events []workflowrun.Event) *UnavailableRetryProof {
+	// Exactly one failed/retry pair: same WorkItemID and SupersedesAttemptID match
+	// with case-sensitive attempt IDs after TrimSpace.
+	type pair struct{ failed, retry *workflowrun.ChildOutcome }
+	var pairs []pair
 	for i := range res.Workflow.Children {
-		c := &res.Workflow.Children[i]
-		if strings.EqualFold(strings.TrimSpace(c.FailureClass), "model_unavailable") {
-			failed = c
-		}
-		if strings.TrimSpace(c.SupersedesAttemptID) != "" {
-			retry = c
-		}
-	}
-	if failed == nil || retry == nil {
-		return nil
-	}
-	// Parse event_ids from RerouteEventRef (event_id=a;event_id=b;...).
-	var eventIDs []string
-	for _, part := range strings.Split(retry.RerouteEventRef, ";") {
-		part = strings.TrimSpace(part)
-		if strings.HasPrefix(part, "event_id=") {
-			id := strings.TrimPrefix(part, "event_id=")
-			if id != "" {
-				eventIDs = append(eventIDs, id)
-			}
-		}
-	}
-	// Capacity states from goal ChildReport notes when present.
-	priorState, altState := "", ""
-	for _, cr := range res.Children {
-		if cr.ChildID != failed.WorkItemID && cr.ChildID != retry.WorkItemID {
+		f := &res.Workflow.Children[i]
+		if !strings.EqualFold(strings.TrimSpace(f.FailureClass), "model_unavailable") {
 			continue
 		}
-		if strings.Contains(cr.CapacityNote, "released=") || cr.CapacityState == "released" {
-			if priorState == "" {
-				priorState = "released"
+		for j := range res.Workflow.Children {
+			r := &res.Workflow.Children[j]
+			if i == j {
+				continue
+			}
+			if !idExact(f.WorkItemID, r.WorkItemID) {
+				continue
+			}
+			if strings.TrimSpace(r.SupersedesAttemptID) == "" {
+				continue
+			}
+			if !idExact(r.SupersedesAttemptID, f.AttemptID) {
+				continue
+			}
+			pairs = append(pairs, pair{failed: f, retry: r})
+		}
+	}
+	if len(pairs) != 1 {
+		return nil
+	}
+	failed, retry := pairs[0].failed, pairs[0].retry
+	if len(events) == 0 {
+		return nil
+	}
+
+	failedAtt := strings.TrimSpace(failed.AttemptID)
+	retryAtt := strings.TrimSpace(retry.AttemptID)
+	wi := strings.TrimSpace(failed.WorkItemID)
+	if failedAtt == "" || retryAtt == "" || wi == "" || failedAtt == retryAtt {
+		return nil
+	}
+
+	countKind := func(kind, attempt string) int {
+		n := 0
+		for _, e := range events {
+			if strings.EqualFold(strings.TrimSpace(e.Kind), kind) && idExact(e.AttemptID, attempt) {
+				n++
 			}
 		}
-		if cr.CapacityState == "reconciled" {
-			if priorState == "" {
-				priorState = "reconciled"
+		return n
+	}
+	findKind := func(kind, attempt string) (EventSnapshot, bool) {
+		for _, e := range events {
+			if !strings.EqualFold(strings.TrimSpace(e.Kind), kind) || !idExact(e.AttemptID, attempt) {
+				continue
 			}
-			altState = "reconciled"
+			if strings.TrimSpace(e.EventID) == "" {
+				continue
+			}
+			// All structured events must carry nonempty WorkItemID equal to wi.
+			if strings.TrimSpace(e.WorkItemID) == "" || !idExact(e.WorkItemID, wi) {
+				continue
+			}
+			return EventSnapshot{
+				EventID: e.EventID, Kind: e.Kind, AttemptID: e.AttemptID,
+				Generation: e.Generation, WorkItemID: e.WorkItemID,
+			}, true
 		}
-		if cr.CapacityState == "reserved" {
-			altState = "reserved"
+		return EventSnapshot{}, false
+	}
+	payloadOf := func(eventID string) (map[string]string, bool) {
+		for _, e := range events {
+			if e.EventID != eventID {
+				continue
+			}
+			if len(e.Payload) == 0 {
+				return nil, false
+			}
+			var m map[string]string
+			if json.Unmarshal(e.Payload, &m) != nil {
+				return nil, false
+			}
+			return m, true
 		}
-		if cr.CapacityState == "released" && altState == "" {
-			altState = "released"
+		return nil, false
+	}
+
+	// Exactly one model_unavailable + one reroute (and claim/launch/terminal) each.
+	if countKind("model_unavailable", failedAtt) != 1 {
+		return nil
+	}
+	if countKind("reroute", retryAtt) != 1 {
+		return nil
+	}
+	muEv, okMU := findKind("model_unavailable", failedAtt)
+	failedTmEv, okFT := findKind("terminal", failedAtt)
+	clEv, okCL := findKind("claim", retryAtt)
+	rrEv, okRR := findKind("reroute", retryAtt)
+	lnEv, okLN := findKind("launch", retryAtt)
+	tmEv, okTM := findKind("terminal", retryAtt)
+	if !okMU || !okFT || !okCL || !okRR || !okLN || !okTM {
+		return nil
+	}
+
+	// rawEvent looks up full event by EventID for Terminal/Evidence/CommitSHA.
+	rawEvent := func(eventID string) (workflowrun.Event, bool) {
+		for _, e := range events {
+			if e.EventID == eventID {
+				return e, true
+			}
+		}
+		return workflowrun.Event{}, false
+	}
+
+	// WorkItemID nonempty + exact on every required event; one consistent nonzero gen on retry.
+	retryGen := 0
+	for _, snap := range []EventSnapshot{muEv, failedTmEv, clEv, rrEv, lnEv, tmEv} {
+		if strings.TrimSpace(snap.WorkItemID) == "" || !idExact(snap.WorkItemID, wi) {
+			return nil
 		}
 	}
-	// When notes incomplete, do not invent — leave empty so Valid fails closed.
-	failedIntegrated := false
-	retryIntegrated := strings.TrimSpace(retry.IntegrateCommitSHA) != "" ||
-		strings.EqualFold(retry.Terminal, "succeeded")
-	// Failed attempt must not have been integrated as success.
-	if strings.EqualFold(failed.Terminal, "succeeded") || strings.TrimSpace(failed.IntegrateCommitSHA) != "" {
-		failedIntegrated = true
+	for _, snap := range []EventSnapshot{clEv, rrEv, lnEv, tmEv} {
+		if snap.Generation <= 0 {
+			return nil
+		}
+		if retryGen == 0 {
+			retryGen = snap.Generation
+		} else if snap.Generation != retryGen {
+			return nil
+		}
 	}
-	return &UnavailableRetryProof{
-		FailedAttemptID:    failed.AttemptID,
-		RetryAttemptID:     retry.AttemptID,
-		FailedClaimClosed:  strings.TrimSpace(failed.Terminal) != "",
-		RetryClaimClosed:   strings.TrimSpace(retry.Terminal) != "",
-		FailedIntegrated:   failedIntegrated,
-		RetryIntegrated:    retryIntegrated,
-		FailedProductFiles: append([]string(nil), failed.FilesTouched...),
-		RetryProductFiles:  append([]string(nil), retry.FilesTouched...),
-		PriorCapacityState: priorState,
-		AltCapacityState:   altState,
-		EventIDs:           eventIDs,
+
+	// MU payload + Event.Terminal/Evidence must be nonempty exact matches to failed outcome.
+	if m, ok := payloadOf(muEv.EventID); !ok ||
+		m["work_item_id"] != wi || m["attempt_id"] != failedAtt ||
+		m["provider"] != strings.TrimSpace(failed.Provider) ||
+		m["model"] != strings.TrimSpace(failed.Model) ||
+		m["failure_class"] != "model_unavailable" {
+		return nil
 	}
+	muRaw, ok := rawEvent(muEv.EventID)
+	if !ok || strings.TrimSpace(muRaw.Terminal) == "" || strings.TrimSpace(muRaw.Evidence) == "" {
+		return nil
+	}
+	if strings.TrimSpace(muRaw.Terminal) != strings.TrimSpace(failed.Terminal) ||
+		strings.TrimSpace(muRaw.Evidence) != strings.TrimSpace(failed.OutputEvidence) {
+		return nil
+	}
+	// Failed terminal event + payload are mandatory and exact (not optional/nonempty-only).
+	ftRaw, ok := rawEvent(failedTmEv.EventID)
+	if !ok || strings.TrimSpace(ftRaw.Terminal) == "" || strings.TrimSpace(ftRaw.Evidence) == "" {
+		return nil
+	}
+	if strings.TrimSpace(ftRaw.Terminal) != strings.TrimSpace(failed.Terminal) ||
+		strings.TrimSpace(ftRaw.Evidence) != strings.TrimSpace(failed.OutputEvidence) {
+		return nil
+	}
+	if m, ok := payloadOf(failedTmEv.EventID); !ok ||
+		m["terminal"] != strings.TrimSpace(failed.Terminal) ||
+		m["output_evidence"] != strings.TrimSpace(failed.OutputEvidence) ||
+		m["work_item_id"] != wi || m["attempt_id"] != failedAtt {
+		return nil
+	}
+
+	// Capacity first: len==2 only; bind prior/alternate before reroute exact checks.
+	if len(res.Workflow.CapacityTransitions) != 2 {
+		return nil
+	}
+	var priorT, altT workflowrun.CapacityTransition
+	priorN, altN := 0, 0
+	for _, tr := range res.Workflow.CapacityTransitions {
+		switch strings.TrimSpace(tr.Role) {
+		case "prior":
+			priorN++
+			priorT = tr
+		case "alternate":
+			altN++
+			altT = tr
+		default:
+			return nil // unknown role
+		}
+	}
+	if priorN != 1 || altN != 1 {
+		return nil
+	}
+	if !idExact(priorT.AttemptID, failedAtt) || !idExact(altT.AttemptID, retryAtt) {
+		return nil
+	}
+	// reconciled => Actual nonnil+Source nonempty; released => Actual nil+Source empty.
+	// Requires Model+Depth (and provider/account/window/reservation).
+	if !validCapacityTransition(priorT) || !validCapacityTransition(altT) {
+		return nil
+	}
+
+	// Claim payload attempt_id must equal retry.
+	if m, ok := payloadOf(clEv.EventID); !ok ||
+		m["work_item_id"] != wi || m["attempt_id"] != retryAtt ||
+		m["supersedes_attempt_id"] != failedAtt || m["retry_attempt_id"] != retryAtt {
+		return nil
+	}
+	// Reroute fields must be nonempty exact matches to retry route/outcome/transition.
+	// Permission must match retry when outcome carries it (not arbitrary nonempty).
+	if m, ok := payloadOf(rrEv.EventID); !ok ||
+		m["work_item_id"] != wi ||
+		m["supersedes_attempt_id"] != failedAtt || m["retry_attempt_id"] != retryAtt ||
+		m["model_unavailable_event_id"] != muEv.EventID || m["claim_event_id"] != clEv.EventID ||
+		m["alt_provider"] == "" || m["alt_provider"] != strings.TrimSpace(retry.Provider) ||
+		m["alt_model"] == "" || m["alt_model"] != strings.TrimSpace(retry.Model) ||
+		m["depth"] == "" || m["depth"] != strings.TrimSpace(retry.Depth) ||
+		m["permission"] == "" ||
+		(strings.TrimSpace(retry.Permission) != "" && m["permission"] != strings.TrimSpace(retry.Permission)) ||
+		m["account_ref"] == "" || m["account_ref"] != strings.TrimSpace(retry.AccountRef) ||
+		m["account_ref"] != strings.TrimSpace(altT.AccountRef) ||
+		m["window_kind"] == "" || m["window_kind"] != strings.TrimSpace(altT.WindowKind) ||
+		(strings.TrimSpace(retry.WindowKind) != "" && m["window_kind"] != strings.TrimSpace(retry.WindowKind)) ||
+		m["reservation_id"] == "" || m["reservation_id"] != strings.TrimSpace(altT.ReservationID) ||
+		(strings.TrimSpace(retry.ReservationID) != "" && m["reservation_id"] != strings.TrimSpace(retry.ReservationID)) {
+		return nil
+	}
+	// Launch must carry full route identity exact to retry/alternate.
+	if m, ok := payloadOf(lnEv.EventID); !ok ||
+		m["work_item_id"] != wi || m["retry_attempt_id"] != retryAtt ||
+		m["reroute_event_id"] != rrEv.EventID || m["supersedes_attempt_id"] != failedAtt ||
+		m["provider"] == "" || m["provider"] != strings.TrimSpace(retry.Provider) ||
+		m["model"] == "" || m["model"] != strings.TrimSpace(retry.Model) ||
+		m["depth"] == "" || m["depth"] != strings.TrimSpace(retry.Depth) ||
+		m["permission"] == "" ||
+		(strings.TrimSpace(retry.Permission) != "" && m["permission"] != strings.TrimSpace(retry.Permission)) ||
+		m["account_ref"] == "" || m["account_ref"] != strings.TrimSpace(retry.AccountRef) ||
+		m["window_kind"] == "" || m["window_kind"] != strings.TrimSpace(altT.WindowKind) ||
+		m["reservation_id"] == "" || m["reservation_id"] != strings.TrimSpace(altT.ReservationID) {
+		return nil
+	}
+	// Terminal payload output_evidence required exact; Event.Terminal/Evidence match too.
+	if m, ok := payloadOf(tmEv.EventID); !ok ||
+		m["work_item_id"] != wi || m["retry_attempt_id"] != retryAtt ||
+		m["supersedes_attempt_id"] != failedAtt ||
+		m["terminal"] != strings.TrimSpace(retry.Terminal) ||
+		m["output_evidence"] == "" || m["output_evidence"] != strings.TrimSpace(retry.OutputEvidence) {
+		return nil
+	}
+	if tmRaw, ok := rawEvent(tmEv.EventID); !ok ||
+		strings.TrimSpace(tmRaw.Terminal) != strings.TrimSpace(retry.Terminal) ||
+		strings.TrimSpace(tmRaw.Evidence) != strings.TrimSpace(retry.OutputEvidence) {
+		return nil
+	}
+
+	// RerouteEventRef complete parse: expected event IDs exactly once,
+	// supersedes_attempt_id exact failed, retry_attempt_id exact retry, no unknown/dup keys.
+	refIDs := map[string]int{}
+	refKeys := map[string]int{}
+	var refSupersedes, refRetry string
+	for _, part := range strings.Split(retry.RerouteEventRef, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		key, val, ok := strings.Cut(part, "=")
+		if !ok || key == "" || val == "" {
+			return nil
+		}
+		refKeys[key]++
+		switch key {
+		case "event_id":
+			refIDs[val]++
+		case "supersedes_attempt_id":
+			refSupersedes = val
+		case "retry_attempt_id":
+			refRetry = val
+		default:
+			return nil // unknown key
+		}
+	}
+	if refKeys["supersedes_attempt_id"] != 1 || refKeys["retry_attempt_id"] != 1 {
+		return nil
+	}
+	if refSupersedes != failedAtt || refRetry != retryAtt {
+		return nil
+	}
+	required := []string{muEv.EventID, clEv.EventID, rrEv.EventID, lnEv.EventID}
+	if len(refIDs) != len(required) || refKeys["event_id"] != len(required) {
+		return nil
+	}
+	for _, id := range required {
+		if refIDs[id] != 1 {
+			return nil
+		}
+	}
+
+	// Exact integrate counts: commits + event log + ChildOutcome SHA alignment.
+	retryIntegrateCommits := 0
+	failedIntegrateCommits := 0
+	for _, ic := range res.Workflow.IntegrateCommits {
+		if idExact(ic.AttemptID, retryAtt) && strings.TrimSpace(ic.CommitSHA) != "" {
+			retryIntegrateCommits++
+		}
+		if idExact(ic.AttemptID, failedAtt) && strings.TrimSpace(ic.CommitSHA) != "" {
+			failedIntegrateCommits++
+		}
+	}
+	retryIntegrateEvents := countKind("integrate", retryAtt)
+	failedIntegrateEvents := countKind("integrate", failedAtt)
+	if failedIntegrateCommits != 0 || failedIntegrateEvents != 0 {
+		return nil
+	}
+	retryIntegrated := false
+	var integrateEv EventSnapshot
+	if sha := strings.TrimSpace(retry.IntegrateCommitSHA); sha != "" {
+		matched := 0
+		for _, ic := range res.Workflow.IntegrateCommits {
+			if idExact(ic.AttemptID, retryAtt) && strings.TrimSpace(ic.CommitSHA) == sha {
+				matched++
+			}
+		}
+		if matched != 1 || retryIntegrateCommits != 1 || retryIntegrateEvents != 1 {
+			return nil
+		}
+		intSnap, ok := findKind("integrate", retryAtt)
+		if !ok {
+			return nil
+		}
+		if m, ok := payloadOf(intSnap.EventID); !ok ||
+			m["work_item_id"] != wi ||
+			m["retry_attempt_id"] != retryAtt || m["supersedes_attempt_id"] != failedAtt ||
+			m["commit_sha"] != sha {
+			return nil
+		}
+		if intSnap.Generation != retryGen {
+			return nil
+		}
+		// Validate integrate Event.CommitSHA plus payload.
+		if intRaw, ok := rawEvent(intSnap.EventID); !ok ||
+			strings.TrimSpace(intRaw.CommitSHA) != sha {
+			return nil
+		}
+		integrateEv = intSnap
+		retryIntegrated = true
+	} else {
+		if retryIntegrateCommits != 0 || retryIntegrateEvents != 0 {
+			return nil
+		}
+	}
+	failedIntegrated := strings.TrimSpace(failed.IntegrateCommitSHA) != ""
+
+	// Exact claim/launch/terminal counts == 1 per generation.
+	if countKind("terminal", failedAtt) != 1 || countKind("terminal", retryAtt) != 1 {
+		return nil
+	}
+	if countKind("claim", failedAtt) != 1 || countKind("claim", retryAtt) != 1 {
+		return nil
+	}
+	if countKind("launch", failedAtt) != 1 || countKind("launch", retryAtt) != 1 {
+		return nil
+	}
+
+	// Exact full identity on capacity vs outcomes (prior + alternate).
+	if strings.TrimSpace(priorT.Provider) != strings.TrimSpace(failed.Provider) ||
+		strings.TrimSpace(priorT.Model) != strings.TrimSpace(failed.Model) ||
+		(strings.TrimSpace(failed.Depth) != "" && strings.TrimSpace(priorT.Depth) != strings.TrimSpace(failed.Depth)) ||
+		(strings.TrimSpace(failed.AccountRef) != "" && strings.TrimSpace(priorT.AccountRef) != strings.TrimSpace(failed.AccountRef)) ||
+		(strings.TrimSpace(failed.WindowKind) != "" && strings.TrimSpace(priorT.WindowKind) != strings.TrimSpace(failed.WindowKind)) ||
+		(strings.TrimSpace(failed.ReservationID) != "" && strings.TrimSpace(priorT.ReservationID) != strings.TrimSpace(failed.ReservationID)) {
+		return nil
+	}
+	if strings.TrimSpace(altT.Provider) != strings.TrimSpace(retry.Provider) ||
+		strings.TrimSpace(altT.Model) != strings.TrimSpace(retry.Model) ||
+		strings.TrimSpace(altT.Depth) != strings.TrimSpace(retry.Depth) ||
+		strings.TrimSpace(altT.AccountRef) != strings.TrimSpace(retry.AccountRef) ||
+		(strings.TrimSpace(retry.WindowKind) != "" && strings.TrimSpace(altT.WindowKind) != strings.TrimSpace(retry.WindowKind)) ||
+		(strings.TrimSpace(retry.ReservationID) != "" && strings.TrimSpace(altT.ReservationID) != strings.TrimSpace(retry.ReservationID)) ||
+		(strings.TrimSpace(retry.Permission) != "" && strings.TrimSpace(altT.Permission) != "" &&
+			strings.TrimSpace(altT.Permission) != strings.TrimSpace(retry.Permission)) {
+		return nil
+	}
+
+	proof := &UnavailableRetryProof{
+		FailedAttemptID:       failedAtt,
+		RetryAttemptID:        retryAtt,
+		WorkItemID:            wi,
+		FailedProvider:        strings.TrimSpace(failed.Provider),
+		FailedClaimCount:      countKind("claim", failedAtt),
+		RetryClaimCount:       countKind("claim", retryAtt),
+		FailedLaunchCount:     countKind("launch", failedAtt),
+		RetryLaunchCount:      countKind("launch", retryAtt),
+		FailedIntegrateCount:  failedIntegrateEvents,
+		RetryIntegrateCount:   retryIntegrateEvents,
+		FailedTerminalCount:   countKind("terminal", failedAtt),
+		RetryTerminalCount:    countKind("terminal", retryAtt),
+		FailedClaimClosed:     strings.TrimSpace(failed.Terminal) != "",
+		RetryClaimClosed:      strings.TrimSpace(retry.Terminal) != "",
+		FailedIntegrated:      failedIntegrated,
+		RetryIntegrated:       retryIntegrated,
+		FailedProductFiles:    append([]string(nil), failed.FilesTouched...),
+		RetryProductFiles:     append([]string(nil), retry.FilesTouched...),
+		PriorTransition:       priorT,
+		AlternateTransition:   altT,
+		ModelUnavailableEvent: muEv,
+		FailedTerminalEvent:   failedTmEv,
+		ClaimEvent:            clEv,
+		RerouteEvent:          rrEv,
+		LaunchEvent:           lnEv,
+		RetryTerminalEvent:    tmEv,
+		IntegrateEvent:        integrateEv,
+	}
+	return proof
 }
 
 func extractKV(s, key string) string {
-	// key=value form inside route reason
 	idx := strings.Index(s, key+"=")
 	if idx < 0 {
 		return ""

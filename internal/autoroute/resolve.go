@@ -13,6 +13,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/quotamode"
 	"github.com/jasonhnd/loopcoder/internal/quotapolicy"
 	"github.com/jasonhnd/loopcoder/internal/routedecision"
+	"github.com/jasonhnd/loopcoder/internal/runtimecap"
 )
 
 // Outcome classifies resolve results.
@@ -34,12 +35,16 @@ type Input struct {
 	Model      string
 	Effort     string
 	Permission string
+	// AccountRef/InstallRef are optional exact capacity bindings on explicit pin.
+	// When set, ExactRouteAffirm must prove account/install support before spend.
+	AccountRef string
+	InstallRef string
 	ProjectID  string
 	// DecisionKey should be stable per run attempt for idempotency.
 	DecisionKey string
-	// TaskClass defaults to ClassTera (ordinary code) when empty.
-	// Production run must pass a classified TaskClass (CRO-006); default remains
-	// for pin-only paths and transitional callers.
+	// TaskClass is required: a valid classified capability floor (luna|tera|soul).
+	// Missing, invalid, or needs_human fail closed with OutcomeInvalid before
+	// explicit pin or auto-route. Never silently defaults to ClassTera.
 	TaskClass capclass.Class
 	Now       time.Time
 	// Inventory is required for auto-route. Nil inventory fails closed — production
@@ -55,6 +60,10 @@ type Result struct {
 	Model      string
 	Effort     string
 	Permission string
+	// AccountRef/WindowKind/InstallRef are first-class capacity identity from the winner.
+	AccountRef string
+	WindowKind string
+	InstallRef string
 	// Decision is non-nil when auto-route path ran Evaluate.
 	Decision *routedecision.Decision
 	Explain  *routedecision.ExplainResult
@@ -104,8 +113,18 @@ func Resolve(in Input) (Result, error) {
 		key = "route_" + shortHash(fmt.Sprintf("%s|%s|%v|%d", provider, model, in.AutoRoute, now.UnixNano()))
 	}
 	taskClass := in.TaskClass
+	// Fail closed before pin or auto-route: no silent ClassTera default.
 	if !taskClass.Valid() {
-		taskClass = capclass.ClassTera
+		return Result{
+			Outcome: OutcomeInvalid,
+			Message: fmt.Sprintf("task class required and must be valid (got %q; no silent tera default)", taskClass),
+		}, fmt.Errorf("%w: task class required", ErrInvalid)
+	}
+	if taskClass == capclass.ClassNeedsHuman {
+		return Result{
+			Outcome: OutcomeInvalid,
+			Message: "task class needs_human cannot route or pin-spend",
+		}, fmt.Errorf("%w: task class needs_human", ErrInvalid)
 	}
 
 	// Partial explicit pin without auto-route is usage error.
@@ -116,8 +135,16 @@ func Resolve(in Input) (Result, error) {
 		}, fmt.Errorf("%w: partial pin", ErrInvalid)
 	}
 
-	// Full explicit pin: never override.
+	// Full explicit pin: never override, but fail closed before reserve/spend when
+	// runtimecap cannot affirm every requested exact dimension. No pin reroute.
 	if provider != "" && model != "" && !in.AutoRoute {
+		if err := validateExplicitPinCapability(provider, model, effort, perm, in.AccountRef, in.InstallRef); err != nil {
+			return Result{
+				Outcome: OutcomePinFail, Provider: provider, Model: model,
+				Effort: effort, Permission: perm,
+				Message: err.Error(),
+			}, err
+		}
 		return Result{
 			Outcome: OutcomeExplicitPin, Provider: provider, Model: model,
 			Effort: effort, Permission: perm,
@@ -229,7 +256,11 @@ func Resolve(in Input) (Result, error) {
 			}, fmt.Errorf("%w: depth mismatch", ErrNoRoute)
 		}
 		res.Permission = firstNonEmpty(d.Winner.Permission, perm)
-		res.Message = fmt.Sprintf("auto-route selected %s/%s depth=%s digest=%s", res.Provider, res.Model, res.Effort, shortHash(d.Digest))
+		res.AccountRef = strings.TrimSpace(d.Winner.AccountRef)
+		res.InstallRef = strings.TrimSpace(d.Winner.InstallRef)
+		res.WindowKind = strings.TrimSpace(d.Winner.WindowKind)
+		res.Message = fmt.Sprintf("auto-route selected %s/%s depth=%s account=%s install=%s digest=%s",
+			res.Provider, res.Model, res.Effort, res.AccountRef, res.InstallRef, shortHash(d.Digest))
 		return res, nil
 	case routedecision.OutcomePinFail:
 		res.Outcome = OutcomePinFail
@@ -310,6 +341,7 @@ func DefaultInventory(now time.Time) Inventory {
 func healthy(p, m string, cl capclass.Class) eligibility.Candidate {
 	return eligibility.Candidate{
 		Provider: p, Model: m, Effort: "medium", Permission: "bounded_write", ModelClass: cl,
+		AccountRef: "acct-" + p, InstallRef: "install-" + p, WindowKind: "five_hour",
 		Installed: okFact(p + "-i"), Authenticated: okFact(p + "-a"), ModelPresent: okFact(p + "-m"),
 		PermissionOK: okFact(p + "-p"), EffortOK: okFact(p + "-e"), Healthy: okFact(p + "-h"),
 		CooldownActive: falseFact(p + "-cd"), ResourceFit: okFact(p + "-r"), QuotaRemaining: 9999,
@@ -321,6 +353,7 @@ func soft(p, m string, rem float64, ttr time.Duration) quotapolicy.Candidate {
 	rel := 0.9
 	return quotapolicy.Candidate{
 		Provider: p, Model: m,
+		AccountRef: "acct-" + p, InstallRef: "install-" + p, WindowKind: "five_hour",
 		Windows: []quotapolicy.Window{{
 			Kind: quotapolicy.WindowFiveHour, RemainingFraction: &rf,
 			Evidence: quotapolicy.EvidenceExact, TimeToReset: &d,
@@ -438,4 +471,44 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// validateExplicitPinCapability fail-closes an owner pin before reserve/spend when
+// the provider is non-production or cannot affirm every requested exact dimension.
+// Explicit pin is never overridden or rerouted — it either holds or fails closed.
+func validateExplicitPinCapability(provider, model, effort, permission, accountRef, installRef string) error {
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	if provider == "" || model == "" {
+		return fmt.Errorf("%w: incomplete pin", ErrInvalid)
+	}
+	// Fixture/unknown: never production-eligible for spend.
+	if strings.EqualFold(provider, "fixture") {
+		return fmt.Errorf("%w: provider %q is test-only (not production eligible for explicit pin spend)", ErrPinFail, provider)
+	}
+	aff := runtimecap.ExactRouteAffirm(provider)
+	if !aff.ProductionEligible {
+		return fmt.Errorf("%w: provider %q is not production-eligible for exact pin (unknown or non-affirmable)", ErrPinFail, provider)
+	}
+	// Model always required and must be affirmable.
+	if !aff.Model {
+		return fmt.Errorf("%w: provider %q cannot affirm exact model for pin", ErrPinFail, provider)
+	}
+	// Permission always required and must be affirmable.
+	if !aff.Permission {
+		return fmt.Errorf("%w: provider %q cannot affirm exact permission for pin", ErrPinFail, provider)
+	}
+	// Depth when requested.
+	if strings.TrimSpace(effort) != "" && !aff.Depth {
+		return fmt.Errorf("%w: provider %q cannot affirm exact depth %q for pin", ErrPinFail, provider, effort)
+	}
+	// Account/install when bound on the pin.
+	if strings.TrimSpace(accountRef) != "" && !aff.Account {
+		return fmt.Errorf("%w: provider %q cannot affirm exact account for pin", ErrPinFail, provider)
+	}
+	if strings.TrimSpace(installRef) != "" && !aff.Install {
+		return fmt.Errorf("%w: provider %q cannot affirm exact install for pin", ErrPinFail, provider)
+	}
+	_ = permission // permission class presence already gated by aff.Permission
+	return nil
 }

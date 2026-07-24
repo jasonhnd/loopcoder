@@ -16,7 +16,7 @@ func t0() time.Time { return time.Date(2026, 7, 22, 19, 0, 0, 0, time.UTC) }
 func testSnap() capacitysnapshot.Snapshot {
 	reset := t0().Add(30 * time.Minute)
 	acc := capacitysnapshot.FromAccountInput(capacitysnapshot.AccountInput{
-		Provider: "codex", AccountRef: "acct-codex", InstallRef: "i1",
+		Provider: "codex", AccountRef: "acct-codex", InstallRef: "i-test",
 		Installed: true, Authenticated: true, Healthy: true,
 		HealthConfidence: capacitysnapshot.ConfidenceExact,
 		HealthFreshness:  capacitysnapshot.FreshnessFresh,
@@ -52,9 +52,11 @@ func TestReserveReconcileIdempotent(t *testing.T) {
 	snap := testSnap()
 	e1, err := l.Reserve(capacityledger.ReserveInput{
 		ProjectID: "p", RunID: "run1", AttemptID: "att1",
-		Policy:   capacityledger.PolicyUseBeforeReset,
+		PlanDigest: "sha256:test-exec-plan", GraphDigest: "sha256:test-graph", TaskClass: "tera", ChildContractDigest: "sha256:test-child-contract", Policy: capacityledger.PolicyUseBeforeReset,
 		Provider: "codex", Model: "gpt-5.5", Depth: "medium",
-		Snapshot: &snap, RouteReason: "use-before-reset winner",
+		AccountRef: "acct-codex", WindowKind: "five_hour",
+		InstallRef: "i-test",
+		Snapshot:   &snap, RouteReason: "use-before-reset winner",
 		DemandFraction: 0.05, DemandConfidence: quotapolicy.EvidenceEstimated,
 	})
 	if err != nil {
@@ -63,11 +65,14 @@ func TestReserveReconcileIdempotent(t *testing.T) {
 	if e1.State != "reserved" || e1.Reserved <= 0 || e1.Before <= 0 {
 		t.Fatalf("%+v", e1)
 	}
-	// Idempotent restart
+	// Idempotent restart — full identity required.
 	e2, err := l.Reserve(capacityledger.ReserveInput{
 		ProjectID: "p", RunID: "run1", AttemptID: "att1",
-		Policy:   capacityledger.PolicyUseBeforeReset,
-		Provider: "codex", Model: "gpt-5.5", Snapshot: &snap,
+		PlanDigest: "sha256:test-exec-plan", GraphDigest: "sha256:test-graph", TaskClass: "tera", ChildContractDigest: "sha256:test-child-contract", Policy: capacityledger.PolicyUseBeforeReset,
+		Provider: "codex", Model: "gpt-5.5", Depth: "medium",
+		AccountRef: e1.AccountRef, WindowKind: e1.WindowKind,
+		InstallRef: "i-test",
+		Snapshot:   &snap,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -75,7 +80,7 @@ func TestReserveReconcileIdempotent(t *testing.T) {
 	if e2.ReservationID != e1.ReservationID || e2.Reserved != e1.Reserved {
 		t.Fatalf("double reserve: %+v vs %+v", e1, e2)
 	}
-	// Reconcile
+	// Reconcile persists ActualSource.
 	e3, err := l.Reconcile("p", "run1", "att1", 0.03, "local_tokens")
 	if err != nil {
 		t.Fatal(err)
@@ -83,13 +88,25 @@ func TestReserveReconcileIdempotent(t *testing.T) {
 	if e3.State != "reconciled" || e3.Actual == nil || e3.After == nil {
 		t.Fatalf("%+v", e3)
 	}
-	// Second reconcile is no-op
-	e4, err := l.Reconcile("p", "run1", "att1", 0.99, "local_tokens")
+	if e3.ActualSource != "local_tokens" {
+		t.Fatalf("ActualSource=%q", e3.ActualSource)
+	}
+	// Same actual+source is idempotent.
+	e4, err := l.Reconcile("p", "run1", "att1", 0.03, "local_tokens")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if *e4.Actual != *e3.Actual {
-		t.Fatalf("reconcile not idempotent: %v vs %v", *e4.Actual, *e3.Actual)
+	if *e4.Actual != *e3.Actual || e4.ActualSource != e3.ActualSource {
+		t.Fatalf("reconcile not idempotent: %+v vs %+v", e3, e4)
+	}
+	// Different actual or source conflicts.
+	if _, err := l.Reconcile("p", "run1", "att1", 0.99, "local_tokens"); err == nil {
+		t.Fatal("want conflict on different actual")
+	} else if !strings.Contains(err.Error(), "conflict") {
+		t.Fatalf("want ErrConflict, got %v", err)
+	}
+	if _, err := l.Reconcile("p", "run1", "att1", 0.03, "other_source"); err == nil {
+		t.Fatal("want conflict on different source")
 	}
 	rep := e3.HumanReport()
 	if rep == "" || containsSecret(rep) {
@@ -106,8 +123,9 @@ func TestObserveAfterWithoutInventingActual(t *testing.T) {
 	snap := testSnap()
 	_, err = l.Reserve(capacityledger.ReserveInput{
 		ProjectID: "p", RunID: "run-obs", AttemptID: "att-obs",
-		Policy: capacityledger.PolicyBalanced, Provider: "codex", Model: "gpt-5.5",
-		Snapshot: &snap, DemandFraction: 0.05, DemandConfidence: quotapolicy.EvidenceExact,
+		PlanDigest: "sha256:test-exec-plan", GraphDigest: "sha256:test-graph", TaskClass: "tera", ChildContractDigest: "sha256:test-child-contract", Policy: capacityledger.PolicyBalanced, Provider: "codex", AccountRef: "acct-codex", WindowKind: "five_hour", Model: "gpt-5.5",
+		InstallRef: "i-test",
+		Snapshot:   &snap, DemandFraction: 0.05, DemandConfidence: quotapolicy.EvidenceExact,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -143,8 +161,9 @@ func TestReleaseOnFailure(t *testing.T) {
 	snap := testSnap()
 	_, err = l.Reserve(capacityledger.ReserveInput{
 		ProjectID: "p", RunID: "run2", AttemptID: "att2",
-		Policy:   capacityledger.PolicyBalanced,
-		Provider: "codex", Model: "gpt-5.5", Snapshot: &snap,
+		PlanDigest: "sha256:test-exec-plan", GraphDigest: "sha256:test-graph", TaskClass: "tera", ChildContractDigest: "sha256:test-child-contract", Policy: capacityledger.PolicyBalanced,
+		Provider: "codex", AccountRef: "acct-codex", WindowKind: "five_hour", Model: "gpt-5.5", Snapshot: &snap,
+		InstallRef:     "i-test",
 		DemandFraction: 0.04, DemandConfidence: quotapolicy.EvidenceExact,
 	})
 	if err != nil {
@@ -187,7 +206,8 @@ func TestUnknownQuotaRefusesWithoutFabrication(t *testing.T) {
 	// Build may be unattended-false; still call Reserve with snapshot
 	_, err = l.Reserve(capacityledger.ReserveInput{
 		ProjectID: "p", RunID: "r", AttemptID: "a",
-		Provider: "grok", Model: "grok-4.5", Snapshot: &s,
+		PlanDigest: "sha256:test-exec-plan", GraphDigest: "sha256:test-graph", TaskClass: "tera", ChildContractDigest: "sha256:test-child-contract", Provider: "grok", AccountRef: "acct-g", WindowKind: "five_hour", Model: "grok-4.5", Snapshot: &s,
+		InstallRef: "i-test",
 	})
 	if err == nil {
 		t.Fatal("expected refuse without usable window")
@@ -201,6 +221,134 @@ func TestDefaultPolicyIsUseBeforeReset(t *testing.T) {
 	cfg := capacityledger.ModeConfig(capacityledger.PolicyUseBeforeReset)
 	if cfg.BurnBoost < 1.5 {
 		t.Fatalf("use-before-reset should boost burn: %+v", cfg)
+	}
+}
+
+func TestReserveIdempotency_ReservedOK_ReleasedRefusesRelaunch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "capacity-ledger.json")
+	l, err := capacityledger.OpenPath(path, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := testSnap()
+	e1, err := l.Reserve(capacityledger.ReserveInput{
+		ProjectID: "p", RunID: "r", AttemptID: "att-idem",
+		PlanDigest: "sha256:test-exec-plan", GraphDigest: "sha256:test-graph", TaskClass: "tera", ChildContractDigest: "sha256:test-child-contract", Provider: "codex", Model: "gpt-5.5", Depth: "medium",
+		AccountRef: "acct-codex", WindowKind: "five_hour", Snapshot: &snap,
+		InstallRef: "i-test",
+	})
+	if err != nil || e1.State != "reserved" {
+		t.Fatalf("%+v %v", e1, err)
+	}
+	// Same reserved attempt is idempotent — full identity required.
+	e2, err := l.Reserve(capacityledger.ReserveInput{
+		ProjectID: "p", RunID: "r", AttemptID: "att-idem",
+		PlanDigest: "sha256:test-exec-plan", GraphDigest: "sha256:test-graph", TaskClass: "tera", ChildContractDigest: "sha256:test-child-contract", Provider: "codex", Model: "gpt-5.5", Depth: "medium",
+		AccountRef: e1.AccountRef, WindowKind: e1.WindowKind,
+		InstallRef: "i-test",
+		Snapshot:   &snap,
+	})
+	if err != nil || e2.ReservationID != e1.ReservationID || e2.State != "reserved" {
+		t.Fatalf("idempotent reserved: %+v %v", e2, err)
+	}
+	if _, err := l.Release("p", "r", "att-idem", "done"); err != nil {
+		t.Fatal(err)
+	}
+	// Released key must fail closed on relaunch.
+	if _, err := l.Reserve(capacityledger.ReserveInput{
+		ProjectID: "p", RunID: "r", AttemptID: "att-idem",
+		PlanDigest: "sha256:test-exec-plan", GraphDigest: "sha256:test-graph", TaskClass: "tera", ChildContractDigest: "sha256:test-child-contract", Provider: "codex", AccountRef: "acct-codex", WindowKind: "five_hour", Model: "gpt-5.5", Snapshot: &snap,
+		InstallRef: "i-test",
+	}); err == nil {
+		t.Fatal("want refuse relaunch after released")
+	}
+	// Reconciled similarly.
+	e3, err := l.Reserve(capacityledger.ReserveInput{
+		ProjectID: "p", RunID: "r", AttemptID: "att-recon",
+		PlanDigest: "sha256:test-exec-plan", GraphDigest: "sha256:test-graph", TaskClass: "tera", ChildContractDigest: "sha256:test-child-contract", Provider: "codex", AccountRef: "acct-codex", WindowKind: "five_hour", Model: "gpt-5.5", Snapshot: &snap,
+		InstallRef: "i-test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Reconcile("p", "r", "att-recon", 0.02, "src"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Reserve(capacityledger.ReserveInput{
+		ProjectID: "p", RunID: "r", AttemptID: "att-recon",
+		PlanDigest: "sha256:test-exec-plan", GraphDigest: "sha256:test-graph", TaskClass: "tera", ChildContractDigest: "sha256:test-child-contract", Provider: "codex", AccountRef: "acct-codex", WindowKind: "five_hour", Model: "gpt-5.5", Snapshot: &snap,
+		InstallRef: "i-test",
+	}); err == nil {
+		t.Fatal("want refuse relaunch after reconciled")
+	}
+	_ = e3
+}
+
+// Reopen-from-disk: Actual + ActualSource survive for prior and alternate
+// exact attempt IDs; ReleaseReason survives with Actual nil / source empty.
+func TestReopenFromDisk_ActualSourceAndReleaseReason(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "capacity-ledger.json")
+	now := t0()
+	l, err := capacityledger.OpenPath(path, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := testSnap()
+	priorAtt := "att-only-deadbeef-g0"
+	altAtt := "att-only-deadbeef-g1"
+	if _, err := l.Reserve(capacityledger.ReserveInput{
+		ProjectID: "p", RunID: "r", AttemptID: priorAtt,
+		PlanDigest: "sha256:test-exec-plan", GraphDigest: "sha256:test-graph", TaskClass: "tera", ChildContractDigest: "sha256:test-child-contract", Provider: "codex", Model: "gpt-5.5", Depth: "medium",
+		AccountRef: "acct-codex", WindowKind: "five_hour", Snapshot: &snap,
+		InstallRef: "i-test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Release("p", "r", priorAtt, "model_unavailable_supersede"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Reserve(capacityledger.ReserveInput{
+		ProjectID: "p", RunID: "r", AttemptID: altAtt,
+		PlanDigest: "sha256:test-exec-plan", GraphDigest: "sha256:test-graph", TaskClass: "tera", ChildContractDigest: "sha256:test-child-contract", Provider: "codex", Model: "gpt-5.5", Depth: "medium",
+		AccountRef: "acct-codex", WindowKind: "five_hour", Snapshot: &snap,
+		InstallRef: "i-test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Reconcile("p", "r", altAtt, 0.04, "provider_usage"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen process-equivalent.
+	l2, err := capacityledger.OpenPath(path, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior, ok := l2.Get("p", "r", priorAtt)
+	if !ok {
+		t.Fatal("missing prior")
+	}
+	if prior.State != "released" {
+		t.Fatalf("prior state=%s", prior.State)
+	}
+	if prior.Actual != nil {
+		t.Fatalf("released prior Actual must stay nil: %+v", prior)
+	}
+	if prior.ActualSource != "" {
+		t.Fatalf("released ActualSource empty, got %q", prior.ActualSource)
+	}
+	if prior.ReleaseReason != "model_unavailable_supersede" {
+		t.Fatalf("ReleaseReason=%q", prior.ReleaseReason)
+	}
+	alt, ok := l2.Get("p", "r", altAtt)
+	if !ok {
+		t.Fatal("missing alternate")
+	}
+	if alt.State != "reconciled" || alt.Actual == nil || *alt.Actual != 0.04 {
+		t.Fatalf("alt: %+v", alt)
+	}
+	if alt.ActualSource != "provider_usage" {
+		t.Fatalf("alt ActualSource=%q", alt.ActualSource)
 	}
 }
 
@@ -233,7 +381,8 @@ func TestObserveAfterRejectsRiseWithoutReset(t *testing.T) {
 	snap := testSnap() // before remaining ~0.80
 	e, err := l.Reserve(capacityledger.ReserveInput{
 		ProjectID: "p", RunID: "r", AttemptID: "a1",
-		Provider: "codex", Model: "gpt-5.5", Snapshot: &snap,
+		PlanDigest: "sha256:test-exec-plan", GraphDigest: "sha256:test-graph", TaskClass: "tera", ChildContractDigest: "sha256:test-child-contract", Provider: "codex", AccountRef: "acct-codex", WindowKind: "five_hour", Model: "gpt-5.5", Snapshot: &snap,
+		InstallRef:     "i-test",
 		DemandFraction: 0.05, DemandConfidence: quotapolicy.EvidenceExact,
 	})
 	if err != nil {
@@ -242,6 +391,7 @@ func TestObserveAfterRejectsRiseWithoutReset(t *testing.T) {
 	// after 0.98 > before without reset → fail closed
 	_, err = l.ObserveAfterBound("p", "r", "a1", 0.98, "cli", "fresh", capacityledger.ObserveAfterOpts{
 		AccountRef: e.AccountRef, WindowKind: e.WindowKind,
+		InstallRef: "i-test",
 	})
 	if err == nil {
 		t.Fatal("want reject rise without reset")
@@ -249,6 +399,7 @@ func TestObserveAfterRejectsRiseWithoutReset(t *testing.T) {
 	// with reset evidence OK
 	e2, err := l.ObserveAfterBound("p", "r", "a1", 0.98, "cli", "fresh", capacityledger.ObserveAfterOpts{
 		AccountRef: e.AccountRef, WindowKind: e.WindowKind,
+		InstallRef:    "i-test",
 		ResetObserved: true, ResetEvidence: "window_reset_observed",
 	})
 	if err != nil {
@@ -268,7 +419,8 @@ func TestObserveAfterRejectsWindowMismatch(t *testing.T) {
 	snap := testSnap()
 	e, err := l.Reserve(capacityledger.ReserveInput{
 		ProjectID: "p", RunID: "r", AttemptID: "a2",
-		Provider: "codex", Model: "gpt-5.5", Snapshot: &snap,
+		PlanDigest: "sha256:test-exec-plan", GraphDigest: "sha256:test-graph", TaskClass: "tera", ChildContractDigest: "sha256:test-child-contract", Provider: "codex", AccountRef: "acct-codex", WindowKind: "five_hour", Model: "gpt-5.5", Snapshot: &snap,
+		InstallRef:     "i-test",
 		DemandFraction: 0.05, DemandConfidence: quotapolicy.EvidenceExact,
 	})
 	if err != nil {
@@ -276,6 +428,7 @@ func TestObserveAfterRejectsWindowMismatch(t *testing.T) {
 	}
 	_, err = l.ObserveAfterBound("p", "r", "a2", 0.75, "cli", "fresh", capacityledger.ObserveAfterOpts{
 		AccountRef: e.AccountRef, WindowKind: "daily", // wrong window
+		InstallRef: "i-test",
 	})
 	if err == nil {
 		t.Fatal("want window mismatch")
@@ -297,7 +450,7 @@ func TestReservePrefersHighestRemainingMultiWindow(t *testing.T) {
 		}
 	}
 	acc := capacitysnapshot.FromAccountInput(capacitysnapshot.AccountInput{
-		Provider: "antigravity", AccountRef: "acct-ag", InstallRef: "i-ag",
+		Provider: "antigravity", AccountRef: "acct-ag", InstallRef: "i-test",
 		Installed: true, Authenticated: true, Healthy: true,
 		HealthConfidence: capacitysnapshot.ConfidenceExact, HealthFreshness: capacitysnapshot.FreshnessFresh,
 		Windows: []capacitysnapshot.Window{
@@ -320,9 +473,11 @@ func TestReservePrefersHighestRemainingMultiWindow(t *testing.T) {
 	}
 	e, err := l.Reserve(capacityledger.ReserveInput{
 		ProjectID: "p", RunID: "run-ag", AttemptID: "att1",
-		Policy:   capacityledger.PolicyUseBeforeReset,
+		PlanDigest: "sha256:test-exec-plan", GraphDigest: "sha256:test-graph", TaskClass: "tera", ChildContractDigest: "sha256:test-child-contract", Policy: capacityledger.PolicyUseBeforeReset,
 		Provider: "antigravity", Model: "GPT-OSS 120B", Depth: "medium",
-		Snapshot: &snap, RouteReason: "multi-window",
+		AccountRef: "acct-ag", WindowKind: "provider-defined",
+		InstallRef: "i-test",
+		Snapshot:   &snap, RouteReason: "multi-window",
 		DemandFraction: 0.05, DemandConfidence: quotapolicy.EvidenceEstimated,
 	})
 	if err != nil {

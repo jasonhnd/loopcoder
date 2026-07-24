@@ -22,6 +22,7 @@ func falseFact(id string) eligibility.Fact {
 func healthy(provider, model string, class capclass.Class) eligibility.Candidate {
 	return eligibility.Candidate{
 		Provider: provider, Model: model, Effort: "high", Permission: "bounded_write",
+		AccountRef: "acct-" + provider, WindowKind: "five_hour",
 		ModelClass: class,
 		Installed:  okFact(provider + "-i"), Authenticated: okFact(provider + "-a"),
 		ModelPresent: okFact(provider + "-m"), PermissionOK: okFact(provider + "-p"),
@@ -32,16 +33,43 @@ func healthy(provider, model string, class capclass.Class) eligibility.Candidate
 }
 
 func soft(provider, model string, rem float64, ttr time.Duration) quotapolicy.Candidate {
+	// Default account/window match healthy() rows so production auto-route
+	// exact-identity winner selection can bind.
+	return softAcct(provider, model, "acct-"+provider, string(quotapolicy.WindowFiveHour), rem, ttr)
+}
+
+func softAcct(provider, model, account, windowKind string, rem float64, ttr time.Duration) quotapolicy.Candidate {
 	rf := rem
 	d := ttr
+	wk := quotapolicy.WindowFiveHour
+	switch strings.ToLower(strings.TrimSpace(windowKind)) {
+	case "weekly":
+		wk = quotapolicy.WindowWeekly
+	case "credit":
+		wk = quotapolicy.WindowCredit
+	case "five_hour", "":
+		wk = quotapolicy.WindowFiveHour
+	default:
+		if windowKind != "" {
+			wk = quotapolicy.WindowKind(windowKind)
+		}
+	}
 	return quotapolicy.Candidate{
 		Provider: provider, Model: model,
+		AccountRef: account, WindowKind: windowKind,
 		Windows: []quotapolicy.Window{{
-			Kind: quotapolicy.WindowFiveHour, RemainingFraction: &rf,
+			Kind: wk, RemainingFraction: &rf,
 			Evidence: quotapolicy.EvidenceExact, TimeToReset: &d,
 		}},
 		Reliability: func() *float64 { v := 0.9; return &v }(), ReliabilityEvidence: quotapolicy.EvidenceExact,
 	}
+}
+
+func healthyAcct(provider, model, account, windowKind string, class capclass.Class) eligibility.Candidate {
+	c := healthy(provider, model, class)
+	c.AccountRef = account
+	c.WindowKind = windowKind
+	return c
 }
 
 func baseReq(cands ...eligibility.Candidate) Request {
@@ -57,6 +85,136 @@ func baseReq(cands ...eligibility.Candidate) Request {
 		},
 		Mode: quotamode.DefaultModeConfig(quotamode.ModeBalanced),
 		Now:  now,
+	}
+}
+
+// Score with empty account/window must not win by filling identity from a bound
+// CandidateView (forbidden PM fallback / post-hoc identity fill).
+func TestDecide_EmptyScoreIdentity_NoBorrowedWinner(t *testing.T) {
+	req := baseReq(
+		healthyAcct("codex", "gpt-5.5", "acct-a", "five_hour", capclass.ClassTera),
+		healthyAcct("codex", "gpt-5.5", "acct-b", "weekly", capclass.ClassTera),
+	)
+	// Soft score has provider/model only — empty account/window.
+	rf := 0.99
+	d := 10 * time.Minute
+	req.SoftCandidates = []quotapolicy.Candidate{{
+		Provider: "codex", Model: "gpt-5.5",
+		// AccountRef/WindowKind intentionally empty
+		Windows: []quotapolicy.Window{{
+			Kind: quotapolicy.WindowFiveHour, RemainingFraction: &rf,
+			Evidence: quotapolicy.EvidenceExact, TimeToReset: &d,
+		}},
+		Reliability: func() *float64 { v := 0.9; return &v }(), ReliabilityEvidence: quotapolicy.EvidenceExact,
+	}}
+	dec, err := Evaluate(req)
+	// no_route is acceptable when no exact-identity score qualifies.
+	if err != nil && !strings.Contains(err.Error(), "no route") {
+		t.Fatal(err)
+	}
+	if dec.Winner != nil && (dec.Winner.AccountRef == "acct-a" || dec.Winner.AccountRef == "acct-b") {
+		t.Fatalf("empty score identity must not borrow bound account: %+v", dec.Winner)
+	}
+	if dec.Winner != nil && dec.Winner.AccountRef != "" && dec.Outcome == OutcomeSelected {
+		t.Fatalf("must not select with fabricated account: %+v", dec.Winner)
+	}
+}
+
+// Bound hard row missing exact account/window score must soft-exclude (never
+// borrow another account's provider/model score).
+func TestDecide_MissingExactAccountScore_FailClosed(t *testing.T) {
+	req := baseReq(
+		healthyAcct("codex", "gpt-5.5", "acct-a", "five_hour", capclass.ClassTera),
+		healthyAcct("codex", "gpt-5.5", "acct-b", "weekly", capclass.ClassTera),
+	)
+	// Only acct-a has a soft score. acct-b is bound but missing exact score → excluded.
+	req.SoftCandidates = []quotapolicy.Candidate{
+		softAcct("codex", "gpt-5.5", "acct-a", "five_hour", 0.90, 20*time.Minute),
+	}
+	d, err := Evaluate(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Winner == nil {
+		t.Fatalf("want winner from scored acct-a: %+v", d)
+	}
+	if d.Winner.AccountRef != "acct-a" {
+		t.Fatalf("winner account=%q want acct-a (not borrow PM score for acct-b)", d.Winner.AccountRef)
+	}
+	// Reverse soft order: only acct-b scored.
+	req2 := baseReq(
+		healthyAcct("codex", "gpt-5.5", "acct-a", "five_hour", capclass.ClassTera),
+		healthyAcct("codex", "gpt-5.5", "acct-b", "weekly", capclass.ClassTera),
+	)
+	req2.SoftCandidates = []quotapolicy.Candidate{
+		softAcct("codex", "gpt-5.5", "acct-b", "weekly", 0.85, 15*time.Minute),
+	}
+	d2, err := Evaluate(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d2.Winner == nil || d2.Winner.AccountRef != "acct-b" {
+		t.Fatalf("want acct-b winner: %+v", d2.Winner)
+	}
+	// Views: acct-a must be soft-excluded for missing exact score.
+	for _, cv := range d2.Candidates {
+		if cv.AccountRef == "acct-a" && !cv.SoftExcluded {
+			t.Fatalf("acct-a missing exact score must SoftExcluded: %+v", cv)
+		}
+	}
+}
+
+// Two same provider/model accounts with different windows/remaining: winner must
+// be the exact scored account+window row (no cross-wire to the other account).
+func TestDecide_TwoAccountsSameProviderModel_ExactAccountWindowWinner(t *testing.T) {
+	req := baseReq(
+		healthyAcct("codex", "gpt-5.5", "acct-primary", "five_hour", capclass.ClassTera),
+		healthyAcct("codex", "gpt-5.5", "acct-secondary", "weekly", capclass.ClassTera),
+	)
+	// Secondary weekly near-reset + low remaining still loses to primary high remaining near-reset,
+	// or we force primary to win via rem+ttr. Primary: rem 0.9, ttr 20m. Secondary: rem 0.15, ttr 20m.
+	// Soft ranking prefers higher remaining when both near reset (balanced). Primary must win.
+	req.SoftCandidates = []quotapolicy.Candidate{
+		softAcct("codex", "gpt-5.5", "acct-primary", "five_hour", 0.90, 20*time.Minute),
+		softAcct("codex", "gpt-5.5", "acct-secondary", "weekly", 0.15, 20*time.Minute),
+	}
+	d, err := Evaluate(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Outcome != OutcomeSelected || d.Winner == nil {
+		t.Fatalf("want selected: %+v", d)
+	}
+	if d.Winner.Provider != "codex" || d.Winner.Model != "gpt-5.5" {
+		t.Fatalf("provider/model: %+v", d.Winner)
+	}
+	if d.Winner.AccountRef != "acct-primary" {
+		t.Fatalf("winner account=%q want acct-primary (exact scored row)", d.Winner.AccountRef)
+	}
+	if d.Winner.WindowKind != "five_hour" && !strings.Contains(d.Winner.WindowKind, "five") {
+		t.Fatalf("winner window=%q want five_hour from scored row", d.Winner.WindowKind)
+	}
+	// Invert: secondary weekly with higher remaining near-reset wins; account/window must match secondary.
+	req2 := baseReq(
+		healthyAcct("codex", "gpt-5.5", "acct-primary", "five_hour", capclass.ClassTera),
+		healthyAcct("codex", "gpt-5.5", "acct-secondary", "weekly", capclass.ClassTera),
+	)
+	req2.SoftCandidates = []quotapolicy.Candidate{
+		softAcct("codex", "gpt-5.5", "acct-primary", "five_hour", 0.10, 40*time.Hour),
+		softAcct("codex", "gpt-5.5", "acct-secondary", "weekly", 0.85, 15*time.Minute),
+	}
+	d2, err := Evaluate(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d2.Winner == nil {
+		t.Fatalf("want winner: %+v", d2)
+	}
+	if d2.Winner.AccountRef != "acct-secondary" {
+		t.Fatalf("winner account=%q want acct-secondary", d2.Winner.AccountRef)
+	}
+	if d2.Winner.WindowKind != "weekly" && !strings.Contains(strings.ToLower(d2.Winner.WindowKind), "week") {
+		t.Fatalf("winner window=%q want weekly", d2.Winner.WindowKind)
 	}
 }
 

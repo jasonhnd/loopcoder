@@ -84,9 +84,43 @@ func (GeminiRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	summary := parseGeminiSummary(stdout.Bytes())
 	metadata := parseGeminiInvocation(stdout.Bytes())
 	result := resultWithSupervision(supervisedExitCode(supervision, runErr), summary, metadata, startedAt, endedAt, supervision, runErr, ctx)
+	exe := ""
+	if p, err := exec.LookPath("gemini"); err == nil {
+		exe = p
+	}
+	AffirmBasicActual(&result, "gemini", exe, inv)
+	if strings.TrimSpace(result.ActualInstallRef) != "" {
+		result.ActualSourceInstall = ActualSourceInstallBinding
+	}
+	argv := append([]string{"gemini"}, BuildGeminiArgs(inv)...)
 	if runErr != nil {
+		ClearAcceptedActual(&result)
 		return result, runErr
 	}
+	if result.ExitCode != 0 {
+		ClearAcceptedActual(&result)
+		return result, nil
+	}
+	// Exact AccountRef cannot be affirmed by Gemini.
+	if want := strings.TrimSpace(inv.AccountRef); want != "" && strings.TrimSpace(result.ActualAccountRef) == "" {
+		result.FailureClass = "auth_refusal"
+		ClearAcceptedActual(&result)
+		return result, fmt.Errorf("gemini: exact AccountRef routing unsupported (cannot affirm login-account identity)")
+	}
+	// Gemini has no effort knob — fail closed on exact depth before any acceptance.
+	if want := strings.TrimSpace(inv.Effort); want != "" {
+		result.ActualEffort = ""
+		result.ActualSourceEffort = ActualSourceUnknown
+		result.FailureClass = "route_mismatch"
+		ClearAcceptedActual(&result)
+		return result, fmt.Errorf("gemini: depth %q required but Gemini ignores effort (cannot affirm actual depth)", want)
+	}
+	// FULL success: exact --yolo/--skip-trust/-m options only.
+	AffirmAcceptedInvocation(&result, inv, argv, true, AcceptedInvocationOpts{
+		PermissionNoFallback: true,
+		ModelNoFallback:      true,
+		EffortNoFallback:     false,
+	})
 	return result, nil
 }
 

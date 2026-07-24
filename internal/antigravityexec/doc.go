@@ -5,3 +5,6 @@
 // envelope. Discovery, quota, routing, and process supervision stay outside.
 // Credentials remain with Antigravity auth; lifecycle/Git/GitHub writes are forbidden.
 package antigravityexec
+
+// TEST-ONLY / non-production: request-as-actual success is not product evidence.
+// Production uses providerexec.AgentAdapter + agent.Runner. Import guard enforced.

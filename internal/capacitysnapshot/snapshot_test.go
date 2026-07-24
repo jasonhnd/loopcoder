@@ -7,6 +7,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/autoroute"
 	"github.com/jasonhnd/loopcoder/internal/capacitysnapshot"
+	"github.com/jasonhnd/loopcoder/internal/capclass"
 	"github.com/jasonhnd/loopcoder/internal/codexquota"
 )
 
@@ -169,7 +170,7 @@ func TestToRouteInventoryFeedsAutoroute(t *testing.T) {
 		t.Fatalf("digest=%s", inv.EvidenceDigest)
 	}
 	res, err := autoroute.Resolve(autoroute.Input{
-		AutoRoute: true, ProjectID: "p", DecisionKey: "cap1", Now: t0(), Inventory: &inv,
+		AutoRoute: true, ProjectID: "p", DecisionKey: "cap1", Now: t0(), Inventory: &inv, TaskClass: capclass.ClassTera,
 	})
 	if err != nil {
 		t.Fatalf("%v %+v", err, res)

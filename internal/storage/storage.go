@@ -23,7 +23,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 32
+	CurrentSchemaVersion = 33
 
 	driverName = "sqlite"
 
@@ -458,6 +458,11 @@ var migrations = []migration{
 		version:    32,
 		name:       "v0.9 work graph versions and items",
 		statements: workGraphSchemaStatements,
+	},
+	{
+		version: 33,
+		name:    "provider execution authority spawn_phase",
+		apply:   migrateProviderExecutionSpawnPhase,
 	},
 }
 

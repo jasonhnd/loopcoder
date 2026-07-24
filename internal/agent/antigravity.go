@@ -137,26 +137,50 @@ func splitAgySlugDepth(s string) (base, depth string, ok bool) {
 	return "", "", false
 }
 
+// parseAgyDisplayDepth extracts base + depth from "Model Name (Medium)" tokens.
+func parseAgyDisplayDepth(s string) (base, depth string, ok bool) {
+	s = strings.TrimSpace(s)
+	if !strings.Contains(s, " (") || !strings.HasSuffix(s, ")") {
+		return "", "", false
+	}
+	i := strings.LastIndex(s, " (")
+	if i <= 0 {
+		return "", "", false
+	}
+	base = strings.TrimSpace(s[:i])
+	depth = strings.ToLower(strings.TrimSpace(strings.TrimSuffix(s[i+2:], ")")))
+	if base == "" || depth == "" {
+		return "", "", false
+	}
+	switch depth {
+	case "medium", "high", "low", "xhigh", "max":
+		return base, depth, true
+	default:
+		return "", "", false
+	}
+}
+
 func (AntigravityRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	selectedModel := AntigravitySelectedModel(inv.Model, inv.Effort)
-	selectedEffort := strings.TrimSpace(inv.Effort)
-	if selectedEffort == "" {
-		selectedEffort = antigravityDefaultEffort(strings.TrimSpace(inv.Model))
-	}
-	metadata := invocationMetadata{
-		Model:  selectedModel,
-		Effort: selectedEffort,
-	}
+	// Do NOT prefill Actual* from request. selectedEffort is argv-only until
+	// provider stream affirms. Exact depth/account requirements fail closed after launch.
 	startedAt := time.Now()
 	// Fail closed BEFORE exec: exact token embedded depth / slug depth must match
 	// inv.Effort when both are present; static base must support explicit effort.
 	// Never launch agy with a mismatched or unobserved model-depth selection.
 	if err := validateAntigravityModelEffort(inv.Model, inv.Effort, selectedModel); err != nil {
 		endedAt := time.Now()
-		res := resultWithTiming(1, err.Error(), metadata, startedAt, endedAt)
+		res := resultWithTiming(1, err.Error(), invocationMetadata{}, startedAt, endedAt)
 		res.FailureClass = "model_unavailable"
 		return res, err
 	}
+	// Exact account/install cannot be affirmed by Antigravity today.
+	if want := strings.TrimSpace(inv.AccountRef); want != "" {
+		return Result{
+			ExitCode: -1, FailureClass: "auth_refusal", ActualProvider: "antigravity",
+		}, fmt.Errorf("antigravity: exact AccountRef routing unsupported (cannot affirm login-account identity)")
+	}
+	metadata := invocationMetadata{} // empty until stream/output affirms
 	if inv.ReadOnly {
 		endedAt := time.Now()
 		return resultWithTiming(1, "", metadata, startedAt, endedAt), runtimecap.RequireProviderCapability("antigravity", runtimecap.ProviderReadOnly)
@@ -209,16 +233,78 @@ func (AntigravityRunner) Run(ctx context.Context, inv Invocation) (Result, error
 		return result, errors.New(msg)
 	}
 	result := resultWithSupervision(supervisedExitCode(supervision, runErr), summary, metadata, startedAt, endedAt, supervision, runErr, ctx)
-	// Typed model_unavailable: CLI rejected --model (unsupported depth combo etc.).
-	// Upstream may auto-reroute to another eligible model+depth; do not invent capacity.
+	result.ActualProvider = "antigravity"
+	result.ActualModel = strings.TrimSpace(result.Model)
+	result.ActualEffort = strings.TrimSpace(result.Effort)
+	argv := append([]string{"agy"}, BuildAntigravityArgs(inv)...)
+	// Typed model_unavailable first — never accepted_invocation on this class.
 	if antigravityInvalidModelSelection(summary, logText) {
 		result.FailureClass = "model_unavailable"
+		ClearAcceptedActual(&result)
 		if runErr == nil {
 			runErr = errors.New("antigravity invalid model selection (model_unavailable)")
 		}
+		return result, runErr
 	}
 	if runErr != nil {
+		ClearAcceptedActual(&result)
 		return result, runErr
+	}
+	if result.ExitCode != 0 {
+		ClearAcceptedActual(&result)
+		return result, nil
+	}
+	// FULL success only: exact --dangerously-skip-permissions / --model token.
+	AffirmAcceptedInvocation(&result, inv, argv, true, AcceptedInvocationOpts{
+		PermissionNoFallback: true,
+		ModelNoFallback:      false,
+		EffortNoFallback:     false,
+	})
+	// accepted_invocation from exact --model token with embedded depth.
+	if selectedModel != "" && argvOptionValueEquals(argv, selectedModel, "--model") {
+		if base, depth, ok := parseAgyDisplayDepth(selectedModel); ok {
+			want := strings.TrimSpace(inv.Effort)
+			if want == "" || strings.EqualFold(want, depth) {
+				if result.Model == "" {
+					result.Model = selectedModel
+				}
+				if result.Effort == "" {
+					result.Effort = depth
+				}
+				if result.ActualModel == "" {
+					result.ActualModel = selectedModel
+					result.ActualSourceModel = ActualSourceAcceptedInvocation
+				}
+				if result.ActualEffort == "" {
+					result.ActualEffort = depth
+					result.ActualSourceEffort = ActualSourceAcceptedInvocation
+				}
+				_ = base
+			}
+		} else if _, depth, ok := splitAgySlugDepth(selectedModel); ok {
+			want := strings.TrimSpace(inv.Effort)
+			if want == "" || strings.EqualFold(want, depth) {
+				if result.Model == "" {
+					result.Model = selectedModel
+				}
+				if result.Effort == "" {
+					result.Effort = depth
+				}
+				if result.ActualModel == "" {
+					result.ActualModel = selectedModel
+					result.ActualSourceModel = ActualSourceAcceptedInvocation
+				}
+				if result.ActualEffort == "" {
+					result.ActualEffort = depth
+					result.ActualSourceEffort = ActualSourceAcceptedInvocation
+				}
+			}
+		}
+	}
+	if want := strings.TrimSpace(inv.Effort); want != "" && result.ActualEffort == "" {
+		result.FailureClass = "route_mismatch"
+		ClearAcceptedActual(&result)
+		return result, fmt.Errorf("antigravity: depth %q requested but not affirmed by provider output", want)
 	}
 	return result, nil
 }
@@ -299,19 +385,4 @@ func firstNonEmpty(a, b string) string {
 		return strings.TrimSpace(a)
 	}
 	return strings.TrimSpace(b)
-}
-
-func antigravityDefaultEffort(model string) string {
-	provider, ok := models.LookupProvider("antigravity")
-	if !ok {
-		return ""
-	}
-	if model == "" {
-		model = provider.DefaultModel
-	}
-	selected, ok := provider.LookupModel(model)
-	if !ok {
-		return ""
-	}
-	return selected.DefaultDepth
 }

@@ -56,24 +56,41 @@ type CanaryProviderObs struct {
 
 // CanaryChild is one real provider-executed child.
 type CanaryChild struct {
-	ChildID              string   `json:"child_id"`
-	AttemptID            string   `json:"attempt_id"`
-	Provider             string   `json:"provider"`
-	Model                string   `json:"model"`
-	DepthRequired        string   `json:"depth_required"`
-	DepthSelected        string   `json:"depth_selected"`
-	DepthInvocation      string   `json:"depth_invocation"`
-	Permission           string   `json:"permission,omitempty"`
-	Terminal             string   `json:"terminal"`
-	WorktreePath         string   `json:"worktree_path,omitempty"`
-	CapacityBefore       *float64 `json:"capacity_before,omitempty"`
-	CapacityReserved     *float64 `json:"capacity_reserved,omitempty"`
-	CapacityActual       *float64 `json:"capacity_actual,omitempty"` // may be nil/unknown
-	CapacityAfter        *float64 `json:"capacity_after,omitempty"`  // required when observed
-	ActualSource         string   `json:"actual_source,omitempty"`
-	AfterSource          string   `json:"after_source,omitempty"`
-	AfterFreshness       string   `json:"after_freshness,omitempty"`
-	RealProviderExecuted bool     `json:"real_provider_executed"`
+	ChildID          string   `json:"child_id"`
+	AttemptID        string   `json:"attempt_id"`
+	Provider         string   `json:"provider"`
+	Model            string   `json:"model"`
+	DepthRequired    string   `json:"depth_required"`
+	DepthSelected    string   `json:"depth_selected"`
+	DepthInvocation  string   `json:"depth_invocation"`
+	Permission       string   `json:"permission,omitempty"`
+	AccountRef       string   `json:"account_ref,omitempty"`
+	InstallRef       string   `json:"install_ref,omitempty"`
+	Terminal         string   `json:"terminal"`
+	WorktreePath     string   `json:"worktree_path,omitempty"`
+	CapacityBefore   *float64 `json:"capacity_before,omitempty"`
+	CapacityReserved *float64 `json:"capacity_reserved,omitempty"`
+	CapacityActual   *float64 `json:"capacity_actual,omitempty"` // may be nil/unknown
+	CapacityAfter    *float64 `json:"capacity_after,omitempty"`  // required when observed
+	// ActualSource is capacity fraction source only (distinct from route sources).
+	ActualSource   string `json:"actual_source,omitempty"`
+	AfterSource    string `json:"after_source,omitempty"`
+	AfterFreshness string `json:"after_freshness,omitempty"`
+	// ActualSources is per-dimension route proof; required for real provider rows.
+	// Erasure or forgery of any required dimension must fail qualification.
+	ActualSources *CanaryRouteSources `json:"actual_sources,omitempty"`
+	// ArgvDigest is redacted exact launched argv fingerprint.
+	ArgvDigest           string `json:"argv_digest,omitempty"`
+	RealProviderExecuted bool   `json:"real_provider_executed"`
+}
+
+// CanaryRouteSources is per-dimension route Actual* proof class.
+type CanaryRouteSources struct {
+	Model      string `json:"model,omitempty"`
+	Effort     string `json:"effort,omitempty"`
+	Permission string `json:"permission,omitempty"`
+	Account    string `json:"account,omitempty"`
+	Install    string `json:"install,omitempty"`
 }
 
 // CanaryUnavailableRetry proves exclude/retry without duplicate claim/output.
@@ -264,6 +281,35 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 		if strings.Contains(strings.ToLower(c.AttemptID), "dry") ||
 			strings.Contains(strings.ToLower(c.WorktreePath), "dry-run") {
 			add("dry_run_child_not_allowed:" + c.ChildID)
+		}
+		// Route ActualSources + ArgvDigest required for real provider rows.
+		// Erasure or forgery of any required dimension must fail closed.
+		if c.RealProviderExecuted && c.Terminal == "succeeded" {
+			if c.ActualSources == nil {
+				add("route_actual_sources_missing:" + c.ChildID)
+			} else {
+				allowed := map[string]bool{
+					"provider_stream": true, "accepted_invocation": true,
+					"auth_binding": true, "install_binding": true,
+				}
+				checkSrc := func(dim, val string) {
+					if strings.TrimSpace(val) == "" || !allowed[val] {
+						add("route_source_invalid:" + c.ChildID + ":" + dim + ":" + val)
+					}
+				}
+				checkSrc("model", c.ActualSources.Model)
+				checkSrc("effort", c.ActualSources.Effort)
+				checkSrc("permission", c.ActualSources.Permission)
+				if strings.TrimSpace(c.AccountRef) != "" {
+					checkSrc("account", c.ActualSources.Account)
+				}
+				if strings.TrimSpace(c.InstallRef) != "" {
+					checkSrc("install", c.ActualSources.Install)
+				}
+			}
+			if strings.TrimSpace(c.ArgvDigest) == "" {
+				add("argv_digest_missing:" + c.ChildID)
+			}
 		}
 	}
 	v.UsefulChildren = useful

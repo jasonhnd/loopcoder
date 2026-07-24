@@ -60,10 +60,17 @@ type Window struct {
 // Candidate is a hard-eligible route with captured soft features.
 // Hard eligibility is assumed already decided (V090-051); this package does not
 // re-open install/auth/pin gates.
+// AccountRef/WindowKind are first-class capacity identity — two same-provider
+// accounts must never collapse into one soft row.
 type Candidate struct {
-	Provider string   `json:"provider"`
-	Model    string   `json:"model"`
-	Windows  []Window `json:"windows"`
+	Provider   string `json:"provider"`
+	Model      string `json:"model"`
+	AccountRef string `json:"account_ref,omitempty"`
+	// InstallRef is the exact provider installation for this soft row.
+	InstallRef string `json:"install_ref,omitempty"`
+	// WindowKind is the binding window identity for this candidate (exact kind).
+	WindowKind string   `json:"window_kind,omitempty"`
+	Windows    []Window `json:"windows"`
 	// Reliability in [0,1] recent success rate when known.
 	Reliability         *float64      `json:"reliability,omitempty"`
 	ReliabilityEvidence EvidenceClass `json:"reliability_evidence"`
@@ -162,6 +169,9 @@ type Score struct {
 	Schema          string      `json:"schema"`
 	Provider        string      `json:"provider"`
 	Model           string      `json:"model"`
+	AccountRef      string      `json:"account_ref,omitempty"`
+	InstallRef      string      `json:"install_ref,omitempty"`
+	WindowKind      string      `json:"window_kind,omitempty"`
 	SoftScore       float64     `json:"soft_score"`
 	Components      []Component `json:"components"`
 	BindingWindow   WindowKind  `json:"binding_window,omitempty"`
@@ -240,10 +250,16 @@ func sortScores(scores []Score) {
 		if scores[i].SoftScore != scores[j].SoftScore {
 			return scores[i].SoftScore > scores[j].SoftScore
 		}
-		// deterministic tie-break: provider then model
+		// deterministic tie-break: provider, model, account, window
 		if scores[i].Provider != scores[j].Provider {
 			return scores[i].Provider < scores[j].Provider
 		}
-		return scores[i].Model < scores[j].Model
+		if scores[i].Model != scores[j].Model {
+			return scores[i].Model < scores[j].Model
+		}
+		if scores[i].AccountRef != scores[j].AccountRef {
+			return scores[i].AccountRef < scores[j].AccountRef
+		}
+		return scores[i].WindowKind < scores[j].WindowKind
 	})
 }

@@ -343,7 +343,8 @@ func TestAntigravityRunnerReadOnlyFailsClosedWithoutLaunchingAgy(t *testing.T) {
 			t.Fatalf("Run error = %v, want substring %q", err, want)
 		}
 	}
-	if result.ExitCode != 1 || result.Model != "Gemini 3.1 Pro (Medium)" || result.Effort != "medium" {
+	// Pre-launch fail-closed: never seed Model/Effort from request.
+	if result.ExitCode != 1 || result.Model != "" || result.Effort != "" {
 		t.Fatalf("read-only result = %#v", result)
 	}
 }

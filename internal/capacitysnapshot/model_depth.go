@@ -19,10 +19,16 @@ type modelDepthSpec struct {
 
 // modelSpecFromCapability maps one inventory capability row into a ModelSpec.
 // ModelID is the exact observed invocation token when available (CLI display
-// form or machine slug). SupportedDepths come only from observed constraints /
-// tokens — never an invented full ladder. base is retained only for static-seed
-// dedup keys, not as the routed ModelID.
-func modelSpecFromCapability(adapterID string, m providerinventory.ModelCapability) modelDepthSpec {
+// form or machine slug).
+//
+// liveMachineReadable: production-routable machine-readable row. SupportedDepths
+// come only from observed constraints/tokens. When the provider output has no
+// depth, use conservative medium-only — never the static registry ladder
+// (e.g. grok models → grok-4.5 only must not become low/high/xhigh).
+//
+// When liveMachineReadable is false (CatalogHintOnly / adapter-declared display
+// rows), static registry depths may fill for display/planning only.
+func modelSpecFromCapability(adapterID string, m providerinventory.ModelCapability, liveMachineReadable bool) modelDepthSpec {
 	canonical := strings.TrimSpace(m.CanonicalModelID)
 	display := strings.TrimSpace(m.DisplayName)
 	if canonical == "" {
@@ -49,8 +55,8 @@ func modelSpecFromCapability(adapterID string, m providerinventory.ModelCapabili
 		exact = firstNonEmpty(canonical, base, display)
 	}
 	lookupBase := firstNonEmpty(base, peelBaseName(exact), exact)
-	if len(depths) == 0 {
-		// Curated static depths only — never invent a full ladder for live rows.
+	if len(depths) == 0 && !liveMachineReadable {
+		// CatalogHintOnly / adapter-declared display only: static registry fill.
 		if p, ok := models.LookupProvider(adapterID); ok {
 			if mod, ok := p.LookupModel(lookupBase); ok && len(mod.Depths) > 0 {
 				for _, d := range mod.Depths {
@@ -65,7 +71,8 @@ func modelSpecFromCapability(adapterID string, m providerinventory.ModelCapabili
 		}
 	}
 	if len(depths) == 0 {
-		// Unknown live model: medium-only fail-closed default (not low+medium+high).
+		// Live machine-readable with no observed depth, or hint row with no
+		// static match: medium-only fail-closed (not low+medium+high/xhigh).
 		depths = []string{"medium"}
 		def = "medium"
 	}
@@ -147,7 +154,8 @@ func parseObservedModelDepths(adapterID string, agyOnly bool, canonical, display
 			return uniqueDepths(depths), base, def, cli
 		}
 	}
-	// No depth in id — base is canonical, depths left for static fill.
+	// No depth in id — base is canonical. Caller may static-fill only for
+	// CatalogHintOnly rows; live machine-readable stays observed-or-medium-only.
 	base = canonical
 	if base == "" {
 		base = display

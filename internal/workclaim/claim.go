@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +19,7 @@ const (
 	SchemaClaim   = "loopcoder.workclaim.v1"
 	SchemaClose   = "loopcoder.workclaim.close.v1"
 	SchemaEvent   = "loopcoder.workclaim.event.v1"
+	SchemaFile    = "loopcoder.workclaim.store.v1"
 	PolicyVersion = "workclaim-v1"
 )
 
@@ -59,11 +62,21 @@ type Claim struct {
 	ProjectID    string `json:"project_id"`
 	GraphID      string `json:"graph_id"`
 	GraphVersion int    `json:"graph_version"`
-	PlanDigest   string `json:"plan_digest"`
-	WorkItemID   string `json:"work_item_id"`
-	AttemptID    string `json:"attempt_id"`
-	ExecutorID   string `json:"executor_id"`
+	// PlanDigest is the canonical ExecutionPlanDigest (workflowdef.Normalize digest).
+	// Never a workgraph.DigestGraph value.
+	PlanDigest string `json:"plan_digest"`
+	// GraphDigest is the separate workgraph.DigestGraph identity (not used for
+	// attempt/capacity keys). Empty only on pre-2A-1 records.
+	GraphDigest string `json:"graph_digest,omitempty"`
+	// TaskClass is the expected classified capability floor (canonical).
+	TaskClass string `json:"task_class,omitempty"`
+	// ChildContractDigest is the expected pre-claim assignment digest.
+	ChildContractDigest string `json:"child_contract_digest,omitempty"`
+	WorkItemID          string `json:"work_item_id"`
+	AttemptID           string `json:"attempt_id"`
+	ExecutorID          string `json:"executor_id"`
 	// Generation increments on each successful claim of the same logical WorkItem.
+	// Positive (≥1) for live claims created by Claim.
 	Generation int64      `json:"generation"`
 	State      ClaimState `json:"state"`
 	ClaimedAt  time.Time  `json:"claimed_at"`
@@ -88,6 +101,13 @@ type ClaimRequest struct {
 	WorkItemID string
 	AttemptID  string
 	ExecutorID string
+	// PlanDigest is the required nonempty canonical ExecutionPlanDigest
+	// (workflowdef.Normalize). No fallback to Graph.PlanDigest / ready.PlanDigest.
+	PlanDigest string
+	// TaskClass is the required expected classified floor (canonical token).
+	TaskClass string
+	// ChildContractDigest is the required expected pre-claim assignment digest.
+	ChildContractDigest string
 	// Lease duration; zero = no lease (manual close only).
 	Lease time.Duration
 	// NonLaunchProven allows reclaim of expired claim when execution never started.
@@ -130,7 +150,8 @@ var (
 	ErrStale    = errors.New("workclaim: stale generation")
 )
 
-// Store is an in-process atomic claim ledger (simulates one-immediate SQLite tx).
+// Store is an atomic claim ledger. When path is set (OpenPath), mutations
+// persist to disk so process restart retains closed/open claim truth.
 //
 // Indexing:
 //   - byAttempt: project|graph|version|workitem|attemptID → claim (closed = immutable)
@@ -140,6 +161,7 @@ var (
 // alternates claim a distinct AttemptID and may set SupersedesAttemptID.
 type Store struct {
 	mu         sync.Mutex
+	path       string            // optional durable JSON path
 	byAttempt  map[string]*Claim // attempt-scoped durable identity
 	liveByItem map[string]string // logical item → live claimID
 	byID       map[string]*Claim
@@ -147,9 +169,21 @@ type Store struct {
 	seq        int64
 	genByItem  map[string]int64 // logical item generation counter
 	now        func() time.Time
+	// TestFailSave when non-nil forces saveLocked to fail (tests only).
+	TestFailSave error
 }
 
-// NewStore creates a claim store with injected clock.
+type fileDoc struct {
+	Schema     string            `json:"schema"`
+	SavedAt    time.Time         `json:"saved_at"`
+	Seq        int64             `json:"seq"`
+	GenByItem  map[string]int64  `json:"gen_by_item,omitempty"`
+	LiveByItem map[string]string `json:"live_by_item,omitempty"`
+	Claims     []Claim           `json:"claims"`
+	Events     []Event           `json:"events,omitempty"`
+}
+
+// NewStore creates an in-memory claim store with injected clock (tests).
 func NewStore(now func() time.Time) *Store {
 	if now == nil {
 		now = time.Now
@@ -161,6 +195,401 @@ func NewStore(now func() time.Time) *Store {
 		genByItem:  map[string]int64{},
 		now:        now,
 	}
+}
+
+// OpenPath opens or creates a durable claim store. Fail closed on corrupt JSON,
+// schema mismatch, or duplicate claim identity.
+func OpenPath(path string, now func() time.Time) (*Store, error) {
+	if now == nil {
+		now = time.Now
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil, fmt.Errorf("%w: empty claim store path", ErrInvalid)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	s := &Store{
+		path:       path,
+		byAttempt:  map[string]*Claim{},
+		liveByItem: map[string]string{},
+		byID:       map[string]*Claim{},
+		genByItem:  map[string]int64{},
+		now:        now,
+	}
+	if err := s.load(); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *Store) load() error {
+	if s == nil || s.path == "" {
+		return nil
+	}
+	b, err := os.ReadFile(s.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var doc fileDoc
+	if err := json.Unmarshal(b, &doc); err != nil {
+		return fmt.Errorf("%w: corrupt claim store JSON: %v", ErrInvalid, err)
+	}
+	// Schema required and exact — no silent upgrade of empty/wrong schema.
+	if strings.TrimSpace(doc.Schema) == "" {
+		return fmt.Errorf("%w: claim store missing schema", ErrInvalid)
+	}
+	if doc.Schema != SchemaFile {
+		return fmt.Errorf("%w: claim store schema %q", ErrInvalid, doc.Schema)
+	}
+	seenID := map[string]bool{}
+	seenAttempt := map[string]bool{}
+	seenEvent := map[string]bool{}
+	maxSeq := doc.Seq
+	for i := range doc.Claims {
+		c := doc.Claims[i]
+		if strings.TrimSpace(c.Schema) == "" || strings.TrimSpace(c.Schema) != SchemaClaim {
+			return fmt.Errorf("%w: claim schema want %q got %q", ErrInvalid, SchemaClaim, c.Schema)
+		}
+		if strings.TrimSpace(c.ClaimID) == "" || strings.TrimSpace(c.AttemptID) == "" {
+			return fmt.Errorf("%w: claim missing claim_id/attempt_id", ErrInvalid)
+		}
+		if !strings.HasPrefix(c.ClaimID, "wcl_") || parseWclSeq(c.ClaimID) <= 0 {
+			return fmt.Errorf("%w: claim_id must be wcl_N got %q", ErrInvalid, c.ClaimID)
+		}
+		if c.Generation <= 0 {
+			return fmt.Errorf("%w: claim %q generation must be positive", ErrInvalid, c.ClaimID)
+		}
+		if strings.TrimSpace(c.ProjectID) == "" || strings.TrimSpace(c.GraphID) == "" ||
+			strings.TrimSpace(c.WorkItemID) == "" || strings.TrimSpace(string(c.State)) == "" {
+			return fmt.Errorf("%w: claim %q missing ProjectID/GraphID/WorkItemID/State", ErrInvalid, c.ClaimID)
+		}
+		if c.Generation < 0 {
+			return fmt.Errorf("%w: claim %q malformed generation", ErrInvalid, c.ClaimID)
+		}
+		if seenID[c.ClaimID] {
+			return fmt.Errorf("%w: duplicate claim_id %q", ErrInvalid, c.ClaimID)
+		}
+		seenID[c.ClaimID] = true
+		akey := claimAttemptKey(c.ProjectID, c.GraphID, c.GraphVersion, c.WorkItemID, c.AttemptID)
+		if seenAttempt[akey] {
+			return fmt.Errorf("%w: duplicate attempt key %q", ErrInvalid, akey)
+		}
+		seenAttempt[akey] = true
+		if n := parseWclSeq(c.ClaimID); n > maxSeq {
+			maxSeq = n
+		}
+		cp := c
+		s.byID[c.ClaimID] = &cp
+		s.byAttempt[akey] = &cp
+	}
+	if doc.LiveByItem != nil {
+		for logical, cid := range doc.LiveByItem {
+			c, ok := s.byID[cid]
+			if !ok || c == nil {
+				return fmt.Errorf("%w: live pointer %q -> missing claim %q", ErrInvalid, logical, cid)
+			}
+			// Live pointers must be claimed/running only — never ambiguous/closed/released/expired.
+			if c.State != StateClaimed && c.State != StateRunning {
+				return fmt.Errorf("%w: live pointer %q -> non-live claim state %s (claimed|running only)", ErrInvalid, logical, c.State)
+			}
+			// Logical key must match claim identity.
+			wantLogical := claimLogicalKey(c.ProjectID, c.GraphID, c.GraphVersion, c.WorkItemID)
+			if logical != wantLogical {
+				return fmt.Errorf("%w: live pointer key %q != claim logical %q", ErrInvalid, logical, wantLogical)
+			}
+			s.liveByItem[logical] = cid
+		}
+	}
+	// GenByItem: recompute high-water from claims; reject unknown keys and missing high-water.
+	recomputedGen := map[string]int64{}
+	for _, c := range s.byID {
+		lk := claimLogicalKey(c.ProjectID, c.GraphID, c.GraphVersion, c.WorkItemID)
+		if c.Generation > recomputedGen[lk] {
+			recomputedGen[lk] = c.Generation
+		}
+	}
+	if doc.GenByItem != nil {
+		for k, v := range doc.GenByItem {
+			if v <= 0 {
+				return fmt.Errorf("%w: gen_by_item %q non-positive %d", ErrInvalid, k, v)
+			}
+			want, ok := recomputedGen[k]
+			if !ok {
+				return fmt.Errorf("%w: gen_by_item unknown key %q (no claims)", ErrInvalid, k)
+			}
+			if v != want {
+				return fmt.Errorf("%w: gen_by_item %q high-water %d != recomputed %d", ErrInvalid, k, v, want)
+			}
+		}
+		// Every claim logical key must appear in gen_by_item when map is present.
+		for k, want := range recomputedGen {
+			if got, ok := doc.GenByItem[k]; !ok || got != want {
+				return fmt.Errorf("%w: gen_by_item missing or wrong key %q want %d", ErrInvalid, k, want)
+			}
+		}
+		s.genByItem = map[string]int64{}
+		for k, v := range recomputedGen {
+			s.genByItem[k] = v
+		}
+	} else if len(recomputedGen) > 0 {
+		// Missing gen_by_item with claims: recompute high-water from claims (fail closed on
+		// unknown keys only when the map is present and inconsistent).
+		s.genByItem = map[string]int64{}
+		for k, v := range recomputedGen {
+			s.genByItem[k] = v
+		}
+	}
+	// Validate claim states and terminal consistency.
+	validState := map[ClaimState]bool{
+		StateClaimed: true, StateRunning: true, StateClosed: true,
+		StateReleased: true, StateExpired: true, StateAmbiguous: true,
+	}
+	liveCount := map[string]int{}
+	for _, c := range s.byID {
+		if !validState[c.State] {
+			return fmt.Errorf("%w: claim %q invalid state %q", ErrInvalid, c.ClaimID, c.State)
+		}
+		if c.State == StateClosed {
+			if c.Terminal == workgraph.TermNone {
+				return fmt.Errorf("%w: closed claim %q missing terminal", ErrInvalid, c.ClaimID)
+			}
+			if c.Terminal == workgraph.TermSucceeded && strings.TrimSpace(c.OutputEvidence) == "" {
+				return fmt.Errorf("%w: succeeded claim %q missing evidence", ErrInvalid, c.ClaimID)
+			}
+		} else if c.Terminal != workgraph.TermNone && c.Terminal != "" {
+			return fmt.Errorf("%w: non-closed claim %q has terminal", ErrInvalid, c.ClaimID)
+		}
+		if strings.TrimSpace(c.ExecutorID) == "" {
+			return fmt.Errorf("%w: claim %q missing executor", ErrInvalid, c.ClaimID)
+		}
+		if c.State == StateClaimed || c.State == StateRunning {
+			lk := claimLogicalKey(c.ProjectID, c.GraphID, c.GraphVersion, c.WorkItemID)
+			liveCount[lk]++
+		}
+	}
+	for lk, n := range liveCount {
+		if n > 1 {
+			return fmt.Errorf("%w: multiple live claims for %q", ErrInvalid, lk)
+		}
+	}
+	// Every live claim must appear exactly once in live_by_item.
+	for lk, n := range liveCount {
+		if n != 1 {
+			continue
+		}
+		if doc.LiveByItem == nil {
+			return fmt.Errorf("%w: live claim missing live_by_item map for %q", ErrInvalid, lk)
+		}
+		if _, ok := doc.LiveByItem[lk]; !ok {
+			return fmt.Errorf("%w: live claim missing from live_by_item for %q", ErrInvalid, lk)
+		}
+	}
+	if len(doc.Events) > 0 {
+		for _, ev := range doc.Events {
+			if strings.TrimSpace(ev.Schema) == "" || strings.TrimSpace(ev.Schema) != SchemaEvent {
+				return fmt.Errorf("%w: claim event schema required %q", ErrInvalid, SchemaEvent)
+			}
+			if strings.TrimSpace(ev.EventID) == "" {
+				return fmt.Errorf("%w: claim event missing event_id", ErrInvalid)
+			}
+			if !strings.HasPrefix(ev.EventID, "wce_") || parseWceSeq(ev.EventID) <= 0 {
+				return fmt.Errorf("%w: claim event_id must be wce_N", ErrInvalid)
+			}
+			if seenEvent[ev.EventID] {
+				return fmt.Errorf("%w: duplicate claim event_id %q", ErrInvalid, ev.EventID)
+			}
+			seenEvent[ev.EventID] = true
+			if strings.TrimSpace(ev.ClaimID) == "" {
+				return fmt.Errorf("%w: claim event missing claim_id", ErrInvalid)
+			}
+			if _, ok := s.byID[ev.ClaimID]; !ok {
+				return fmt.Errorf("%w: claim event claim_id %q unknown", ErrInvalid, ev.ClaimID)
+			}
+			if strings.TrimSpace(ev.Type) == "" {
+				return fmt.Errorf("%w: claim event missing type", ErrInvalid)
+			}
+			if ev.CreatedAt.IsZero() {
+				return fmt.Errorf("%w: claim event missing created_at", ErrInvalid)
+			}
+			if n := parseWceSeq(ev.EventID); n > maxSeq {
+				maxSeq = n
+			}
+		}
+		s.events = append(s.events, doc.Events...)
+	}
+	// Seed sequence from high-water mark of claim/event IDs — never recycle wcl_N.
+	if maxSeq > s.seq {
+		s.seq = maxSeq
+	}
+	return nil
+}
+
+func parseWclSeq(id string) int64 {
+	const p = "wcl_"
+	if !strings.HasPrefix(id, p) {
+		return 0
+	}
+	var n int64
+	for _, r := range id[len(p):] {
+		if r < '0' || r > '9' {
+			return 0
+		}
+		n = n*10 + int64(r-'0')
+	}
+	return n
+}
+
+func parseWceSeq(id string) int64 {
+	const p = "wce_"
+	if !strings.HasPrefix(id, p) {
+		return 0
+	}
+	var n int64
+	for _, r := range id[len(p):] {
+		if r < '0' || r > '9' {
+			return 0
+		}
+		n = n*10 + int64(r-'0')
+	}
+	return n
+}
+
+// snapshotLocked captures mutable store state for rollback on save failure.
+type storeSnap struct {
+	byAttempt  map[string]*Claim
+	liveByItem map[string]string
+	byID       map[string]*Claim
+	events     []Event
+	seq        int64
+	genByItem  map[string]int64
+}
+
+func (s *Store) snapshotLocked() storeSnap {
+	snap := storeSnap{
+		byAttempt:  map[string]*Claim{},
+		liveByItem: map[string]string{},
+		byID:       map[string]*Claim{},
+		genByItem:  map[string]int64{},
+		seq:        s.seq,
+	}
+	// Clone each claim once and index by both maps so restore keeps identity.
+	byPtr := map[*Claim]*Claim{}
+	for _, v := range s.byID {
+		if v == nil {
+			continue
+		}
+		if _, ok := byPtr[v]; ok {
+			continue
+		}
+		cp := *v
+		byPtr[v] = &cp
+	}
+	for k, v := range s.byID {
+		if v != nil {
+			snap.byID[k] = byPtr[v]
+		}
+	}
+	for k, v := range s.byAttempt {
+		if v != nil {
+			snap.byAttempt[k] = byPtr[v]
+		}
+	}
+	for k, v := range s.liveByItem {
+		snap.liveByItem[k] = v
+	}
+	for k, v := range s.genByItem {
+		snap.genByItem[k] = v
+	}
+	if len(s.events) > 0 {
+		snap.events = append([]Event(nil), s.events...)
+	}
+	return snap
+}
+
+func (s *Store) restoreLocked(snap storeSnap) {
+	s.byAttempt = snap.byAttempt
+	s.byID = snap.byID
+	s.liveByItem = snap.liveByItem
+	s.genByItem = snap.genByItem
+	s.events = snap.events
+	s.seq = snap.seq
+}
+
+// commitLocked persists or rolls back to snap on failure.
+func (s *Store) commitLocked(snap storeSnap) error {
+	if err := s.saveLocked(); err != nil {
+		s.restoreLocked(snap)
+		return err
+	}
+	return nil
+}
+
+func (s *Store) saveLocked() error {
+	if s == nil || s.path == "" {
+		return nil
+	}
+	if s.TestFailSave != nil {
+		return s.TestFailSave
+	}
+	doc := fileDoc{
+		Schema:     SchemaFile,
+		SavedAt:    s.now().UTC(),
+		Seq:        s.seq,
+		GenByItem:  map[string]int64{},
+		LiveByItem: map[string]string{},
+	}
+	for k, v := range s.genByItem {
+		doc.GenByItem[k] = v
+	}
+	for k, v := range s.liveByItem {
+		doc.LiveByItem[k] = v
+	}
+	for _, c := range s.byID {
+		if c != nil {
+			doc.Claims = append(doc.Claims, *c)
+		}
+	}
+	if len(s.events) > 0 {
+		doc.Events = append(doc.Events, s.events...)
+	}
+	b, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := s.path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.path)
+}
+
+// Path returns the durable store path (empty for in-memory).
+func (s *Store) Path() string {
+	if s == nil {
+		return ""
+	}
+	return s.path
+}
+
+// AllClaims returns a snapshot of every claim (for reconciliation/tests).
+func (s *Store) AllClaims() []Claim {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Claim, 0, len(s.byID))
+	for _, c := range s.byID {
+		if c != nil {
+			out = append(out, *clone(c))
+		}
+	}
+	return out
 }
 
 // claimLogicalKey is the logical WorkItem ownership namespace (not claimable alone).
@@ -184,6 +613,29 @@ func (s *Store) Claim(req ClaimRequest) (ClaimResult, error) {
 	if strings.TrimSpace(req.ProjectID) == "" || strings.TrimSpace(req.WorkItemID) == "" ||
 		strings.TrimSpace(req.AttemptID) == "" || strings.TrimSpace(req.ExecutorID) == "" {
 		return ClaimResult{}, fmt.Errorf("%w: project/workitem/attempt/executor required", ErrInvalid)
+	}
+	// Fail closed before any mutation: explicit ExecutionPlanDigest + contract required.
+	// Never synthesize from Graph.PlanDigest / EvaluateReady (that recreated the identity split).
+	planDigest := strings.TrimSpace(req.PlanDigest)
+	if planDigest == "" {
+		return ClaimResult{}, fmt.Errorf("%w: plan_digest (execution plan digest) required; no silent ready/graph fallback", ErrInvalid)
+	}
+	taskClass := strings.TrimSpace(req.TaskClass)
+	if taskClass == "" {
+		return ClaimResult{}, fmt.Errorf("%w: task_class required on claim (no empty/default)", ErrInvalid)
+	}
+	ccd := strings.TrimSpace(req.ChildContractDigest)
+	if ccd == "" {
+		return ClaimResult{}, fmt.Errorf("%w: child_contract_digest required on claim (no post-exec synthesis)", ErrInvalid)
+	}
+	// GraphDigest is canonical workgraph.DigestGraph — compute and verify; never
+	// blindly store empty or inconsistent req.Graph.PlanDigest.
+	graphDigest := workgraph.DigestGraph(req.Graph)
+	if graphDigest == "" {
+		return ClaimResult{}, fmt.Errorf("%w: graph_digest empty after DigestGraph", ErrInvalid)
+	}
+	if stored := strings.TrimSpace(req.Graph.PlanDigest); stored != "" && stored != graphDigest {
+		return ClaimResult{}, fmt.Errorf("%w: graph plan_digest inconsistent with DigestGraph (stored=%q computed=%q)", ErrInvalid, stored, graphDigest)
 	}
 
 	s.mu.Lock()
@@ -224,26 +676,30 @@ func (s *Store) Claim(req ClaimRequest) (ClaimResult, error) {
 		case StateClaimed, StateRunning:
 			if !prev.LeaseUntil.IsZero() && now.After(prev.LeaseUntil) {
 				if req.NonLaunchProven && prev.State == StateClaimed {
+					snap := s.snapshotLocked()
 					prev.State = StateReleased
 					s.clearLiveLocked(logical, prev.ClaimID)
 					s.appendEventLocked(prev.ClaimID, "released_non_launch", nil, now)
-					// Fall through only for a *different* attempt after release —
-					// same attemptID remains released, not reopened.
+					if err := s.commitLocked(snap); err != nil {
+						return ClaimResult{}, fmt.Errorf("%w: persist release: %v", ErrInvalid, err)
+					}
 					return ClaimResult{Code: ResultTerminalReused, Reason: "released_same_attempt_immutable:" + prev.AttemptID, Claim: clone(prev)}, nil
 				}
+				snap := s.snapshotLocked()
 				prev.State = StateAmbiguous
 				s.clearLiveLocked(logical, prev.ClaimID)
 				s.appendEventLocked(prev.ClaimID, "ambiguous_expired", nil, now)
+				if err := s.commitLocked(snap); err != nil {
+					return ClaimResult{}, fmt.Errorf("%w: persist ambiguous: %v", ErrInvalid, err)
+				}
 				return ClaimResult{Code: ResultNeedsHuman, Reason: "expired_live_ambiguous", Claim: clone(prev)}, nil
 			}
 			return ClaimResult{Code: ResultAlreadyRunning, Reason: "owned_by_" + prev.ClaimID, Claim: clone(prev)}, nil
 		case StateAmbiguous:
 			return ClaimResult{Code: ResultNeedsHuman, Reason: "ambiguous_needs_human", Claim: clone(prev)}, nil
 		case StateClosed:
-			// Immutable closed attempt — never reopen or replace terminal state.
 			return ClaimResult{Code: ResultTerminalReused, Reason: "closed:" + string(prev.Terminal), Claim: clone(prev)}, nil
 		case StateReleased, StateExpired:
-			// Same attempt identity already consumed; require a new AttemptID.
 			return ClaimResult{Code: ResultTerminalReused, Reason: string(prev.State) + "_same_attempt_immutable", Claim: clone(prev)}, nil
 		}
 	}
@@ -256,14 +712,22 @@ func (s *Store) Claim(req ClaimRequest) (ClaimResult, error) {
 			case StateClaimed, StateRunning:
 				if !live.LeaseUntil.IsZero() && now.After(live.LeaseUntil) {
 					if req.NonLaunchProven && live.State == StateClaimed {
+						snap := s.snapshotLocked()
 						live.State = StateReleased
 						s.clearLiveLocked(logical, live.ClaimID)
 						s.appendEventLocked(live.ClaimID, "released_non_launch", nil, now)
+						if err := s.commitLocked(snap); err != nil {
+							return ClaimResult{}, fmt.Errorf("%w: persist release: %v", ErrInvalid, err)
+						}
 						// continue — new AttemptID may claim
 					} else {
+						snap := s.snapshotLocked()
 						live.State = StateAmbiguous
 						s.clearLiveLocked(logical, live.ClaimID)
 						s.appendEventLocked(live.ClaimID, "ambiguous_expired", nil, now)
+						if err := s.commitLocked(snap); err != nil {
+							return ClaimResult{}, fmt.Errorf("%w: persist ambiguous: %v", ErrInvalid, err)
+						}
 						return ClaimResult{Code: ResultNeedsHuman, Reason: "expired_live_ambiguous", Claim: clone(live)}, nil
 					}
 				} else {
@@ -272,11 +736,19 @@ func (s *Store) Claim(req ClaimRequest) (ClaimResult, error) {
 			case StateAmbiguous:
 				return ClaimResult{Code: ResultNeedsHuman, Reason: "ambiguous_needs_human", Claim: clone(live)}, nil
 			default:
-				// Stale live pointer (closed/released) — clear and continue.
+				// Stale live pointer — clear and persist.
+				snap := s.snapshotLocked()
 				s.clearLiveLocked(logical, liveID)
+				if err := s.commitLocked(snap); err != nil {
+					return ClaimResult{}, fmt.Errorf("%w: persist clear live: %v", ErrInvalid, err)
+				}
 			}
 		} else {
+			snap := s.snapshotLocked()
 			delete(s.liveByItem, logical)
+			if err := s.commitLocked(snap); err != nil {
+				return ClaimResult{}, fmt.Errorf("%w: persist clear live: %v", ErrInvalid, err)
+			}
 		}
 	}
 
@@ -297,6 +769,7 @@ func (s *Store) Claim(req ClaimRequest) (ClaimResult, error) {
 		// Prior remains immutable under priorKey; relation is recorded on the new claim only.
 	}
 
+	snap := s.snapshotLocked()
 	s.seq++
 	s.genByItem[logical]++
 	gen := s.genByItem[logical]
@@ -304,8 +777,12 @@ func (s *Store) Claim(req ClaimRequest) (ClaimResult, error) {
 	c := &Claim{
 		Schema: SchemaClaim, ClaimID: id,
 		ProjectID: req.ProjectID, GraphID: req.Graph.GraphID, GraphVersion: req.Graph.Version,
-		PlanDigest: ready.PlanDigest, WorkItemID: req.WorkItemID,
-		AttemptID: req.AttemptID, ExecutorID: req.ExecutorID,
+		PlanDigest:          planDigest,
+		GraphDigest:         graphDigest,
+		TaskClass:           taskClass,
+		ChildContractDigest: ccd,
+		WorkItemID:          req.WorkItemID,
+		AttemptID:           req.AttemptID, ExecutorID: req.ExecutorID,
 		Generation: gen, State: StateClaimed, ClaimedAt: now, RenewedAt: now,
 		SupersedesAttemptID: supersedes,
 	}
@@ -316,12 +793,10 @@ func (s *Store) Claim(req ClaimRequest) (ClaimResult, error) {
 	s.byID[id] = c
 	s.liveByItem[logical] = id
 	if supersedes != "" {
-		// Type is a closed token; relation lives in Payload (stable attempt IDs).
 		s.appendEventLocked(id, "claimed_superseding", map[string]string{
 			"supersedes_attempt_id": supersedes,
 			"attempt_id":            req.AttemptID,
 		}, now)
-		// Explicit relation on prior claim events only — does not mutate prior state/terminal.
 		priorKey := claimAttemptKey(req.ProjectID, req.Graph.GraphID, req.Graph.Version, req.WorkItemID, supersedes)
 		if prior, ok := s.byAttempt[priorKey]; ok && prior != nil {
 			s.appendEventLocked(prior.ClaimID, "superseded", map[string]string{
@@ -331,6 +806,9 @@ func (s *Store) Claim(req ClaimRequest) (ClaimResult, error) {
 		}
 	} else {
 		s.appendEventLocked(id, "claimed", nil, now)
+	}
+	if err := s.commitLocked(snap); err != nil {
+		return ClaimResult{}, fmt.Errorf("%w: persist claim: %v", ErrInvalid, err)
 	}
 	return ClaimResult{Code: ResultClaimed, Claim: clone(c)}, nil
 }
@@ -373,6 +851,7 @@ func (s *Store) Renew(claimID string, generation int64, executorID, attemptID st
 	if c.State != StateClaimed && c.State != StateRunning {
 		return ClaimResult{Code: ResultConflict, Reason: "not_renewable:" + string(c.State)}, nil
 	}
+	snap := s.snapshotLocked()
 	now := s.now().UTC()
 	c.State = StateRunning
 	c.RenewedAt = now
@@ -380,6 +859,9 @@ func (s *Store) Renew(claimID string, generation int64, executorID, attemptID st
 		c.LeaseUntil = now.Add(lease)
 	}
 	s.appendEventLocked(c.ClaimID, "renewed", nil, now)
+	if err := s.commitLocked(snap); err != nil {
+		return ClaimResult{}, fmt.Errorf("%w: persist renew: %v", ErrInvalid, err)
+	}
 	return ClaimResult{Code: ResultClaimed, Claim: clone(c)}, nil
 }
 
@@ -410,6 +892,7 @@ func (s *Store) Close(req CloseRequest) (ClaimResult, error) {
 	if req.Terminal == workgraph.TermSucceeded && strings.TrimSpace(req.OutputEvidence) == "" {
 		return ClaimResult{Code: ResultConflict, Reason: "success_requires_output_evidence"}, nil
 	}
+	snap := s.snapshotLocked()
 	now := s.now().UTC()
 	c.State = StateClosed
 	c.Terminal = req.Terminal
@@ -418,6 +901,9 @@ func (s *Store) Close(req CloseRequest) (ClaimResult, error) {
 	logical := claimLogicalKey(c.ProjectID, c.GraphID, c.GraphVersion, c.WorkItemID)
 	s.clearLiveLocked(logical, c.ClaimID)
 	s.appendEventLocked(c.ClaimID, "closed_"+string(req.Terminal), nil, now)
+	if err := s.commitLocked(snap); err != nil {
+		return ClaimResult{}, fmt.Errorf("%w: persist close: %v", ErrInvalid, err)
+	}
 	return ClaimResult{Code: ResultClosed, Claim: clone(c)}, nil
 }
 

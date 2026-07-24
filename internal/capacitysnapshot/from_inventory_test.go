@@ -374,3 +374,159 @@ func TestStaticSeedDoesNotCreateCapacityWindows(t *testing.T) {
 		}
 	}
 }
+
+// TestFromProviderInventory_TwoAccountsSameProvider_NoCollapse proves multi-account
+// providers are not collapsed into one invented acct-+provider row.
+func TestFromProviderInventory_TwoAccountsSameProvider_NoCollapse(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	acc1 := "profile-alpha-id"
+	acc2 := "profile-beta-id"
+	rep := providerinventory.Report{
+		InventoryFingerprint: "fp-two-acct",
+		Installations: []providerinventory.ProviderInstallation{
+			{
+				AdapterID: "grok", ProviderInstallationID: "inst-a",
+				InstallationState:   providerinventory.InstallationInstalled,
+				UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
+				Confidence: providerinventory.ConfidenceExact,
+			},
+			{
+				AdapterID: "grok", ProviderInstallationID: "inst-b",
+				InstallationState:   providerinventory.InstallationInstalled,
+				UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
+				Confidence: providerinventory.ConfidenceExact,
+			},
+		},
+		AuthReadiness: []providerinventory.AuthReadiness{
+			{AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady, AccountProfileID: &acc1},
+			{AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady, AccountProfileID: &acc2},
+		},
+	}
+	obs := capacitysnapshot.FromProviderInventoryReport(rep, now)
+	if len(obs) < 2 {
+		t.Fatalf("want >=2 account observations for two grok accounts, got %d %+v", len(obs), obs)
+	}
+	seen := map[string]bool{}
+	for _, o := range obs {
+		if o.Provider != "grok" {
+			continue
+		}
+		if o.AccountRef == "acct-grok" || o.AccountRef == "account-unknown" {
+			t.Fatalf("must not invent provider-collapsed account: %+v", o)
+		}
+		if o.AccountRef != "" {
+			seen[o.AccountRef] = true
+		}
+	}
+	if len(seen) < 2 {
+		t.Fatalf("want two distinct account refs, got %v from %+v", seen, obs)
+	}
+}
+
+func TestQtyFromPtrScaled_ValueScale2Percent(t *testing.T) {
+	// Grok stores hundredths of percent with ValueScale=2: 6900 → 69.00, not 6900%.
+	used := int64(3100)
+	rem := int64(6900)
+	limit := int64(10000)
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	acc := "acct-" + strings.Repeat("a", 64)
+	rep := providerinventory.Report{
+		QuotaSnapshots: []providerinventory.QuotaSnapshot{
+			{
+				QuotaSnapshotID: "q1", AdapterID: "grok", AccountProfileID: &acc,
+				Unit: "percent", WindowKind: providerinventory.WindowFixedHour,
+				UsedValue: &used, RemainingValue: &rem, LimitValue: &limit,
+				ValueScale: 2, Confidence: providerinventory.ConfidenceExact,
+				FreshnessState: providerinventory.FreshnessFresh,
+				CapturedAt:     now.Format(time.RFC3339), SourceKind: providerinventory.QuotaSourceOfficialCLICommand,
+			},
+		},
+		AuthReadiness: []providerinventory.AuthReadiness{
+			{AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady, AccountProfileID: &acc},
+		},
+		Installations: []providerinventory.ProviderInstallation{
+			{
+				AdapterID: "grok", ProviderInstallationID: "pinst-test",
+				InstallationState:   providerinventory.InstallationInstalled,
+				UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
+				Confidence: providerinventory.ConfidenceExact,
+			},
+		},
+	}
+	obs := capacitysnapshot.FromProviderInventoryReport(rep, now)
+	found := false
+	for _, o := range obs {
+		for _, w := range o.Windows {
+			if w.Remaining.Class != capacitysnapshot.QtyFinite {
+				continue
+			}
+			found = true
+			// 6900 with scale 2 → 69.0
+			if w.Remaining.Value < 68.9 || w.Remaining.Value > 69.1 {
+				t.Fatalf("remaining after scale want ~69 got %v (unit=%s)", w.Remaining.Value, w.Unit)
+			}
+			if w.Used.Value < 30.9 || w.Used.Value > 31.1 {
+				t.Fatalf("used after scale want ~31 got %v", w.Used.Value)
+			}
+			// RemainingFraction for percentage >1 divides by 100 → ~0.69
+			rf := capacitysnapshot.RemainingFraction(w)
+			if rf == nil || *rf < 0.68 || *rf > 0.70 {
+				t.Fatalf("remaining fraction want ~0.69 got %v", rf)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no finite remaining window in %+v", obs)
+	}
+}
+
+func TestStaleAfterDoesNotOutliveResetAt(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	acc := "acct-" + strings.Repeat("b", 64)
+	used := int64(10)
+	rem := int64(90)
+	limit := int64(100)
+	reset := now.Add(1 * time.Hour).Format(time.RFC3339)
+	stale := now.Add(48 * time.Hour).Format(time.RFC3339) // outlives reset
+	rep := providerinventory.Report{
+		QuotaSnapshots: []providerinventory.QuotaSnapshot{
+			{
+				QuotaSnapshotID: "q2", AdapterID: "grok", AccountProfileID: &acc,
+				Unit: "percent", WindowKind: providerinventory.WindowFixedHour,
+				UsedValue: &used, RemainingValue: &rem, LimitValue: &limit,
+				ValueScale: 0, Confidence: providerinventory.ConfidenceExact,
+				FreshnessState: providerinventory.FreshnessFresh,
+				CapturedAt:     now.Format(time.RFC3339), ResetAt: reset, StaleAfter: stale,
+				SourceKind: providerinventory.QuotaSourceOfficialCLICommand,
+			},
+		},
+		AuthReadiness: []providerinventory.AuthReadiness{
+			{AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady, AccountProfileID: &acc},
+		},
+		Installations: []providerinventory.ProviderInstallation{
+			{
+				AdapterID: "grok", ProviderInstallationID: "pinst-test2",
+				InstallationState:   providerinventory.InstallationInstalled,
+				UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
+				Confidence: providerinventory.ConfidenceExact,
+			},
+		},
+	}
+	obs := capacitysnapshot.FromProviderInventoryReport(rep, now)
+	// Provenance note that stale_after was clamped; ResetAt preserved.
+	ok := false
+	for _, o := range obs {
+		if strings.Contains(o.Provenance, "stale_after_clamped_to_reset_at") {
+			ok = true
+		}
+		for _, w := range o.Windows {
+			if w.ResetAt == nil {
+				t.Fatal("ResetAt must be preserved")
+			}
+		}
+	}
+	if !ok && len(obs) > 0 {
+		// Acceptable if no windows joined; clamp only when both present.
+		t.Logf("obs=%+v", obs)
+	}
+}

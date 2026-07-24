@@ -19,11 +19,14 @@ const CheckpointSchema = "loopcoder.goalrun.checkpoint.v1"
 // Succeeded children carry attempt_id + output_evidence so resume reuses them
 // without a second claim, provider call, file write, or capacity deduction.
 type Checkpoint struct {
-	Schema       string                     `json:"schema"`
-	ProjectID    string                     `json:"project_id"`
-	RunID        string                     `json:"run_id"`
-	GraphID      string                     `json:"graph_id"`
-	PlanDigest   string                     `json:"plan_digest"`
+	Schema    string `json:"schema"`
+	ProjectID string `json:"project_id"`
+	RunID     string `json:"run_id"`
+	GraphID   string `json:"graph_id"`
+	// PlanDigest is the canonical ExecutionPlanDigest (workflowdef.Normalize).
+	PlanDigest string `json:"plan_digest"`
+	// GraphDigest is the separate workgraph.DigestGraph identity.
+	GraphDigest  string                     `json:"graph_digest,omitempty"`
 	Goal         string                     `json:"goal,omitempty"`
 	Issue        string                     `json:"issue,omitempty"`
 	Actor        string                     `json:"actor,omitempty"`
@@ -47,9 +50,13 @@ type Checkpoint struct {
 	AttemptGeneration map[string]int `json:"attempt_generation,omitempty"`
 	// EventLogPath is the append-only raw event ledger for evidence derivation.
 	EventLogPath string `json:"event_log_path,omitempty"`
+	// CapacityTransitions are final ledger-backed prior/alternate transitions
+	// (post applyChildOutcomes). Required for model_unavailable canary proof on resume.
+	CapacityTransitions []workflowrun.CapacityTransition `json:"capacity_transitions,omitempty"`
 }
 
-// CheckpointPath returns $HOME/projects/<project>/runs/<runID>/goal-checkpoint.json.
+// CheckpointPath returns the durable write path and ensures parent directories exist.
+// Write/ensure only — never use for read-only load.
 func CheckpointPath(homeDir, projectID, runID string) (string, error) {
 	projectID = strings.TrimSpace(projectID)
 	runID = strings.TrimSpace(runID)
@@ -86,6 +93,23 @@ func CheckpointPath(homeDir, projectID, runID string) (string, error) {
 	return filepath.Join(dir, "goal-checkpoint.json"), nil
 }
 
+// checkpointPathRead derives the checkpoint path without creating any directory
+// or file. Missing parents are fine — callers treat missing file as ErrNotExist.
+func checkpointPathRead(homeDir, projectID, runID string) (string, error) {
+	projectID = strings.TrimSpace(projectID)
+	runID = strings.TrimSpace(runID)
+	if projectID == "" || runID == "" {
+		return "", fmt.Errorf("goalrun: checkpoint requires project_id and run_id")
+	}
+	root, err := workflowrun.ResolveDurableHome(homeDir)
+	if err != nil {
+		return "", err
+	}
+	// Pure path derivation — no MkdirAll / EnsureProject / EnsureMinimumLayout.
+	dir := filepath.Join(root, "projects", projectID, "runs", sanitizeRunKey(runID))
+	return filepath.Join(dir, "goal-checkpoint.json"), nil
+}
+
 // SaveCheckpoint writes durable resume state (owner-only file mode).
 func SaveCheckpoint(homeDir string, cp Checkpoint) (string, error) {
 	if strings.TrimSpace(cp.Schema) == "" {
@@ -95,7 +119,7 @@ func SaveCheckpoint(homeDir string, cp Checkpoint) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// Derive PriorSucceeded from workflow kids + children if not set.
+	// Write-side fill only: never run during Load.
 	if cp.PriorSucceeded == nil {
 		cp.PriorSucceeded = PriorSucceededFrom(cp.WorkflowKids, cp.Children)
 	}
@@ -115,40 +139,50 @@ func SaveCheckpoint(homeDir string, cp Checkpoint) (string, error) {
 }
 
 // LoadCheckpoint reads durable resume state when present.
+// Read-only: never MkdirAll, EnsureProject, create home/project/run/file, or
+// derive/repair PriorSucceeded. Missing path returns an os.ErrNotExist-compatible
+// error and leaves the filesystem unchanged.
 func LoadCheckpoint(homeDir, projectID, runID string) (Checkpoint, string, error) {
-	path, err := CheckpointPath(homeDir, projectID, runID)
+	path, err := checkpointPathRead(homeDir, projectID, runID)
 	if err != nil {
 		return Checkpoint{}, "", err
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
+		// Preserve ErrNotExist semantics for missing path.
 		return Checkpoint{}, path, err
 	}
 	var cp Checkpoint
 	if err := json.Unmarshal(raw, &cp); err != nil {
 		return Checkpoint{}, path, err
 	}
-	if cp.Schema != "" && cp.Schema != CheckpointSchema {
-		return Checkpoint{}, path, fmt.Errorf("goalrun: unsupported checkpoint schema %q", cp.Schema)
-	}
-	if cp.PriorSucceeded == nil {
-		cp.PriorSucceeded = PriorSucceededFrom(cp.WorkflowKids, cp.Children)
-	}
+	// Do not derive or repair PriorSucceeded on load — reusable seed must already
+	// be durable. Legacy derivation is audit-only via AuditPriorSucceededFrom.
 	return cp, path, nil
 }
 
-// PriorSucceededFrom builds the resume seed: only terminal succeeded with
-// attempt_id + non-empty output_evidence.
+// PriorSucceededFrom builds a resume seed from terminal outcomes (write-side /
+// audit helper). LoadCheckpoint never calls this — product resume requires an
+// explicit durable PriorSucceeded map on the checkpoint/partial document.
 func PriorSucceededFrom(wf []workflowrun.ChildOutcome, reports []ChildReport) map[string]workflowrun.ChildOutcome {
+	return AuditPriorSucceededFrom(wf, reports)
+}
+
+// AuditPriorSucceededFrom is the explicit audit-only derivation of prior
+// succeeded outcomes from workflow kids + child reports. Never used as a
+// product resume seed path (LoadCheckpoint does not call it).
+func AuditPriorSucceededFrom(wf []workflowrun.ChildOutcome, reports []ChildReport) map[string]workflowrun.ChildOutcome {
 	out := map[string]workflowrun.ChildOutcome{}
 	for _, c := range wf {
 		if !isResumeEligible(c.Terminal, c.AttemptID, c.OutputEvidence) {
 			continue
 		}
-		c.Terminal = "succeeded"
-		out[c.WorkItemID] = c
+		// Copy without mutating the caller's slice element identity fields
+		// beyond terminal normalization for the audit map value.
+		cc := c
+		cc.Terminal = "succeeded"
+		out[c.WorkItemID] = cc
 	}
-	// Fill gaps from child reports (capacity-bearing) when workflow kid missing.
 	for _, r := range reports {
 		if _, ok := out[r.ChildID]; ok {
 			continue
@@ -158,7 +192,10 @@ func PriorSucceededFrom(wf []workflowrun.ChildOutcome, reports []ChildReport) ma
 		}
 		out[r.ChildID] = workflowrun.ChildOutcome{
 			WorkItemID: r.ChildID, Provider: r.Provider, Model: r.Model, Depth: r.Depth,
-			AccountRef: r.AccountRef, RouteReason: r.RouteReason,
+			AccountRef: r.AccountRef, InstallRef: r.InstallRef, WindowKind: r.WindowKind,
+			Permission: r.Permission, RouteReason: r.RouteReason,
+			TaskClass: r.TaskClass, ExecutionPlanDigest: r.ExecutionPlanDigest,
+			ChildContractDigest: r.ChildContractDigest, Generation: r.Generation,
 			Terminal: "succeeded", OutputEvidence: r.OutputEvidence,
 			WorktreePath: r.WorktreePath, AttemptID: r.AttemptID,
 			ActualCapacity: r.CapacityActual, ActualSource: r.ActualSource,

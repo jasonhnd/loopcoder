@@ -15,16 +15,43 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/home"
+	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 	"github.com/jasonhnd/loopcoder/internal/workgraph"
 )
 
 // ChildRoute is the immutable per-child provider pin for one WorkItem.
+// Permission/WindowKind/AccountRef/ReservationID/InstallRef are first-class
+// atomic route identity — not optional prose.
 type ChildRoute struct {
-	Provider    string `json:"provider"`
-	Model       string `json:"model"`
-	Depth       string `json:"depth,omitempty"`
-	AccountRef  string `json:"account_ref,omitempty"`
-	RouteReason string `json:"route_reason,omitempty"`
+	Provider   string `json:"provider"`
+	Model      string `json:"model"`
+	Depth      string `json:"depth,omitempty"`
+	Permission string `json:"permission,omitempty"`
+	// TaskClass is the exact classified capability floor (luna|tera|soul) from
+	// the child's RouteRequirement. Empty only for legacy resume rows.
+	TaskClass  string `json:"task_class,omitempty"`
+	AccountRef string `json:"account_ref,omitempty"`
+	// InstallRef is the non-secret install/observation binding for the account.
+	InstallRef    string `json:"install_ref,omitempty"`
+	WindowKind    string `json:"window_kind,omitempty"`
+	ReservationID string `json:"reservation_id,omitempty"`
+	RouteReason   string `json:"route_reason,omitempty"`
+}
+
+// ProcessStart is workflow-owned spawn identity published while the provider
+// process is alive (via agent.Invocation.OnProviderStart / supervisedexec OnStart).
+// Not JSON-serialized on ChildExecInput; Service binds a callback per attempt.
+type ProcessStart struct {
+	PID                   int
+	PGID                  int
+	ProcessBirthIdentity  string
+	ExecutableIdentity    string
+	ObservedAt            time.Time
+	IdentityAmbiguous     bool
+	IdentityAmbiguityNote string
+	// WorktreePath/LogPath set by ProductionChildExecutor before callback (authority).
+	WorktreePath string
+	LogPath      string
 }
 
 // ChildExecInput is one LoopCoder-owned child launch request.
@@ -43,6 +70,23 @@ type ChildExecInput struct {
 	// ReadOnly forces read-only provider mode (research children).
 	ReadOnly bool
 	Timeout  time.Duration
+	// OnProcessStart is a non-serialized, workflow-owned process-start callback.
+	// ProductionChildExecutor wires it to agent.Invocation.OnProviderStart so the
+	// Service can persist a critical pid event while the child is still alive.
+	// Returning an error fails closed through supervisedexec OnStart (kill+drain).
+	// ProcessStart.WorktreePath/LogPath are filled by ProductionChildExecutor
+	// before the callback so authority can be persisted with the same paths.
+	OnProcessStart func(ProcessStart) error `json:"-"`
+	// Guardian configures macOS supervisor-death guardian (supervisedexec).
+	// Production Service fills this for real spawns; empty = disabled.
+	Guardian supervisedexec.GuardianOptions `json:"-"`
+	// OnWorktreeAllocated is invoked after exclusive worktree allocation succeeds
+	// (real concurrent peak enter). Returning a non-nil error aborts the child
+	// before further work (Service refuses a second allocation while one is active).
+	// On error, the executor must synchronously release the just-created path —
+	// Service still tracks only the prior lease and will not clean the new path.
+	// Service owns exact leave after integrate/final terminal/error unwind.
+	OnWorktreeAllocated func(path string) error `json:"-"`
 }
 
 // ChildExecResult is durable child terminal evidence. Capacity actual is only
@@ -52,16 +96,42 @@ type ChildExecResult struct {
 	OutputEvidence string // required for success close
 	WorktreePath   string
 	ProcessPID     int
-	ExitCode       int
-	InputTokens    int64
-	OutputTokens   int64
+	// Spawn-time process identity (production path fills from OnProviderStart).
+	ProcessPGID           int
+	ProcessBirthIdentity  string
+	ExecutableIdentity    string
+	ProcessObservedAt     time.Time
+	IdentityAmbiguous     bool
+	IdentityAmbiguityNote string
+	// SpawnObserved is true when ProductionChildExecutor saw a real OnProviderStart.
+	SpawnObserved bool
+	ExitCode      int
+	InputTokens   int64
+	OutputTokens  int64
 	// ActualCapacity is a fraction [0,1] when known; nil means unknown.
 	ActualCapacity *float64
-	// ActualSource is provider_usage|estimated|unknown (never invent numbers).
+	// ActualSource is provider_usage|estimated|unknown for capacity fraction
+	// (never invent numbers). Distinct from ActualSources for route dimensions.
 	ActualSource string
+	// ActualSources is per-dimension evidence class for InvokedRoute Actual*
+	// (provider_stream|accepted_invocation|auth_binding|install_binding|unknown).
+	// accepted_invocation is never collapsed into provider_stream.
+	ActualSources struct {
+		Model      string `json:"model,omitempty"`
+		Effort     string `json:"effort,omitempty"`
+		Permission string `json:"permission,omitempty"`
+		Account    string `json:"account,omitempty"`
+		Install    string `json:"install,omitempty"`
+	} `json:"actual_sources,omitempty"`
+	// ArgvDigest is redacted exact launched argv fingerprint when known.
+	ArgvDigest   string
 	FailureClass string
 	Message      string
-	// Actual route observed (must match requested on success integrity path).
+	// InvokedRoute is the actual invocation metadata the executor used.
+	// Service exact-compares this to ChildExecInput.Route before success;
+	// never copy route from the request into ChildOutcome without this echo.
+	InvokedRoute ChildRoute
+	// Deprecated fields kept for intermediate mapping — prefer InvokedRoute.
 	Provider string
 	Model    string
 	Depth    string
@@ -86,11 +156,25 @@ type FakeChildExecutor struct {
 	// (simulates forced interrupt mid-child). Prefer FailIDs for hard fails.
 	CancelAfterIDs map[string]bool
 	// HangIDs block until ctx is cancelled (true forced interrupt mid-flight).
-	// Sets ProcessPID to os.Getpid() for event ledger evidence.
+	// Does NOT call OnProcessStart and does NOT use a production spawn identity.
+	// ProcessPID may be left 0; tests that need durable pid/authority must use
+	// the test-only package workflowrun/testspawn (own process group), never the
+	// supervisor PID and never a production Fake OnProcessStart with os.Getpid.
 	HangIDs map[string]bool
+	// OnHangEntry is a test-only handshake invoked after the HangIDs branch has
+	// entered the wait state, immediately before blocking on ctx.Done.
+	OnHangEntry func(workItemID string, pid int)
+	// ForceProcessPID is deprecated for production-path evidence. When true it may
+	// set ProcessPID for occupancy-only pulses but never calls OnProcessStart and
+	// never claims the current process as a child (no authority over the runner).
+	ForceProcessPID bool
 	// Calls records provider-exec invocations per work item (exactly-once tests).
 	// When non-nil, each Execute increments Calls[WorkItemID].
 	Calls map[string]int
+	// InvocationCountPath when set appends one line per Execute (subprocess tests).
+	InvocationCountPath string
+	// MutateInvokedRoute when set alters echoed InvokedRoute for mismatch tests.
+	MutateInvokedRoute func(ChildRoute) ChildRoute
 	// ProductFiles optional per-work-item relative paths to write as product
 	// content (for integrate tests). Default: notes/<id>.md + optional test.
 	ProductFiles map[string][]string
@@ -102,17 +186,63 @@ type FakeChildExecutor struct {
 	Now     func() time.Time
 }
 
+// echoRoute returns InvokedRoute metadata for the actual invocation.
+// Writes a durable invocation-binding evidence file under the worktree so
+// InvokedRoute is not merely a request copy without side-effect proof.
+// MutateInvokedRoute (tests) may alter a copy for identity mismatch injection.
+func (f FakeChildExecutor) echoRoute(in ChildExecInput) ChildRoute {
+	r := in.Route
+	if f.MutateInvokedRoute != nil {
+		r = f.MutateInvokedRoute(r)
+	}
+	return r
+}
+
+// writeInvocationBinding persists non-secret route binding for audit; returns
+// the binding used as InvokedRoute (must match request for success).
+func writeInvocationBinding(wt string, r ChildRoute) error {
+	if wt == "" {
+		return nil
+	}
+	dir := filepath.Join(wt, ".loopcoder")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	b, err := json.Marshal(map[string]string{
+		"provider": r.Provider, "model": r.Model, "depth": r.Depth,
+		"permission": r.Permission, "account_ref": r.AccountRef,
+		"install_ref": r.InstallRef, "window_kind": r.WindowKind,
+		"reservation_id": r.ReservationID,
+	})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "invocation-binding.json"), b, 0o600)
+}
+
+func withRoute(base ChildExecResult, r ChildRoute) ChildExecResult {
+	base.InvokedRoute = r
+	base.Provider = r.Provider
+	base.Model = r.Model
+	base.Depth = r.Depth
+	return base
+}
+
 // Execute implements ChildExecutor for tests.
 func (f FakeChildExecutor) Execute(ctx context.Context, in ChildExecInput) (ChildExecResult, error) {
 	if f.Calls != nil {
 		f.Calls[in.WorkItemID]++
 	}
+	// Persist invocation count to durable file when configured (subprocess tests).
+	if p := strings.TrimSpace(f.InvocationCountPath); p != "" {
+		_ = appendInvocationCount(p, in.WorkItemID)
+	}
+	route := f.echoRoute(in)
 	if err := ctx.Err(); err != nil {
-		return ChildExecResult{
+		return withRoute(ChildExecResult{
 			Terminal: workgraph.TermCancelled, FailureClass: "cancelled", Message: err.Error(),
-			Provider: in.Route.Provider, Model: in.Route.Model, Depth: in.Route.Depth,
 			ActualSource: "unknown",
-		}, err
+		}, route), err
 	}
 	now := f.Now
 	if now == nil {
@@ -120,75 +250,111 @@ func (f FakeChildExecutor) Execute(ctx context.Context, in ChildExecInput) (Chil
 	}
 	wt, err := allocateChildWorktree(f.HomeDir, in.ProjectID, in.GraphID, in.WorkItemID, in.AttemptID, in.RepoPath, in.BaseRef)
 	if err != nil {
-		return ChildExecResult{
+		return withRoute(ChildExecResult{
 			Terminal: workgraph.TermFailed, FailureClass: "worktree", Message: err.Error(),
-			Provider: in.Route.Provider, Model: in.Route.Model, Depth: in.Route.Depth,
 			ActualSource: "unknown",
-		}, err
+		}, route), err
+	}
+	// Allocation enter only — Service owns exact leave after integrate/terminal/unwind.
+	if in.OnWorktreeAllocated != nil {
+		if aerr := in.OnWorktreeAllocated(wt); aerr != nil {
+			// Callback rejected: release the just-created path (prior lease is Service-owned).
+			cerr := releaseChildWorktree(in.RepoPath, wt)
+			msg := aerr.Error()
+			if cerr != nil {
+				msg = msg + "; cleanup new worktree: " + cerr.Error()
+			}
+			return withRoute(ChildExecResult{
+				Terminal: workgraph.TermFailed, FailureClass: "worktree_lease", Message: msg,
+				// Path empty only if cleanup succeeded; otherwise retain for leak evidence.
+				WorktreePath: worktreePathIfLeaked(wt, cerr), ActualSource: "unknown",
+			}, route), fmt.Errorf("%s", msg)
+		}
 	}
 	evPath, digest, files, err := writeChildEvidence(wt, in, "fake_executor", now().UTC())
 	if err != nil {
-		return ChildExecResult{
+		return withRoute(ChildExecResult{
 			Terminal: workgraph.TermFailed, FailureClass: "evidence", Message: err.Error(),
-			WorktreePath: wt, Provider: in.Route.Provider, Model: in.Route.Model, Depth: in.Route.Depth,
-			ActualSource: "unknown",
-		}, err
+			WorktreePath: wt, ActualSource: "unknown",
+		}, route), err
 	}
-	// Product files for goal-branch integration (not meta-only).
 	prod := writeFakeProductFiles(wt, in, f.ProductFiles)
 	files = append(files, prod...)
+	// Durable invocation binding (non-secret) — proves which route was used.
+	if err := writeInvocationBinding(wt, route); err != nil {
+		return withRoute(ChildExecResult{
+			Terminal: workgraph.TermFailed, FailureClass: "invocation_binding", Message: err.Error(),
+			WorktreePath: wt, ActualSource: "unknown",
+		}, route), err
+	}
 	if f.FailIDs != nil && f.FailIDs[in.WorkItemID] {
-		return ChildExecResult{
+		return withRoute(ChildExecResult{
 			Terminal: workgraph.TermFailed, OutputEvidence: digest, WorktreePath: wt,
 			ExitCode: 1, FailureClass: "injected_fail", Message: "fake fail " + in.WorkItemID,
-			Provider: in.Route.Provider, Model: in.Route.Model, Depth: in.Route.Depth,
 			FilesTouched: files, ActualSource: "unknown",
-		}, nil
+		}, route), nil
 	}
 	if strings.TrimSpace(f.FailModel) != "" &&
 		strings.EqualFold(strings.TrimSpace(in.Route.Model), strings.TrimSpace(f.FailModel)) {
-		return ChildExecResult{
+		return withRoute(ChildExecResult{
 			Terminal: workgraph.TermFailed, OutputEvidence: digest, WorktreePath: wt,
 			ExitCode: 1, FailureClass: "model_unavailable",
-			Message:  "invalid model selection " + in.Route.Model,
-			Provider: in.Route.Provider, Model: in.Route.Model, Depth: in.Route.Depth,
+			Message:      "invalid model selection " + in.Route.Model,
 			FilesTouched: files, ActualSource: "unknown",
-		}, nil
+		}, route), nil
 	}
 	if f.HangIDs != nil && f.HangIDs[in.WorkItemID] {
-		// True mid-flight interrupt: wait for ctx cancel with a real PID recorded.
-		pid := os.Getpid()
+		// No OnProcessStart / no supervisor PID. For durable spawn identity tests use
+		// the test-only package workflowrun/testspawn instead.
+		if f.OnHangEntry != nil {
+			f.OnHangEntry(in.WorkItemID, 0)
+		}
 		<-ctx.Done()
-		return ChildExecResult{
+		return withRoute(ChildExecResult{
 			Terminal: workgraph.TermCancelled, OutputEvidence: digest, WorktreePath: wt,
-			ProcessPID: pid, ExitCode: 130, FailureClass: "forced_interrupt",
-			Message:  "forced interrupt while running " + in.WorkItemID,
-			Provider: in.Route.Provider, Model: in.Route.Model, Depth: in.Route.Depth,
+			ExitCode: 130, FailureClass: "forced_interrupt",
+			Message:      "forced interrupt while running " + in.WorkItemID,
 			FilesTouched: files, ActualSource: "unknown",
-		}, ctx.Err()
+		}, route), ctx.Err()
 	}
 	if f.CancelAfterIDs != nil && f.CancelAfterIDs[in.WorkItemID] {
-		return ChildExecResult{
+		// Executor-local cancel — not Service forced_interrupt. Service reclassifies
+		// any forced_interrupt label without Service emission to executor_cancelled.
+		return withRoute(ChildExecResult{
 			Terminal: workgraph.TermCancelled, OutputEvidence: digest, WorktreePath: wt,
-			ExitCode: 130, FailureClass: "forced_interrupt", Message: "fake interrupt " + in.WorkItemID,
-			Provider: in.Route.Provider, Model: in.Route.Model, Depth: in.Route.Depth,
+			ExitCode: 130, FailureClass: FailureClassExecutorCancelled, Message: "fake executor cancel " + in.WorkItemID,
 			FilesTouched: files, ActualSource: "unknown",
-		}, context.Canceled
+		}, route), nil
 	}
 	_ = evPath
-	// Fake does not invent capacity actual — honest unknown.
-	return ChildExecResult{
+	// ForceProcessPID never attaches production authority to the current process.
+	// It is ignored for durable spawn identity (no OnProcessStart, SpawnObserved=false).
+	_ = f.ForceProcessPID
+	return withRoute(ChildExecResult{
 		Terminal: workgraph.TermSucceeded, OutputEvidence: digest, WorktreePath: wt,
-		ExitCode: 0, Provider: in.Route.Provider, Model: in.Route.Model, Depth: in.Route.Depth,
-		FilesTouched: files, ActualSource: "unknown",
+		ExitCode: 0, FilesTouched: files, ActualSource: "unknown",
 		Message: "fake_executor_ok",
-	}, nil
+	}, route), nil
+}
+
+func appendInvocationCount(path, workItemID string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = fmt.Fprintf(f, "%s\n", workItemID)
+	return err
 }
 
 // ProductionChildExecutor is the default LoopCoder-owned child executor.
 // It allocates an exclusive worktree and invokes the routed provider via
 // agent.Runner with DisableDelegation (never provider-native subagents).
-// Fixture routes produce local worktree evidence without a live process.
+// Fixture routes are test-only (AllowFixture); production fails closed on
+// empty/auto/fixture without explicit test mode.
 type ProductionChildExecutor struct {
 	HomeDir string
 	// Lookup defaults to agent.Lookup.
@@ -196,6 +362,9 @@ type ProductionChildExecutor struct {
 	Now    func() time.Time
 	// HardCap bounds each child provider call (default 10m).
 	HardCap time.Duration
+	// AllowFixture enables fixture_local evidence without a live process.
+	// Production must leave this false.
+	AllowFixture bool
 }
 
 // DefaultChildExecutor returns the production executor.
@@ -203,14 +372,31 @@ func DefaultChildExecutor() ChildExecutor {
 	return ProductionChildExecutor{}
 }
 
+// stampRoute copies only InvokedRoute fields already filled on out (actuals).
+// Never copies requested route model/depth/permission into success actuals.
+func stampRoute(out ChildExecResult, route ChildRoute) ChildExecResult {
+	if out.InvokedRoute.Provider == "" && out.Provider != "" {
+		out.InvokedRoute.Provider = out.Provider
+	}
+	if out.InvokedRoute.Model == "" && out.Model != "" {
+		out.InvokedRoute.Model = out.Model
+	}
+	if out.InvokedRoute.Depth == "" && out.Depth != "" {
+		out.InvokedRoute.Depth = out.Depth
+	}
+	_ = route
+	return out
+}
+
 // Execute implements ChildExecutor for production.
 func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput) (ChildExecResult, error) {
+	route := in.Route
 	if err := ctx.Err(); err != nil {
-		return ChildExecResult{
+		return stampRoute(ChildExecResult{
 			Terminal: workgraph.TermCancelled, FailureClass: "cancelled", Message: err.Error(),
 			Provider: in.Route.Provider, Model: in.Route.Model, Depth: in.Route.Depth,
 			ActualSource: "unknown",
-		}, err
+		}, route), err
 	}
 	now := p.Now
 	if now == nil {
@@ -219,16 +405,36 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	prov := strings.TrimSpace(in.Route.Provider)
 	model := strings.TrimSpace(in.Route.Model)
 	depth := strings.TrimSpace(in.Route.Depth)
-	if prov == "" {
-		prov = "fixture"
+	if prov == "" || model == "" {
+		return ChildExecResult{
+			Terminal: workgraph.TermFailed, FailureClass: "route_incomplete",
+			Message:      "provider and model required (no fixture production default)",
+			ActualSource: "unknown",
+		}, fmt.Errorf("workflowrun: provider/model required")
 	}
-	if model == "" {
-		model = "fixture-model"
+	if strings.EqualFold(prov, "auto") || strings.EqualFold(model, "auto") {
+		return ChildExecResult{
+			Terminal: workgraph.TermFailed, FailureClass: "route_unresolved",
+			Message:      "auto provider/model not resolved (fail closed)",
+			ActualSource: "unknown",
+		}, fmt.Errorf("workflowrun: auto route unresolved")
 	}
 	if depth == "" {
-		depth = "medium"
+		// Depth unset is not medium invent — fail when exact depth is required later.
+		// Keep empty so exactRouteMatch fails closed if parent required a depth.
 	}
 	in.Route.Provider, in.Route.Model, in.Route.Depth = prov, model, depth
+
+	// Fixture is test-only.
+	if strings.EqualFold(prov, "fixture") || strings.EqualFold(model, "fixture-model") {
+		if !p.AllowFixture {
+			return ChildExecResult{
+				Terminal: workgraph.TermFailed, FailureClass: "fixture_forbidden",
+				Message:  "fixture provider forbidden on production executor",
+				Provider: prov, Model: model, Depth: depth, ActualSource: "unknown",
+			}, fmt.Errorf("workflowrun: fixture requires AllowFixture")
+		}
+	}
 
 	wt, err := allocateChildWorktree(p.HomeDir, in.ProjectID, in.GraphID, in.WorkItemID, in.AttemptID, in.RepoPath, in.BaseRef)
 	if err != nil {
@@ -237,6 +443,20 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 			Provider: prov, Model: model, Depth: depth, ActualSource: "unknown",
 		}, err
 	}
+	// Allocation enter only — Service owns exact leave after integrate/terminal/unwind.
+	if in.OnWorktreeAllocated != nil {
+		if aerr := in.OnWorktreeAllocated(wt); aerr != nil {
+			cerr := releaseChildWorktree(in.RepoPath, wt)
+			msg := aerr.Error()
+			if cerr != nil {
+				msg = msg + "; cleanup new worktree: " + cerr.Error()
+			}
+			return ChildExecResult{
+				Terminal: workgraph.TermFailed, FailureClass: "worktree_lease", Message: msg,
+				WorktreePath: worktreePathIfLeaked(wt, cerr), Provider: prov, Model: model, Depth: depth, ActualSource: "unknown",
+			}, fmt.Errorf("%s", msg)
+		}
+	}
 	// Snapshot parent/disposable root + durable project root before provider runs.
 	// Root mutation during child execution is an isolation failure (fail closed).
 	parentRoot := strings.TrimSpace(in.RepoPath)
@@ -244,8 +464,8 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	parentSnap := snapshotDirTree(parentRoot)
 	projectSnap := snapshotDirTree(projectRoot)
 
-	// Fixture / unknown providers: durable local evidence without inventing a live process.
-	if prov == "fixture" || prov == "auto" {
+	// Explicit test fixture path only (AllowFixture).
+	if p.AllowFixture && (strings.EqualFold(prov, "fixture") || strings.EqualFold(model, "fixture-model")) {
 		_, digest, files, werr := writeChildEvidence(wt, in, "fixture_local", now().UTC())
 		if werr != nil {
 			return ChildExecResult{
@@ -253,12 +473,19 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 				WorktreePath: wt, Provider: prov, Model: model, Depth: depth, ActualSource: "unknown",
 			}, werr
 		}
-		return ChildExecResult{
+		// Still hash product files when present; stub-only is allowed only in AllowFixture.
+		if productDig, productFiles, perr := productOutputDigest(wt); perr == nil && productDig != "" {
+			digest = productDig
+			files = mergeUniquePaths(files, productFiles)
+		}
+		return stampRoute(ChildExecResult{
 			Terminal: workgraph.TermSucceeded, OutputEvidence: digest, WorktreePath: wt,
 			ExitCode: 0, Provider: prov, Model: model, Depth: depth,
 			FilesTouched: files, ActualSource: "unknown",
 			Message: "fixture_local_evidence",
-		}, nil
+			InvokedRoute: ChildRoute{Provider: prov, Model: model, Depth: depth,
+				Permission: in.Route.Permission, AccountRef: in.Route.AccountRef, InstallRef: in.Route.InstallRef},
+		}, route), nil
 	}
 
 	lookup := p.Lookup
@@ -300,6 +527,11 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 		Prompt:            prompt,
 		Model:             model,
 		Effort:            depth,
+		Permission:        strings.TrimSpace(in.Route.Permission),
+		AccountRef:        strings.TrimSpace(in.Route.AccountRef),
+		InstallRef:        strings.TrimSpace(in.Route.InstallRef),
+		WindowKind:        strings.TrimSpace(in.Route.WindowKind),
+		ReservationID:     strings.TrimSpace(in.Route.ReservationID),
 		ReadOnly:          in.ReadOnly,
 		BoundedWrite:      !in.ReadOnly,
 		DisableDelegation: true,
@@ -308,10 +540,34 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 		RunID:             in.AttemptID,
 		ProviderKey:       in.AttemptID,
 		HardCap:           hardCap,
+		Guardian:          in.Guardian,
 	}
 	if in.ReadOnly {
 		inv.Role = "nested-read-only"
 		inv.BoundedWrite = false
+	}
+	// Capture real spawn identity from agent.OnProviderStart (supervisedexec authority).
+	// Never invent PID after runner.Run returns.
+	var spawnStart ProcessStart
+	var spawnSeen bool
+	inv.OnProviderStart = func(pp agent.ProviderProcess) error {
+		ps := ProcessStart{
+			PID:                   pp.PID,
+			PGID:                  pp.PGID,
+			ProcessBirthIdentity:  pp.ProcessBirthIdentity,
+			ExecutableIdentity:    pp.ExecutableIdentity,
+			ObservedAt:            pp.ObservedAt,
+			IdentityAmbiguous:     pp.IdentityAmbiguous,
+			IdentityAmbiguityNote: pp.IdentityAmbiguityNote,
+			WorktreePath:          wt,
+			LogPath:               logPath,
+		}
+		spawnStart = ps
+		spawnSeen = true
+		if in.OnProcessStart != nil {
+			return in.OnProcessStart(ps)
+		}
+		return nil
 	}
 
 	res, rerr := runner.Run(runCtx, inv)
@@ -323,11 +579,46 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	if isModelUnavailableResult(res, rerr) && res.FailureClass == "" {
 		res.FailureClass = "model_unavailable"
 	}
-	// Always materialize evidence files (even on failure) for audit.
-	_, digest, files, _ := writeChildEvidence(wt, in, "provider_run", now().UTC())
-	// Requested route identity is authoritative (never swap provider←model).
-	actualModel := firstNonEmpty(res.Model, model)
-	actualDepth := firstNonEmpty(res.Effort, depth)
+	// Audit stub (not acceptance evidence). Product OutputEvidence comes from
+	// actual changed product paths after execution.
+	_, _, auditFiles, _ := writeChildEvidence(wt, in, "provider_run", now().UTC())
+	// Actual route ONLY from independently verified runner Actual* fields.
+	// Never res.Model/res.Effort (request-echo) or inv request fallbacks.
+	actualProv := strings.TrimSpace(res.ActualProvider)
+	actualModel := strings.TrimSpace(res.ActualModel)
+	actualDepth := strings.TrimSpace(res.ActualEffort)
+	actualPerm := strings.TrimSpace(res.ActualPermission)
+	actualAcct := strings.TrimSpace(res.ActualAccountRef)
+	actualInstall := strings.TrimSpace(res.ActualInstallRef)
+	// Carry honest per-dimension sources + argv digest through child evidence.
+	bindSources := func(out *ChildExecResult) {
+		if out == nil {
+			return
+		}
+		out.ActualSources.Model = res.ActualSourceModel
+		out.ActualSources.Effort = res.ActualSourceEffort
+		out.ActualSources.Permission = res.ActualSourcePermission
+		out.ActualSources.Account = res.ActualSourceAccount
+		out.ActualSources.Install = res.ActualSourceInstall
+		out.ArgvDigest = res.ArgvDigest
+	}
+	// Stamp spawn-time identity captured from OnProviderStart only.
+	bindSpawn := func(out *ChildExecResult) {
+		if out == nil || !spawnSeen {
+			return
+		}
+		out.SpawnObserved = true
+		out.ProcessPID = spawnStart.PID
+		out.ProcessPGID = spawnStart.PGID
+		out.ProcessBirthIdentity = spawnStart.ProcessBirthIdentity
+		out.ExecutableIdentity = spawnStart.ExecutableIdentity
+		out.ProcessObservedAt = spawnStart.ObservedAt
+		out.IdentityAmbiguous = spawnStart.IdentityAmbiguous
+		out.IdentityAmbiguityNote = spawnStart.IdentityAmbiguityNote
+	}
+	// Product evidence digest from actual worktree changes (not stub evidence file).
+	digest, files, _ := productOutputDigest(wt)
+	files = mergeUniquePaths(files, auditFiles)
 	if rerr != nil {
 		term := workgraph.TermFailed
 		fc := firstNonEmpty(res.FailureClass, "process_failure")
@@ -341,8 +632,14 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 		out := ChildExecResult{
 			Terminal: term, OutputEvidence: digest, WorktreePath: wt,
 			ExitCode: res.ExitCode, FailureClass: fc, Message: rerr.Error(),
-			Provider: prov, Model: actualModel, Depth: actualDepth, FilesTouched: files,
+			Provider: actualProv, Model: actualModel, Depth: actualDepth, FilesTouched: files,
 			ActualSource: "unknown",
+		}
+		bindSources(&out)
+		bindSpawn(&out)
+		out.InvokedRoute = ChildRoute{
+			Provider: actualProv, Model: actualModel, Depth: actualDepth,
+			Permission: actualPerm, AccountRef: actualAcct, InstallRef: actualInstall,
 		}
 		out = attachUsage(out, res)
 		return out, rerr
@@ -352,30 +649,25 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 			Terminal: workgraph.TermFailed, OutputEvidence: digest, WorktreePath: wt,
 			ExitCode: res.ExitCode, FailureClass: firstNonEmpty(res.FailureClass, "nonzero_exit"),
 			Message:  firstNonEmpty(res.Summary, fmt.Sprintf("exit %d", res.ExitCode)),
-			Provider: prov, Model: actualModel, Depth: actualDepth, FilesTouched: files,
+			Provider: actualProv, Model: actualModel, Depth: actualDepth, FilesTouched: files,
 			ActualSource: "unknown",
+		}
+		bindSources(&out)
+		bindSpawn(&out)
+		out.InvokedRoute = ChildRoute{
+			Provider: actualProv, Model: actualModel, Depth: actualDepth,
+			Permission: actualPerm, AccountRef: actualAcct, InstallRef: actualInstall,
 		}
 		out = attachUsage(out, res)
 		return out, nil
 	}
-	// Success requires non-empty output evidence (workclaim close contract).
-	if strings.TrimSpace(digest) == "" {
-		return ChildExecResult{
-			Terminal: workgraph.TermFailed, WorktreePath: wt, FailureClass: "missing_evidence",
-			Message: "empty output evidence", Provider: prov, Model: model, Depth: depth,
-			ActualSource: "unknown",
-		}, fmt.Errorf("workflowrun: empty child output evidence")
-	}
-	// Isolation fail-closed: product writes outside the assigned worktree, or any
-	// mutation of the parent/disposable root (or durable project root outside the
-	// worktree), abort success and cleanup/restore. Never relocate escapes into
-	// the worktree and claim success (#1368 regression).
+	// Isolation first (before evidence/actual requirements) so escapes fail closed
+	// even when no in-worktree product files or Actual* affirmation exist.
 	if !in.ReadOnly {
 		escaped := detectWorktreeEscapes(wt)
 		parentMut := diffDirTree(parentSnap, snapshotDirTree(parentRoot), wt)
 		projectMut := diffDirTree(projectSnap, snapshotDirTree(projectRoot), wt)
 		if len(escaped) > 0 || len(parentMut) > 0 || len(projectMut) > 0 {
-			// Cleanup: remove escaped product files; restore parent/project roots.
 			cleanupIsolationViolation(escaped, parentMut, projectMut, parentSnap, projectSnap, parentRoot, projectRoot)
 			all := append(append([]string{}, escaped...), parentMut...)
 			all = append(all, projectMut...)
@@ -384,25 +676,328 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 			out := ChildExecResult{
 				Terminal: workgraph.TermFailed, OutputEvidence: digest, WorktreePath: wt,
 				ExitCode: 1, FailureClass: "isolation_violation", Message: msg,
-				Provider: prov, Model: actualModel, Depth: actualDepth, FilesTouched: append(files, all...),
+				Provider: actualProv, Model: actualModel, Depth: actualDepth, FilesTouched: append(files, all...),
 				ActualSource: "unknown",
 			}
 			out = attachUsage(out, res)
 			return out, fmt.Errorf("workflowrun: %s", msg)
 		}
 	}
-	// Discover real provider product writes (not only evidence stubs). Accept
-	// and integrate must see notes.go / *_test.go changes, not just child-output.
-	if discovered, derr := discoverProductFiles(wt); derr == nil && len(discovered) > 0 {
-		files = mergeUniquePaths(files, discovered)
+	// Re-hash product after isolation check; mutation must invalidate acceptance.
+	digest, files, _ = productOutputDigest(wt)
+	if strings.TrimSpace(digest) == "" {
+		out := ChildExecResult{
+			Terminal: workgraph.TermFailed, WorktreePath: wt, FailureClass: "missing_evidence",
+			Message: "no product artifact content after execution", ActualSource: "unknown",
+		}
+		bindSpawn(&out)
+		return out, fmt.Errorf("workflowrun: no product artifacts")
+	}
+	// Exact route success requires independently affirmed identity.
+	if actualProv == "" || actualModel == "" {
+		out := ChildExecResult{
+			Terminal: workgraph.TermFailed, WorktreePath: wt, FailureClass: "route_mismatch",
+			Message: "runner did not affirm actual provider/model", ActualSource: "unknown",
+		}
+		bindSpawn(&out)
+		return out, fmt.Errorf("workflowrun: actual provider/model unobserved")
+	}
+	if strings.TrimSpace(in.Route.Depth) != "" && actualDepth == "" {
+		out := ChildExecResult{
+			Terminal: workgraph.TermFailed, WorktreePath: wt, FailureClass: "route_mismatch",
+			Message: "runner did not affirm actual depth for exact depth route", ActualSource: "unknown",
+		}
+		bindSpawn(&out)
+		return out, fmt.Errorf("workflowrun: actual depth unobserved")
+	}
+	if strings.TrimSpace(in.Route.AccountRef) != "" && actualAcct == "" {
+		out := ChildExecResult{
+			Terminal: workgraph.TermFailed, WorktreePath: wt, FailureClass: "route_mismatch",
+			Message: "runner did not affirm account_ref", Provider: actualProv, Model: actualModel, Depth: actualDepth,
+			ActualSource: "unknown",
+		}
+		bindSpawn(&out)
+		return out, fmt.Errorf("workflowrun: runner did not affirm account_ref")
+	}
+	if strings.TrimSpace(in.Route.AccountRef) != "" && actualAcct != "" &&
+		!strings.EqualFold(strings.TrimSpace(in.Route.AccountRef), actualAcct) {
+		out := ChildExecResult{
+			Terminal: workgraph.TermFailed, WorktreePath: wt, FailureClass: "route_mismatch",
+			Message:  fmt.Sprintf("account_ref mismatch requested=%s actual=%s", in.Route.AccountRef, actualAcct),
+			Provider: actualProv, Model: actualModel, Depth: actualDepth, ActualSource: "unknown",
+		}
+		bindSpawn(&out)
+		return out, fmt.Errorf("workflowrun: account_ref mismatch")
+	}
+	if strings.TrimSpace(in.Route.InstallRef) != "" {
+		if actualInstall == "" {
+			out := ChildExecResult{
+				Terminal: workgraph.TermFailed, WorktreePath: wt, FailureClass: "route_mismatch",
+				Message: "runner did not affirm install_ref", ActualSource: "unknown",
+			}
+			bindSpawn(&out)
+			return out, fmt.Errorf("workflowrun: install_ref unobserved")
+		}
+		if actualInstall != strings.TrimSpace(in.Route.InstallRef) {
+			out := ChildExecResult{
+				Terminal: workgraph.TermFailed, WorktreePath: wt, FailureClass: "route_mismatch",
+				Message:      fmt.Sprintf("install_ref mismatch requested=%s actual=%s", in.Route.InstallRef, actualInstall),
+				ActualSource: "unknown",
+			}
+			bindSpawn(&out)
+			return out, fmt.Errorf("workflowrun: install_ref mismatch")
+		}
+	}
+	// Invoked route from runner-affirmed actuals only — never request fallbacks.
+	// Window/reservation attach only after exact account+install match.
+	invoked := ChildRoute{
+		Provider:   actualProv,
+		Model:      actualModel,
+		Depth:      actualDepth,
+		Permission: actualPerm,
+		AccountRef: actualAcct,
+		InstallRef: actualInstall,
+	}
+	if actualAcct != "" && strings.EqualFold(actualAcct, strings.TrimSpace(in.Route.AccountRef)) &&
+		actualInstall != "" && actualInstall == strings.TrimSpace(in.Route.InstallRef) {
+		invoked.WindowKind = strings.TrimSpace(in.Route.WindowKind)
+		invoked.ReservationID = strings.TrimSpace(in.Route.ReservationID)
+	}
+	// Production success requires a real spawn-time identity callback while the
+	// process was alive — never invent PID after Run returns.
+	if !spawnSeen {
+		return ChildExecResult{
+			Terminal: workgraph.TermFailed, OutputEvidence: digest, WorktreePath: wt,
+			ExitCode: 1, FailureClass: "missing_spawn_identity",
+			Message:  "production child requires OnProviderStart spawn identity while process is alive",
+			Provider: actualProv, Model: actualModel, Depth: actualDepth, FilesTouched: files,
+			ActualSource: "unknown", InvokedRoute: invoked,
+		}, fmt.Errorf("workflowrun: missing spawn-time process identity")
+	}
+	if err := ValidateProcessStart(spawnStart); err != nil {
+		out := ChildExecResult{
+			Terminal: workgraph.TermFailed, OutputEvidence: digest, WorktreePath: wt,
+			ExitCode: 1, FailureClass: "spawn_identity_invalid", Message: err.Error(),
+			Provider: actualProv, Model: actualModel, Depth: actualDepth, FilesTouched: files,
+			ActualSource: "unknown", InvokedRoute: invoked,
+		}
+		bindSpawn(&out)
+		return out, err
 	}
 	out := ChildExecResult{
 		Terminal: workgraph.TermSucceeded, OutputEvidence: digest, WorktreePath: wt,
 		ExitCode: 0, Message: firstNonEmpty(res.Summary, "provider_ok"),
-		Provider: prov, Model: actualModel, Depth: actualDepth, FilesTouched: files,
+		Provider: invoked.Provider, Model: invoked.Model, Depth: invoked.Depth, FilesTouched: files,
 	}
+	bindSources(&out)
+	bindSpawn(&out)
 	out = attachUsage(out, res)
+	if err := writeInvocationBinding(wt, invoked); err != nil {
+		return ChildExecResult{
+			Terminal: workgraph.TermFailed, FailureClass: "invocation_binding",
+			Message: err.Error(), WorktreePath: wt, ActualSource: "unknown",
+			InvokedRoute: invoked,
+		}, err
+	}
+	out.InvokedRoute = invoked
 	return out, nil
+}
+
+// ValidateProcessStart enforces the supervised start identity contract for
+// workflow-owned pid events: PID/PGID > 0, non-empty birth + executable,
+// non-zero ObservedAt (freshness from the real start callback — never invented),
+// and not ambiguous.
+func ValidateProcessStart(ps ProcessStart) error {
+	if ps.PID <= 0 {
+		return fmt.Errorf("workflowrun: process start PID must be > 0")
+	}
+	if ps.PGID <= 0 {
+		return fmt.Errorf("workflowrun: process start PGID required (pid=%d)", ps.PID)
+	}
+	if strings.TrimSpace(ps.ProcessBirthIdentity) == "" {
+		return fmt.Errorf("workflowrun: process_birth_identity required (pid=%d)", ps.PID)
+	}
+	if strings.TrimSpace(ps.ExecutableIdentity) == "" {
+		return fmt.Errorf("workflowrun: executable_identity required (pid=%d)", ps.PID)
+	}
+	if ps.ObservedAt.IsZero() {
+		return fmt.Errorf("workflowrun: process start observed_at required (pid=%d)", ps.PID)
+	}
+	if ps.IdentityAmbiguous {
+		note := strings.TrimSpace(ps.IdentityAmbiguityNote)
+		if note == "" {
+			note = "ambiguous"
+		}
+		return fmt.Errorf("workflowrun: process identity ambiguous (pid=%d): %s", ps.PID, note)
+	}
+	return nil
+}
+
+// processStartPayload is the non-secret structured pid event payload.
+// observed_at is always RFC3339Nano from the real ProcessStart (caller must
+// ValidateProcessStart first — zero ObservedAt is not filled here).
+// worktree_path and log_path are required for recovery identity.
+func processStartPayload(ps ProcessStart) map[string]string {
+	return map[string]string{
+		"pid":                     fmt.Sprintf("%d", ps.PID),
+		"pgid":                    fmt.Sprintf("%d", ps.PGID),
+		"process_birth_identity":  strings.TrimSpace(ps.ProcessBirthIdentity),
+		"executable_identity":     strings.TrimSpace(ps.ExecutableIdentity),
+		"observed_at":             ps.ObservedAt.UTC().Format(time.RFC3339Nano),
+		"worktree_path":           strings.TrimSpace(ps.WorktreePath),
+		"log_path":                strings.TrimSpace(ps.LogPath),
+		"identity_ambiguous":      fmt.Sprintf("%v", ps.IdentityAmbiguous),
+		"identity_ambiguity_note": strings.TrimSpace(ps.IdentityAmbiguityNote),
+	}
+}
+
+// ValidatePIDEventPayload checks durable pid event Event.PID and payload agree,
+// observed_at is a parseable non-zero RFC3339Nano, and worktree_path/log_path are nonempty.
+func ValidatePIDEventPayload(ev Event) error {
+	if strings.TrimSpace(ev.Kind) != "pid" {
+		return fmt.Errorf("workflowrun: ValidatePIDEventPayload requires kind=pid")
+	}
+	if ev.PID <= 0 {
+		return fmt.Errorf("workflowrun: pid event Event.PID must be > 0")
+	}
+	if len(ev.Payload) == 0 {
+		return fmt.Errorf("workflowrun: pid event payload required")
+	}
+	var m map[string]string
+	if err := json.Unmarshal(ev.Payload, &m); err != nil {
+		return fmt.Errorf("workflowrun: pid event payload: %w", err)
+	}
+	payloadPID := strings.TrimSpace(m["pid"])
+	if payloadPID == "" {
+		return fmt.Errorf("workflowrun: pid event payload missing pid")
+	}
+	if payloadPID != fmt.Sprintf("%d", ev.PID) {
+		return fmt.Errorf("workflowrun: pid event Event.PID=%d != payload pid=%s", ev.PID, payloadPID)
+	}
+	if strings.TrimSpace(m["pgid"]) == "" {
+		return fmt.Errorf("workflowrun: pid event payload missing pgid")
+	}
+	if strings.TrimSpace(m["process_birth_identity"]) == "" {
+		return fmt.Errorf("workflowrun: pid event payload missing process_birth_identity")
+	}
+	if strings.TrimSpace(m["executable_identity"]) == "" {
+		return fmt.Errorf("workflowrun: pid event payload missing executable_identity")
+	}
+	obs := strings.TrimSpace(m["observed_at"])
+	if obs == "" {
+		return fmt.Errorf("workflowrun: pid event payload missing observed_at")
+	}
+	ts, err := time.Parse(time.RFC3339Nano, obs)
+	if err != nil {
+		// Also accept RFC3339 without nano fraction.
+		ts, err = time.Parse(time.RFC3339, obs)
+		if err != nil {
+			return fmt.Errorf("workflowrun: pid event observed_at not RFC3339Nano: %w", err)
+		}
+	}
+	if ts.IsZero() {
+		return fmt.Errorf("workflowrun: pid event observed_at is zero")
+	}
+	if strings.TrimSpace(m["worktree_path"]) == "" {
+		return fmt.Errorf("workflowrun: pid event payload missing worktree_path")
+	}
+	if strings.TrimSpace(m["log_path"]) == "" {
+		return fmt.Errorf("workflowrun: pid event payload missing log_path")
+	}
+	return nil
+}
+
+// childRoutePayloadFields returns non-secret required route keys from a ChildRoute.
+func childRoutePayloadFields(r ChildRoute) map[string]string {
+	return map[string]string{
+		"provider":       strings.TrimSpace(r.Provider),
+		"model":          strings.TrimSpace(r.Model),
+		"depth":          strings.TrimSpace(r.Depth),
+		"permission":     strings.TrimSpace(r.Permission),
+		"account_ref":    strings.TrimSpace(r.AccountRef),
+		"install_ref":    strings.TrimSpace(r.InstallRef),
+		"window_kind":    strings.TrimSpace(r.WindowKind),
+		"reservation_id": strings.TrimSpace(r.ReservationID),
+		"route_reason":   strings.TrimSpace(r.RouteReason),
+	}
+}
+
+// mergePayloadStringMap copies src into dst (dst may be nil).
+func mergePayloadStringMap(dst, src map[string]string) map[string]string {
+	if dst == nil {
+		dst = map[string]string{}
+	}
+	for k, v := range src {
+		if strings.TrimSpace(v) != "" {
+			dst[k] = strings.TrimSpace(v)
+		}
+	}
+	return dst
+}
+
+// processStartFromResult rebuilds ProcessStart from ChildExecResult spawn fields.
+func processStartFromResult(out ChildExecResult) ProcessStart {
+	return ProcessStart{
+		PID:                   out.ProcessPID,
+		PGID:                  out.ProcessPGID,
+		ProcessBirthIdentity:  out.ProcessBirthIdentity,
+		ExecutableIdentity:    out.ExecutableIdentity,
+		ObservedAt:            out.ProcessObservedAt,
+		IdentityAmbiguous:     out.IdentityAmbiguous,
+		IdentityAmbiguityNote: out.IdentityAmbiguityNote,
+	}
+}
+
+// productOutputDigest hashes actual changed product paths/content under the
+// worktree (excluding .loopcoder audit stubs and ownership markers). Empty when
+// no useful product change exists — cannot become successful evidence.
+// Directory entries from discovery are hard failures (must not silently skip).
+func productOutputDigest(wt string) (digest string, files []string, err error) {
+	discovered, derr := discoverProductFiles(wt)
+	if derr != nil {
+		return "", nil, derr
+	}
+	var product []string
+	for _, rel := range discovered {
+		rel = filepath.ToSlash(strings.TrimSpace(rel))
+		if rel == "" || rel == ".loopcoder-owned-worktree" {
+			continue
+		}
+		if strings.HasPrefix(rel, ".loopcoder/") {
+			continue
+		}
+		if strings.HasPrefix(rel, "child-output-") {
+			continue
+		}
+		product = append(product, rel)
+	}
+	if len(product) == 0 {
+		return "", nil, nil
+	}
+	h := sha256.New()
+	for _, rel := range product {
+		full := filepath.Join(wt, filepath.FromSlash(rel))
+		st, serr := os.Stat(full)
+		if serr != nil {
+			return "", nil, fmt.Errorf("workflowrun: product path %s: %w", rel, serr)
+		}
+		if st.IsDir() {
+			return "", nil, fmt.Errorf("workflowrun: product path %s is a directory (file-level discovery required)", rel)
+		}
+		raw, rerr := os.ReadFile(full)
+		if rerr != nil {
+			return "", nil, fmt.Errorf("workflowrun: product path %s: %w", rel, rerr)
+		}
+		h.Write([]byte(rel))
+		h.Write([]byte{0})
+		h.Write(raw)
+		h.Write([]byte{0})
+		files = append(files, rel)
+	}
+	if len(files) == 0 {
+		return "", nil, nil
+	}
+	return "sha256:" + hex.EncodeToString(h.Sum(nil)), files, nil
 }
 
 func mergeUniquePaths(base, extra []string) []string {
@@ -587,6 +1182,79 @@ func attachUsage(out ChildExecResult, res agent.Result) ChildExecResult {
 	out.ActualCapacity = &frac
 	out.ActualSource = "estimated"
 	return out
+}
+
+// worktreePathIfLeaked returns wt when cleanup failed (leak evidence), else "".
+func worktreePathIfLeaked(wt string, cleanupErr error) string {
+	if cleanupErr != nil {
+		return wt
+	}
+	return ""
+}
+
+// releaseChildWorktree deregisters a child git worktree from the parent repo
+// (when linked) and removes the worktree directory. Preserves underlying git/
+// RemoveAll errors and verifies filesystem + git-registration absence.
+// Exactly-once safe if path empty (nil error).
+func releaseChildWorktree(repoPath, wtPath string) error {
+	wtPath = strings.TrimSpace(wtPath)
+	if wtPath == "" {
+		return nil
+	}
+	var errs []string
+	if rerr := releaseIntegrateWorktree(repoPath, wtPath); rerr != nil {
+		errs = append(errs, rerr.Error())
+	}
+	// Filesystem agreement: path must be gone after release.
+	if _, err := os.Stat(wtPath); err == nil {
+		if rerr := os.RemoveAll(wtPath); rerr != nil {
+			errs = append(errs, fmt.Sprintf("retry RemoveAll: %v", rerr))
+		}
+		if _, err2 := os.Stat(wtPath); err2 == nil {
+			errs = append(errs, fmt.Sprintf("worktree path still present: %s", wtPath))
+		}
+	} else if !os.IsNotExist(err) {
+		errs = append(errs, fmt.Sprintf("stat: %v", err))
+	}
+	// Git registration agreement when repo is known.
+	repoPath = strings.TrimSpace(repoPath)
+	if repoPath != "" {
+		if listed, lerr := gitWorktreeListContains(repoPath, wtPath); lerr != nil {
+			errs = append(errs, fmt.Sprintf("worktree list: %v", lerr))
+		} else if listed {
+			errs = append(errs, fmt.Sprintf("worktree still registered: %s", wtPath))
+		}
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("workflowrun: releaseChildWorktree: %s", strings.Join(errs, "; "))
+}
+
+// gitWorktreeListContains reports whether path appears in `git worktree list --porcelain`.
+func gitWorktreeListContains(repoPath, wtPath string) (bool, error) {
+	cmd := exec.Command("git", "-C", repoPath, "worktree", "list", "--porcelain")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		// No git repo / not a worktree parent — treat as not registered.
+		if strings.Contains(string(out), "not a git repository") ||
+			strings.Contains(err.Error(), "not a git repository") {
+			return false, nil
+		}
+		return false, fmt.Errorf("%v: %s", err, out)
+	}
+	absWT, _ := filepath.Abs(wtPath)
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.HasPrefix(line, "worktree ") {
+			continue
+		}
+		p := strings.TrimSpace(strings.TrimPrefix(line, "worktree "))
+		absP, _ := filepath.Abs(p)
+		if absP == absWT || p == wtPath {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func allocateChildWorktree(homeDir, projectID, graphID, workItemID, attemptID, repoPath, baseRef string) (string, error) {

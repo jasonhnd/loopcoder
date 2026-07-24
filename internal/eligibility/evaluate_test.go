@@ -309,3 +309,105 @@ func TestPinMissingCandidateFailClosed(t *testing.T) {
 		t.Fatalf("%+v", d)
 	}
 }
+
+// trueFreshUnknown is State=true + FreshUnknown — KnownTrue alone still passes;
+// factGate/IsUnknown must reject for auto-route and pin.
+func trueFreshUnknown(id string) Fact {
+	return Fact{State: FactTrue, EvidenceID: id, Freshness: FreshUnknown}
+}
+
+// TestHardFactsTrueFreshUnknownMatrix mutates every positive hard fact and machine
+// CapacityOK to State=true + FreshUnknown and proves ineligible for automatic and
+// explicit-pin modes.
+func TestHardFactsTrueFreshUnknownMatrix(t *testing.T) {
+	type mut struct {
+		name string
+		fn   func(*Candidate)
+	}
+	positive := []struct {
+		name string
+		set  func(*Candidate, Fact)
+	}{
+		{"Installed", func(c *Candidate, f Fact) { c.Installed = f }},
+		{"Authenticated", func(c *Candidate, f Fact) { c.Authenticated = f }},
+		{"ModelPresent", func(c *Candidate, f Fact) { c.ModelPresent = f }},
+		{"PermissionOK", func(c *Candidate, f Fact) { c.PermissionOK = f }},
+		{"EffortOK", func(c *Candidate, f Fact) { c.EffortOK = f }},
+		{"Healthy", func(c *Candidate, f Fact) { c.Healthy = f }},
+		{"ResourceFit", func(c *Candidate, f Fact) { c.ResourceFit = f }},
+	}
+	var cases []mut
+	for _, p := range positive {
+		p := p
+		cases = append(cases, mut{
+			name: p.name + "_true_fresh_unknown",
+			fn:   func(c *Candidate) { p.set(c, trueFreshUnknown(p.name)) },
+		})
+	}
+	// CooldownActive true+FreshUnknown (active unknown) and false+FreshUnknown.
+	cases = append(cases,
+		mut{"CooldownActive_true_fresh_unknown", func(c *Candidate) {
+			c.CooldownActive = trueFreshUnknown("cd-true-unk")
+		}},
+		mut{"CooldownActive_false_fresh_unknown", func(c *Candidate) {
+			c.CooldownActive = Fact{State: FactFalse, EvidenceID: "cd-false-unk", Freshness: FreshUnknown}
+		}},
+	)
+
+	for _, tc := range cases {
+		t.Run("auto_"+tc.name, func(t *testing.T) {
+			c := healthyCandidate("grok", "grok-4.5", capclass.ClassSoul)
+			tc.fn(&c)
+			snap := baseSnap(c)
+			d, err := Evaluate(snap)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(d.Eligible) != 0 {
+				t.Fatalf("auto must reject %s: eligible=%+v", tc.name, d.Eligible)
+			}
+		})
+		t.Run("pin_"+tc.name, func(t *testing.T) {
+			c := healthyCandidate("grok", "grok-4.5", capclass.ClassSoul)
+			tc.fn(&c)
+			snap := baseSnap(c)
+			pin := PinFields{Provider: "grok", Model: "grok-4.5", Effort: "high", Permission: "bounded_write"}
+			snap.ExplicitPin = &pin
+			d, err := Evaluate(snap)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !d.FailClosed || d.PinSelected != nil || len(d.Eligible) != 0 {
+				t.Fatalf("pin must fail closed on %s: %+v", tc.name, d)
+			}
+		})
+	}
+
+	// Machine CapacityOK State=true + FreshUnknown.
+	t.Run("auto_machine_true_fresh_unknown", func(t *testing.T) {
+		c := healthyCandidate("codex", "gpt-5.5", capclass.ClassSoul)
+		snap := baseSnap(c)
+		snap.Machine = MachineAdmission{CapacityOK: trueFreshUnknown("mach"), ConcurrentSlots: 2}
+		d, err := Evaluate(snap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(d.Eligible) != 0 {
+			t.Fatalf("machine FreshUnknown must block auto: %+v", d.Eligible)
+		}
+	})
+	t.Run("pin_machine_true_fresh_unknown", func(t *testing.T) {
+		c := healthyCandidate("codex", "gpt-5.5", capclass.ClassSoul)
+		snap := baseSnap(c)
+		snap.Machine = MachineAdmission{CapacityOK: trueFreshUnknown("mach"), ConcurrentSlots: 2}
+		pin := PinFields{Provider: "codex", Model: "gpt-5.5"}
+		snap.ExplicitPin = &pin
+		d, err := Evaluate(snap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !d.FailClosed || len(d.Eligible) != 0 {
+			t.Fatalf("machine FreshUnknown must fail pin: %+v", d)
+		}
+	})
+}

@@ -50,14 +50,14 @@ func TestChildIntegrateOntoSharedGoalBranchVisibleToNext(t *testing.T) {
 			},
 		},
 	}
-	res, err := svc.Execute(context.Background(), workflowrun.Request{
+	res, err := svc.Execute(context.Background(), withExpectedPlanDigest(t, workflowrun.Request{
 		ProjectID: "proj-int", RunID: "run_int_1",
 		Definition: workflowrun.ChainDefinition("g-int"),
 		Actor:      "owner",
 		RepoPath:   repo,
 		BaseRef:    "main",
 		GoalBranch: "loopcoder/goal-run_int_1",
-	})
+	}))
 	if err != nil {
 		t.Fatalf("%v %+v", err, res)
 	}
@@ -83,22 +83,26 @@ func TestChildIntegrateOntoSharedGoalBranchVisibleToNext(t *testing.T) {
 	if !strings.Contains(show("notes/notes_test.go"), "TestNotes") {
 		t.Fatal("notes_test.go missing on goal branch")
 	}
-	// b's worktree was based on goal branch after a integrated — b should see a's file.
-	var bWT string
+	// b was based on the goal branch after a integrated. Child worktrees are
+	// released after each attempt (lease cleanup), so prove sequencing via the
+	// goal branch tip (already checked above) and integrate order/events —
+	// not a post-release Stat of b's tree.
+	var bPath string
 	for _, c := range res.Children {
 		if c.WorkItemID == "b" {
-			bWT = c.WorktreePath
+			bPath = c.WorktreePath
 		}
 	}
-	if bWT == "" {
-		t.Fatal("missing b worktree")
-	}
-	if _, err := os.Stat(filepath.Join(bWT, "notes/notes.go")); err != nil {
-		t.Fatalf("b must see a's integrated notes.go: %v", err)
+	if bPath == "" {
+		t.Fatal("missing b worktree path on outcome")
 	}
 	joined := strings.Join(res.Events, "\n")
 	if !strings.Contains(joined, "integrate.ok:a") && !strings.Contains(joined, "integrate.skip:a") {
 		t.Fatalf("missing integrate event: %v", res.Events)
+	}
+	// a then b integrate commits: tip already has a's notes.go; b's product must also land.
+	if !strings.Contains(show("notes/notes.go"), "package notes") {
+		t.Fatal("goal branch lost a's notes.go after b integrate")
 	}
 }
 

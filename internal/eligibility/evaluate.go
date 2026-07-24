@@ -131,13 +131,15 @@ func Evaluate(snap Snapshot) (Decision, error) {
 }
 
 func checkMachine(m MachineAdmission) (bool, []string) {
+	// Same hard-fact contract as candidate facts: reject IsUnknown (including
+	// State=true + FreshUnknown) before accepting KnownTrue.
 	if m.CapacityOK.IsUnknown() {
 		return false, []string{ReasonMachineUnknown}
 	}
 	if m.CapacityOK.KnownFalse() {
 		return false, []string{ReasonMachineCapacity}
 	}
-	if !m.CapacityOK.KnownTrue() {
+	if !m.CapacityOK.KnownTrue() || m.CapacityOK.IsUnknown() {
 		return false, []string{ReasonMachineUnknown}
 	}
 	return true, nil
@@ -153,6 +155,9 @@ func assessCandidate(c Candidate, snap Snapshot, machineOK bool, machineReasons 
 		Model:      c.Model,
 		Effort:     c.Effort,
 		Permission: c.Permission,
+		AccountRef: c.AccountRef,
+		InstallRef: c.InstallRef,
+		WindowKind: c.WindowKind,
 		ModelClass: c.ModelClass,
 		Evidence:   evidenceMap(c),
 	}
@@ -238,9 +243,18 @@ func assessCandidate(c Candidate, snap Snapshot, machineOK bool, machineReasons 
 	return view, reasons
 }
 
+// factGate enforces exact hard eligibility for one positive fact.
+// Stale/expired → staleCode. Any IsUnknown (including State=true + FreshUnknown
+// or FreshMissing) → unknownCode. Only KnownTrue with usable freshness passes.
+// Shared by auto-route and explicit pin via Evaluate.
 func factGate(f Fact, falseCode, unknownCode, staleCode string) []string {
 	if f.Freshness == FreshStale || f.Freshness == FreshExpired {
 		return []string{staleCode}
+	}
+	// Reject FreshUnknown / FreshMissing / unknown state even when State=true.
+	// KnownTrue alone still allows FreshUnknown — IsUnknown closes that hole.
+	if f.IsUnknown() {
+		return []string{unknownCode}
 	}
 	if f.KnownTrue() {
 		return nil

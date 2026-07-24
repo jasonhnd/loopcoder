@@ -136,6 +136,9 @@ func scenarioThreeNodeChain(now time.Time) ScenarioResult {
 		res, err := cs.Claim(workclaim.ClaimRequest{
 			ProjectID: "proj", Graph: mat.Graph, Evidence: ev, WorkItemID: id,
 			AttemptID: "att-" + id, ExecutorID: "ex", Lease: time.Minute,
+			PlanDigest:          plan.Digest,
+			TaskClass:           "tera",
+			ChildContractDigest: "sha256:canary-child-contract",
 		})
 		if err != nil || res.Code != workclaim.ResultClaimed {
 			return ScenarioResult{Name: name, Passed: false, Detail: fmt.Sprint(res, err)}

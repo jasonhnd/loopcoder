@@ -290,10 +290,14 @@ func discoverCodexBar(ctx context.Context, deps Deps) codexBarBridge {
 
 func codexBarQuotaSource(provider, trustClass string, now time.Time) QuotaTelemetrySource {
 	now = now.UTC()
+	// CodexBar is a third-party trusted bridge — never OfficialCLICommand and
+	// never operator policy overlay (semantically different). Distinct source
+	// kind carries trust_class / version / fingerprint in diagnostics.
+	sourceKind := QuotaSourceTrustedThirdPartyBridge
 	return normalizeQuotaTelemetrySource(QuotaTelemetrySource{
 		AdapterID:           provider,
-		SourceKind:          QuotaSourceOfficialCLICommand,
-		SourceKey:           "codexbar-json-bridge-" + safeSourceToken(trustClass),
+		SourceKind:          sourceKind,
+		SourceKey:           "codexbar-third-party-bridge-" + safeSourceToken(trustClass),
 		SourceSchemaVersion: codexBarQuotaSchema,
 		SupportedQuantities: []QuantityKind{QuantityInputTokens, QuantityOutputTokens, QuantityTotalTokens, QuantityRequests, QuantityProviderDefined},
 		SupportedWindows:    []WindowKind{WindowFixedHour, WindowFixedDay, WindowFixedWeek, WindowRolling, WindowProviderDefined, WindowUnbounded, WindowUnknown},
@@ -310,7 +314,7 @@ func codexBarQuotaSource(provider, trustClass string, now time.Time) QuotaTeleme
 		EnvironmentKeys:        codexBarEnvKeys(),
 		TimeoutMS:              int(codexBarQuotaTimeout / time.Millisecond),
 		OutputLimits:           OutputLimits{StdoutBytes: codexBarStdoutBytes, StderrBytes: codexBarStderrBytes, CombinedBytes: codexBarStdoutBytes + codexBarStderrBytes, DecodedBytes: codexBarStdoutBytes},
-		ClassificationRules:    []string{"codexbar-json-field-allowlist", "one-provider-per-command", "configured-trust-class-required", "redact-before-truncate", "no-credential-material", "no-raw-output-persistence"},
+		ClassificationRules:    []string{"codexbar-third-party-bridge", "not-provider-official-cli", "codexbar-json-field-allowlist", "one-provider-per-command", "configured-trust-class-required", "redact-before-truncate", "no-credential-material", "no-raw-output-persistence", "trust_class=" + safeSourceToken(trustClass)},
 		CreatedAt:              formatTime(now),
 		UpdatedAt:              formatTime(now),
 		PolicyVersion:          PolicyVersion,
@@ -435,6 +439,8 @@ func snapshotsFromCodexBar(source QuotaTelemetrySource, payload codexBarPayload,
 		if !ok {
 			return nil, fmt.Errorf("%w: confidence", ErrCodexBarMalformed)
 		}
+		// Third-party bridge must never claim exact: cap to estimated under OperatorOverlay.
+		confidence = capConfidenceForSource(source.SourceKind, confidence)
 		freshness, ok := codexBarFreshness(firstNonEmpty(snapshot.FreshnessState, payload.Source.Freshness))
 		if !ok {
 			return nil, fmt.Errorf("%w: freshness", ErrCodexBarMalformed)
@@ -470,6 +476,9 @@ func snapshotsFromCodexBar(source QuotaTelemetrySource, payload codexBarPayload,
 		fieldConfidences, err := codexBarFieldConfidences(snapshot.FieldConfidences, confidence)
 		if err != nil {
 			return nil, err
+		}
+		for field, fc := range fieldConfidences {
+			fieldConfidences[field] = capConfidenceForSource(source.SourceKind, fc)
 		}
 		scope := codexBarScopeKey(payload.Provider, snapshot.Scope, index)
 		diag := fmt.Sprintf("codexbar quota bridge schema %s version %s trust %s command %s", codexBarQuotaSchema, safeSummary(firstNonEmpty(payload.CodexBarVersion, bridge.version)), safeSummary(trustClass), bridge.fingerprint)
@@ -812,9 +821,11 @@ func codexBarTerminal(err error) string {
 }
 
 func codexBarConfidenceContract(snapshots []QuotaSnapshot) map[string]Confidence {
+	// Max contract for third-party bridge is estimated (never exact).
 	out := map[string]Confidence{"limit_value": ConfidenceUnknown, "used_value": ConfidenceUnknown, "remaining_value": ConfidenceUnknown, "reset_at": ConfidenceUnknown}
 	for _, snapshot := range snapshots {
 		for field, confidence := range snapshot.FieldConfidences {
+			confidence = capConfidenceForSource(QuotaSourceTrustedThirdPartyBridge, confidence)
 			if codexBarConfidenceRank(confidence) > codexBarConfidenceRank(out[field]) {
 				out[field] = confidence
 			}
@@ -837,7 +848,8 @@ func codexBarConfidenceRank(confidence Confidence) int {
 }
 
 func confidenceForCodexBarSnapshots(snapshots []QuotaSnapshot) Confidence {
-	confidence := ConfidenceExact
+	// Aggregate starts at estimated: third-party bridge never claims exact.
+	confidence := ConfidenceEstimated
 	for _, snapshot := range snapshots {
 		if codexBarConfidenceRank(snapshot.Confidence) < codexBarConfidenceRank(confidence) {
 			confidence = snapshot.Confidence

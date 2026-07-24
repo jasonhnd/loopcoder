@@ -38,10 +38,10 @@ func TestNestedChildRouteProductionUsesDecideAndPermissionGate(t *testing.T) {
 				ChosenCandidateID: "cand-1",
 				ChosenReason:      "eligible",
 				EligibleCandidates: []routing.Candidate{{
-					RoutingCandidateID: "cand-1",
-					AdapterID:          "codex",
-					ModelCapabilityID:  "model-codex",
-					CanonicalModelID:   "codex-model",
+					RoutingCandidateID:   "cand-1",
+					AdapterID:            "codex",
+					ModelCapabilityID:    "model-codex",
+					CanonicalModelID:     "codex-model",
 					InvocationProfileKey: "default",
 				}},
 			},
@@ -124,14 +124,14 @@ func TestValidateNestedPlanProvidersAllowsDistinctChildPinsWhenUnpinnedGlobally(
 	plan := orchestration.ChildPlan{
 		Items: []orchestration.ChildRunPlan{
 			{
-				ChildKey:    "ro",
-				Permission:  "read-only",
-				Metadata:    []byte(`{"provider":"claude"}`),
+				ChildKey:   "ro",
+				Permission: "read-only",
+				Metadata:   []byte(`{"provider":"claude"}`),
 			},
 			{
-				ChildKey:    "wr",
-				Permission:  "write",
-				Metadata:    []byte(`{"provider":"codex"}`),
+				ChildKey:   "wr",
+				Permission: "write",
+				Metadata:   []byte(`{"provider":"codex"}`),
 			},
 		},
 	}

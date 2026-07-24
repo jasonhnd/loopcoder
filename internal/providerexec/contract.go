@@ -22,32 +22,48 @@ const (
 type FailureClass string
 
 const (
-	FailNone          FailureClass = ""
-	FailTimeout       FailureClass = "timeout"
-	FailAuth          FailureClass = "auth_refusal"
-	FailUnsupported   FailureClass = "unsupported_capability"
-	FailRateLimit     FailureClass = "rate_limit"
-	FailMalformed     FailureClass = "malformed_output"
-	FailCancelled     FailureClass = "cancelled"
-	FailProcess       FailureClass = "process_failure"
-	FailRouteMismatch FailureClass = "route_mismatch"
-	FailIntegrity     FailureClass = "integrity"
+	FailNone             FailureClass = ""
+	FailTimeout          FailureClass = "timeout"
+	FailAuth             FailureClass = "auth_refusal"
+	FailUnsupported      FailureClass = "unsupported_capability"
+	FailRateLimit        FailureClass = "rate_limit"
+	FailMalformed        FailureClass = "malformed_output"
+	FailCancelled        FailureClass = "cancelled"
+	FailProcess          FailureClass = "process_failure"
+	FailRouteMismatch    FailureClass = "route_mismatch"
+	FailIntegrity        FailureClass = "integrity"
+	FailModelUnavailable FailureClass = "model_unavailable"
 )
 
-// Route is the explicit provider/model/effort/permission pin.
+// Route is the explicit provider/model/effort/permission pin plus account/install
+// and capacity binding. Requested route fields must be preserved immutably;
+// actual route is independently verified by the adapter.
 type Route struct {
 	Provider   string `json:"provider"`
 	Model      string `json:"model"`
 	Effort     string `json:"effort,omitempty"`
 	Permission string `json:"permission,omitempty"`
+	// AccountRef is the exact non-secret account binding (never truncated).
+	AccountRef string `json:"account_ref,omitempty"`
+	// InstallRef is the exact provider installation identity used for launch.
+	InstallRef string `json:"install_ref,omitempty"`
+	// WindowKind is the observed capacity window (never invented five_hour).
+	WindowKind string `json:"window_kind,omitempty"`
+	// ReservationID is the capacity ledger reservation when reserved.
+	ReservationID string `json:"reservation_id,omitempty"`
+	// RouteReason is the selection reason (explain/winner line).
+	RouteReason string `json:"route_reason,omitempty"`
 	// NativeDelegation is always false for this minimal contract unless explicitly allowed.
 	NativeDelegation bool `json:"native_delegation"`
 }
 
-// Digest returns stable requested-route digest.
+// Digest returns stable requested-route digest including account/install/window.
 func (r Route) Digest() string {
 	h := sha256.New()
-	fmt.Fprintf(h, "%s|%s|%s|%s|%v", r.Provider, r.Model, r.Effort, r.Permission, r.NativeDelegation)
+	fmt.Fprintf(h, "%s|%s|%s|%s|%s|%s|%s|%s|%s|%v",
+		r.Provider, r.Model, r.Effort, r.Permission,
+		r.AccountRef, r.InstallRef, r.WindowKind, r.ReservationID, r.RouteReason,
+		r.NativeDelegation)
 	return "sha256:" + hex.EncodeToString(h.Sum(nil))[:24]
 }
 
@@ -65,6 +81,19 @@ type Request struct {
 	Labels      map[string]string `json:"labels,omitempty"`
 	AcceptedAt  time.Time         `json:"accepted_at"`
 	RouteDigest string            `json:"route_digest"`
+	// OnProviderStart is a non-serialized spawn-authority callback. Directrun
+	// wires it to atomically record PID/PGID/process-birth on real spawn only.
+	// Never JSON-marshaled; Clone copies the function reference.
+	OnProviderStart func(ProcessStart) error `json:"-"`
+}
+
+// ProcessStart is durable spawn identity published at provider process start.
+type ProcessStart struct {
+	PID                  int
+	PGID                 int
+	ProcessBirthIdentity string
+	ExecutableIdentity   string
+	ObservedAt           time.Time
 }
 
 // Clone returns a deep copy (immutability helper).
@@ -77,6 +106,7 @@ func (r Request) Clone() Request {
 			cp.Labels[k] = v
 		}
 	}
+	// OnProviderStart function reference is retained intentionally (not serialized).
 	return cp
 }
 
@@ -112,19 +142,34 @@ type UsageEvidence struct {
 	OutputTokens int64 `json:"output_tokens,omitempty"`
 }
 
+// ActualSources is the per-dimension evidence class for ActualRoute fields.
+// Values: provider_stream | accepted_invocation | auth_binding | install_binding | unknown.
+// accepted_invocation is never collapsed into provider_stream.
+type ActualSources struct {
+	Model      string `json:"model,omitempty"`
+	Effort     string `json:"effort,omitempty"`
+	Permission string `json:"permission,omitempty"`
+	Account    string `json:"account,omitempty"`
+	Install    string `json:"install,omitempty"`
+}
+
 // Outcome is the normalized execution result envelope.
 type Outcome struct {
-	Schema         string          `json:"schema"`
-	RequestID      string          `json:"request_id"`
-	RequestedRoute Route           `json:"requested_route"`
-	ActualRoute    Route           `json:"actual_route"`
-	RouteDigest    string          `json:"route_digest"`
-	Process        ProcessEvidence `json:"process"`
-	Usage          UsageEvidence   `json:"usage"`
-	ExitCode       int             `json:"exit_code"`
-	Failure        FailureClass    `json:"failure_class,omitempty"`
-	Message        string          `json:"message,omitempty"`
-	FinishedAt     time.Time       `json:"finished_at"`
+	Schema         string `json:"schema"`
+	RequestID      string `json:"request_id"`
+	RequestedRoute Route  `json:"requested_route"`
+	ActualRoute    Route  `json:"actual_route"`
+	// ActualSources binds honest evidence class for each ActualRoute dimension.
+	ActualSources ActualSources `json:"actual_sources,omitempty"`
+	// ArgvDigest is the redacted exact launched argv fingerprint when recorded.
+	ArgvDigest  string          `json:"argv_digest,omitempty"`
+	RouteDigest string          `json:"route_digest"`
+	Process     ProcessEvidence `json:"process"`
+	Usage       UsageEvidence   `json:"usage"`
+	ExitCode    int             `json:"exit_code"`
+	Failure     FailureClass    `json:"failure_class,omitempty"`
+	Message     string          `json:"message,omitempty"`
+	FinishedAt  time.Time       `json:"finished_at"`
 	// OutputDigest is a redacted content fingerprint, not body.
 	OutputDigest string `json:"output_digest,omitempty"`
 }
@@ -233,18 +278,41 @@ func (f *FakeAdapter) Execute(ctx context.Context, req Request) (Outcome, error)
 	case FailProcess:
 		return outcomeFail(req, FailProcess, "process failed", proc), nil
 	}
-	// Actual must match requested exactly.
+	// Actual must match requested exactly (test-only Fake; production uses AgentAdapter).
 	actual := req.Route
 	if actual.Digest() != req.RouteDigest {
 		return outcomeFail(req, FailRouteMismatch, "actual route digest mismatch", proc), nil
 	}
+	// Explicit test-mode sources: Fake affirms request as actual with labeled
+	// accepted_invocation / auth_binding / install_binding — never silent empty sources.
+	// Fixture is never a production AgentAdapter path.
+	src := ActualSources{}
+	if strings.TrimSpace(actual.Model) != "" {
+		src.Model = "accepted_invocation"
+	}
+	if strings.TrimSpace(actual.Effort) != "" {
+		src.Effort = "accepted_invocation"
+	}
+	if strings.TrimSpace(actual.Permission) != "" {
+		src.Permission = "accepted_invocation"
+	}
+	if strings.TrimSpace(actual.AccountRef) != "" {
+		src.Account = "auth_binding"
+	}
+	if strings.TrimSpace(actual.InstallRef) != "" {
+		src.Install = "install_binding"
+	}
 	code := f.ExitCode
 	out := Outcome{
 		Schema: SchemaOutcome, RequestID: req.RequestID,
-		RequestedRoute: req.Route, ActualRoute: actual, RouteDigest: req.RouteDigest,
+		RequestedRoute: req.Route, ActualRoute: actual, ActualSources: src,
+		ArgvDigest: "sha256:fake-argv", RouteDigest: req.RouteDigest,
 		Process: proc, ExitCode: code, FinishedAt: time.Now().UTC(),
 		OutputDigest: "sha256:fake-ok",
 		Usage:        UsageEvidence{InputTokens: 1, OutputTokens: 1},
+	}
+	if code != 0 && out.Failure == "" {
+		out.Failure = FailProcess
 	}
 	return out, nil
 }

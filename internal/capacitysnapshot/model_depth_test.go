@@ -144,6 +144,8 @@ func TestFromInventory_GrokDoesNotUseAgySlugParse(t *testing.T) {
 			AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
 			FreshnessState: providerinventory.FreshnessFresh,
 		}},
+		// Fresh `grok models` presence: model id only, no observed depth tokens
+		// (production shape). Must not backfill static registry low/high/xhigh.
 		ModelCapabilities: []providerinventory.ModelCapability{{
 			AdapterID: "grok", CanonicalModelID: "grok-4.5",
 			AvailabilityState: providerinventory.AvailabilityAvailable,
@@ -153,6 +155,7 @@ func TestFromInventory_GrokDoesNotUseAgySlugParse(t *testing.T) {
 			EntrySources: []providerinventory.CatalogEntrySource{{
 				SourceKind: providerinventory.CatalogSourceProviderMachineReadable,
 				Confidence: providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
+				SourceReference: "provider-machine-readable:grok:models",
 			}},
 			Source: providerinventory.SourceDescriptor{Kind: string(providerinventory.CatalogSourceProviderMachineReadable)},
 		}},
@@ -164,13 +167,135 @@ func TestFromInventory_GrokDoesNotUseAgySlugParse(t *testing.T) {
 		}},
 	}
 	accounts := capacitysnapshot.FromProviderInventoryReport(rep, now)
+	var grok *capacitysnapshot.AccountObservation
+	for i := range accounts {
+		if accounts[i].Provider == "grok" {
+			grok = &accounts[i]
+			break
+		}
+	}
+	if grok == nil {
+		t.Fatal("missing grok account")
+	}
+	found := false
+	for _, m := range grok.Models {
+		if m.ModelID != "grok-4.5" || !m.PresentInCatalog || m.CatalogHintOnly {
+			continue
+		}
+		found = true
+		if len(m.SupportedDepths) != 1 || m.SupportedDepths[0] != "medium" {
+			t.Fatalf("live grok-4.5 must be medium-only (no static ladder), depths=%v", m.SupportedDepths)
+		}
+		if m.DefaultDepth != "medium" {
+			t.Fatalf("DefaultDepth=%q want medium", m.DefaultDepth)
+		}
+	}
+	if !found {
+		t.Fatalf("want production-routable grok-4.5 present models=%+v", grok.Models)
+	}
 	inv, err := capacitysnapshot.ToRouteInventory(mustBuild(t, accounts, now), now)
 	if err != nil {
 		t.Fatal(err)
 	}
+	depths := map[string]bool{}
 	for _, c := range inv.Candidates {
 		if c.Provider == "grok" && (c.Model == "GPT-OSS 120B" || c.Model == "GPT-OSS 120B (Medium)") {
 			t.Fatalf("agy parse leaked onto grok: %+v", c)
+		}
+		if c.Provider == "grok" && c.Model == "grok-4.5" {
+			depths[c.Effort] = true
+		}
+	}
+	if !depths["medium"] {
+		t.Fatal("want medium effort candidate for grok-4.5")
+	}
+	for d := range depths {
+		if d != "medium" {
+			t.Fatalf("static depth %q must not be production-routable for live grok-4.5: %v", d, depths)
+		}
+	}
+}
+
+// Live machine-readable row for a model that *does* exist in the static registry
+// (gpt-5.5 → low/medium/high/xhigh). Without observed depth tokens, production
+// must not backfill that ladder — only medium-only (or later explicit observed
+// depths). Static fill remains CatalogHintOnly / seed display only.
+func TestFromInventory_LiveMachineReadableNoDepth_NoStaticLadder(t *testing.T) {
+	now := time.Date(2026, 7, 23, 18, 0, 0, 0, time.UTC)
+	rem, lim := int64(40), int64(100)
+	rep := providerinventory.Report{
+		Installations: []providerinventory.ProviderInstallation{{
+			AdapterID: "codex", InstallationState: providerinventory.InstallationInstalled,
+			UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
+			Confidence: providerinventory.ConfidenceExact,
+		}},
+		AuthReadiness: []providerinventory.AuthReadiness{{
+			AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
+			FreshnessState: providerinventory.FreshnessFresh,
+		}},
+		ModelCapabilities: []providerinventory.ModelCapability{{
+			AdapterID: "codex", CanonicalModelID: "gpt-5.5",
+			AvailabilityState: providerinventory.AvailabilityAvailable,
+			LifecycleState:    providerinventory.LifecycleAvailable,
+			FreshnessState:    providerinventory.FreshnessFresh,
+			Confidence:        providerinventory.ConfidenceExact,
+			// No Constraints, no depth tokens — same shape as providers that only
+			// list model ids (Codex supportedReasoningEfforts lands in a later PR).
+			EntrySources: []providerinventory.CatalogEntrySource{{
+				SourceKind:      providerinventory.CatalogSourceProviderMachineReadable,
+				SourceReference: "provider-machine-readable:codex:models",
+				Confidence:      providerinventory.ConfidenceExact,
+				FreshnessState:  providerinventory.FreshnessFresh,
+			}},
+			Source: providerinventory.SourceDescriptor{Kind: string(providerinventory.CatalogSourceProviderMachineReadable)},
+		}},
+		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
+			AdapterID: "codex", Unit: "percent", WindowKind: providerinventory.WindowFixedHour,
+			RemainingValue: &rem, LimitValue: &lim,
+			Confidence: providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
+			CapturedAt: now.Format(time.RFC3339),
+		}},
+	}
+	accounts := capacitysnapshot.FromProviderInventoryReport(rep, now)
+	var codex *capacitysnapshot.AccountObservation
+	for i := range accounts {
+		if accounts[i].Provider == "codex" {
+			codex = &accounts[i]
+			break
+		}
+	}
+	if codex == nil {
+		t.Fatal("missing codex account")
+	}
+	found := false
+	for _, m := range codex.Models {
+		if m.ModelID != "gpt-5.5" || !m.PresentInCatalog || m.CatalogHintOnly {
+			continue
+		}
+		found = true
+		if len(m.SupportedDepths) != 1 || m.SupportedDepths[0] != "medium" {
+			t.Fatalf("live gpt-5.5 with no observed depth must be medium-only (not static low/high/xhigh), depths=%v", m.SupportedDepths)
+		}
+	}
+	if !found {
+		t.Fatalf("want production-routable live gpt-5.5 models=%+v", codex.Models)
+	}
+	inv, err := capacitysnapshot.ToRouteInventory(mustBuild(t, accounts, now), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	depths := map[string]bool{}
+	for _, c := range inv.Candidates {
+		if c.Provider == "codex" && c.Model == "gpt-5.5" {
+			depths[c.Effort] = true
+		}
+	}
+	if !depths["medium"] {
+		t.Fatal("want medium effort candidate for live gpt-5.5")
+	}
+	for d := range depths {
+		if d != "medium" {
+			t.Fatalf("static depth %q must not route for live gpt-5.5 with no observed depths: %v", d, depths)
 		}
 	}
 }

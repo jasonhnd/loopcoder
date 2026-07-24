@@ -140,30 +140,103 @@ func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 				// Window present but no usable remaining → unfit (not invented full).
 				resFit = factBool(false, "res-unknown-remaining-"+a.Provider)
 			}
+			// Capacity window identity for this account (soft-bound best remaining window).
+			winKind := ""
+			for _, w := range a.Windows {
+				if w.Freshness != FreshnessFresh {
+					continue
+				}
+				if capacitysnapshotRemainingOK(w) {
+					winKind = string(w.Kind)
+					// Empty/unknown windows stay empty — never invent five_hour.
+					break
+				}
+			}
+			// Prefer the same highest-remaining window used for soft ranking when available.
+			if rem != nil {
+				var bestKind string
+				var bestRem *float64
+				for _, w := range a.Windows {
+					if w.Freshness != FreshnessFresh {
+						continue
+					}
+					f := RemainingFraction(w)
+					if f == nil {
+						continue
+					}
+					if bestRem == nil || *f > *bestRem {
+						rf := *f
+						bestRem = &rf
+						bestKind = string(w.Kind)
+					}
+				}
+				if bestKind != "" {
+					winKind = bestKind
+				}
+			}
+			accRef := strings.TrimSpace(a.AccountRef)
+			instRef := strings.TrimSpace(a.InstallRef)
+			// Runtime hard-eligibility: capacity reserve requires exact
+			// account/install/depth affirmation. Exclude providers whose runners
+			// cannot affirm required dimensions before spend.
+			affirm := providerRuntimeAffirm(a.Provider)
 			for _, effort := range depths {
+				authFact := factBool(a.Authenticated, "auth-"+a.Provider)
+				effortFact := factBool(true, "effort-"+a.Provider+"-"+effort)
+				// ModelPresent must reflect ExactRouteAffirm.Model (not always true).
+				modelPresent := factBool(true, "model-"+a.Provider+"-"+m.ModelID)
+				if !affirm.Model {
+					modelPresent = factBool(false, "runtime-no-model-affirm-"+a.Provider)
+				}
+				// Fixture / non-production adapters are never capacity-bound winners.
+				if !affirm.ProductionEligible {
+					authFact = factBool(false, "runtime-not-production-eligible-"+a.Provider)
+				}
+				if !affirm.Account && accRef != "" {
+					// Capacity-bound product path requires account affirmation.
+					authFact = factBool(false, "runtime-no-account-affirm-"+a.Provider)
+				}
+				if !affirm.Depth {
+					effortFact = factBool(false, "runtime-no-depth-affirm-"+a.Provider)
+				}
+				if !affirm.Install && instRef != "" {
+					authFact = factBool(false, "runtime-no-install-affirm-"+a.Provider)
+				}
 				base := eligibility.Candidate{
 					Provider: a.Provider, Model: m.ModelID, Effort: effort,
+					AccountRef:     accRef,
+					InstallRef:     instRef,
+					WindowKind:     winKind,
 					ModelClass:     cl,
 					Installed:      factBool(a.Installed, "inst-"+a.Provider),
-					Authenticated:  factBool(a.Authenticated, "auth-"+a.Provider),
-					ModelPresent:   factBool(true, "model-"+a.Provider+"-"+m.ModelID),
-					EffortOK:       factBool(true, "effort-"+a.Provider+"-"+effort),
+					Authenticated:  authFact,
+					ModelPresent:   modelPresent,
+					EffortOK:       effortFact,
 					Healthy:        healthyFact,
 					CooldownActive: cooldownFact,
 					ResourceFit:    resFit,
 					QuotaRemaining: quotaRemainingUnits(rem),
 				}
-				// Emit permission-specific candidates. PermissionOK is a hard gate.
+				// PermissionOK must reflect ExactRouteAffirm.Permission.
+				// Providers that cannot affirm permission never win/reserve.
 				if writeOK {
 					wc := base
 					wc.Permission = "bounded_write"
-					wc.PermissionOK = factBool(true, "perm-write-"+a.Provider)
+					if affirm.Permission {
+						wc.PermissionOK = factBool(true, "perm-write-"+a.Provider)
+					} else {
+						wc.PermissionOK = factBool(false, "runtime-no-permission-affirm-"+a.Provider)
+					}
 					cands = append(cands, wc)
 				}
 				if roOK {
 					rc := base
 					rc.Permission = "read-only"
-					rc.PermissionOK = factBool(true, "perm-ro-"+a.Provider)
+					if affirm.Permission {
+						rc.PermissionOK = factBool(true, "perm-ro-"+a.Provider)
+					} else {
+						rc.PermissionOK = factBool(false, "runtime-no-permission-affirm-"+a.Provider)
+					}
 					cands = append(cands, rc)
 				} else {
 					// Explicit ineligible row so reports can show denial reasons when
@@ -174,14 +247,41 @@ func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 					cands = append(cands, rc)
 				}
 			}
+			// One soft row per account identity with exact window kind (never hardcode five_hour).
 			sc := quotapolicy.Candidate{
 				Provider: a.Provider, Model: m.ModelID,
+				AccountRef:          accRef,
+				InstallRef:          instRef,
+				WindowKind:          winKind,
 				ReliabilityEvidence: quotapolicy.EvidenceUnknown,
 			}
 			if rem != nil {
 				rf := *rem
+				// Preserve exact observed kind — never invent five_hour for empty/unknown.
+				var wk quotapolicy.WindowKind
+				switch strings.ToLower(strings.TrimSpace(winKind)) {
+				case "weekly", "fixed-week", "fixed_week":
+					wk = quotapolicy.WindowWeekly
+				case "credit":
+					wk = quotapolicy.WindowCredit
+				case "five_hour", "fixed_hour", "fixed-hour", "5h":
+					wk = quotapolicy.WindowFiveHour
+				case "daily":
+					wk = quotapolicy.WindowOther
+				case "":
+					// Unknown/empty: leave sc.WindowKind empty; soft window Kind stays empty
+					// so production exact routing cannot treat it as five_hour.
+					wk = ""
+				default:
+					wk = quotapolicy.WindowKind(strings.ToLower(strings.TrimSpace(winKind)))
+				}
+				sc.WindowKind = string(wk)
+				if winKind != "" && sc.WindowKind == "" {
+					sc.WindowKind = strings.ToLower(strings.TrimSpace(winKind))
+					wk = quotapolicy.WindowKind(sc.WindowKind)
+				}
 				win := quotapolicy.Window{
-					Kind: quotapolicy.WindowFiveHour, RemainingFraction: &rf,
+					Kind: wk, RemainingFraction: &rf,
 					Evidence: confSoft,
 				}
 				if ttr != nil {
@@ -214,6 +314,17 @@ func ToRouteInventory(s Snapshot, now time.Time) (autoroute.Inventory, error) {
 		// usable capacity before reset (V090-CRO-007).
 		Mode: quotamode.DefaultModeConfig(quotamode.ModeBurnBeforeReset),
 	}, nil
+}
+
+func capacitysnapshotRemainingOK(w Window) bool {
+	return RemainingFraction(w) != nil
+}
+
+// providerRuntimeAffirm is a thin alias of the single authoritative
+// runtimecap.ExactRouteAffirm contract (auto-route and explicit pin share it).
+// Fixture is never production-eligible.
+func providerRuntimeAffirm(provider string) runtimecap.ExactRouteAffirmation {
+	return runtimecap.ExactRouteAffirm(provider)
 }
 
 // providerPermissionSupportFixed returns (readOnlyOK, writeOK) from the

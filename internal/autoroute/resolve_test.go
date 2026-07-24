@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/autoroute"
+	"github.com/jasonhnd/loopcoder/internal/capclass"
 	"github.com/jasonhnd/loopcoder/internal/routedecision"
 )
 
@@ -19,13 +20,18 @@ func withFake(in autoroute.Input) autoroute.Input {
 	if in.Now.IsZero() {
 		in.Now = t0()
 	}
+	// Tests must pass classified TaskClass explicitly (Resolve never invents Tera).
+	if !in.TaskClass.Valid() {
+		in.TaskClass = capclass.ClassTera
+	}
 	return in
 }
 
 func TestExplicitPinNeverOverridden(t *testing.T) {
+	// Fixture is test-only and must not production-spend; pin a real provider/model.
 	res, err := autoroute.Resolve(autoroute.Input{
-		Provider: "fixture", Model: "m", Effort: "low", Permission: "default",
-		ProjectID: "p", DecisionKey: "k1", Now: t0(),
+		Provider: "codex", Model: "gpt-5.5", Effort: "medium", Permission: "bounded_write",
+		ProjectID: "p", DecisionKey: "k1", Now: t0(), TaskClass: capclass.ClassTera,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -33,7 +39,7 @@ func TestExplicitPinNeverOverridden(t *testing.T) {
 	if res.Outcome != autoroute.OutcomeExplicitPin {
 		t.Fatalf("%+v", res)
 	}
-	if res.Provider != "fixture" || res.Model != "m" {
+	if res.Provider != "codex" || res.Model != "gpt-5.5" {
 		t.Fatalf("%+v", res)
 	}
 }
@@ -81,15 +87,72 @@ func TestOmittedRouteWithoutFlagUsesAutoPath(t *testing.T) {
 func TestPartialPinInvalid(t *testing.T) {
 	_, err := autoroute.Resolve(autoroute.Input{
 		Provider: "fixture", Model: "", ProjectID: "p", DecisionKey: "partial", Now: t0(),
+		TaskClass: capclass.ClassTera,
 	})
 	if err == nil {
 		t.Fatal("expected error")
 	}
 }
 
+func TestResolveTaskClassRequiredNoSilentTera(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cl   capclass.Class
+	}{
+		{"empty", ""},
+		{"invalid", "mega"},
+		{"needs_human", capclass.ClassNeedsHuman},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := autoroute.Resolve(autoroute.Input{
+				Provider: "codex", Model: "gpt-5.5", Effort: "medium", Permission: "bounded_write",
+				ProjectID: "p", DecisionKey: "tc-" + tc.name, Now: t0(), TaskClass: tc.cl,
+			})
+			if err == nil || res.Outcome != autoroute.OutcomeInvalid {
+				t.Fatalf("want OutcomeInvalid, got %+v err=%v", res, err)
+			}
+			if strings.Contains(strings.ToLower(res.Message), "silent") || !strings.Contains(strings.ToLower(res.Message), "task class") {
+				// message must name task class failure
+				if !strings.Contains(strings.ToLower(res.Message), "task class") && !strings.Contains(strings.ToLower(res.Message), "needs_human") {
+					t.Fatalf("message: %q", res.Message)
+				}
+			}
+		})
+	}
+}
+
+func TestResolveSourceDoesNotDefaultTaskClassTera(t *testing.T) {
+	src, err := os.ReadFile("resolve.go")
+	if err != nil {
+		src, err = os.ReadFile(filepath.Join("internal", "autoroute", "resolve.go"))
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(src)
+	idx := strings.Index(body, "func Resolve(")
+	if idx < 0 {
+		t.Fatal("Resolve not found")
+	}
+	end := strings.Index(body[idx:], "\nfunc FakeInventory")
+	if end < 0 {
+		end = strings.Index(body[idx:], "\nfunc DefaultInventory")
+	}
+	if end < 0 {
+		t.Fatal("cannot bound Resolve body")
+	}
+	resolveBody := body[idx : idx+end]
+	// Guard: no silent assignment of ClassTera for missing TaskClass.
+	if strings.Contains(resolveBody, "taskClass = capclass.ClassTera") ||
+		strings.Contains(resolveBody, "TaskClass = capclass.ClassTera") {
+		t.Fatal("Resolve must not silently assign ClassTera for missing TaskClass")
+	}
+}
+
 func TestNilInventoryAutoRouteFailsClosed(t *testing.T) {
 	res, err := autoroute.Resolve(autoroute.Input{
 		AutoRoute: true, ProjectID: "p", DecisionKey: "nil-inv", Now: t0(),
+		TaskClass: capclass.ClassTera,
 		// Inventory deliberately nil
 	})
 	if err == nil {
@@ -111,6 +174,7 @@ func TestHistoricalFakeDigestRefused(t *testing.T) {
 	inv.EvidenceDigest = "default-official-fake-v1"
 	res, err := autoroute.Resolve(autoroute.Input{
 		AutoRoute: true, ProjectID: "p", DecisionKey: "fake-digest", Now: t0(), Inventory: &inv,
+		TaskClass: capclass.ClassTera,
 	})
 	if err == nil {
 		t.Fatal("expected refuse of historical fake digest")
@@ -130,6 +194,7 @@ func TestEmptyInventoryNoRoute(t *testing.T) {
 	}
 	res, err := autoroute.Resolve(autoroute.Input{
 		AutoRoute: true, ProjectID: "p", DecisionKey: "empty", Now: t0(), Inventory: &inv,
+		TaskClass: capclass.ClassTera,
 	})
 	if err == nil && res.Outcome == autoroute.OutcomeSelected {
 		t.Fatalf("expected no route: %+v", res)

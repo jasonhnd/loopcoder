@@ -31,12 +31,17 @@ const (
 	SubagentAllowed   SubagentPolicy = "allowed"
 )
 
-// Fields are the explicit pin components.
+// Fields are the explicit pin components including account/install/window binding.
 type Fields struct {
 	Provider         string         `json:"provider"`
 	Model            string         `json:"model"`
 	Effort           string         `json:"effort,omitempty"`
 	Permission       string         `json:"permission,omitempty"`
+	AccountRef       string         `json:"account_ref,omitempty"`
+	InstallRef       string         `json:"install_ref,omitempty"`
+	WindowKind       string         `json:"window_kind,omitempty"`
+	ReservationID    string         `json:"reservation_id,omitempty"`
+	RouteReason      string         `json:"route_reason,omitempty"`
 	SubagentPolicy   SubagentPolicy `json:"subagent_policy"`
 	NativeDelegation bool           `json:"native_delegation"`
 }
@@ -48,6 +53,11 @@ func (f Fields) Normalize() (Fields, error) {
 		Model:            strings.TrimSpace(f.Model),
 		Effort:           strings.TrimSpace(f.Effort),
 		Permission:       strings.TrimSpace(f.Permission),
+		AccountRef:       strings.TrimSpace(f.AccountRef),
+		InstallRef:       strings.TrimSpace(f.InstallRef),
+		WindowKind:       strings.TrimSpace(f.WindowKind),
+		ReservationID:    strings.TrimSpace(f.ReservationID),
+		RouteReason:      strings.TrimSpace(f.RouteReason),
 		SubagentPolicy:   f.SubagentPolicy,
 		NativeDelegation: f.NativeDelegation,
 	}
@@ -73,11 +83,13 @@ func (f Fields) Normalize() (Fields, error) {
 	return out, nil
 }
 
-// Digest is the immutable route digest.
+// Digest is the immutable route digest including account/install/window.
 func (f Fields) Digest() string {
 	h := sha256.New()
-	fmt.Fprintf(h, "%s|%s|%s|%s|%s|%v",
-		f.Provider, f.Model, f.Effort, f.Permission, f.SubagentPolicy, f.NativeDelegation)
+	fmt.Fprintf(h, "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%v",
+		f.Provider, f.Model, f.Effort, f.Permission,
+		f.AccountRef, f.InstallRef, f.WindowKind, f.ReservationID, f.RouteReason,
+		f.SubagentPolicy, f.NativeDelegation)
 	return "sha256:" + hex.EncodeToString(h.Sum(nil))[:24]
 }
 
@@ -85,7 +97,9 @@ func (f Fields) Digest() string {
 func (f Fields) ToExecRoute() providerexec.Route {
 	return providerexec.Route{
 		Provider: f.Provider, Model: f.Model, Effort: f.Effort,
-		Permission: f.Permission, NativeDelegation: f.NativeDelegation,
+		Permission: f.Permission, AccountRef: f.AccountRef, InstallRef: f.InstallRef,
+		WindowKind: f.WindowKind, ReservationID: f.ReservationID, RouteReason: f.RouteReason,
+		NativeDelegation: f.NativeDelegation,
 	}
 }
 

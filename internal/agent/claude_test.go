@@ -269,10 +269,11 @@ func TestParseClaudeStreamJSONOutput(t *testing.T) {
 			inv:         Invocation{Effort: "max"},
 			wantSummary: `{"verdict":"pass","findings":[],"evidence":"streamed final event","spec_conformance":"pass"}`,
 			wantModel:   "claude-opus-4-8[1m]",
-			wantEffort:  "max",
-			wantInput:   testInt64Ptr(33346),
-			wantOutput:  testInt64Ptr(4),
-			wantTotal:   testInt64Ptr(33350),
+			// Effort is never seeded from request — stream does not echo effort.
+			wantEffort: "",
+			wantInput:  testInt64Ptr(33346),
+			wantOutput: testInt64Ptr(4),
+			wantTotal:  testInt64Ptr(33350),
 		},
 		{
 			name: "result event without structured output returns result text",
@@ -293,7 +294,8 @@ func TestParseClaudeStreamJSONOutput(t *testing.T) {
 {"type":"result"`),
 			inv:         Invocation{Effort: "xhigh"},
 			wantSummary: "",
-			wantEffort:  "xhigh",
+			// Request effort is never treated as observed.
+			wantEffort: "",
 		},
 		{
 			name: "last result event wins",
@@ -405,9 +407,10 @@ func TestParseClaudeInvocation(t *testing.T) {
 					}
 				}
 			}`),
-			inv:        Invocation{Effort: "high"},
-			wantModel:  "claude-opus-4-20250514",
-			wantEffort: "high",
+			inv:       Invocation{Effort: "high"},
+			wantModel: "claude-opus-4-20250514",
+			// Stream does not echo effort — never seed from request.
+			wantEffort: "",
 			wantInput:  testInt64Ptr(1234),
 			wantOutput: testInt64Ptr(567),
 			wantTotal:  testInt64Ptr(1801),
@@ -438,7 +441,7 @@ func TestParseClaudeInvocation(t *testing.T) {
 			wantOutput: testInt64Ptr(71),
 		},
 		{
-			name: "pinned model present wins over higher token auxiliary",
+			name: "stream primary model wins; request pin never seeds actual model",
 			output: []byte(`{
 				"type": "result",
 				"subtype": "success",
@@ -454,8 +457,9 @@ func TestParseClaudeInvocation(t *testing.T) {
 					}
 				}
 			}`),
-			inv:       Invocation{Model: "claude-opus-4-8[1m]"},
-			wantModel: "claude-opus-4-8[1m]",
+			inv: Invocation{Model: "claude-opus-4-8[1m]"},
+			// Primary by token volume is haiku; request pin is not a source of truth.
+			wantModel: "claude-haiku-4-5-20251001",
 		},
 		{
 			name: "pinned model absent falls back to primary model",
@@ -509,10 +513,10 @@ func TestParseClaudeInvocation(t *testing.T) {
 			wantTotal: testInt64Ptr(42),
 		},
 		{
-			name:       "invalid json keeps invocation effort only",
+			name:       "invalid json never seeds effort from request",
 			output:     []byte(`not json`),
 			inv:        Invocation{Effort: "xhigh"},
-			wantEffort: "xhigh",
+			wantEffort: "",
 		},
 	}
 

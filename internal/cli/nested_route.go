@@ -24,15 +24,15 @@ import (
 // Explicit pins come from the immutable child contract and optional global
 // --provider/--model/--effort flags.
 type NestedChildRouteInput struct {
-	RepoPath         string
-	ParentRunID      string
-	HostProfile      string
-	GlobalProvider   string
-	GlobalModel      string
-	GlobalEffort     string
-	HostName         string
-	Now              time.Time
-	PermissionSafe   func(permission, provider string) error
+	RepoPath       string
+	ParentRunID    string
+	HostProfile    string
+	GlobalProvider string
+	GlobalModel    string
+	GlobalEffort   string
+	HostName       string
+	Now            time.Time
+	PermissionSafe func(permission, provider string) error
 }
 
 // nestedChildRouteProduction builds durable nested-child task evidence, persists
@@ -88,9 +88,9 @@ func nestedChildRouteProduction(ctx context.Context, request orchestration.Child
 		hostName = "generic-local"
 	}
 	actor := delivery.Actor{
-		ActorKind:         "system",
-		ActorID:           "loopcoder-nested",
-		Display:           "loopcoder nested",
+		ActorKind: "system",
+		ActorID:   "loopcoder-nested",
+		Display:   "loopcoder nested",
 		// Routing decisions require authority router|user (not a free-form tag).
 		DecisionAuthority: "router",
 		Source:            "cli.nested",
