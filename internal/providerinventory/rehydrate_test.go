@@ -317,4 +317,303 @@ func TestRehydrateEstimatedOrStaleDurableInstallNoTranslate(t *testing.T) {
 	}
 }
 
+// RC37 Stage D: live Discover adapter-declared models must not suppress durable
+// exact+fresh machine-readable model catalogs for the same adapter.
+func TestRehydrateModelsOverlaysDurableMRWhenLiveOnlyAdapterDeclared(t *testing.T) {
+	now := time.Date(2026, 7, 24, 14, 0, 0, 0, time.UTC)
+	live := providerinventory.Report{
+		Installations: []providerinventory.ProviderInstallation{{
+			AdapterID: "codex", ProviderInstallationID: "pinst_live",
+			InstallationState:   providerinventory.InstallationInstalled,
+			UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
+			Confidence: providerinventory.ConfidenceExact,
+		}},
+		ModelCapabilities: []providerinventory.ModelCapability{{
+			AdapterID: "codex", CanonicalModelID: "gpt-5.5",
+			AvailabilityState: providerinventory.AvailabilityAvailable,
+			LifecycleState:    providerinventory.LifecycleAvailable,
+			FreshnessState:    providerinventory.FreshnessFresh,
+			Confidence:        providerinventory.ConfidenceExact,
+			EntrySources: []providerinventory.CatalogEntrySource{{
+				SourceKind:     providerinventory.CatalogSourceAdapterDeclared,
+				Confidence:     providerinventory.ConfidenceExact,
+				FreshnessState: providerinventory.FreshnessFresh,
+			}},
+		}},
+		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
+			AdapterID: "codex", Confidence: providerinventory.ConfidenceUnavailable,
+			FreshnessState: providerinventory.FreshnessNotApplicable,
+			CapturedAt:     now.Format(time.RFC3339),
+		}},
+	}
+	durable := providerinventory.Report{
+		ModelCapabilities: []providerinventory.ModelCapability{{
+			AdapterID: "codex", CanonicalModelID: "gpt-5.5",
+			AvailabilityState: providerinventory.AvailabilityAvailable,
+			LifecycleState:    providerinventory.LifecycleAvailable,
+			FreshnessState:    providerinventory.FreshnessFresh,
+			Confidence:        providerinventory.ConfidenceExact,
+			Constraints:       []string{"supported_depth=low", "supported_depth=medium", "supported_depth=high"},
+			EntrySources: []providerinventory.CatalogEntrySource{{
+				SourceKind:      providerinventory.CatalogSourceProviderMachineReadable,
+				SourceReference: "codex-app-server:model-list#test",
+				Confidence:      providerinventory.ConfidenceExact,
+				FreshnessState:  providerinventory.FreshnessFresh,
+			}},
+		}},
+		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{{
+			ModelCatalogSnapshotID: "mc_mr", AdapterID: "codex",
+			CatalogSourceKind: providerinventory.CatalogSourceProviderMachineReadable,
+			Confidence:        providerinventory.ConfidenceExact,
+			FreshnessState:    providerinventory.FreshnessFresh,
+			EntryCount:        1,
+		}},
+	}
+	merged := providerinventory.RehydrateForAutoRoute(live, durable, now)
+	var mr, declared int
+	for _, m := range merged.ModelCapabilities {
+		if m.AdapterID != "codex" {
+			continue
+		}
+		for _, s := range m.EntrySources {
+			switch s.SourceKind {
+			case providerinventory.CatalogSourceProviderMachineReadable:
+				mr++
+			case providerinventory.CatalogSourceAdapterDeclared:
+				declared++
+			}
+		}
+	}
+	if mr == 0 {
+		t.Fatalf("durable exact+fresh MR model must rehydrate over live adapter-declared only; models=%#v", merged.ModelCapabilities)
+	}
+	if declared == 0 {
+		t.Fatal("live adapter-declared row should remain (capacity mapper marks CatalogHintOnly when MR present)")
+	}
+}
+
+// EntrySources is authoritative: adapter-declared EntrySources must not count as
+// live MR even when top-level Source.Kind falsely claims machine-readable.
+func TestRehydrateModels_EntrySourcesAuthority_ConflictingSourceKindDoesNotBlockDurableMR(t *testing.T) {
+	now := time.Date(2026, 7, 24, 14, 0, 0, 0, time.UTC)
+	live := providerinventory.Report{
+		ModelCapabilities: []providerinventory.ModelCapability{{
+			AdapterID: "codex", CanonicalModelID: "gpt-5.5",
+			AvailabilityState: providerinventory.AvailabilityAvailable,
+			LifecycleState:    providerinventory.LifecycleAvailable,
+			FreshnessState:    providerinventory.FreshnessFresh,
+			Confidence:        providerinventory.ConfidenceExact,
+			// Conflicting shape that previously false-positived production MR.
+			Source: providerinventory.SourceDescriptor{
+				Kind: string(providerinventory.CatalogSourceProviderMachineReadable),
+			},
+			EntrySources: []providerinventory.CatalogEntrySource{{
+				SourceKind:     providerinventory.CatalogSourceAdapterDeclared,
+				Confidence:     providerinventory.ConfidenceExact,
+				FreshnessState: providerinventory.FreshnessFresh,
+			}},
+		}},
+	}
+	durable := providerinventory.Report{
+		ModelCapabilities: []providerinventory.ModelCapability{{
+			AdapterID: "codex", CanonicalModelID: "gpt-5.5",
+			AvailabilityState: providerinventory.AvailabilityAvailable,
+			LifecycleState:    providerinventory.LifecycleAvailable,
+			FreshnessState:    providerinventory.FreshnessFresh,
+			Confidence:        providerinventory.ConfidenceExact,
+			Constraints:       []string{"supported_depth=low", "supported_depth=high"},
+			EntrySources: []providerinventory.CatalogEntrySource{{
+				SourceKind:     providerinventory.CatalogSourceProviderMachineReadable,
+				Confidence:     providerinventory.ConfidenceExact,
+				FreshnessState: providerinventory.FreshnessFresh,
+			}},
+		}},
+	}
+	merged := providerinventory.RehydrateForAutoRoute(live, durable, now)
+	var hasDurableMR bool
+	for _, m := range merged.ModelCapabilities {
+		for _, s := range m.EntrySources {
+			if s.SourceKind == providerinventory.CatalogSourceProviderMachineReadable {
+				hasDurableMR = true
+			}
+		}
+	}
+	if !hasDurableMR {
+		t.Fatalf("EntrySources=adapter-declared must not block durable MR despite Source.Kind=MR; got %#v", merged.ModelCapabilities)
+	}
+	_ = now
+}
+
+func TestRehydrateModelsSkipsDurableWhenLiveAlreadyHasProductionMR(t *testing.T) {
+	now := time.Date(2026, 7, 24, 14, 0, 0, 0, time.UTC)
+	liveMR := providerinventory.ModelCapability{
+		AdapterID: "codex", CanonicalModelID: "gpt-5.5",
+		AvailabilityState: providerinventory.AvailabilityAvailable,
+		LifecycleState:    providerinventory.LifecycleAvailable,
+		FreshnessState:    providerinventory.FreshnessFresh,
+		Confidence:        providerinventory.ConfidenceExact,
+		Constraints:       []string{"supported_depth=medium"},
+		EntrySources: []providerinventory.CatalogEntrySource{{
+			SourceKind:     providerinventory.CatalogSourceProviderMachineReadable,
+			Confidence:     providerinventory.ConfidenceExact,
+			FreshnessState: providerinventory.FreshnessFresh,
+		}},
+	}
+	live := providerinventory.Report{
+		ModelCapabilities: []providerinventory.ModelCapability{liveMR},
+		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{{
+			ModelCatalogSnapshotID: "live_mc", AdapterID: "codex",
+			CatalogSourceKind: providerinventory.CatalogSourceProviderMachineReadable,
+			Confidence:        providerinventory.ConfidenceExact,
+			FreshnessState:    providerinventory.FreshnessFresh,
+			EntryCount:        1,
+		}},
+	}
+	durable := providerinventory.Report{
+		ModelCapabilities: []providerinventory.ModelCapability{{
+			AdapterID: "codex", CanonicalModelID: "gpt-5.4",
+			AvailabilityState: providerinventory.AvailabilityAvailable,
+			LifecycleState:    providerinventory.LifecycleAvailable,
+			FreshnessState:    providerinventory.FreshnessFresh,
+			Confidence:        providerinventory.ConfidenceExact,
+			EntrySources: []providerinventory.CatalogEntrySource{{
+				SourceKind:     providerinventory.CatalogSourceProviderMachineReadable,
+				Confidence:     providerinventory.ConfidenceExact,
+				FreshnessState: providerinventory.FreshnessFresh,
+			}},
+		}},
+	}
+	merged := providerinventory.RehydrateForAutoRoute(live, durable, now)
+	for _, m := range merged.ModelCapabilities {
+		if m.CanonicalModelID == "gpt-5.4" {
+			t.Fatalf("when live already has production MR, durable MR must not inject another model set: %#v", merged.ModelCapabilities)
+		}
+	}
+	if len(merged.ModelCapabilities) != 1 || merged.ModelCapabilities[0].CanonicalModelID != "gpt-5.5" {
+		t.Fatalf("want sole live MR gpt-5.5, got %#v", merged.ModelCapabilities)
+	}
+	_ = now
+}
+
+// Live rows with MR source but not present (mapper would not produce candidates)
+// must not block durable exact+fresh available MR.
+func TestRehydrateModels_UnpresentLiveMRDoesNotBlockDurableMR(t *testing.T) {
+	now := time.Date(2026, 7, 24, 14, 0, 0, 0, time.UTC)
+	baseMRSource := func() providerinventory.ModelCapability {
+		return providerinventory.ModelCapability{
+			AdapterID: "codex", CanonicalModelID: "live-broken",
+			AvailabilityState: providerinventory.AvailabilityAvailable,
+			LifecycleState:    providerinventory.LifecycleAvailable,
+			FreshnessState:    providerinventory.FreshnessFresh,
+			Confidence:        providerinventory.ConfidenceExact,
+			EntrySources: []providerinventory.CatalogEntrySource{{
+				SourceKind:     providerinventory.CatalogSourceProviderMachineReadable,
+				Confidence:     providerinventory.ConfidenceExact,
+				FreshnessState: providerinventory.FreshnessFresh,
+			}},
+		}
+	}
+	durableMR := providerinventory.ModelCapability{
+		AdapterID: "codex", CanonicalModelID: "gpt-5.5",
+		AvailabilityState: providerinventory.AvailabilityAvailable,
+		LifecycleState:    providerinventory.LifecycleAvailable,
+		FreshnessState:    providerinventory.FreshnessFresh,
+		Confidence:        providerinventory.ConfidenceExact,
+		Constraints:       []string{"supported_depth=low", "supported_depth=high"},
+		EntrySources: []providerinventory.CatalogEntrySource{{
+			SourceKind:     providerinventory.CatalogSourceProviderMachineReadable,
+			Confidence:     providerinventory.ConfidenceExact,
+			FreshnessState: providerinventory.FreshnessFresh,
+		}},
+	}
+
+	cases := []struct {
+		name string
+		mut  func(*providerinventory.ModelCapability)
+	}{
+		{"empty_canonical_id", func(m *providerinventory.ModelCapability) { m.CanonicalModelID = "" }},
+		{"unavailable", func(m *providerinventory.ModelCapability) {
+			m.AvailabilityState = providerinventory.AvailabilityTemporarilyUnavailable
+		}},
+		{"removed", func(m *providerinventory.ModelCapability) {
+			m.LifecycleState = providerinventory.LifecycleRemoved
+		}},
+		{"deprecated", func(m *providerinventory.ModelCapability) {
+			m.LifecycleState = providerinventory.LifecycleDeprecated
+		}},
+		{"stale_top_level", func(m *providerinventory.ModelCapability) {
+			m.FreshnessState = providerinventory.FreshnessStale
+		}},
+		{"expired_top_level", func(m *providerinventory.ModelCapability) {
+			m.FreshnessState = providerinventory.FreshnessExpired
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			liveRow := baseMRSource()
+			tc.mut(&liveRow)
+			merged := providerinventory.RehydrateForAutoRoute(
+				providerinventory.Report{ModelCapabilities: []providerinventory.ModelCapability{liveRow}},
+				providerinventory.Report{ModelCapabilities: []providerinventory.ModelCapability{durableMR}},
+				now,
+			)
+			var hasDurable bool
+			for _, m := range merged.ModelCapabilities {
+				if m.CanonicalModelID == "gpt-5.5" {
+					for _, s := range m.EntrySources {
+						if s.SourceKind == providerinventory.CatalogSourceProviderMachineReadable {
+							hasDurable = true
+						}
+					}
+				}
+			}
+			if !hasDurable {
+				t.Fatalf("unpresent live MR (%s) must not block durable exact+fresh MR; got %#v", tc.name, merged.ModelCapabilities)
+			}
+		})
+	}
+}
+
+// Durable static / estimated rows must not be injected as rehydrate catalog truth.
+func TestRehydrateModelsDoesNotOverlayDurableStaticOrEstimated(t *testing.T) {
+	now := time.Date(2026, 7, 24, 14, 0, 0, 0, time.UTC)
+	live := providerinventory.Report{
+		// No production MR live catalog.
+		ModelCapabilities: nil,
+	}
+	durable := providerinventory.Report{
+		ModelCapabilities: []providerinventory.ModelCapability{
+			{
+				AdapterID: "codex", CanonicalModelID: "static-only",
+				AvailabilityState: providerinventory.AvailabilityAvailable,
+				LifecycleState:    providerinventory.LifecycleAvailable,
+				FreshnessState:    providerinventory.FreshnessFresh,
+				Confidence:        providerinventory.ConfidenceExact,
+				EntrySources: []providerinventory.CatalogEntrySource{{
+					SourceKind:     providerinventory.CatalogSourceAdapterDeclared,
+					Confidence:     providerinventory.ConfidenceExact,
+					FreshnessState: providerinventory.FreshnessFresh,
+				}},
+			},
+			{
+				AdapterID: "codex", CanonicalModelID: "estimated-mr",
+				AvailabilityState: providerinventory.AvailabilityAvailable,
+				LifecycleState:    providerinventory.LifecycleAvailable,
+				FreshnessState:    providerinventory.FreshnessFresh,
+				Confidence:        providerinventory.ConfidenceEstimated,
+				EntrySources: []providerinventory.CatalogEntrySource{{
+					SourceKind:     providerinventory.CatalogSourceProviderMachineReadable,
+					Confidence:     providerinventory.ConfidenceEstimated,
+					FreshnessState: providerinventory.FreshnessFresh,
+				}},
+			},
+		},
+	}
+	merged := providerinventory.RehydrateForAutoRoute(live, durable, now)
+	if len(merged.ModelCapabilities) != 0 {
+		t.Fatalf("static/estimated durable models must not rehydrate as route truth: %#v", merged.ModelCapabilities)
+	}
+	_ = now
+}
+
 func strPtr(s string) *string { return &s }
