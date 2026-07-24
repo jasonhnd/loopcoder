@@ -283,44 +283,85 @@ func hasAnyFindings(worktree string) bool {
 }
 
 // readRegularFindingsFile Lstats then reads a leaf under worktree. Rejects
-// symlinks, directories, FIFOs, and any path escape. Re-Lstats after read to
-// refuse races that swap a regular file for a non-regular node.
+// symlinks, directories, FIFOs, and any path escape.
+//
+// Identity chain (fail closed on race):
+//  1. preLstat path — must be regular non-symlink under worktree
+//  2. Open path
+//  3. f.Stat() — must be regular; os.SameFile(preLstat, fdStat)
+//  4. read from fd
+//  5. postLstat path — must be regular non-symlink; os.SameFile(fdStat, postLstat)
+//
+// Without SameFile, Lstat→Open can follow a swapped symlink and leak external
+// content into acceptance while path Lstats still look clean.
 func readRegularFindingsFile(worktreeAbs, name string) ([]byte, bool) {
+	return readRegularFindingsFileChecked(worktreeAbs, name)
+}
+
+// readRegularFindingsFileChecked is the testable implementation. Returns
+// (nil, false) on any identity/safety failure.
+func readRegularFindingsFileChecked(worktreeAbs, name string) ([]byte, bool) {
+	raw, err := readRegularFindingsFileErr(worktreeAbs, name)
+	return raw, err == nil
+}
+
+// readRegularFindingsFileErr returns a non-nil error describing identity/safety
+// failures (used by unit tests). Callers that only need bool use Checked.
+func readRegularFindingsFileErr(worktreeAbs, name string) ([]byte, error) {
 	name = filepath.Base(strings.TrimSpace(name))
 	if name == "" || name == "." || name == ".." {
-		return nil, false
+		return nil, fmt.Errorf("findings leaf name invalid")
 	}
 	full := filepath.Join(worktreeAbs, name)
 	if err := requirePathUnderRoot(worktreeAbs, full); err != nil {
-		return nil, false
+		return nil, err
 	}
-	st, err := os.Lstat(full)
+	pre, err := os.Lstat(full)
 	if err != nil {
-		return nil, false
+		return nil, err
 	}
-	if st.Mode()&os.ModeSymlink != 0 || !st.Mode().IsRegular() {
-		return nil, false
+	if pre.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("%s is a symlink", name)
 	}
-	// Cap read size to avoid loading huge external-looking artifacts.
+	if !pre.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file (mode=%v)", name, pre.Mode())
+	}
 	const maxFindings = 1 << 20
 	f, err := os.Open(full)
 	if err != nil {
-		return nil, false
+		return nil, err
 	}
 	defer f.Close()
-	// Post-open: still a regular non-symlink at the path (Lstat, not Stat).
-	if st2, err := os.Lstat(full); err != nil || st2.Mode()&os.ModeSymlink != 0 || !st2.Mode().IsRegular() {
-		return nil, false
+	fdStat, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fdStat.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s fd is not a regular file", name)
+	}
+	// Opened fd must be the same inode as the pre-open Lstat (no symlink swap).
+	if !os.SameFile(pre, fdStat) {
+		return nil, fmt.Errorf("%s identity mismatch: pre-lstat vs open fd", name)
 	}
 	raw, err := io.ReadAll(io.LimitReader(f, maxFindings+1))
-	if err != nil || len(raw) > maxFindings {
-		return nil, false
+	if err != nil {
+		return nil, err
 	}
-	// Final Lstat after read — refuse if node type flipped.
-	if st3, err := os.Lstat(full); err != nil || st3.Mode()&os.ModeSymlink != 0 || !st3.Mode().IsRegular() {
-		return nil, false
+	if len(raw) > maxFindings {
+		return nil, fmt.Errorf("%s exceeds max findings size", name)
 	}
-	return raw, true
+	post, err := os.Lstat(full)
+	if err != nil {
+		return nil, err
+	}
+	if post.Mode()&os.ModeSymlink != 0 || !post.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s post-read node is not a regular non-symlink file", name)
+	}
+	// Path node after read must still be the same file as the opened fd.
+	if !os.SameFile(fdStat, post) {
+		return nil, fmt.Errorf("%s identity mismatch: open fd vs post-lstat", name)
+	}
+	return raw, nil
 }
 
 func hasVerifierVerdict(product []string, worktree, evidence string) bool {

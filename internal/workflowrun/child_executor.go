@@ -688,11 +688,31 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	// Research is read-only in the provider sandbox but must still leave a durable
 	// findings product for acceptance — materialize from independently observed
 	// provider Summary after process exit (LoopCoder-owned write, not Actual* echo).
+	//
+	// If materialize is attempted and fails, surface the real typed failure —
+	// never swallow into generic missing_evidence (RC39 Stage D diagnostics).
 	digest, files, _ = productOutputDigest(wt)
 	if strings.TrimSpace(digest) == "" && isResearchWorkItem(in.WorkItemID, in.Intent) {
-		if merr := materializeResearchFindings(wt, res.Summary, in); merr == nil {
-			digest, files, _ = productOutputDigest(wt)
+		if merr := materializeResearchFindings(wt, res.Summary, in); merr != nil {
+			out := ChildExecResult{
+				Terminal: workgraph.TermFailed, WorktreePath: wt,
+				FailureClass: FailureClassResearchFindingsMaterialization,
+				Message:      merr.Error(),
+				// Preserve observed spawn/actuals — do not invent route identity
+				// or overwrite with route_mismatch / empty InvokedRoute.
+				Provider: actualProv, Model: actualModel, Depth: actualDepth,
+				ActualSource: "unknown",
+				InvokedRoute: ChildRoute{
+					Provider: actualProv, Model: actualModel, Depth: actualDepth,
+					Permission: actualPerm, AccountRef: actualAcct, InstallRef: actualInstall,
+				},
+			}
+			bindSources(&out)
+			bindSpawn(&out)
+			out = attachUsage(out, res)
+			return out, merr
 		}
+		digest, files, _ = productOutputDigest(wt)
 	}
 	if strings.TrimSpace(digest) == "" {
 		out := ChildExecResult{

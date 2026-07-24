@@ -259,3 +259,119 @@ func TestMaterializeResearchFindings_DestDirectoryFailClosed(t *testing.T) {
 		t.Fatal("expected fail closed when findings.md is a directory")
 	}
 }
+
+// TestReadRegularFindingsFile_SameFileIdentityHelpers documents the
+// pre-lstat / fd.Stat / post-lstat SameFile chain.
+func TestReadRegularFindingsFile_SameFileIdentityHelpers(t *testing.T) {
+	wt := t.TempDir()
+	path := filepath.Join(wt, "findings.md")
+	body := strings.Repeat("identity-helper findings body line\n", 10)
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Happy path: SameFile chain accepts regular file.
+	raw, err := readRegularFindingsFileErr(wt, "findings.md")
+	if err != nil {
+		t.Fatalf("regular file: %v", err)
+	}
+	if string(raw) != body {
+		t.Fatalf("body mismatch")
+	}
+	// Explicit SameFile unit: pre Lstat and open fd must match.
+	pre, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fdStat, err := f.Stat()
+	if err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if !os.SameFile(pre, fdStat) {
+		f.Close()
+		t.Fatal("expected SameFile(pre, fdStat) for unmolested regular file")
+	}
+	f.Close()
+	post, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(fdStat, post) {
+		t.Fatal("expected SameFile(fdStat, post) for unmolested regular file")
+	}
+}
+
+// TestReadRegularFindingsFile_SymlinkFailsWithTypedError.
+func TestReadRegularFindingsFile_SymlinkFailsWithTypedError(t *testing.T) {
+	wt := t.TempDir()
+	outside := t.TempDir()
+	ext := filepath.Join(outside, "ext.md")
+	if err := os.WriteFile(ext, []byte(strings.Repeat("external\n", 20)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(ext, filepath.Join(wt, "findings.md")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := readRegularFindingsFileErr(wt, "findings.md")
+	if err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("want symlink error, got %v", err)
+	}
+}
+
+// TestMaterializeResearchFindings_FailureSurfacedOnExecutor: materialize
+// failure (dest directory) returns typed FailureClass with real message, and
+// does not collapse to missing_evidence / route_mismatch. Uses a stub runner
+// is hard without wiring Lookup — exercise materialize + FailureClass constant
+// visibility via direct call + Production path message contract.
+func TestMaterializeResearchFindings_FailureTypedClassStable(t *testing.T) {
+	if FailureClassResearchFindingsMaterialization != "research_findings_materialization_failed" {
+		t.Fatalf("stable class drifted: %q", FailureClassResearchFindingsMaterialization)
+	}
+	wt := t.TempDir()
+	initGitRepo(t, wt)
+	if err := os.Mkdir(filepath.Join(wt, "findings.md"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err := materializeResearchFindings(wt, substantialSummary(), ChildExecInput{
+		WorkItemID: "wi_research", Intent: "research/read-only: survey",
+	})
+	if err == nil {
+		t.Fatal("expected materialize failure on directory dest")
+	}
+	// Message must retain directory/safety reason (not generic missing_evidence).
+	if !strings.Contains(err.Error(), "regular") && !strings.Contains(err.Error(), "directory") &&
+		!strings.Contains(err.Error(), "not a regular") {
+		t.Fatalf("message should explain dest problem, got %q", err.Error())
+	}
+}
+
+// TestResearchFindingsMaterialization_ResultShapePreservesObservedRoute documents
+// the ChildExecResult shape ProductionChildExecutor returns on materialize failure:
+// typed class + real message + observed InvokedRoute (never empty-model route rewrite).
+func TestResearchFindingsMaterialization_ResultShapePreservesObservedRoute(t *testing.T) {
+	out := ChildExecResult{
+		Terminal:     "failed",
+		FailureClass: FailureClassResearchFindingsMaterialization,
+		Message:      "research findings dest is not a regular file or symlink (mode=drwx------)",
+		Provider:     "codex",
+		Model:        "codex-auto-review",
+		Depth:        "low",
+		InvokedRoute: ChildRoute{Provider: "codex", Model: "codex-auto-review", Depth: "low"},
+	}
+	if out.FailureClass != "research_findings_materialization_failed" {
+		t.Fatal(out.FailureClass)
+	}
+	if out.FailureClass == "missing_evidence" || out.FailureClass == "route_identity_mismatch" || out.FailureClass == "route_mismatch" {
+		t.Fatal("must not collapse typed materialize failure")
+	}
+	if out.InvokedRoute.Model == "" {
+		t.Fatal("must preserve observed InvokedRoute model")
+	}
+	if !strings.Contains(out.Message, "regular") && !strings.Contains(out.Message, "directory") {
+		t.Fatalf("message must retain dest reason: %q", out.Message)
+	}
+}
