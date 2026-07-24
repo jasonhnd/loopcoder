@@ -567,28 +567,88 @@ func rehydrateAuth(live, durable []AuthReadiness, now time.Time) []AuthReadiness
 	return out
 }
 
+// machineReadableExactFreshSource mirrors capacitysnapshot.capabilityIsDynamicExactFresh
+// for rehydrate gate decisions (keep source priority identical; do not fork).
+//
+// EntrySources is the authoritative production-route gate when present. A row
+// with EntrySources=[adapter-declared] must NOT become MR truth even if
+// top-level Source.Kind claims machine-readable. Source.Kind fallback applies
+// only when len(EntrySources)==0 and Confidence/Freshness are exact+fresh.
+func machineReadableExactFreshSource(m ModelCapability) bool {
+	for _, s := range m.EntrySources {
+		if s.SourceKind != CatalogSourceProviderMachineReadable {
+			continue
+		}
+		if s.Confidence != ConfidenceExact {
+			continue
+		}
+		if s.FreshnessState != FreshnessFresh {
+			continue
+		}
+		return true
+	}
+	if len(m.EntrySources) == 0 &&
+		(m.Source.Kind == string(CatalogSourceProviderMachineReadable) ||
+			m.Source.Kind == "provider-machine-readable") &&
+		m.Confidence == ConfidenceExact &&
+		m.FreshnessState == FreshnessFresh {
+		return true
+	}
+	return false
+}
+
+// productionRoutableMRModel is the full "may stand as production model truth"
+// predicate used both for live has-MR skip decisions and durable overlay.
+//
+// Requires:
+//  1. machineReadableExactFreshSource (EntrySources authority; Source.Kind
+//     fallback only when EntrySources empty) — same as capabilityIsDynamicExactFresh
+//  2. present semantics aligned with FromProviderInventoryReport: nonempty
+//     CanonicalModelID, AvailabilityAvailable, not removed/deprecated, and
+//     top-level FreshnessState neither stale nor expired.
+//
+// Live rows that are MR-sourced but not present (empty id, unavailable, removed,
+// stale/expired) must NOT block durable exact+fresh MR overlay.
+func productionRoutableMRModel(m ModelCapability) bool {
+	if !machineReadableExactFreshSource(m) {
+		return false
+	}
+	if strings.TrimSpace(m.CanonicalModelID) == "" {
+		return false
+	}
+	if m.AvailabilityState != AvailabilityAvailable {
+		return false
+	}
+	if m.LifecycleState == LifecycleRemoved || m.LifecycleState == LifecycleDeprecated {
+		return false
+	}
+	if m.FreshnessState == FreshnessStale || m.FreshnessState == FreshnessExpired {
+		return false
+	}
+	return true
+}
+
 func rehydrateModels(live, durable []ModelCapability) []ModelCapability {
 	if len(durable) == 0 {
 		return live
 	}
-	hasLive := map[string]bool{}
+	// Skip durable only when live already has a present production-routable MR
+	// model for that adapter. Unroutable live rows (empty id, unavailable,
+	// removed, stale) must not suppress durable exact+fresh MR.
+	hasLiveProductionMR := map[string]bool{}
 	for _, m := range live {
-		if strings.TrimSpace(m.CanonicalModelID) != "" {
-			hasLive[m.AdapterID] = true
+		if productionRoutableMRModel(m) {
+			ad := strings.ToLower(strings.TrimSpace(m.AdapterID))
+			hasLiveProductionMR[ad] = true
 		}
 	}
 	out := append([]ModelCapability(nil), live...)
 	for _, m := range durable {
-		if hasLive[m.AdapterID] {
+		ad := strings.ToLower(strings.TrimSpace(m.AdapterID))
+		if hasLiveProductionMR[ad] {
 			continue
 		}
-		if m.FreshnessState == FreshnessStale || m.FreshnessState == FreshnessExpired {
-			continue
-		}
-		if m.AvailabilityState != AvailabilityAvailable {
-			continue
-		}
-		if m.LifecycleState == LifecycleRemoved || m.LifecycleState == LifecycleDeprecated {
+		if !productionRoutableMRModel(m) {
 			continue
 		}
 		out = append(out, m)
