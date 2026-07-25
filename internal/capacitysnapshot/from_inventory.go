@@ -288,17 +288,33 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 
 	// Dynamic catalog: bind by installation/account scope when ModelCapability
 	// carries explicit IDs; otherwise replicate only to explicitly linked accounts.
+	snapshotByID := make(map[string]providerinventory.ModelCatalogSnapshot, len(rep.ModelCatalogSnapshots))
+	for _, snapshot := range rep.ModelCatalogSnapshots {
+		snapshotByID[snapshot.ModelCatalogSnapshotID] = snapshot
+	}
+	dynamicCapability := func(m providerinventory.ModelCapability) bool {
+		if !capabilityIsDynamicExactFresh(m) {
+			return false
+		}
+		if !strings.EqualFold(strings.TrimSpace(m.AdapterID), "claude") {
+			return true
+		}
+		snapshot, ok := snapshotByID[m.ModelCatalogSnapshotID]
+		return ok && providerinventory.ValidClaudeVerifiedCapability(snapshot, m, now)
+	}
 	liveModels := map[string]bool{}
 	dynamicExactAdapters := map[string]bool{}
 	for _, m := range rep.ModelCapabilities {
-		if capabilityIsDynamicExactFresh(m) {
+		if dynamicCapability(m) {
 			dynamicExactAdapters[strings.ToLower(strings.TrimSpace(m.AdapterID))] = true
 		}
 	}
 	for _, snap := range rep.ModelCatalogSnapshots {
 		if snap.CatalogSourceKind == providerinventory.CatalogSourceProviderMachineReadable &&
 			snap.Confidence == providerinventory.ConfidenceExact &&
-			snap.FreshnessState == providerinventory.FreshnessFresh {
+			snap.FreshnessState == providerinventory.FreshnessFresh &&
+			(!strings.EqualFold(strings.TrimSpace(snap.AdapterID), "claude") ||
+				providerinventory.ValidClaudeVerifiedSnapshot(snap, now)) {
 			dynamicExactAdapters[strings.ToLower(strings.TrimSpace(snap.AdapterID))] = true
 		}
 	}
@@ -306,7 +322,7 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 	modelIdx := map[string]int{}
 	caps := append([]providerinventory.ModelCapability(nil), rep.ModelCapabilities...)
 	sort.SliceStable(caps, func(i, j int) bool {
-		di, dj := capabilityIsDynamicExactFresh(caps[i]), capabilityIsDynamicExactFresh(caps[j])
+		di, dj := dynamicCapability(caps[i]), dynamicCapability(caps[j])
 		if di != dj {
 			return di && !dj
 		}
@@ -357,7 +373,7 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 	}
 	for _, m := range caps {
 		adapterKey := strings.ToLower(strings.TrimSpace(m.AdapterID))
-		dynamic := capabilityIsDynamicExactFresh(m)
+		dynamic := dynamicCapability(m)
 		if dynamicExactAdapters[adapterKey] && !dynamic {
 			// Suppress static for adapters with dynamic catalog (record on any linked row).
 			for _, k := range builderKeysForProvider(m.AdapterID) {

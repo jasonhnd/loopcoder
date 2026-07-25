@@ -19,6 +19,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/capacitysnapshot"
 	"github.com/jasonhnd/loopcoder/internal/capclass"
 	"github.com/jasonhnd/loopcoder/internal/goalpr"
+	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/quotapolicy"
 	"github.com/jasonhnd/loopcoder/internal/routecontract"
 	"github.com/jasonhnd/loopcoder/internal/workflowdef"
@@ -242,6 +243,9 @@ type Result struct {
 	// InventoryReportDigest is the exact immutable inventory snapshot used for
 	// route/reserve decisions in this run.
 	InventoryReportDigest string `json:"inventory_report_digest,omitempty"`
+	// ClaudeCatalogReceipts are the exact account-bound paid capability probes
+	// covered by InventoryReportDigest. Static catalog rows never populate this.
+	ClaudeCatalogReceipts []providerinventory.ClaudeCapabilityProbeReceipt `json:"claude_catalog_receipts,omitempty"`
 	// CapacityLedgerEntries are exact read-backs for this run's attempts. Canary
 	// emission serializes them as raw qualification proof; they contain no
 	// credentials.
@@ -1270,6 +1274,7 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		RunID: runID, ProjectID: projectID,
 		Children: children, Workflow: wres, Resumed: resumed,
 		InventoryReportDigest: inventoryReportDigest,
+		ClaudeCatalogReceipts: append([]providerinventory.ClaudeCapabilityProbeReceipt(nil), snap.ClaudeCatalogReceipts...),
 	}
 	out.ReuseCount = wres.ReuseCount
 	out.WorktreePeak = wres.WorktreePeak

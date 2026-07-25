@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/capacityledger"
+	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/workclaim"
 	"github.com/jasonhnd/loopcoder/internal/workflowrun"
 )
@@ -40,6 +41,9 @@ type CanaryEvidence struct {
 	InventoryReportDigest string `json:"inventory_report_digest"`
 	// Fresh provider quota observations (source-tagged).
 	ProviderObservations []CanaryProviderObs `json:"provider_observations"`
+	// ClaudeCatalogReceipts bind account-scoped paid model/depth capability
+	// probes to the exact inventory digest used by this canary.
+	ClaudeCatalogReceipts []CanaryClaudeCatalogReceipt `json:"claude_catalog_receipts,omitempty"`
 	// Real child executions (not dry-run plan rows).
 	Children []CanaryChild `json:"children"`
 	// Unavailable/stale/rate-limit exclude or new attempt without duplicate work.
@@ -59,6 +63,11 @@ type CanaryEvidence struct {
 	ProducedAt time.Time `json:"produced_at"`
 	// Optional content digest of the rest of the body for anti-tamper.
 	ContentDigest string `json:"content_digest,omitempty"`
+}
+
+type CanaryClaudeCatalogReceipt struct {
+	InventoryReportDigest string                                         `json:"inventory_report_digest"`
+	Receipt               providerinventory.ClaudeCapabilityProbeReceipt `json:"receipt"`
 }
 
 // CanaryProviderObs is one fresh capacity observation from real structured
@@ -349,6 +358,24 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 	// Build counted real-child identity keys for provider-obs correspondence.
 	type childIDKey struct{ p, acc, inst, win string }
 	realChildIDs := map[childIDKey]bool{}
+	validClaudeReceipts := map[string]bool{}
+	for _, wrapped := range ev.ClaudeCatalogReceipts {
+		receipt := wrapped.Receipt
+		key := strings.Join([]string{receipt.AccountProfileID, receipt.ProviderInstallationID, receipt.ActualModel, receipt.AcceptedEffort}, "\x00")
+		if validClaudeReceipts[key] {
+			add("claude_catalog_receipt_duplicate")
+			continue
+		}
+		if wrapped.InventoryReportDigest == "" || wrapped.InventoryReportDigest != ev.InventoryReportDigest {
+			add("claude_catalog_receipt_inventory_digest_mismatch")
+			continue
+		}
+		if err := providerinventory.ValidateClaudeCapabilityProbeReceipt(receipt, ev.ProducedAt); err != nil {
+			add("claude_catalog_receipt_invalid")
+			continue
+		}
+		validClaudeReceipts[key] = true
+	}
 
 	// Real children first (so provider obs can require correspondence).
 	depths := map[string]bool{}
@@ -503,6 +530,12 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 		}
 		if strings.TrimSpace(c.ArgvDigest) == "" {
 			add("argv_digest_missing:" + c.ChildID)
+		}
+		if canonicalProviderCompany(c.Provider) == "anthropic" {
+			key := strings.Join([]string{c.AccountRef, c.InstallRef, c.Model, strings.ToLower(strings.TrimSpace(c.DepthInvocation))}, "\x00")
+			if !validClaudeReceipts[key] {
+				add("claude_catalog_receipt_missing_or_mismatched:" + c.ChildID)
+			}
 		}
 	}
 

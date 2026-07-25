@@ -23,6 +23,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/autoroute"
 	"github.com/jasonhnd/loopcoder/internal/budget"
 	"github.com/jasonhnd/loopcoder/internal/capacitysnapshot"
+	"github.com/jasonhnd/loopcoder/internal/claudecatalog"
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
@@ -133,6 +134,7 @@ type Deps struct {
 	ProviderInventoryRefresh func(ctx context.Context, report providerinventory.Report, now time.Time) error
 	ProviderQuotaRefresh     func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.RefreshResult, error)
 	ProviderQuotaStatus      func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error)
+	ClaudeCatalogVerify      func(ctx context.Context, req claudecatalog.Request) (claudecatalog.Result, error)
 	RouteExplain             func(ctx context.Context, store storage.Store, request routing.StoredRouteRequest) (routing.RouteOperationResult, error)
 	RouteDecide              func(ctx context.Context, store storage.Store, request routing.StoredRouteRequest) (routing.RouteOperationResult, error)
 	// ResolveWorkerDispatchRoute selects provider/model/effort for ordinary
@@ -320,6 +322,30 @@ func DefaultDeps() Deps {
 		},
 		ProviderQuotaStatus: func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error) {
 			return quotaLifecycle.Status(ctx, req)
+		},
+		ClaudeCatalogVerify: func(ctx context.Context, req claudecatalog.Request) (claudecatalog.Result, error) {
+			now := req.Now
+			if now == nil {
+				now = time.Now
+			}
+			store, err := providerinventory.OpenDefaultStore(ctx, providerinventory.DefaultDeps(), now)
+			if err != nil {
+				return claudecatalog.Result{}, err
+			}
+			defer store.Close()
+			result, err := claudecatalog.Verify(ctx, store, req, claudecatalog.DefaultDeps())
+			if err != nil {
+				if result.Report.SchemaVersion != "" {
+					if persistErr := providerinventory.Refresh(ctx, store, result.Report, now().UTC()); persistErr != nil {
+						return claudecatalog.Result{}, errors.Join(err, persistErr)
+					}
+				}
+				return result, err
+			}
+			if err := providerinventory.Refresh(ctx, store, result.Report, now().UTC()); err != nil {
+				return claudecatalog.Result{}, err
+			}
+			return result, nil
 		},
 		RouteExplain: routing.ExplainStoredRoute,
 		RouteDecide:  routing.DecideStoredRoute,
@@ -1965,14 +1991,16 @@ func printProvidersHelp(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  loopcoder providers refresh [flags]")
 	fmt.Fprintln(w, "  loopcoder providers status [flags]")
+	fmt.Fprintln(w, "  loopcoder providers verify-claude-model [flags]")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Refresh bounded provider CLI installation inventory and show cached quota status.")
+	fmt.Fprintln(w, "Refresh bounded provider inventory, show cached quota status, or explicitly run one paid account-bound Claude capability probe.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
 	fmt.Fprintln(w, "  --repo string                    repository path (default \".\")")
 	fmt.Fprintln(w, "  --base-branch string             base branch for .delivery.yml fallback (default \"main\")")
 	fmt.Fprintln(w, "  --grant-quota-telemetry string   comma-separated adapter ids (or \"all\") granted network for quota telemetry")
 	fmt.Fprintln(w, "  --format string                  output format: text or json (default \"text\")")
+	fmt.Fprintln(w, "  verify-claude-model additionally requires --project-id (or a registered project) and accepts --model, --effort, --account-ref, --install-ref, and --timeout")
 	fmt.Fprintln(w, "  --help                           show help")
 }
 
@@ -2014,7 +2042,10 @@ func runProviders(args []string, stdout, stderr io.Writer, deps Deps) int {
 		if subcommand == "status" {
 			return runProvidersStatus(args, stdout, stderr, deps)
 		}
-		fmt.Fprintf(stderr, "providers: unsupported subcommand %q (want refresh or status)\n", subcommand)
+		if subcommand == "verify-claude-model" {
+			return runProvidersVerifyClaudeModel(args, stdout, stderr, deps)
+		}
+		fmt.Fprintf(stderr, "providers: unsupported subcommand %q (want refresh, status, or verify-claude-model)\n", subcommand)
 		return 2
 	}
 
@@ -2176,6 +2207,135 @@ func runProviders(args []string, stdout, stderr io.Writer, deps Deps) int {
 		)
 	}
 	fmt.Fprintln(stdout, "Installation evidence does not prove authentication, account readiness, model authorization, quota, or usable capacity.")
+	return 0
+}
+
+func runProvidersVerifyClaudeModel(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.ProviderInventory == nil {
+		deps.ProviderInventory = DefaultDeps().ProviderInventory
+	}
+	if deps.ClaudeCatalogVerify == nil {
+		deps.ClaudeCatalogVerify = DefaultDeps().ClaudeCatalogVerify
+	}
+	if deps.Now == nil {
+		deps.Now = DefaultDeps().Now
+	}
+	fs := flag.NewFlagSet("providers verify-claude-model", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	repoPath := "."
+	baseBranch := lcdefaults.BaseBranch
+	projectID := ""
+	deliveryRunID := ""
+	model := "sonnet"
+	effort := "low"
+	accountRef := ""
+	installRef := ""
+	format := "text"
+	timeout := claudecatalog.DefaultTimeout
+	reservedTokens := int64(32768)
+	fs.StringVar(&repoPath, "repo", ".", "repository path")
+	fs.StringVar(&baseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
+	fs.StringVar(&projectID, "project-id", "", "project id")
+	fs.StringVar(&deliveryRunID, "delivery-run-id", "", "delivery run id")
+	fs.StringVar(&model, "model", "sonnet", "adapter-declared Claude model alias or full ID")
+	fs.StringVar(&effort, "effort", "low", "Claude effort: low, medium, high, xhigh, or max")
+	fs.StringVar(&accountRef, "account-ref", "", "required opaque account profile id")
+	fs.StringVar(&installRef, "install-ref", "", "required provider installation id")
+	fs.DurationVar(&timeout, "timeout", claudecatalog.DefaultTimeout, "bounded paid probe timeout")
+	fs.Int64Var(&reservedTokens, "reserve-tokens", 32768, "bounded token reservation")
+	fs.StringVar(&format, "format", "text", "output format")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "providers verify-claude-model: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format != "text" && format != "json" {
+		fmt.Fprintf(stderr, "providers verify-claude-model: invalid --format %q; want text or json\n", format)
+		return 2
+	}
+	if timeout < time.Second || timeout > 5*time.Minute {
+		fmt.Fprintln(stderr, "providers verify-claude-model: --timeout must be between 1s and 5m")
+		return 2
+	}
+	if reservedTokens <= 0 || reservedTokens > 1_000_000 {
+		fmt.Fprintln(stderr, "providers verify-claude-model: --reserve-tokens must be between 1 and 1000000")
+		return 2
+	}
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "providers verify-claude-model: %v\n", err)
+		return 2
+	}
+	if strings.TrimSpace(projectID) == "" {
+		if project, resolveErr := registry.Resolve(context.Background(), registry.Options{RepoPath: resolvedRepo}, registry.DefaultDeps()); resolveErr == nil {
+			projectID = project.ProjectID
+		}
+	}
+	if strings.TrimSpace(projectID) == "" {
+		fmt.Fprintln(stderr, "providers verify-claude-model: --project-id is required when the repository is not registered")
+		return 2
+	}
+	cfg, err := loadDeliveryConfig(resolvedRepo, baseBranch, false)
+	if err != nil {
+		fmt.Fprintf(stderr, "providers verify-claude-model: %v\n", err)
+		return 1
+	}
+	inventory, err := deps.ProviderInventory(context.Background(), providerinventory.Options{
+		RepoPath:        resolvedRepo,
+		Config:          cfg,
+		Now:             deps.Now,
+		ActiveProviders: []string{"claude"},
+		IdentityOnly:    true,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "providers verify-claude-model: identity inventory: %v\n", err)
+		return 1
+	}
+	result, err := deps.ClaudeCatalogVerify(context.Background(), claudecatalog.Request{
+		RepoPath:       resolvedRepo,
+		ProjectID:      strings.TrimSpace(projectID),
+		DeliveryRunID:  strings.TrimSpace(deliveryRunID),
+		Model:          strings.TrimSpace(model),
+		Effort:         strings.TrimSpace(effort),
+		AccountRef:     strings.TrimSpace(accountRef),
+		InstallRef:     strings.TrimSpace(installRef),
+		Timeout:        timeout,
+		ReservedTokens: reservedTokens,
+		Now:            deps.Now,
+		Inventory:      inventory,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "providers verify-claude-model: %v\n", err)
+		return 1
+	}
+	if format == "json" {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(result); err != nil {
+			fmt.Fprintf(stderr, "providers verify-claude-model: write output: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	receipt := result.Receipt
+	fmt.Fprintf(stdout, "Claude verified subset recorded: requested=%s actual=%s effort=%s install=%s account=%s tokens_reserved=%d tokens_actual=%d tokens_released=%d budget=%s freshness=%s expires_at=%s inventory=%s\n",
+		receipt.RequestedModel,
+		receipt.ActualModel,
+		receipt.AcceptedEffort,
+		receipt.ProviderInstallationID,
+		receipt.AccountProfileID,
+		receipt.ReservedTokens,
+		receipt.CommittedTokens,
+		receipt.ReleasedTokens,
+		receipt.BudgetState,
+		receipt.FreshnessState,
+		receipt.ExpiresAt,
+		result.Report.InventoryFingerprint,
+	)
+	fmt.Fprintln(stdout, "The probe is paid and bounded; raw prompt/result/session/principal/credential material was not retained.")
 	return 0
 }
 

@@ -255,6 +255,22 @@ func RefreshUsageLedgerFromReports(ctx context.Context, store storage.Store, rep
 	return result, err
 }
 
+// RecordUsage persists one already-allowlisted local usage fact. It is used by
+// explicit provider capability probes whose paid usage must not disappear into
+// model-catalog observation. Replays are idempotent.
+func RecordUsage(ctx context.Context, store storage.Store, record UsageRecord) (bool, error) {
+	if store == nil {
+		return false, errors.New("record usage: storage store is required")
+	}
+	var inserted bool
+	err := store.WithWriteTx(ctx, func(tx storage.Tx) error {
+		var err error
+		inserted, err = insertUsageRecord(ctx, tx, record)
+		return err
+	})
+	return inserted, err
+}
+
 func BuildQuotaUsageBudgetFromReports(ctx context.Context, store storage.Store, repoPath, projectID string, observedAt time.Time) (QuotaUsageBudget, error) {
 	var records []UsageRecord
 	var gaps []string

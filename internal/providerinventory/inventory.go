@@ -593,6 +593,10 @@ type Options struct {
 	Now             func() time.Time
 	NetworkGrants   []NetworkGrant
 	ActiveProviders []string
+	// IdentityOnly limits discovery to installation/version/auth/catalog hints.
+	// It is used immediately before explicit paid capability probes and never
+	// launches quota or model-usage surfaces.
+	IdentityOnly bool
 }
 
 type Deps struct {
@@ -784,7 +788,7 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 				if authProbe != nil {
 					probes = append(probes, *authProbe)
 				}
-				if adapter.AdapterID == "codex" && !adapterQuotaAttempted {
+				if !opts.IdentityOnly && adapter.AdapterID == "codex" && !adapterQuotaAttempted {
 					source, snapshots, quotaProbe := inspectCodexQuota(ctx, discovery, adapter, candidate, installation, now, deps)
 					quotaTelemetrySources = append(quotaTelemetrySources, source)
 					quotaSnapshots = append(quotaSnapshots, snapshots...)
@@ -801,7 +805,7 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 						gaps = append(gaps, "provider-codex-catalog-network-permission-denied")
 					}
 				}
-				if adapter.AdapterID == "claude" && !adapterQuotaAttempted {
+				if !opts.IdentityOnly && adapter.AdapterID == "claude" && !adapterQuotaAttempted {
 					source, snapshots, quotaProbe := inspectClaudeQuota(ctx, discovery, adapter, candidate, installation, profiles, readiness, now, deps)
 					quotaTelemetrySources = append(quotaTelemetrySources, source)
 					quotaSnapshots = append(quotaSnapshots, snapshots...)
@@ -809,7 +813,7 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 					adapterQuotaAttempted = true
 					adapterQuotaCollected = quotaProbe.Outcome == OutcomeInstalled && len(snapshots) > 0 && snapshots[0].Confidence == ConfidenceExact
 				}
-				if adapter.AdapterID == "grok" && !adapterQuotaAttempted {
+				if !opts.IdentityOnly && adapter.AdapterID == "grok" && !adapterQuotaAttempted {
 					source, snapshots, quotaProbe := inspectGrokACPBilling(ctx, discovery, adapter, candidate, installation, now, deps)
 					quotaTelemetrySources = append(quotaTelemetrySources, source)
 					quotaSnapshots = append(quotaSnapshots, snapshots...)
@@ -817,7 +821,7 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 					adapterQuotaAttempted = true
 					adapterQuotaCollected = quotaProbe.Outcome == OutcomeInstalled && len(snapshots) > 0
 				}
-				if adapter.AdapterID == "antigravity" && !adapterQuotaAttempted {
+				if !opts.IdentityOnly && adapter.AdapterID == "antigravity" && !adapterQuotaAttempted {
 					source, snapshots, quotaProbe := inspectAntigravityQuota(ctx, discovery, adapter, installation, now, deps)
 					quotaTelemetrySources = append(quotaTelemetrySources, source)
 					quotaSnapshots = append(quotaSnapshots, snapshots...)
@@ -869,7 +873,7 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 			gaps = append(gaps, "provider-"+adapter.AdapterID+"-quota-unsupported")
 		}
 	}
-	if opts.Config.ProviderInventory.CodexBar.Enabled {
+	if !opts.IdentityOnly && opts.Config.ProviderInventory.CodexBar.Enabled {
 		sources, snapshots, codexbarProbes := inspectCodexBarQuota(ctx, opts.Config.ProviderInventory.CodexBar, now, deps)
 		quotaTelemetrySources = append(quotaTelemetrySources, sources...)
 		quotaSnapshots = append(quotaSnapshots, snapshots...)
@@ -2307,6 +2311,13 @@ func accountProfileID(adapterID, source, referenceHash string) string {
 	// Never re-hash these into acct_<base32> (RC38 split inventory vs agent preflight).
 	if strings.HasPrefix(referenceHash, "acct-") && len(referenceHash) == 5+64 {
 		return strings.ToLower(referenceHash)
+	}
+	// Claude's machine-readable status is shared by discovery, paid catalog
+	// probes, and the runner preflight. Use the exact-routable acct- form so the
+	// capacity layer preserves it verbatim instead of wrapping acct_<base32>
+	// into a second opaque identity.
+	if strings.EqualFold(strings.TrimSpace(adapterID), "claude") {
+		return "acct-" + hashHex("claude-auth-binding-v1", adapterID, source, referenceHash)
 	}
 	return "acct_" + hashBase32(adapterID, source, referenceHash)[:32]
 }

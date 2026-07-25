@@ -3,6 +3,7 @@ package capacitysnapshot
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/autoroute"
@@ -69,6 +70,31 @@ func LoadRouteInventory(ctx context.Context, opts LoadOptions) (autoroute.Invent
 	snap, err := Build(accounts, now)
 	if err != nil {
 		return autoroute.Inventory{}, Snapshot{}, err
+	}
+	for _, catalog := range rep.ModelCatalogSnapshots {
+		if !providerinventory.ValidClaudeVerifiedSnapshot(catalog, now) || catalog.CapabilityProbeReceipt == nil {
+			continue
+		}
+		receipt := *catalog.CapabilityProbeReceipt
+		receipt.UsageRecordIDs = append([]string(nil), receipt.UsageRecordIDs...)
+		receipt.GapReasons = append([]string(nil), receipt.GapReasons...)
+		snap.ClaudeCatalogReceipts = append(snap.ClaudeCatalogReceipts, receipt)
+	}
+	sort.SliceStable(snap.ClaudeCatalogReceipts, func(i, j int) bool {
+		left, right := snap.ClaudeCatalogReceipts[i], snap.ClaudeCatalogReceipts[j]
+		if left.AccountProfileID != right.AccountProfileID {
+			return left.AccountProfileID < right.AccountProfileID
+		}
+		if left.ActualModel != right.ActualModel {
+			return left.ActualModel < right.ActualModel
+		}
+		return left.AcceptedEffort < right.AcceptedEffort
+	})
+	if len(snap.ClaudeCatalogReceipts) > 0 {
+		snap.Digest, err = digestOf(snap)
+		if err != nil {
+			return autoroute.Inventory{}, Snapshot{}, err
+		}
 	}
 	inv, err := ToRouteInventory(snap, now)
 	if err != nil {

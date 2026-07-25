@@ -100,14 +100,20 @@ func TestExplicitPinGeminiDepthFails(t *testing.T) {
 	}
 }
 
-func TestExplicitPinClaudeAccountFails(t *testing.T) {
-	_, err := autoroute.Resolve(autoroute.Input{
+func TestExplicitPinClaudeAccountCapabilityOK(t *testing.T) {
+	account := "acct-" + strings.Repeat("a", 64)
+	result, err := autoroute.Resolve(autoroute.Input{
 		Provider: "claude", Model: "claude-sonnet-4-5", Effort: "medium", Permission: "bounded_write",
-		AccountRef: "acct-" + strings.Repeat("a", 64),
+		AccountRef: account,
 		TaskClass:  capclass.ClassTera,
 	})
-	if err == nil {
-		t.Fatal("claude pin with account must fail closed (no account affirm)")
+	if err != nil {
+		t.Fatalf("claude exact account capability: %v", err)
+	}
+	if result.Outcome != autoroute.OutcomeExplicitPin ||
+		result.Provider != "claude" ||
+		result.Model != "claude-sonnet-4-5" {
+		t.Fatalf("claude explicit pin changed: %+v", result)
 	}
 }
 
@@ -149,6 +155,25 @@ func TestBindExplicitPinRequiresExactInventoryCandidate(t *testing.T) {
 	_, err = autoroute.BindExplicitPinWithClass("codex", "other-model", "medium", "bounded_write", capclass.ClassTera, inv)
 	if err == nil {
 		t.Fatal("wrong model must fail bind")
+	}
+	// Claude now affirms exact account/install through the same executable's
+	// pre/post machine-readable auth observations. Binding still requires an
+	// exact hard-eligible inventory row.
+	claudeAccount := "acct-" + strings.Repeat("a", 64)
+	invClaude := pinInv(eligibility.Candidate{
+		Provider: "claude", Model: "claude-sonnet-5", Effort: "low", Permission: "bounded_write",
+		ModelClass: capclass.ClassTera,
+		AccountRef: claudeAccount, InstallRef: "pinst_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", WindowKind: "five_hour",
+		Installed: okFact("i"), Authenticated: okFact("a"), ModelPresent: okFact("m"),
+		PermissionOK: okFact("p"), EffortOK: okFact("e"), Healthy: okFact("h"),
+		CooldownActive: falseFact("cd"), ResourceFit: okFact("r"),
+	})
+	claudeBound, err := autoroute.BindExplicitPinWithClass("claude", "claude-sonnet-5", "low", "bounded_write", capclass.ClassTera, invClaude)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claudeBound.AccountRef != claudeAccount || claudeBound.InstallRef != "pinst_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Fatalf("claude exact binding incomplete: %+v", claudeBound)
 	}
 	// Antigravity cannot account-affirm even if inventory row present.
 	invAG := pinInv(eligibility.Candidate{

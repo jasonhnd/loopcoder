@@ -26,6 +26,7 @@ type Provider struct {
 
 type Model struct {
 	Name         string
+	Aliases      []string
 	Depths       []Depth
 	DefaultDepth string
 }
@@ -123,6 +124,7 @@ var staticRegistry = Registry{
 			Models: []Model{
 				{
 					Name:         "claude-opus-4-8[1m]",
+					Aliases:      []string{"opus"},
 					DefaultDepth: "high",
 					Depths: []Depth{
 						{Token: "low", Label: "low"},
@@ -133,6 +135,7 @@ var staticRegistry = Registry{
 				},
 				{
 					Name:         "claude-sonnet-4-5",
+					Aliases:      []string{"sonnet"},
 					DefaultDepth: "medium",
 					Depths: []Depth{
 						{Token: "low", Label: "low"},
@@ -142,6 +145,7 @@ var staticRegistry = Registry{
 				},
 				{
 					Name:         "claude-haiku-4-5",
+					Aliases:      []string{"haiku"},
 					DefaultDepth: "low",
 					Depths: []Depth{
 						{Token: "low", Label: "low"},
@@ -410,6 +414,7 @@ func cloneProvider(provider Provider) Provider {
 }
 
 func cloneModel(model Model) Model {
+	model.Aliases = append([]string(nil), model.Aliases...)
 	model.Depths = append([]Depth(nil), model.Depths...)
 	return model
 }
