@@ -1931,7 +1931,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 							evFail.EventID, evClaim.EventID, evReroute.EventID, evLaunch.EventID, failedAttemptID, newAttemptID,
 						)
 						childIn2 := ChildExecInput{
-							ProjectID: projectID, GraphID: g.GraphID, WorkItemID: id,
+							ProjectID: projectID, RunID: runID, GraphID: g.GraphID, WorkItemID: id,
 							ClaimID: res2.Claim.ClaimID, AttemptID: newAttemptID,
 							Intent: it.Intent, Route: altRoute, RepoPath: req.RepoPath,
 							BaseRef: firstNonEmpty(goalBranch, baseRef), ReadOnly: readOnly,
