@@ -308,8 +308,27 @@ func rewriteCatalogInstallIDs(snaps []ModelCatalogSnapshot, alias map[string]str
 		if out[i].ProviderInstallationID == nil {
 			continue
 		}
-		id := strings.TrimSpace(*out[i].ProviderInstallationID)
+		originalID := *out[i].ProviderInstallationID
+		id := strings.TrimSpace(originalID)
 		if live, ok := alias[id]; ok && live != "" {
+			// Claude's account-bound verified subset is authenticated by the
+			// embedded capability receipt. Alias translation must preserve the
+			// receipt↔snapshot installation equality required by
+			// ValidClaudeVerifiedSnapshot. Only translate a receipt that was
+			// already bound exactly to the snapshot's unnormalised durable ID;
+			// never repair malformed or mismatched evidence into validity.
+			if out[i].AdapterID == "claude" {
+				if originalID != id ||
+					out[i].CapabilityProbeReceipt == nil ||
+					out[i].CapabilityProbeReceipt.ProviderInstallationID != originalID {
+					continue
+				}
+				receipt := *out[i].CapabilityProbeReceipt
+				receipt.UsageRecordIDs = append([]string(nil), receipt.UsageRecordIDs...)
+				receipt.GapReasons = append([]string(nil), receipt.GapReasons...)
+				receipt.ProviderInstallationID = live
+				out[i].CapabilityProbeReceipt = &receipt
+			}
 			v := live
 			out[i].ProviderInstallationID = &v
 		}

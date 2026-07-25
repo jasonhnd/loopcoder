@@ -17,37 +17,7 @@ func TestClaudeMachineReadableCatalogRequiresAccountBoundInvocationReceipt(t *te
 		snapID  = "mcatsnap_claude_verified"
 	)
 	remaining, limit := int64(92), int64(100)
-	receipt := providerinventory.ClaudeCapabilityProbeReceipt{
-		SchemaVersion:          providerinventory.ClaudeCapabilityProbeReceiptSchema,
-		Provider:               "claude",
-		RequestedModel:         "sonnet",
-		ActualModel:            "claude-sonnet-5",
-		AcceptedEffort:         "low",
-		ProviderInstallationID: install,
-		AccountProfileID:       account,
-		AuthReadinessID:        authID,
-		AuthObservedAt:         now.Add(-time.Minute).Format(time.RFC3339Nano),
-		ExecutedAt:             now.Add(-time.Minute).Format(time.RFC3339Nano),
-		ExpiresAt:              now.Add(29 * time.Minute).Format(time.RFC3339Nano),
-		AuthRawSHA256:          "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		OutputRawSHA256:        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-		ArgvDigest:             "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-		InputTokens:            2,
-		OutputTokens:           4,
-		CacheReadInputTokens:   20,
-		CacheCreateInputTokens: 5,
-		TotalTokens:            31,
-		BudgetReservationID:    "bres_claude_verified",
-		ReservedTokens:         1000,
-		CommittedTokens:        31,
-		ReleasedTokens:         969,
-		BudgetState:            "released",
-		UsageRecordIDs:         []string{"usage_claude_verified"},
-		Source:                 "claude-code-stream-json",
-		Confidence:             providerinventory.ConfidenceExact,
-		FreshnessState:         providerinventory.FreshnessFresh,
-		GapReasons:             []string{},
-	}
+	receipt := verifiedClaudeReceipt(now, install, account, authID)
 	report := providerinventory.Report{
 		InventoryFingerprint: "sha256:inventory-claude-verified",
 		Installations: []providerinventory.ProviderInstallation{
@@ -143,5 +113,39 @@ func TestClaudeMachineReadableCatalogRequiresAccountBoundInvocationReceipt(t *te
 				t.Fatalf("static/generic MR row routed without invocation receipt: %+v", candidate)
 			}
 		}
+	}
+}
+
+func verifiedClaudeReceipt(now time.Time, install, account, authID string) providerinventory.ClaudeCapabilityProbeReceipt {
+	return providerinventory.ClaudeCapabilityProbeReceipt{
+		SchemaVersion:          providerinventory.ClaudeCapabilityProbeReceiptSchema,
+		Provider:               "claude",
+		RequestedModel:         "sonnet",
+		ActualModel:            "claude-sonnet-5",
+		AcceptedEffort:         "low",
+		ProviderInstallationID: install,
+		AccountProfileID:       account,
+		AuthReadinessID:        authID,
+		AuthObservedAt:         now.Add(-time.Minute).Format(time.RFC3339Nano),
+		ExecutedAt:             now.Add(-time.Minute).Format(time.RFC3339Nano),
+		ExpiresAt:              now.Add(29 * time.Minute).Format(time.RFC3339Nano),
+		AuthRawSHA256:          "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		OutputRawSHA256:        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		ArgvDigest:             "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		InputTokens:            2,
+		OutputTokens:           4,
+		CacheReadInputTokens:   20,
+		CacheCreateInputTokens: 5,
+		TotalTokens:            31,
+		BudgetReservationID:    "bres_claude_verified",
+		ReservedTokens:         1000,
+		CommittedTokens:        31,
+		ReleasedTokens:         969,
+		BudgetState:            "released",
+		UsageRecordIDs:         []string{"usage_claude_verified"},
+		Source:                 "claude-code-stream-json",
+		Confidence:             providerinventory.ConfidenceExact,
+		FreshnessState:         providerinventory.FreshnessFresh,
+		GapReasons:             []string{},
 	}
 }
