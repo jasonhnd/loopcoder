@@ -111,6 +111,58 @@ func TestDiscoverProductFiles_NestedUntrackedDirectory(t *testing.T) {
 	}
 }
 
+func TestProductFilesOnly_ExcludesProviderRuntimeRoots(t *testing.T) {
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%v: %s", err, out)
+		}
+	}
+	run("git", "init")
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run("git", "add", "README.md")
+	run("git", "commit", "-m", "init")
+
+	for _, rel := range []string{".cache/go-build/a", ".tmp/test/b"} {
+		path := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("runtime-only"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "slug.go"), []byte("package slug\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	discovered, err := discoverProductFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	product := ProductFilesOnly(discovered)
+	if len(product) != 1 || product[0] != "slug.go" {
+		t.Fatalf("product=%v discovered=%v", product, discovered)
+	}
+	digest, hashed, err := productOutputDigest(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest == "" || len(hashed) != 1 || hashed[0] != "slug.go" {
+		t.Fatalf("digest=%q hashed=%v", digest, hashed)
+	}
+}
+
 func TestDiffDirTree_IgnoresGit(t *testing.T) {
 	before := dirSnap{}
 	after := dirSnap{".git/objects/ab/cd": "deadbeef", "notes.go": "cafe"}

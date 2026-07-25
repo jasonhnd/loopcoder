@@ -1545,7 +1545,16 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 	// Real PR human merge gate: LoopCoder creates branch/commit/push/PR itself.
 	if req.OpenPR && wres.Status == workflowrun.StatusHumanGate {
 		// Structured independent verifier only — ignore Request pins/prose entirely.
-		ind, verEv, bindOK := bindOpenPRVerifierFromChildren(wres.Children)
+		bindingEvents, bindEventsErr := loadOpenPRBindingEvents(wres.EventLogPath, projectID, runID)
+		if bindEventsErr != nil {
+			out.Status = "blocked"
+			out.Message = firstNonEmpty(out.Message, "") + "; open_pr_event_binding_invalid"
+			for _, cr := range out.Children {
+				emitChild(req.ReportOut, cr)
+			}
+			return out, fmt.Errorf("goalrun: open pr: raw event binding: %w", bindEventsErr)
+		}
+		ind, verEv, bindOK := bindOpenPRVerifierFromChildren(wres.Children, bindingEvents)
 		if !bindOK {
 			out.Status = "blocked"
 			out.Message = firstNonEmpty(out.Message, "") + "; open_pr_verifier_binding_invalid"
@@ -1573,7 +1582,7 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 			// Head is the integrate goal branch (product commits + receipt).
 			Branch:    firstNonEmpty(wres.GoalBranch, goalBranch),
 			ProjectID: projectID, RunID: runID, GraphID: g.GraphID, PlanDigest: execPlanDigest,
-			SourceIssue: issueN, Actor: actor, Children: wres.Children,
+			SourceIssue: issueN, Actor: actor, Children: productOnlyChildOutcomes(wres.Children),
 			IndependentVerifier: ind, VerifierEvidence: verEv,
 			RequiredCheckNames:  req.RequiredCheckNames,
 			InstallMeaningfulCI: &inst,
@@ -2029,7 +2038,7 @@ func applyOutcomeRouteFields(cr *ChildReport, co workflowrun.ChildOutcome) {
 	cr.Terminal = co.Terminal
 	cr.AttemptID = co.AttemptID
 	cr.OutputEvidence = co.OutputEvidence
-	cr.FilesTouched = append([]string(nil), co.FilesTouched...)
+	cr.FilesTouched = workflowrun.ProductFilesOnly(co.FilesTouched)
 	cr.WorktreePath = co.WorktreePath
 	cr.ActualSource = co.ActualSource
 	cr.ActualSources = co.ActualSources
@@ -2117,7 +2126,7 @@ func appendMUFailedChildReports(
 				WindowKind: co.WindowKind, ReservationID: co.ReservationID,
 				RouteReason: co.RouteReason, Terminal: co.Terminal, AttemptID: att,
 				OutputEvidence: co.OutputEvidence, WorktreePath: co.WorktreePath,
-				FilesTouched: append([]string(nil), co.FilesTouched...),
+				FilesTouched: workflowrun.ProductFilesOnly(co.FilesTouched),
 				FailureClass: co.FailureClass, Stage: "terminal", NextAction: "inspect_model_unavailable",
 				ActualSource: co.ActualSource, ActualSources: co.ActualSources,
 				ArgvDigest: co.ArgvDigest,
@@ -2516,8 +2525,9 @@ func childReportFromOutcome(co workflowrun.ChildOutcome) ChildReport {
 		AccountRef: co.AccountRef, InstallRef: co.InstallRef, WindowKind: co.WindowKind,
 		ReservationID: co.ReservationID, RouteReason: co.RouteReason,
 		Terminal: co.Terminal, FailureClass: co.FailureClass,
-		OutputEvidence: co.OutputEvidence, WorktreePath: co.WorktreePath,
-		Stage: stage, NextAction: next,
+		OutputEvidence: co.OutputEvidence, FilesTouched: workflowrun.ProductFilesOnly(co.FilesTouched),
+		WorktreePath: co.WorktreePath,
+		Stage:        stage, NextAction: next,
 		// Never integrate historical non-success projection.
 		IntegrateCommitSHA: "",
 	}
@@ -4340,8 +4350,10 @@ func recordModelUnavailableExcludes(wres workflowrun.Result, record func(childID
 // Requires exactly one succeeded wi_verify (soul) and one succeeded wi_implement
 // (tera) with distinct providers; OutputEvidence must be sha256:+64 hex.
 // WorkItemID and TaskClass must be exact literals (no TrimSpace acceptance).
-// Duplicate exact required IDs or invalid exact required children fail closed.
-func bindOpenPRVerifierFromChildren(children []workflowrun.ChildOutcome) (provider, evidence string, ok bool) {
+// Duplicate exact required IDs or invalid exact required children fail closed,
+// except one raw-event-proven forced-interrupt implement predecessor followed
+// by its immediate same-route successful generation.
+func bindOpenPRVerifierFromChildren(children []workflowrun.ChildOutcome, events []workflowrun.Event) (provider, evidence string, ok bool) {
 	var verifyKids, implementKids []workflowrun.ChildOutcome
 	for _, c := range children {
 		// Exact WorkItemID literals only — whitespace-altered IDs never match.
@@ -4361,18 +4373,44 @@ func bindOpenPRVerifierFromChildren(children []workflowrun.ChildOutcome) (provid
 			implementKids = append(implementKids, c)
 		}
 	}
-	// Exactly one of each required ID; duplicates fail closed.
-	if len(verifyKids) != 1 || len(implementKids) != 1 {
+	// Exactly one verifier. Implement may have either one direct success or the
+	// one exact forced-interrupt predecessor + its immediate successful retry.
+	if len(verifyKids) != 1 || (len(implementKids) != 1 && len(implementKids) != 2) {
 		return "", "", false
 	}
 	v := verifyKids[0]
-	imp := implementKids[0]
 	// Re-check exact success + class (invalid exact-ID rows already length-gated
 	// when mixed with valid ones via count!=1; single invalid still fails here).
 	if v.TaskClass != "soul" || v.Terminal != "succeeded" {
 		return "", "", false
 	}
-	if imp.TaskClass != "tera" || imp.Terminal != "succeeded" {
+	var imp workflowrun.ChildOutcome
+	switch len(implementKids) {
+	case 1:
+		imp = implementKids[0]
+		if imp.TaskClass != "tera" || imp.Terminal != "succeeded" {
+			return "", "", false
+		}
+	case 2:
+		var failed workflowrun.ChildOutcome
+		successes := 0
+		failures := 0
+		for _, c := range implementKids {
+			switch {
+			case c.TaskClass == "tera" && c.Terminal == "succeeded" && c.FailureClass == "":
+				imp = c
+				successes++
+			case c.TaskClass == "tera" && c.Terminal == "cancelled" && c.FailureClass == "forced_interrupt":
+				failed = c
+				failures++
+			default:
+				return "", "", false
+			}
+		}
+		if successes != 1 || failures != 1 || !exactForcedInterruptRetryBinding(failed, imp, events) {
+			return "", "", false
+		}
+	default:
 		return "", "", false
 	}
 	if v.Provider == "" || v.AttemptID == "" {
@@ -4391,6 +4429,190 @@ func bindOpenPRVerifierFromChildren(children []workflowrun.ChildOutcome) (provid
 		return "", "", false
 	}
 	return v.Provider, v.OutputEvidence, true
+}
+
+func productOnlyChildOutcomes(children []workflowrun.ChildOutcome) []workflowrun.ChildOutcome {
+	out := make([]workflowrun.ChildOutcome, len(children))
+	copy(out, children)
+	for i := range out {
+		out[i].FilesTouched = workflowrun.ProductFilesOnly(out[i].FilesTouched)
+	}
+	return out
+}
+
+func loadOpenPRBindingEvents(path, projectID, runID string) ([]workflowrun.Event, error) {
+	if err := requireExactEventLogPathStamp("open pr binding", path); err != nil {
+		return nil, err
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	events, err := workflowrun.ParseEventJSONLStrict(string(raw), projectID, runID)
+	if err != nil {
+		return nil, err
+	}
+	if len(events) == 0 {
+		return nil, fmt.Errorf("empty exact event log")
+	}
+	for _, ev := range events {
+		if workflowrun.IsParentOnlyEvent(ev) {
+			continue
+		}
+		if err := workflowrun.ValidateChildEventIdentity(ev); err != nil {
+			return nil, err
+		}
+	}
+	if err := workflowrun.ValidateEventStreamInvariants(events); err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+func exactForcedInterruptRetryBinding(failed, retry workflowrun.ChildOutcome, events []workflowrun.Event) bool {
+	if failed.WorkItemID != "wi_implement" || retry.WorkItemID != "wi_implement" ||
+		failed.TaskClass != "tera" || retry.TaskClass != "tera" ||
+		failed.Terminal != "cancelled" || failed.FailureClass != "forced_interrupt" ||
+		retry.Terminal != "succeeded" || retry.FailureClass != "" ||
+		failed.IntegrateCommitSHA != "" || retry.IntegrateCommitSHA == "" ||
+		!openPRIsExactSHA256Digest(retry.OutputEvidence) {
+		return false
+	}
+	if failed.Generation <= 0 || retry.Generation != failed.Generation+1 {
+		return false
+	}
+	failedGen, err := workflowrun.ClaimGenerationFromAttemptID(failed.AttemptID)
+	if err != nil || failedGen != failed.Generation {
+		return false
+	}
+	retryGen, err := workflowrun.ClaimGenerationFromAttemptID(retry.AttemptID)
+	if err != nil || retryGen != retry.Generation {
+		return false
+	}
+	if !sameForcedRetryRoute(failed, retry) {
+		return false
+	}
+	if err := workflowrun.ValidateEventStreamInvariants(events); err != nil {
+		return false
+	}
+
+	type counts struct {
+		claim, launch, pid, interrupt, terminal, integrate, reuse int
+	}
+	failedCounts := counts{}
+	retryCounts := counts{}
+	interruptID := ""
+	for _, ev := range events {
+		if ev.WorkItemID != "wi_implement" {
+			continue
+		}
+		var child workflowrun.ChildOutcome
+		var c *counts
+		switch ev.AttemptID {
+		case failed.AttemptID:
+			child, c = failed, &failedCounts
+		case retry.AttemptID:
+			child, c = retry, &retryCounts
+		default:
+			return false
+		}
+		if err := workflowrun.ValidateChildEventIdentity(ev); err != nil {
+			return false
+		}
+		if ev.Generation != child.Generation || ev.TaskClass != child.TaskClass ||
+			ev.ExecutionPlanDigest != child.ExecutionPlanDigest ||
+			ev.ChildContractDigest != child.ChildContractDigest {
+			return false
+		}
+		payload, ok := exactStringPayload(ev.Payload)
+		if !ok || payload["work_item_id"] != child.WorkItemID ||
+			payload["attempt_id"] != child.AttemptID ||
+			payload["generation"] != fmt.Sprintf("%d", child.Generation) ||
+			payload["task_class"] != child.TaskClass ||
+			payload["execution_plan_digest"] != child.ExecutionPlanDigest ||
+			payload["child_contract_digest"] != child.ChildContractDigest ||
+			payload["provider"] != child.Provider ||
+			payload["model"] != child.Model ||
+			payload["depth"] != child.Depth ||
+			payload["permission"] != child.Permission ||
+			payload["account_ref"] != child.AccountRef ||
+			payload["install_ref"] != child.InstallRef {
+			return false
+		}
+		switch ev.Kind {
+		case "claim":
+			c.claim++
+		case "launch":
+			c.launch++
+		case "pid":
+			c.pid++
+		case "interrupt":
+			c.interrupt++
+			if ev.Terminal != "cancelled" || ev.FailureClass != "forced_interrupt" ||
+				payload["terminal"] != "cancelled" ||
+				payload["failure_class"] != "forced_interrupt" ||
+				payload["interrupt_class"] != workflowrun.InterruptClassServiceForced ||
+				payload["interrupt_id"] == "" {
+				return false
+			}
+			interruptID = payload["interrupt_id"]
+		case "terminal":
+			c.terminal++
+			if child.AttemptID == failed.AttemptID {
+				if ev.Terminal != "cancelled" || ev.FailureClass != "forced_interrupt" ||
+					payload["terminal"] != "cancelled" ||
+					payload["failure_class"] != "forced_interrupt" ||
+					payload["interrupt_class"] != workflowrun.InterruptClassServiceForced ||
+					payload["interrupt_id"] == "" || payload["interrupt_id"] != interruptID {
+					return false
+				}
+			} else if ev.Terminal != "succeeded" || ev.FailureClass != "" ||
+				ev.Evidence != retry.OutputEvidence ||
+				payload["terminal"] != "succeeded" ||
+				payload["output_evidence"] != retry.OutputEvidence {
+				return false
+			}
+		case "integrate":
+			c.integrate++
+			if child.AttemptID != retry.AttemptID ||
+				ev.CommitSHA != retry.IntegrateCommitSHA ||
+				payload["commit_sha"] != retry.IntegrateCommitSHA {
+				return false
+			}
+		case "reuse":
+			c.reuse++
+		}
+	}
+	return failedCounts == (counts{claim: 1, launch: 1, pid: 1, interrupt: 1, terminal: 1}) &&
+		retryCounts == (counts{claim: 1, launch: 1, pid: 1, terminal: 1, integrate: 1}) &&
+		interruptID != ""
+}
+
+func sameForcedRetryRoute(a, b workflowrun.ChildOutcome) bool {
+	if a.Provider == "" || a.Model == "" || a.Depth == "" || a.Permission == "" ||
+		a.AccountRef == "" || a.InstallRef == "" ||
+		a.ExecutionPlanDigest == "" || a.ChildContractDigest == "" {
+		return false
+	}
+	return a.Provider == b.Provider &&
+		a.Model == b.Model &&
+		a.Depth == b.Depth &&
+		a.Permission == b.Permission &&
+		a.AccountRef == b.AccountRef &&
+		a.InstallRef == b.InstallRef &&
+		a.ExecutionPlanDigest == b.ExecutionPlanDigest &&
+		a.ChildContractDigest == b.ChildContractDigest
+}
+
+func exactStringPayload(raw json.RawMessage) (map[string]string, bool) {
+	if len(raw) == 0 {
+		return nil, false
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, false
+	}
+	return payload, true
 }
 
 // openPRIsExactSHA256Digest requires exact "sha256:" + 64 hex (no surrounding trim).
