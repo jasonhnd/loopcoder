@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/capacitysnapshot"
+	"github.com/jasonhnd/loopcoder/internal/capclass"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 )
 
@@ -102,6 +103,37 @@ func TestClaudeMachineReadableCatalogRequiresAccountBoundInvocationReceipt(t *te
 	}
 	if !found {
 		t.Fatalf("verified Claude route absent: %+v", inventory.Candidates)
+	}
+
+	opusReport := report
+	opusReceipt := receipt
+	opusReceipt.RequestedModel = "opus"
+	opusReceipt.ActualModel = "claude-opus-4-8"
+	opusReceipt.AcceptedEffort = "high"
+	opusSnapshot := report.ModelCatalogSnapshots[0]
+	opusSnapshot.CapabilityProbeReceipt = &opusReceipt
+	opusModel := report.ModelCapabilities[0]
+	opusModel.CanonicalModelID = "claude-opus-4-8"
+	opusModel.DisplayName = "claude-opus-4-8"
+	opusModel.Constraints = []string{"supported_depth=high", "default_depth=high"}
+	opusReport.ModelCatalogSnapshots = []providerinventory.ModelCatalogSnapshot{opusSnapshot}
+	opusReport.ModelCapabilities = []providerinventory.ModelCapability{opusModel}
+	opusAccounts := capacitysnapshot.FromProviderInventoryReport(opusReport, now)
+	opusInventory, err := capacitysnapshot.ToRouteInventory(mustBuild(t, opusAccounts, now), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opusFound := false
+	for _, candidate := range opusInventory.Candidates {
+		if candidate.Provider == "claude" && candidate.Model == "claude-opus-4-8" && candidate.Effort == "high" {
+			opusFound = true
+			if candidate.ModelClass != capclass.ClassSoul {
+				t.Fatalf("observed exact Opus class = %s, want soul: %+v", candidate.ModelClass, candidate)
+			}
+		}
+	}
+	if !opusFound {
+		t.Fatalf("verified exact Opus route absent: %+v", opusInventory.Candidates)
 	}
 
 	report.ModelCatalogSnapshots[0].CapabilityProbeReceipt = nil

@@ -55,6 +55,19 @@ func TestValidateClaudeCapabilityProbeReceiptAcceptsFullyCommittedReservation(t 
 	}
 }
 
+func TestValidateClaudeCapabilityProbeReceiptAcceptsDeclaredBracketedOpusID(t *testing.T) {
+	now := time.Date(2026, 7, 26, 8, 0, 0, 0, time.UTC)
+	receipt := testClaudeCapabilityReceipt(now)
+	receipt.RequestedModel = "opus"
+	receipt.ActualModel = "claude-opus-4-8[1m]"
+	if _, ok := ClaudeCatalogCandidate(receipt.RequestedModel); !ok {
+		t.Fatal("test requires adapter-declared opus alias")
+	}
+	if err := ValidateClaudeCapabilityProbeReceipt(receipt, now); err != nil {
+		t.Fatalf("declared exact Opus receipt: %v", err)
+	}
+}
+
 func testClaudeCapabilityReceipt(now time.Time) ClaudeCapabilityProbeReceipt {
 	return ClaudeCapabilityProbeReceipt{
 		SchemaVersion:          ClaudeCapabilityProbeReceiptSchema,

@@ -45,7 +45,11 @@ var (
 
 	credentialPattern = regexp.MustCompile(`(?i)(authorization\s*:\s*bearer|bearer\s+[A-Za-z0-9._~-]{12,}|sk-[A-Za-z0-9_-]{12,})`)
 	emailPattern      = regexp.MustCompile(`(?i)\b[A-Z0-9._%+\-]{1,64}@[A-Z0-9.\-]{1,190}\.[A-Z]{2,24}\b`)
-	modelIDPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}$`)
+	// Claude's official exact model identifiers are slug-like, with a bounded
+	// bracketed context suffix used by entries such as
+	// claude-opus-4-8[1m]. Path, whitespace, shell, and principal separators
+	// remain outside this allowlist.
+	modelIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:\[\]-]{0,119}$`)
 )
 
 type Request struct {
@@ -581,47 +585,75 @@ func parseStreamJSON(output []byte) (parsedUsage, error) {
 			// Unknown event kinds are not persisted and do not establish any fact.
 		}
 	}
-	if !resultSeen || !resultSucceeded || isError || len(modelUsage) != 1 {
-		return parsedUsage{}, fmt.Errorf("%w: successful result and one exact model are required", ErrProbeOutput)
+	if !resultSeen || !resultSucceeded || isError || len(modelUsage) == 0 {
+		return parsedUsage{}, fmt.Errorf("%w: successful result and exact model usage are required", ErrProbeOutput)
 	}
-	actualModel := ""
-	for modelID := range modelUsage {
-		actualModel = modelID
+	actualModel := strings.TrimSpace(initModel)
+	if actualModel != "" {
+		if _, ok := modelUsage[actualModel]; !ok {
+			return parsedUsage{}, fmt.Errorf("%w: init model is absent from modelUsage", ErrProbeOutput)
+		}
+	} else if len(modelUsage) == 1 {
+		for modelID := range modelUsage {
+			actualModel = modelID
+		}
+	} else {
+		// modelUsage can include auxiliary models used internally by Claude
+		// Code. Without the exact official init identity, selecting the
+		// largest usage row or the requested alias would be an inference.
+		return parsedUsage{}, fmt.Errorf("%w: multiple modelUsage identities require exact init model", ErrProbeOutput)
 	}
 	if !modelIDPattern.MatchString(actualModel) {
 		return parsedUsage{}, fmt.Errorf("%w: unsafe or absent model identity", ErrProbeOutput)
-	}
-	if initModel != "" && initModel != actualModel {
-		return parsedUsage{}, fmt.Errorf("%w: init and modelUsage identities differ", ErrProbeOutput)
 	}
 	if !assistantSeen && strings.TrimSpace(initModel) == "" {
 		// A successful result plus modelUsage is sufficient, but completely
 		// context-free result events remain too weak.
 		return parsedUsage{}, fmt.Errorf("%w: result lacks assistant or init context", ErrProbeOutput)
 	}
-	usage := modelUsage[actualModel]
-	values := []int64{usage.InputTokens, usage.OutputTokens, usage.CacheReadInputTokens, usage.CacheCreationTokens}
-	total := int64(0)
-	for _, value := range values {
-		if value < 0 || value > math.MaxInt64-total {
+	var inputTokens, outputTokens, cacheReadTokens, cacheCreateTokens, total int64
+	var costUSD float64
+	add := func(dst *int64, value int64) bool {
+		if value < 0 || value > math.MaxInt64-*dst {
+			return false
+		}
+		*dst += value
+		return true
+	}
+	for modelID, usage := range modelUsage {
+		if modelID != strings.TrimSpace(modelID) || !modelIDPattern.MatchString(modelID) {
+			return parsedUsage{}, fmt.Errorf("%w: unsafe modelUsage identity", ErrProbeOutput)
+		}
+		if !add(&inputTokens, usage.InputTokens) ||
+			!add(&outputTokens, usage.OutputTokens) ||
+			!add(&cacheReadTokens, usage.CacheReadInputTokens) ||
+			!add(&cacheCreateTokens, usage.CacheCreationTokens) {
 			return parsedUsage{}, fmt.Errorf("%w: invalid token usage", ErrProbeOutput)
 		}
-		total += value
+		if math.IsNaN(usage.CostUSD) || math.IsInf(usage.CostUSD, 0) || usage.CostUSD < 0 {
+			return parsedUsage{}, fmt.Errorf("%w: invalid cost usage", ErrProbeOutput)
+		}
+		costUSD += usage.CostUSD
+		if math.IsNaN(costUSD) || math.IsInf(costUSD, 0) {
+			return parsedUsage{}, fmt.Errorf("%w: invalid aggregate cost usage", ErrProbeOutput)
+		}
 	}
-	costMicros := usage.CostUSD * 1_000_000
+	for _, value := range []int64{inputTokens, outputTokens, cacheReadTokens, cacheCreateTokens} {
+		if !add(&total, value) {
+			return parsedUsage{}, fmt.Errorf("%w: invalid aggregate token usage", ErrProbeOutput)
+		}
+	}
+	costMicros := costUSD * 1_000_000
 	if total <= 0 ||
-		math.IsNaN(usage.CostUSD) ||
-		math.IsInf(usage.CostUSD, 0) ||
-		usage.CostUSD < 0 ||
 		costMicros > float64(math.MaxInt64) {
 		return parsedUsage{}, fmt.Errorf("%w: exact positive usage is required", ErrProbeOutput)
 	}
 	return parsedUsage{
 		ActualModel:            actualModel,
-		InputTokens:            usage.InputTokens,
-		OutputTokens:           usage.OutputTokens,
-		CacheReadInputTokens:   usage.CacheReadInputTokens,
-		CacheCreateInputTokens: usage.CacheCreationTokens,
+		InputTokens:            inputTokens,
+		OutputTokens:           outputTokens,
+		CacheReadInputTokens:   cacheReadTokens,
+		CacheCreateInputTokens: cacheCreateTokens,
 		TotalTokens:            total,
 		CostUSDMicros:          int64(math.Round(costMicros)),
 	}, nil
