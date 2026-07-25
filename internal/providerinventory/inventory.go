@@ -802,7 +802,7 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 					}
 				}
 				if adapter.AdapterID == "claude" && !adapterQuotaAttempted {
-					source, snapshots, quotaProbe := inspectClaudeQuota(ctx, discovery, adapter, candidate, installation, now, deps)
+					source, snapshots, quotaProbe := inspectClaudeQuota(ctx, discovery, adapter, candidate, installation, profiles, readiness, now, deps)
 					quotaTelemetrySources = append(quotaTelemetrySources, source)
 					quotaSnapshots = append(quotaSnapshots, snapshots...)
 					probes = append(probes, quotaProbe)
@@ -1370,6 +1370,13 @@ func inspectCandidate(ctx context.Context, adapter AdapterDeclaration, candidate
 	stderr, stderrFindings := redactProviderOutput(result.Stderr)
 	probe.StdoutSummary = stdout
 	probe.StderrSummary = stderr
+	if adapter.AuthProbeParser == "claude-auth-status-json" {
+		// Claude's machine status may contain an account email. Parse it only
+		// into an opaque durable identity hash; never persist even a partially
+		// redacted address in probe summaries.
+		probe.StdoutSummary = "claude auth status machine JSON received"
+		probe.StderrSummary = ""
+	}
 	probe.SecretFindingCount = stdoutFindings + stderrFindings
 	probe.TimedOut = result.TimedOut
 	probe.Killed = result.Killed
@@ -1580,6 +1587,9 @@ func inspectAuthCommand(ctx context.Context, discovery *discoveryContext, adapte
 		"profile_count": fmt.Sprintf("%d", len(parsed)),
 		"parser":        firstNonEmpty(adapter.AuthProbeParser, "allowlisted-text-auth-status"),
 	})
+	if adapter.AuthProbeParser == "claude-auth-status-json" {
+		probe.StdoutSummary = fmt.Sprintf("claude auth status machine JSON accepted profiles %d", len(parsed))
+	}
 	if result.ExitCode != 0 {
 		probe.Confidence = ConfidenceUnknown
 		probe.GapReasons = []string{"auth-probe-nonzero-exit"}
@@ -2037,8 +2047,9 @@ func parseClaudeAuthStatus(output string, exitCode int) []parsedAuthStatus {
 	for index, profile := range profiles {
 		state, scope, summary, refresh, gaps, _ := classifyAuthLine(firstNonEmpty(profile.Status, status.Status, boolAuthStatus(status.LoggedIn, exitCode)))
 		reference := firstNonEmpty(profile.ID, profile.Email, profile.OrgID, profile.OrgName, fmt.Sprintf("claude-profile-%d", index))
-		display := safeSummary(firstNonEmpty(profile.Display, profile.Email, profile.OrgName, fmt.Sprintf("profile-%d", index+1)))
-		display = emailPattern.ReplaceAllStringFunc(display, redactEmail)
+		// Email may contribute to the in-memory reference hash, but it is
+		// never retained as a profile display or diagnostic.
+		display := safeSummary(firstNonEmpty(profile.Display, profile.OrgName, fmt.Sprintf("profile-%d", index+1)))
 		if strings.TrimSpace(display) == "" || secretLike(display) {
 			display = "profile-" + hashBase32("claude", reference)[:8]
 		}

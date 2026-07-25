@@ -213,6 +213,7 @@ func TestClaudeQuotaFailureFixturesLeaveUnavailableSnapshot(t *testing.T) {
 		{name: "truncated", result: ClaudePTYResult{Output: "Claude Code Usage\n", ExitCode: 0, Truncated: true}, wantCode: "ErrClaudeQuotaOutputTruncated", wantGap: "quota-output-truncated"},
 		{name: "credential", result: ClaudePTYResult{Output: "Claude Code Usage\napi_key=sk-" + strings.Repeat("A", 24), ExitCode: 0}, wantCode: "ErrQuotaCredentialMaterial", wantGap: "credential-material-redacted"},
 		{name: "timeout", result: ClaudePTYResult{TimedOut: true, Killed: true, ExitCode: -1}, wantCode: "ErrClaudeQuotaTimeout", wantGap: "quota-probe-timeout"},
+		{name: "workspace-trust-prompt", result: ClaudePTYResult{Output: "Do you trust the files in this workspace?", TimedOut: true, Killed: true, ExitCode: -1}, wantCode: "ErrClaudeQuotaWorkspaceTrustPrompt", wantGap: "quota-workspace-trust-prompt"},
 		{name: "nonzero", result: ClaudePTYResult{ExitCode: 2}, wantCode: "ErrClaudeQuotaNonZeroExit", wantGap: "quota-probe-nonzero-exit"},
 		{name: "transport", result: ClaudePTYResult{ExitCode: -1}, err: errors.New("pty closed"), wantCode: "ErrClaudeQuotaExecutionFailed", wantGap: "quota-probe-failed"},
 		{name: "old-version", version: "claude 0.9.9", result: ClaudePTYResult{ExitCode: 0}, wantCode: "ErrUnsupportedVersion", wantGap: "unsupported-cli-version"},
