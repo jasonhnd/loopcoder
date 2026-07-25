@@ -1633,6 +1633,150 @@ func TestForcedInterrupt_ExactCancelledEvidence(t *testing.T) {
 	}
 }
 
+func TestForcedInterrupt_PartialInvokedRouteBindsExactSelectedPermission(t *testing.T) {
+	for _, permission := range []string{"bounded_write", "read-only"} {
+		t.Run(permission, func(t *testing.T) {
+			home := testHome(t)
+			hangEntered := make(chan struct{})
+			var hangOnce sync.Once
+			svc := workflowrun.Service{
+				Now: t0, HomeDir: home,
+				Executor: testspawn.Executor{
+					HomeDir: home, Now: t0, Hang: true,
+					MutateInterruptedRoute: func(route workflowrun.ChildRoute) workflowrun.ChildRoute {
+						route.Permission = ""
+						return route
+					},
+					OnHangEntry: func(workItemID string, pid int) {
+						if workItemID == "only" && pid > 0 {
+							hangOnce.Do(func() { close(hangEntered) })
+						}
+					},
+				},
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			go func() {
+				<-hangEntered
+				cancel()
+			}()
+			def := workflowdef.Definition{
+				SchemaVersion: 1, GraphID: "g-partial-" + permission, Source: "explicit_definition",
+				Items: []workflowdef.DefItem{{
+					ID: "only", Intent: "verify exact interrupted route", Status: "required", IntegrationOrder: 1,
+					RouteRequirement: "class=tera,depth=medium,permission=" + permission,
+					OutputContract:   "route_receipt",
+				}},
+			}
+			route := workflowrun.ChildRoute{
+				Provider: "fixture", Model: "fixture-model", TaskClass: "tera", Depth: "medium",
+				Permission: permission, AccountRef: "acct-f", InstallRef: "install-f",
+				WindowKind: "five_hour", ReservationID: "res-f",
+				RouteReason: "Winner: fixture/test",
+			}
+			res, _ := svc.Execute(ctx, withExpectedPlanDigest(t, workflowrun.Request{
+				ProjectID: "proj-partial-" + permission, RunID: "run_partial_" + permission,
+				Definition: def, Actor: "owner",
+				ChildRoutes: map[string]workflowrun.ChildRoute{"only": route},
+			}))
+			if !res.Interrupted {
+				t.Fatalf("partial interrupted route must remain resumable: %+v", res)
+			}
+			var child *workflowrun.ChildOutcome
+			for i := range res.Children {
+				if res.Children[i].WorkItemID == "only" {
+					child = &res.Children[i]
+					break
+				}
+			}
+			if child == nil {
+				t.Fatalf("missing child: %+v", res)
+			}
+			if child.Terminal != "cancelled" || child.FailureClass != "forced_interrupt" {
+				t.Fatalf("unexpected interrupted terminal: %+v", child)
+			}
+			if child.Permission != permission ||
+				child.Provider != route.Provider ||
+				child.Model != route.Model ||
+				child.Depth != route.Depth ||
+				child.AccountRef != route.AccountRef ||
+				child.InstallRef != route.InstallRef ||
+				child.WindowKind != route.WindowKind ||
+				child.ReservationID != route.ReservationID {
+				t.Fatalf("interrupted route was not bound exactly to selected route: got=%+v want=%+v", child, route)
+			}
+			partial, err := workflowrun.LoadPartialPrior(home, "proj-partial-"+permission, "run_partial_"+permission)
+			if err != nil {
+				t.Fatalf("load partial: %v", err)
+			}
+			if len(partial.WorkflowKids) != 1 || partial.WorkflowKids[0].Permission != permission {
+				t.Fatalf("durable partial lost selected permission: %+v", partial.WorkflowKids)
+			}
+		})
+	}
+}
+
+func TestForcedInterrupt_NonemptyInvokedPermissionMismatchFailsClosed(t *testing.T) {
+	home := testHome(t)
+	hangEntered := make(chan struct{})
+	var hangOnce sync.Once
+	svc := workflowrun.Service{
+		Now: t0, HomeDir: home,
+		Executor: testspawn.Executor{
+			HomeDir: home, Now: t0, Hang: true,
+			MutateInterruptedRoute: func(route workflowrun.ChildRoute) workflowrun.ChildRoute {
+				route.Permission = "read-only"
+				return route
+			},
+			OnHangEntry: func(workItemID string, pid int) {
+				if workItemID == "only" && pid > 0 {
+					hangOnce.Do(func() { close(hangEntered) })
+				}
+			},
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-hangEntered
+		cancel()
+	}()
+	res, err := svc.Execute(ctx, withExpectedPlanDigest(t, workflowrun.Request{
+		ProjectID: "proj-interrupt-route-mismatch", RunID: "run_interrupt_route_mismatch",
+		Definition: workflowrun.OneNodeDefinition("g-interrupt-route-mismatch", "implement"),
+		Actor:      "owner",
+		ChildRoutes: map[string]workflowrun.ChildRoute{
+			"only": {
+				Provider: "fixture", Model: "fixture-model", TaskClass: "tera", Depth: "medium",
+				Permission: "bounded_write", AccountRef: "acct-f", InstallRef: "install-f",
+				WindowKind: "five_hour", ReservationID: "res-f", RouteReason: "Winner: fixture/test",
+			},
+		},
+	}))
+	if err == nil {
+		t.Fatalf("mismatched interrupted route must fail closed: %+v", res)
+	}
+	if res.Interrupted {
+		t.Fatalf("mismatched route must not create resumable service interrupt: %+v", res)
+	}
+	var child *workflowrun.ChildOutcome
+	for i := range res.Children {
+		if res.Children[i].WorkItemID == "only" {
+			child = &res.Children[i]
+			break
+		}
+	}
+	if child == nil || child.Terminal != "failed" || child.FailureClass != "interrupt_route_mismatch" {
+		t.Fatalf("want exact interrupt_route_mismatch failure: child=%+v result=%+v", child, res)
+	}
+	raw, readErr := os.ReadFile(res.EventLogPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if strings.Contains(string(raw), `"kind":"interrupt"`) ||
+		strings.Contains(string(raw), workflowrun.InterruptClassServiceForced) {
+		t.Fatalf("mismatched route must not emit valid service interrupt pair: %s", raw)
+	}
+}
+
 func TestMalformedEventLog_ResumeZeroLaunches(t *testing.T) {
 	home := testHome(t)
 	// Pre-seed a corrupt event log for the run.
