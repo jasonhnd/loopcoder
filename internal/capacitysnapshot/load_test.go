@@ -107,6 +107,127 @@ func TestLoadRouteInventoryRehydratesDurableQuotaWithoutSnapshotFlag(t *testing.
 	}
 }
 
+func TestLoadRouteInventoryRehydratesClaudeVerifiedReceiptAcrossPATHAlias(t *testing.T) {
+	now := time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC)
+	const (
+		liveInstall    = "pinst_claude_live_primary"
+		durableInstall = "pinst_claude_durable_alias"
+		account        = "acct-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		authID         = "auth_claude_verified_alias"
+		snapshotID     = "mcatsnap_claude_verified_alias"
+		resolvedHash   = "sha256:claude-same-resolved-binary"
+	)
+	remaining, limit := int64(96), int64(100)
+	receipt := verifiedClaudeReceipt(now, durableInstall, account, authID)
+	liveInst := exactFreshInstall("claude", liveInstall, resolvedHash, "sha256:live-path")
+	liveInst.DiscoveryOrder = 0
+	durableInst := exactFreshInstall("claude", durableInstall, resolvedHash, "sha256:durable-path")
+	durableInst.DiscoveryOrder = 1
+
+	live := providerinventory.Report{
+		Installations: []providerinventory.ProviderInstallation{liveInst},
+		AuthReadiness: []providerinventory.AuthReadiness{{
+			AuthReadinessID:        authID,
+			AdapterID:              "claude",
+			ReadinessState:         providerinventory.ReadinessReady,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			Confidence:             providerinventory.ConfidenceExact,
+			ReadinessConfidence:    providerinventory.ConfidenceExact,
+			AccountProfileID:       ptrStr(account),
+			ProviderInstallationID: ptrStr(liveInstall),
+		}},
+		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
+			AdapterID: "claude", QuotaSnapshotID: "live-unavailable",
+			Confidence:     providerinventory.ConfidenceUnavailable,
+			FreshnessState: providerinventory.FreshnessNotApplicable,
+			CapturedAt:     now.Format(time.RFC3339Nano),
+		}},
+	}
+	durable := providerinventory.Report{
+		Installations: []providerinventory.ProviderInstallation{durableInst},
+		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{{
+			ModelCatalogSnapshotID: snapshotID,
+			AdapterID:              "claude",
+			ProviderInstallationID: ptrStr(durableInstall),
+			AccountProfileID:       ptrStr(account),
+			AuthReadinessID:        ptrStr(authID),
+			CatalogSourceKind:      providerinventory.CatalogSourceProviderMachineReadable,
+			CatalogSourceReference: "claude-capability-probe#" + receipt.OutputRawSHA256,
+			SourceSchemaVersion:    providerinventory.ClaudeCapabilityProbeReceiptSchema,
+			EntryCount:             1,
+			Confidence:             providerinventory.ConfidenceExact,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			CapabilityProbeReceipt: &receipt,
+		}},
+		ModelCapabilities: []providerinventory.ModelCapability{{
+			ModelCatalogSnapshotID: snapshotID,
+			AdapterID:              "claude",
+			CanonicalModelID:       receipt.ActualModel,
+			DisplayName:            receipt.ActualModel,
+			AvailabilityState:      providerinventory.AvailabilityAvailable,
+			LifecycleState:         providerinventory.LifecycleAvailable,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			Confidence:             providerinventory.ConfidenceExact,
+			Constraints:            []string{"supported_depth=low", "default_depth=low"},
+			EntrySources: []providerinventory.CatalogEntrySource{{
+				SourceKind:      providerinventory.CatalogSourceProviderMachineReadable,
+				SourceReference: "claude-capability-probe#" + receipt.OutputRawSHA256,
+				Confidence:      providerinventory.ConfidenceExact,
+				FreshnessState:  providerinventory.FreshnessFresh,
+			}},
+			Source: providerinventory.SourceDescriptor{Kind: string(providerinventory.CatalogSourceProviderMachineReadable)},
+		}},
+		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
+			AdapterID: "claude", QuotaSnapshotID: "durable-claude-quota",
+			WindowKind: providerinventory.WindowRolling, Unit: "percent",
+			RemainingValue: &remaining, LimitValue: &limit,
+			AccountProfileID:       ptrStr(account),
+			ProviderInstallationID: ptrStr(durableInstall),
+			Confidence:             providerinventory.ConfidenceExact,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			CapturedAt:             now.Format(time.RFC3339Nano),
+			StaleAfter:             now.Add(time.Hour).Format(time.RFC3339Nano),
+			ResetAt:                now.Add(5 * time.Hour).Format(time.RFC3339Nano),
+		}},
+	}
+
+	inventory, snapshot, err := capacitysnapshot.LoadRouteInventory(context.Background(), capacitysnapshot.LoadOptions{
+		Now:                     now,
+		SkipDefaultDurableStore: true,
+		Discover: func(context.Context, providerinventory.Options) (providerinventory.Report, error) {
+			return live, nil
+		},
+		LoadDurable: func(context.Context) (providerinventory.Report, error) {
+			return durable, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("LoadRouteInventory: %v", err)
+	}
+	if len(snapshot.ClaudeCatalogReceipts) != 1 {
+		t.Fatalf("Claude receipts = %#v, want exactly one", snapshot.ClaudeCatalogReceipts)
+	}
+	gotReceipt := snapshot.ClaudeCatalogReceipts[0]
+	if gotReceipt.ProviderInstallationID != liveInstall ||
+		gotReceipt.AccountProfileID != account ||
+		gotReceipt.OutputRawSHA256 != receipt.OutputRawSHA256 {
+		t.Fatalf("receipt binding/provenance changed incorrectly: %#v", gotReceipt)
+	}
+	found := false
+	for _, candidate := range inventory.Candidates {
+		if candidate.Provider == "claude" && candidate.Model == receipt.ActualModel &&
+			candidate.Effort == "low" && candidate.Permission == "read-only" {
+			found = true
+			if candidate.AccountRef != account || candidate.InstallRef != liveInstall {
+				t.Fatalf("candidate identity = %+v", candidate)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("verified Claude candidate absent after production load: %+v", inventory.Candidates)
+	}
+}
+
 func TestLoadRouteInventoryFailClosedWithoutDurableOrUsableQuota(t *testing.T) {
 	now := time.Date(2026, 7, 22, 16, 30, 0, 0, time.UTC)
 	live := providerinventory.Report{
