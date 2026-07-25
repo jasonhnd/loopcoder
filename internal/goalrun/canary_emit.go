@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/artifactqual"
+	"github.com/jasonhnd/loopcoder/internal/workclaim"
 	"github.com/jasonhnd/loopcoder/internal/workflowrun"
 )
 
@@ -46,12 +48,24 @@ func EmitCanaryFromResult(res Result, opts CanaryEmitOptions) (artifactqual.Cana
 		return artifactqual.CanaryEvidence{}, fmt.Errorf("goalrun: canary out path required")
 	}
 	// Structural inventory provenance: release canary never from snapshot/injected.
-	if opts.RequireLiveInventory && opts.InventoryProvenance != InventoryProvenanceLiveDiscover &&
-		opts.InventoryProvenance != InventoryProvenanceUnspecified {
+	if opts.RequireLiveInventory && opts.InventoryProvenance != InventoryProvenanceLiveDiscover {
 		return artifactqual.CanaryEvidence{}, fmt.Errorf("goalrun: canary emit rejects inventory provenance %q (require live_discover)", opts.InventoryProvenance)
 	}
 
 	events, evPath, loadErr := loadWorkflowEvents(res, opts.HomeDir)
+	var claims []workclaim.Claim
+	if loadErr == nil && evPath != "" {
+		claimPath := filepath.Join(filepath.Dir(evPath), "workclaims.json")
+		if _, statErr := os.Stat(claimPath); statErr == nil {
+			store, claimErr := workclaim.OpenPath(claimPath, time.Now)
+			if claimErr != nil {
+				return artifactqual.CanaryEvidence{}, fmt.Errorf("goalrun: canary claim evidence: %w", claimErr)
+			}
+			claims = store.AllClaims()
+		} else if !os.IsNotExist(statErr) {
+			return artifactqual.CanaryEvidence{}, fmt.Errorf("goalrun: canary claim evidence stat: %w", statErr)
+		}
+	}
 	// Other canary metrics may still emit; claimed model_unavailable proof needs events.
 	var unavail *artifactqual.CanaryUnavailableRetry
 	if loadErr != nil {
@@ -98,14 +112,18 @@ func EmitCanaryFromResult(res Result, opts CanaryEmitOptions) (artifactqual.Cana
 		ArchiveDigest: opts.ArchiveDigest, PreProdSHA: opts.PreProdSHA,
 		BinaryVersion: opts.BinaryVersion, BinaryCommit: opts.BinaryCommit,
 		ProjectID: res.ProjectID, RunID: res.RunID,
-		Children: children, ProviderObs: obs, Events: events, EventLogPath: evPath,
+		InventoryProvenance:   string(opts.InventoryProvenance),
+		InventoryReportDigest: res.InventoryReportDigest,
+		Children:              children, ProviderObs: obs, Events: events, Claims: claims,
+		LedgerEntries: res.CapacityLedgerEntries, EventLogPath: evPath,
 		ReuseCount: res.ReuseCount, WorktreePeak: res.WorktreePeak, ProcessPeak: res.ProcessPeak,
 		// Occupancy measured from workflowrun.Result at return (never invent zeros).
 		WorktreeActive: res.Workflow.WorktreeActive, ProcessActive: res.Workflow.ProcessActive,
 		ActiveOccupancyMeasured: true,
-		Resumed:                 res.Resumed || res.Workflow.Interrupted,
-		RepoPath:                opts.RepoPath,
-		PRURL:                   prURL, PRRepository: prRepo, PRBranch: prBranch, PRNumber: prNum,
+		// Interrupted is not evidence of a completed durable resume.
+		Resumed:  res.Resumed,
+		RepoPath: opts.RepoPath,
+		PRURL:    prURL, PRRepository: prRepo, PRBranch: prBranch, PRNumber: prNum,
 		PRBaseRef: prBase, PRHeadOID: prHead,
 		PRRequiredChecks: prChecks, PRRequiredChecksGreen: prGreen,
 		PRIndependentVerifier: prVer, PRVerifierEvidenceRef: prVerRef,
@@ -219,6 +237,7 @@ func canaryChildrenFromReports(res Result) []artifactqual.CanaryChild {
 			Permission: c.Permission, AccountRef: c.AccountRef, InstallRef: c.InstallRef,
 			WindowKind: c.WindowKind,
 			Terminal:   c.Terminal, WorktreePath: c.WorktreePath,
+			FilesTouched:   append([]string(nil), c.FilesTouched...),
 			CapacityBefore: c.CapacityBefore, CapacityReserved: c.CapacityReserved,
 			CapacityActual: c.CapacityActual, CapacityAfter: c.CapacityAfter,
 			ActualSource: c.ActualSource, ActualConfidence: c.CapacityActualConfidence,
@@ -266,29 +285,32 @@ func canaryProviderObsFromReports(res Result) []artifactqual.CanaryProviderObs {
 		// Prefer real observed-after evidence; else real before-window evidence.
 		// Never invent Source/Freshness/CapturedAt via time.Now or "capacity_snapshot".
 		var (
-			rem   *float64
-			src   string
-			fresh string
-			conf  string
-			capAt time.Time
+			rem       *float64
+			src       string
+			fresh     string
+			conf      string
+			invDigest string
+			capAt     time.Time
 		)
-		if c.CapacityAfter != nil && strings.EqualFold(c.CapacityAfterState, "observed") {
+		if c.CapacityAfter != nil && c.CapacityAfterState == "observed" {
 			rem = c.CapacityAfter
-			src = strings.TrimSpace(c.CapacityAfterSource)
-			fresh = strings.TrimSpace(c.CapacityAfterFreshness)
-			conf = strings.TrimSpace(c.CapacityAfterConfidence)
+			src = c.CapacityAfterSource
+			fresh = c.CapacityAfterFreshness
+			conf = c.CapacityAfterConfidence
+			invDigest = c.CapacityAfterInventoryDigest
 			capAt = c.CapacityAfterObservedAt
 		} else if c.CapacityBefore != nil {
 			rem = c.CapacityBefore
-			src = strings.TrimSpace(c.CapacityBeforeSource)
-			fresh = strings.TrimSpace(c.CapacityBeforeFreshness)
-			conf = strings.TrimSpace(c.CapacityBeforeConfidence)
+			src = c.CapacityBeforeSource
+			fresh = c.CapacityBeforeFreshness
+			conf = c.CapacityBeforeConfidence
+			invDigest = c.CapacityBeforeInventoryDigest
 			capAt = c.CapacityBeforeCapturedAt
 		} else {
 			continue
 		}
 		// Incomplete structured evidence: skip rather than fabricate.
-		if rem == nil || src == "" || fresh == "" || capAt.IsZero() {
+		if rem == nil || src == "" || fresh == "" || invDigest == "" || capAt.IsZero() {
 			continue
 		}
 		seen[p] = true
@@ -297,7 +319,8 @@ func canaryProviderObsFromReports(res Result) []artifactqual.CanaryProviderObs {
 			InstallRef: c.InstallRef, WindowKind: c.WindowKind,
 			Source: src, Freshness: fresh, Confidence: conf,
 			Remaining: rem, CapturedAt: capAt.UTC(),
-			ResetAt: copyTimeUTC(c.CapacityResetAt),
+			ResetAt:               copyTimeUTC(c.CapacityResetAt),
+			InventoryReportDigest: invDigest,
 		})
 	}
 	return out
@@ -329,7 +352,7 @@ func firstRetryAttempt(res Result) string {
 // hasClaimedModelUnavailableExclude reports any Claimed model_unavailable exclude.
 func hasClaimedModelUnavailableExclude(excludes []RouteExclude) bool {
 	for _, e := range excludes {
-		if e.Claimed && strings.EqualFold(strings.TrimSpace(e.Reason), "model_unavailable") {
+		if e.Claimed && e.Reason == "model_unavailable" {
 			return true
 		}
 	}
@@ -345,12 +368,12 @@ func hasClaimedModelUnavailableExclude(excludes []RouteExclude) bool {
 // or incomplete events yield nil (unavailable_retry not_run).
 func proofFromResult(res Result, events []workflowrun.Event) *UnavailableRetryProof {
 	// Exactly one failed/retry pair: same WorkItemID and SupersedesAttemptID match
-	// with case-sensitive attempt IDs after TrimSpace.
+	// with byte-exact durable attempt IDs.
 	type pair struct{ failed, retry *workflowrun.ChildOutcome }
 	var pairs []pair
 	for i := range res.Workflow.Children {
 		f := &res.Workflow.Children[i]
-		if !strings.EqualFold(strings.TrimSpace(f.FailureClass), "model_unavailable") {
+		if f.FailureClass != "model_unavailable" {
 			continue
 		}
 		for j := range res.Workflow.Children {
@@ -361,7 +384,7 @@ func proofFromResult(res Result, events []workflowrun.Event) *UnavailableRetryPr
 			if !idExact(f.WorkItemID, r.WorkItemID) {
 				continue
 			}
-			if strings.TrimSpace(r.SupersedesAttemptID) == "" {
+			if r.SupersedesAttemptID == "" {
 				continue
 			}
 			if !idExact(r.SupersedesAttemptID, f.AttemptID) {
@@ -378,9 +401,9 @@ func proofFromResult(res Result, events []workflowrun.Event) *UnavailableRetryPr
 		return nil
 	}
 
-	failedAtt := strings.TrimSpace(failed.AttemptID)
-	retryAtt := strings.TrimSpace(retry.AttemptID)
-	wi := strings.TrimSpace(failed.WorkItemID)
+	failedAtt := failed.AttemptID
+	retryAtt := retry.AttemptID
+	wi := failed.WorkItemID
 	if failedAtt == "" || retryAtt == "" || wi == "" || failedAtt == retryAtt {
 		return nil
 	}
@@ -388,7 +411,7 @@ func proofFromResult(res Result, events []workflowrun.Event) *UnavailableRetryPr
 	countKind := func(kind, attempt string) int {
 		n := 0
 		for _, e := range events {
-			if strings.EqualFold(strings.TrimSpace(e.Kind), kind) && idExact(e.AttemptID, attempt) {
+			if e.Kind == kind && idExact(e.AttemptID, attempt) {
 				n++
 			}
 		}
@@ -396,14 +419,14 @@ func proofFromResult(res Result, events []workflowrun.Event) *UnavailableRetryPr
 	}
 	findKind := func(kind, attempt string) (EventSnapshot, bool) {
 		for _, e := range events {
-			if !strings.EqualFold(strings.TrimSpace(e.Kind), kind) || !idExact(e.AttemptID, attempt) {
+			if e.Kind != kind || !idExact(e.AttemptID, attempt) {
 				continue
 			}
-			if strings.TrimSpace(e.EventID) == "" {
+			if e.EventID == "" {
 				continue
 			}
 			// All structured events must carry nonempty WorkItemID equal to wi.
-			if strings.TrimSpace(e.WorkItemID) == "" || !idExact(e.WorkItemID, wi) {
+			if e.WorkItemID == "" || !idExact(e.WorkItemID, wi) {
 				continue
 			}
 			return EventSnapshot{
@@ -460,7 +483,7 @@ func proofFromResult(res Result, events []workflowrun.Event) *UnavailableRetryPr
 	// WorkItemID nonempty + exact on every required event; one consistent nonzero gen on retry.
 	retryGen := 0
 	for _, snap := range []EventSnapshot{muEv, failedTmEv, clEv, rrEv, lnEv, tmEv} {
-		if strings.TrimSpace(snap.WorkItemID) == "" || !idExact(snap.WorkItemID, wi) {
+		if snap.WorkItemID == "" || !idExact(snap.WorkItemID, wi) {
 			return nil
 		}
 	}
@@ -478,31 +501,29 @@ func proofFromResult(res Result, events []workflowrun.Event) *UnavailableRetryPr
 	// MU payload + Event.Terminal/Evidence must be nonempty exact matches to failed outcome.
 	if m, ok := payloadOf(muEv.EventID); !ok ||
 		m["work_item_id"] != wi || m["attempt_id"] != failedAtt ||
-		m["provider"] != strings.TrimSpace(failed.Provider) ||
-		m["model"] != strings.TrimSpace(failed.Model) ||
+		m["provider"] != failed.Provider ||
+		m["model"] != failed.Model ||
 		m["failure_class"] != "model_unavailable" {
 		return nil
 	}
 	muRaw, ok := rawEvent(muEv.EventID)
-	if !ok || strings.TrimSpace(muRaw.Terminal) == "" || strings.TrimSpace(muRaw.Evidence) == "" {
+	if !ok || muRaw.Terminal == "" || muRaw.Evidence == "" {
 		return nil
 	}
-	if strings.TrimSpace(muRaw.Terminal) != strings.TrimSpace(failed.Terminal) ||
-		strings.TrimSpace(muRaw.Evidence) != strings.TrimSpace(failed.OutputEvidence) {
+	if muRaw.Terminal != failed.Terminal || muRaw.Evidence != failed.OutputEvidence {
 		return nil
 	}
 	// Failed terminal event + payload are mandatory and exact (not optional/nonempty-only).
 	ftRaw, ok := rawEvent(failedTmEv.EventID)
-	if !ok || strings.TrimSpace(ftRaw.Terminal) == "" || strings.TrimSpace(ftRaw.Evidence) == "" {
+	if !ok || ftRaw.Terminal == "" || ftRaw.Evidence == "" {
 		return nil
 	}
-	if strings.TrimSpace(ftRaw.Terminal) != strings.TrimSpace(failed.Terminal) ||
-		strings.TrimSpace(ftRaw.Evidence) != strings.TrimSpace(failed.OutputEvidence) {
+	if ftRaw.Terminal != failed.Terminal || ftRaw.Evidence != failed.OutputEvidence {
 		return nil
 	}
 	if m, ok := payloadOf(failedTmEv.EventID); !ok ||
-		m["terminal"] != strings.TrimSpace(failed.Terminal) ||
-		m["output_evidence"] != strings.TrimSpace(failed.OutputEvidence) ||
+		m["terminal"] != failed.Terminal ||
+		m["output_evidence"] != failed.OutputEvidence ||
 		m["work_item_id"] != wi || m["attempt_id"] != failedAtt {
 		return nil
 	}
@@ -514,7 +535,7 @@ func proofFromResult(res Result, events []workflowrun.Event) *UnavailableRetryPr
 	var priorT, altT workflowrun.CapacityTransition
 	priorN, altN := 0, 0
 	for _, tr := range res.Workflow.CapacityTransitions {
-		switch strings.TrimSpace(tr.Role) {
+		switch tr.Role {
 		case "prior":
 			priorN++
 			priorT = tr
@@ -549,44 +570,44 @@ func proofFromResult(res Result, events []workflowrun.Event) *UnavailableRetryPr
 		m["work_item_id"] != wi ||
 		m["supersedes_attempt_id"] != failedAtt || m["retry_attempt_id"] != retryAtt ||
 		m["model_unavailable_event_id"] != muEv.EventID || m["claim_event_id"] != clEv.EventID ||
-		m["alt_provider"] == "" || m["alt_provider"] != strings.TrimSpace(retry.Provider) ||
-		m["alt_model"] == "" || m["alt_model"] != strings.TrimSpace(retry.Model) ||
-		m["depth"] == "" || m["depth"] != strings.TrimSpace(retry.Depth) ||
+		m["alt_provider"] == "" || m["alt_provider"] != retry.Provider ||
+		m["alt_model"] == "" || m["alt_model"] != retry.Model ||
+		m["depth"] == "" || m["depth"] != retry.Depth ||
 		m["permission"] == "" ||
-		(strings.TrimSpace(retry.Permission) != "" && m["permission"] != strings.TrimSpace(retry.Permission)) ||
-		m["account_ref"] == "" || m["account_ref"] != strings.TrimSpace(retry.AccountRef) ||
-		m["account_ref"] != strings.TrimSpace(altT.AccountRef) ||
-		m["window_kind"] == "" || m["window_kind"] != strings.TrimSpace(altT.WindowKind) ||
-		(strings.TrimSpace(retry.WindowKind) != "" && m["window_kind"] != strings.TrimSpace(retry.WindowKind)) ||
-		m["reservation_id"] == "" || m["reservation_id"] != strings.TrimSpace(altT.ReservationID) ||
-		(strings.TrimSpace(retry.ReservationID) != "" && m["reservation_id"] != strings.TrimSpace(retry.ReservationID)) {
+		(retry.Permission != "" && m["permission"] != retry.Permission) ||
+		m["account_ref"] == "" || m["account_ref"] != retry.AccountRef ||
+		m["account_ref"] != altT.AccountRef ||
+		m["window_kind"] == "" || m["window_kind"] != altT.WindowKind ||
+		(retry.WindowKind != "" && m["window_kind"] != retry.WindowKind) ||
+		m["reservation_id"] == "" || m["reservation_id"] != altT.ReservationID ||
+		(retry.ReservationID != "" && m["reservation_id"] != retry.ReservationID) {
 		return nil
 	}
 	// Launch must carry full route identity exact to retry/alternate.
 	if m, ok := payloadOf(lnEv.EventID); !ok ||
 		m["work_item_id"] != wi || m["retry_attempt_id"] != retryAtt ||
 		m["reroute_event_id"] != rrEv.EventID || m["supersedes_attempt_id"] != failedAtt ||
-		m["provider"] == "" || m["provider"] != strings.TrimSpace(retry.Provider) ||
-		m["model"] == "" || m["model"] != strings.TrimSpace(retry.Model) ||
-		m["depth"] == "" || m["depth"] != strings.TrimSpace(retry.Depth) ||
+		m["provider"] == "" || m["provider"] != retry.Provider ||
+		m["model"] == "" || m["model"] != retry.Model ||
+		m["depth"] == "" || m["depth"] != retry.Depth ||
 		m["permission"] == "" ||
-		(strings.TrimSpace(retry.Permission) != "" && m["permission"] != strings.TrimSpace(retry.Permission)) ||
-		m["account_ref"] == "" || m["account_ref"] != strings.TrimSpace(retry.AccountRef) ||
-		m["window_kind"] == "" || m["window_kind"] != strings.TrimSpace(altT.WindowKind) ||
-		m["reservation_id"] == "" || m["reservation_id"] != strings.TrimSpace(altT.ReservationID) {
+		(retry.Permission != "" && m["permission"] != retry.Permission) ||
+		m["account_ref"] == "" || m["account_ref"] != retry.AccountRef ||
+		m["window_kind"] == "" || m["window_kind"] != altT.WindowKind ||
+		m["reservation_id"] == "" || m["reservation_id"] != altT.ReservationID {
 		return nil
 	}
 	// Terminal payload output_evidence required exact; Event.Terminal/Evidence match too.
 	if m, ok := payloadOf(tmEv.EventID); !ok ||
 		m["work_item_id"] != wi || m["retry_attempt_id"] != retryAtt ||
 		m["supersedes_attempt_id"] != failedAtt ||
-		m["terminal"] != strings.TrimSpace(retry.Terminal) ||
-		m["output_evidence"] == "" || m["output_evidence"] != strings.TrimSpace(retry.OutputEvidence) {
+		m["terminal"] != retry.Terminal ||
+		m["output_evidence"] == "" || m["output_evidence"] != retry.OutputEvidence {
 		return nil
 	}
 	if tmRaw, ok := rawEvent(tmEv.EventID); !ok ||
-		strings.TrimSpace(tmRaw.Terminal) != strings.TrimSpace(retry.Terminal) ||
-		strings.TrimSpace(tmRaw.Evidence) != strings.TrimSpace(retry.OutputEvidence) {
+		tmRaw.Terminal != retry.Terminal ||
+		tmRaw.Evidence != retry.OutputEvidence {
 		return nil
 	}
 
@@ -596,7 +617,6 @@ func proofFromResult(res Result, events []workflowrun.Event) *UnavailableRetryPr
 	refKeys := map[string]int{}
 	var refSupersedes, refRetry string
 	for _, part := range strings.Split(retry.RerouteEventRef, ";") {
-		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
 		}
@@ -636,10 +656,10 @@ func proofFromResult(res Result, events []workflowrun.Event) *UnavailableRetryPr
 	retryIntegrateCommits := 0
 	failedIntegrateCommits := 0
 	for _, ic := range res.Workflow.IntegrateCommits {
-		if idExact(ic.AttemptID, retryAtt) && strings.TrimSpace(ic.CommitSHA) != "" {
+		if idExact(ic.AttemptID, retryAtt) && ic.CommitSHA != "" {
 			retryIntegrateCommits++
 		}
-		if idExact(ic.AttemptID, failedAtt) && strings.TrimSpace(ic.CommitSHA) != "" {
+		if idExact(ic.AttemptID, failedAtt) && ic.CommitSHA != "" {
 			failedIntegrateCommits++
 		}
 	}
@@ -650,10 +670,10 @@ func proofFromResult(res Result, events []workflowrun.Event) *UnavailableRetryPr
 	}
 	retryIntegrated := false
 	var integrateEv EventSnapshot
-	if sha := strings.TrimSpace(retry.IntegrateCommitSHA); sha != "" {
+	if sha := retry.IntegrateCommitSHA; sha != "" {
 		matched := 0
 		for _, ic := range res.Workflow.IntegrateCommits {
-			if idExact(ic.AttemptID, retryAtt) && strings.TrimSpace(ic.CommitSHA) == sha {
+			if idExact(ic.AttemptID, retryAtt) && ic.CommitSHA == sha {
 				matched++
 			}
 		}
@@ -675,7 +695,7 @@ func proofFromResult(res Result, events []workflowrun.Event) *UnavailableRetryPr
 		}
 		// Validate integrate Event.CommitSHA plus payload.
 		if intRaw, ok := rawEvent(intSnap.EventID); !ok ||
-			strings.TrimSpace(intRaw.CommitSHA) != sha {
+			intRaw.CommitSHA != sha {
 			return nil
 		}
 		integrateEv = intSnap
@@ -685,7 +705,7 @@ func proofFromResult(res Result, events []workflowrun.Event) *UnavailableRetryPr
 			return nil
 		}
 	}
-	failedIntegrated := strings.TrimSpace(failed.IntegrateCommitSHA) != ""
+	failedIntegrated := failed.IntegrateCommitSHA != ""
 
 	// Exact claim/launch/terminal counts == 1 per generation.
 	if countKind("terminal", failedAtt) != 1 || countKind("terminal", retryAtt) != 1 {
@@ -699,22 +719,21 @@ func proofFromResult(res Result, events []workflowrun.Event) *UnavailableRetryPr
 	}
 
 	// Exact full identity on capacity vs outcomes (prior + alternate).
-	if strings.TrimSpace(priorT.Provider) != strings.TrimSpace(failed.Provider) ||
-		strings.TrimSpace(priorT.Model) != strings.TrimSpace(failed.Model) ||
-		(strings.TrimSpace(failed.Depth) != "" && strings.TrimSpace(priorT.Depth) != strings.TrimSpace(failed.Depth)) ||
-		(strings.TrimSpace(failed.AccountRef) != "" && strings.TrimSpace(priorT.AccountRef) != strings.TrimSpace(failed.AccountRef)) ||
-		(strings.TrimSpace(failed.WindowKind) != "" && strings.TrimSpace(priorT.WindowKind) != strings.TrimSpace(failed.WindowKind)) ||
-		(strings.TrimSpace(failed.ReservationID) != "" && strings.TrimSpace(priorT.ReservationID) != strings.TrimSpace(failed.ReservationID)) {
+	if priorT.Provider != failed.Provider ||
+		priorT.Model != failed.Model ||
+		(failed.Depth != "" && priorT.Depth != failed.Depth) ||
+		(failed.AccountRef != "" && priorT.AccountRef != failed.AccountRef) ||
+		(failed.WindowKind != "" && priorT.WindowKind != failed.WindowKind) ||
+		(failed.ReservationID != "" && priorT.ReservationID != failed.ReservationID) {
 		return nil
 	}
-	if strings.TrimSpace(altT.Provider) != strings.TrimSpace(retry.Provider) ||
-		strings.TrimSpace(altT.Model) != strings.TrimSpace(retry.Model) ||
-		strings.TrimSpace(altT.Depth) != strings.TrimSpace(retry.Depth) ||
-		strings.TrimSpace(altT.AccountRef) != strings.TrimSpace(retry.AccountRef) ||
-		(strings.TrimSpace(retry.WindowKind) != "" && strings.TrimSpace(altT.WindowKind) != strings.TrimSpace(retry.WindowKind)) ||
-		(strings.TrimSpace(retry.ReservationID) != "" && strings.TrimSpace(altT.ReservationID) != strings.TrimSpace(retry.ReservationID)) ||
-		(strings.TrimSpace(retry.Permission) != "" && strings.TrimSpace(altT.Permission) != "" &&
-			strings.TrimSpace(altT.Permission) != strings.TrimSpace(retry.Permission)) {
+	if altT.Provider != retry.Provider ||
+		altT.Model != retry.Model ||
+		altT.Depth != retry.Depth ||
+		altT.AccountRef != retry.AccountRef ||
+		(retry.WindowKind != "" && altT.WindowKind != retry.WindowKind) ||
+		(retry.ReservationID != "" && altT.ReservationID != retry.ReservationID) ||
+		(retry.Permission != "" && altT.Permission != "" && altT.Permission != retry.Permission) {
 		return nil
 	}
 
@@ -722,7 +741,7 @@ func proofFromResult(res Result, events []workflowrun.Event) *UnavailableRetryPr
 		FailedAttemptID:       failedAtt,
 		RetryAttemptID:        retryAtt,
 		WorkItemID:            wi,
-		FailedProvider:        strings.TrimSpace(failed.Provider),
+		FailedProvider:        failed.Provider,
 		FailedClaimCount:      countKind("claim", failedAtt),
 		RetryClaimCount:       countKind("claim", retryAtt),
 		FailedLaunchCount:     countKind("launch", failedAtt),
@@ -731,8 +750,8 @@ func proofFromResult(res Result, events []workflowrun.Event) *UnavailableRetryPr
 		RetryIntegrateCount:   retryIntegrateEvents,
 		FailedTerminalCount:   countKind("terminal", failedAtt),
 		RetryTerminalCount:    countKind("terminal", retryAtt),
-		FailedClaimClosed:     strings.TrimSpace(failed.Terminal) != "",
-		RetryClaimClosed:      strings.TrimSpace(retry.Terminal) != "",
+		FailedClaimClosed:     failed.Terminal != "",
+		RetryClaimClosed:      retry.Terminal != "",
 		FailedIntegrated:      failedIntegrated,
 		RetryIntegrated:       retryIntegrated,
 		FailedProductFiles:    append([]string(nil), failed.FilesTouched...),

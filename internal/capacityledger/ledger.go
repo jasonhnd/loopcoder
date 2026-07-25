@@ -75,6 +75,9 @@ type Entry struct {
 	// (never invented; empty when unknown).
 	BeforeSource     string     `json:"before_source,omitempty"`
 	BeforeCapturedAt *time.Time `json:"before_captured_at,omitempty"`
+	// BeforeInventoryDigest binds the exact immutable inventory report used to
+	// select the reserve window.
+	BeforeInventoryDigest string `json:"before_inventory_digest,omitempty"`
 	// After is remaining after observation or derived estimate.
 	After *float64 `json:"capacity_after,omitempty"`
 	// AfterState is "observed" (fresh same-window ObserveAfter) or "derived"
@@ -86,8 +89,11 @@ type Entry struct {
 	AfterObservedAt *time.Time                `json:"after_observed_at,omitempty"`
 	AfterFreshness  string                    `json:"after_freshness,omitempty"`
 	AfterConfidence quotapolicy.EvidenceClass `json:"after_confidence,omitempty"`
-	ReservationID   string                    `json:"reservation_id,omitempty"`
-	RouteReason     string                    `json:"route_reason,omitempty"`
+	// AfterInventoryDigest binds the exact post-run inventory report that
+	// supplied the observed remaining value.
+	AfterInventoryDigest string `json:"after_inventory_digest,omitempty"`
+	ReservationID        string `json:"reservation_id,omitempty"`
+	RouteReason          string `json:"route_reason,omitempty"`
 	// ReleaseReason is set when State is released (fail/cancel/unknown usage).
 	// Does not invent Actual — release remains honest-unknown when no reconcile.
 	ReleaseReason  string `json:"release_reason,omitempty"`
@@ -386,6 +392,10 @@ func (l *Ledger) Reserve(in ReserveInput) (Entry, error) {
 	}
 	now := l.now().UTC()
 	cfg := ModeConfig(in.Policy)
+	beforeInventoryDigest := ""
+	if in.Snapshot != nil {
+		beforeInventoryDigest = in.Snapshot.Digest
+	}
 	// Atomic account+install+window selection; never cross-wire install/account.
 	win, before, conf, fresh, resetAt, accRef, beforeSrc, beforeCap, err := pickWindow(in)
 	planDig := strings.TrimSpace(in.PlanDigest)
@@ -399,7 +409,8 @@ func (l *Ledger) Reserve(in ReserveInput) (Entry, error) {
 			Policy: ParsePolicy(string(in.Policy)), Provider: in.Provider, Model: in.Model, Depth: in.Depth,
 			AccountRef: CanonicalAccountRef(accRef), InstallRef: strings.TrimSpace(in.InstallRef),
 			Confidence: quotapolicy.EvidenceUnknown, Freshness: "unknown",
-			State: "refused", IdempotencyKey: key, CreatedAt: now, UpdatedAt: now,
+			BeforeInventoryDigest: beforeInventoryDigest,
+			State:                 "refused", IdempotencyKey: key, CreatedAt: now, UpdatedAt: now,
 			RouteReason: in.RouteReason,
 		}
 		l.byKey[key] = &e
@@ -443,7 +454,8 @@ func (l *Ledger) Reserve(in ReserveInput) (Entry, error) {
 			Policy: ParsePolicy(string(in.Policy)), Provider: in.Provider, Model: in.Model, Depth: in.Depth,
 			AccountRef: accCanon, InstallRef: installCanon, WindowKind: string(win), Confidence: conf, Freshness: fresh,
 			ResetAt: resetAt, Before: before, BeforeSource: beforeSrc, BeforeCapturedAt: beforeCapPtr,
-			Reserved: 0, State: "refused",
+			BeforeInventoryDigest: beforeInventoryDigest,
+			Reserved:              0, State: "refused",
 			ReservationID: res.ID, IdempotencyKey: key, CreatedAt: now, UpdatedAt: now,
 			RouteReason: in.RouteReason + "; reserve_refused=" + rerr.Error(),
 		}
@@ -460,7 +472,8 @@ func (l *Ledger) Reserve(in ReserveInput) (Entry, error) {
 		Policy: ParsePolicy(string(in.Policy)), Provider: in.Provider, Model: in.Model, Depth: in.Depth,
 		AccountRef: accCanon, InstallRef: installCanon, WindowKind: string(win), Confidence: conf, Freshness: fresh,
 		ResetAt: resetAt, Before: before, BeforeSource: beforeSrc, BeforeCapturedAt: beforeCapPtr,
-		Reserved: res.Fraction, State: "reserved",
+		BeforeInventoryDigest: beforeInventoryDigest,
+		Reserved:              res.Fraction, State: "reserved",
 		ReservationID: res.ID, IdempotencyKey: key, CreatedAt: now, UpdatedAt: now,
 		SoftExpiresAt: &exp, RouteReason: in.RouteReason,
 	}
@@ -672,6 +685,9 @@ type ObserveAfterOpts struct {
 	ObservedAt time.Time
 	// Confidence of the after observation (exact|estimated|unknown).
 	Confidence quotapolicy.EvidenceClass
+	// InventoryDigest is the exact capacity snapshot/report digest that supplied
+	// this observation. Production qualification requires it.
+	InventoryDigest string
 	// ResetObserved true when the observation includes a quota reset since reserve
 	// (allows after > before). Without this, after rising is fail-closed.
 	ResetObserved bool
@@ -761,6 +777,7 @@ func (l *Ledger) ObserveAfterBound(projectID, runID, attemptID string, afterFrac
 	e.AfterFreshness = fr
 	obsAt := opts.ObservedAt.UTC()
 	e.AfterObservedAt = &obsAt
+	e.AfterInventoryDigest = opts.InventoryDigest
 	if opts.Confidence != "" {
 		e.AfterConfidence = opts.Confidence
 	} else {

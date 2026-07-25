@@ -10,22 +10,28 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/capacityledger"
+	"github.com/jasonhnd/loopcoder/internal/workclaim"
 	"github.com/jasonhnd/loopcoder/internal/workflowrun"
 )
 
 // EmitInput is the exact-binary input set for canary_evidence.v1.
 // Do not construct from hand-written booleans: pass raw events + measured results.
 type EmitInput struct {
-	ArchiveDigest string
-	PreProdSHA    string
-	BinaryVersion string
-	BinaryCommit  string
-	ProjectID     string
-	RunID         string
-	Children      []CanaryChild
-	ProviderObs   []CanaryProviderObs
-	Events        []workflowrun.Event
-	EventLogPath  string
+	ArchiveDigest         string
+	PreProdSHA            string
+	BinaryVersion         string
+	BinaryCommit          string
+	ProjectID             string
+	RunID                 string
+	InventoryProvenance   string
+	InventoryReportDigest string
+	Children              []CanaryChild
+	ProviderObs           []CanaryProviderObs
+	Events                []workflowrun.Event
+	Claims                []workclaim.Claim
+	LedgerEntries         []capacityledger.Entry
+	EventLogPath          string
 	// Workflow peaks / resume / occupancy (measured from workflowrun.Result).
 	ReuseCount              int
 	WorktreePeak            int
@@ -70,6 +76,12 @@ func EmitCanaryEvidence(in EmitInput) (CanaryEvidence, error) {
 	}
 	if strings.TrimSpace(in.RunID) == "" {
 		return CanaryEvidence{}, fmt.Errorf("artifactqual: run_id required")
+	}
+	if in.InventoryProvenance != "live_discover" {
+		return CanaryEvidence{}, fmt.Errorf("artifactqual: exact live_discover inventory provenance required")
+	}
+	if in.InventoryReportDigest == "" || in.InventoryReportDigest != strings.TrimSpace(in.InventoryReportDigest) {
+		return CanaryEvidence{}, fmt.Errorf("artifactqual: exact inventory report digest required")
 	}
 	if strings.Contains(strings.ToLower(in.PRVerifierEvidenceRef), "pending") {
 		return CanaryEvidence{}, fmt.Errorf("artifactqual: refuse pending-live verifier evidence")
@@ -191,20 +203,26 @@ func EmitCanaryEvidence(in EmitInput) (CanaryEvidence, error) {
 	}
 
 	ev := CanaryEvidence{
-		Schema:               SchemaCanaryEvidence,
-		ArchiveDigest:        in.ArchiveDigest,
-		PreProdSHA:           in.PreProdSHA,
-		BinaryVersion:        in.BinaryVersion,
-		BinaryCommit:         in.BinaryCommit,
-		ProjectID:            in.ProjectID,
-		RunID:                in.RunID,
-		ProviderObservations: in.ProviderObs,
-		Children:             in.Children,
-		UnavailableRetry:     in.Unavailable,
-		Restart:              restart,
-		PR:                   pr,
-		ProducedAt:           at,
+		Schema:                SchemaCanaryEvidence,
+		ArchiveDigest:         in.ArchiveDigest,
+		PreProdSHA:            in.PreProdSHA,
+		BinaryVersion:         in.BinaryVersion,
+		BinaryCommit:          in.BinaryCommit,
+		ProjectID:             in.ProjectID,
+		RunID:                 in.RunID,
+		InventoryProvenance:   in.InventoryProvenance,
+		InventoryReportDigest: in.InventoryReportDigest,
+		ProviderObservations:  in.ProviderObs,
+		Children:              in.Children,
+		UnavailableRetry:      in.Unavailable,
+		Restart:               restart,
+		PR:                    pr,
+		RawEvents:             append([]workflowrun.Event(nil), in.Events...),
+		RawClaims:             append([]workclaim.Claim(nil), in.Claims...),
+		RawLedgerEntries:      append([]capacityledger.Entry(nil), in.LedgerEntries...),
+		ProducedAt:            at,
 	}
+	ev.DurableEvidenceDigest = DigestDurableEvidence(ev)
 	ev.ContentDigest = DigestCanaryBody(ev)
 	return ev, nil
 }
@@ -251,48 +269,42 @@ func deriveForcedRestartEvidence(events []workflowrun.Event, resumed bool) force
 		return m
 	}
 	isForcedClass := func(fc, ic string) bool {
-		fc = strings.ToLower(strings.TrimSpace(fc))
-		ic = strings.ToLower(strings.TrimSpace(ic))
-		switch fc {
-		case "forced_interrupt", "hard_kill_recovery":
-			// ok
-		default:
-			return false
-		}
-		switch ic {
-		case "service_forced_interrupt", "hard_kill_recovery", "forced_interrupt":
-			return true
-		default:
-			// Accept failure_class alone when interrupt_class empty on legacy.
-			return ic == "" && (fc == "forced_interrupt" || fc == "hard_kill_recovery")
-		}
+		return (fc == "forced_interrupt" && ic == "service_forced_interrupt") ||
+			(fc == "hard_kill_recovery" && ic == "hard_kill_recovery")
 	}
 
 	for _, e := range events {
-		wi := strings.TrimSpace(e.WorkItemID)
-		att := strings.TrimSpace(e.AttemptID)
+		wi := e.WorkItemID
+		att := e.AttemptID
 		pm := payloadMap(e)
 		switch e.Kind {
 		case "interrupt":
-			out.Interrupted = true
-			fc := firstNonEmpty(e.FailureClass, pm["failure_class"])
-			ic := firstNonEmpty(pm["interrupt_class"], "")
-			intID := strings.TrimSpace(pm["interrupt_id"])
+			fc := e.FailureClass
+			if fc == "" {
+				fc = pm["failure_class"]
+			}
+			ic := pm["interrupt_class"]
+			intID := pm["interrupt_id"]
 			if wi == "" || att == "" || intID == "" || !isForcedClass(fc, ic) {
 				continue
 			}
 			interrupts[attKey{wi, att}] = intPair{wi: wi, att: att, intID: intID, fc: fc, ic: ic}
 		case "terminal":
-			term := strings.ToLower(strings.TrimSpace(e.Terminal))
+			term := e.Terminal
 			if term == "" {
-				term = strings.ToLower(strings.TrimSpace(pm["terminal"]))
+				term = pm["terminal"]
 			}
-			fc := firstNonEmpty(e.FailureClass, pm["failure_class"])
-			ic := firstNonEmpty(pm["interrupt_class"], "")
-			intID := strings.TrimSpace(pm["interrupt_id"])
+			fc := e.FailureClass
+			if fc == "" {
+				fc = pm["failure_class"]
+			}
+			ic := pm["interrupt_class"]
+			intID := pm["interrupt_id"]
 			k := attKey{wi, att}
 			if term == "cancelled" && wi != "" && att != "" && intID != "" {
-				if ip, ok := interrupts[k]; ok && ip.intID == intID && isForcedClass(fc, ic) {
+				if ip, ok := interrupts[k]; ok &&
+					ip.intID == intID && ip.fc == fc && ip.ic == ic &&
+					isForcedClass(fc, ic) {
 					cancelledAbort[k] = ip
 					out.AbortedAttempts[wi] = att
 				}
@@ -315,9 +327,6 @@ func deriveForcedRestartEvidence(events []workflowrun.Event, resumed bool) force
 				launchByAttempt[att]++
 				if wi != "" {
 					g := workflowrun.ParseAttemptGeneration(att)
-					if g <= 0 && e.Generation > 0 {
-						g = e.Generation
-					}
 					launchGens[wi] = append(launchGens[wi], g)
 				}
 			}
@@ -325,6 +334,7 @@ func deriveForcedRestartEvidence(events []workflowrun.Event, resumed bool) force
 			reuseCount++
 		}
 	}
+	out.Interrupted = len(cancelledAbort) > 0
 	out.ReuseCount = reuseCount
 	for _, n := range launchByAttempt {
 		if n > 1 {
@@ -359,23 +369,7 @@ func deriveForcedRestartEvidence(events []workflowrun.Event, resumed bool) force
 			}
 		}
 	}
-	// Durable resume flag also contributes when events show reuse after abort.
-	if resumed && reuseCount > 0 && len(out.AbortedAttempts) > 0 && !out.LaterGenerationResume {
-		// Still require a distinct later generation in the ledger when possible.
-		// If generation parse fails but reuse exists with aborted, keep false
-		// (fail closed) unless a second launch string differs.
-		for wi, att := range out.AbortedAttempts {
-			for _, e := range events {
-				if e.Kind != "launch" || strings.TrimSpace(e.WorkItemID) != wi {
-					continue
-				}
-				if strings.TrimSpace(e.AttemptID) != "" && strings.TrimSpace(e.AttemptID) != att {
-					out.LaterGenerationResume = true
-					break
-				}
-			}
-		}
-	}
+	_ = resumed // caller state never manufactures a higher generation.
 	return out
 }
 

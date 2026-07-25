@@ -90,3 +90,40 @@ func TestParseAntigravityMissingUsedPercentNotCapacity(t *testing.T) {
 		t.Fatalf("window without usedPercent must not become capacity: %+v", snaps)
 	}
 }
+
+func TestParseAntigravityInvalidResetAndObservedAtDowngradesTruthfully(t *testing.T) {
+	now := time.Date(2026, 7, 22, 18, 30, 0, 0, time.UTC)
+	raw := `[{"provider":"antigravity","usage":{"primary":{"resetsAt":"not-rfc3339","usedPercent":1,"windowMinutes":300},"updatedAt":"also-invalid"}}]`
+	snaps, err := parseAntigravityCodexBarUsage(raw, QuotaTelemetrySource{QuotaSourceID: "qsrc"}, nil, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snaps) != 1 {
+		t.Fatalf("snapshots=%d", len(snaps))
+	}
+	got := snaps[0]
+	if got.ResetAt != "" || got.ResetSemantics != ResetUnknown ||
+		got.CapturedAt != formatTime(now) {
+		t.Fatalf("invalid timestamps passed as live evidence: %#v", got)
+	}
+	for _, reason := range []string{"invalid-reset-at", "invalid-observed-at", "missing-exact-account-identity"} {
+		if !containsString(got.GapReasons, reason) {
+			t.Fatalf("missing gap %q: %#v", reason, got.GapReasons)
+		}
+	}
+}
+
+func TestParseAntigravityExhaustionIsTyped(t *testing.T) {
+	now := time.Date(2026, 7, 22, 18, 30, 0, 0, time.UTC)
+	raw := `[{"provider":"antigravity","usage":{"primary":{"resetsAt":"2026-07-22T23:13:39Z","usedPercent":100,"windowMinutes":300},"updatedAt":"2026-07-22T18:30:00Z"}}]`
+	snaps, err := parseAntigravityCodexBarUsage(raw, QuotaTelemetrySource{QuotaSourceID: "qsrc"}, nil, now)
+	if err != nil || len(snaps) != 1 {
+		t.Fatalf("snapshots=%d err=%v", len(snaps), err)
+	}
+	got := snaps[0]
+	if got.RemainingValue == nil || *got.RemainingValue != 0 ||
+		got.TerminalErrorCode != "ErrQuotaExhausted" ||
+		!containsString(got.GapReasons, "quota-exhausted") {
+		t.Fatalf("exhaustion not typed: %#v", got)
+	}
+}

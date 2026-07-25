@@ -1,13 +1,20 @@
 package artifactqual
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/capacityledger"
+	"github.com/jasonhnd/loopcoder/internal/workclaim"
+	"github.com/jasonhnd/loopcoder/internal/workflowrun"
 )
 
 // SchemaCanaryEvidence is the exact-binary real canary evidence package for #1343.
@@ -27,6 +34,10 @@ type CanaryEvidence struct {
 	// Durable isolation
 	ProjectID string `json:"project_id"`
 	RunID     string `json:"run_id"`
+	// Inventory provenance and digest bind every provider observation to the
+	// exact live report used by the product run.
+	InventoryProvenance   string `json:"inventory_provenance"`
+	InventoryReportDigest string `json:"inventory_report_digest"`
 	// Fresh provider quota observations (source-tagged).
 	ProviderObservations []CanaryProviderObs `json:"provider_observations"`
 	// Real child executions (not dry-run plan rows).
@@ -37,6 +48,13 @@ type CanaryEvidence struct {
 	Restart *CanaryRestart `json:"restart,omitempty"`
 	// Real PR human gate (not status=human_gate alone).
 	PR *CanaryPR `json:"pr,omitempty"`
+	// Raw durable evidence is included so qualification recomputes unavailable
+	// retry, forced restart, and capacity accounting without trusting summary
+	// booleans or EvidenceRef strings.
+	RawEvents             []workflowrun.Event    `json:"raw_events"`
+	RawClaims             []workclaim.Claim      `json:"raw_claims"`
+	RawLedgerEntries      []capacityledger.Entry `json:"raw_ledger_entries"`
+	DurableEvidenceDigest string                 `json:"durable_evidence_digest"`
 	// Manifest integrity
 	ProducedAt time.Time `json:"produced_at"`
 	// Optional content digest of the rest of the body for anti-tamper.
@@ -56,7 +74,8 @@ type CanaryProviderObs struct {
 	Remaining  *float64  `json:"remaining,omitempty"`
 	CapturedAt time.Time `json:"captured_at"`
 	// ResetAt is exact window reset identity for finite/fixed windows (UTC).
-	ResetAt *time.Time `json:"reset_at,omitempty"`
+	ResetAt               *time.Time `json:"reset_at,omitempty"`
+	InventoryReportDigest string     `json:"inventory_report_digest"`
 }
 
 // CanaryChild is one real provider-executed child.
@@ -79,6 +98,7 @@ type CanaryChild struct {
 	WindowKind       string   `json:"window_kind,omitempty"`
 	Terminal         string   `json:"terminal"`
 	WorktreePath     string   `json:"worktree_path,omitempty"`
+	FilesTouched     []string `json:"files_touched,omitempty"`
 	CapacityBefore   *float64 `json:"capacity_before,omitempty"`
 	CapacityReserved *float64 `json:"capacity_reserved,omitempty"`
 	CapacityActual   *float64 `json:"capacity_actual,omitempty"` // quota-window fraction only
@@ -217,7 +237,15 @@ func LoadCanaryEvidence(path string) (CanaryEvidence, error) {
 		return CanaryEvidence{}, err
 	}
 	var ev CanaryEvidence
-	if err := json.Unmarshal(raw, &ev); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&ev); err != nil {
+		return CanaryEvidence{}, fmt.Errorf("canary evidence json: %w", err)
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("multiple JSON values")
+		}
 		return CanaryEvidence{}, fmt.Errorf("canary evidence json: %w", err)
 	}
 	if strings.TrimSpace(ev.Schema) != SchemaCanaryEvidence {
@@ -279,6 +307,12 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 	if strings.TrimSpace(ev.RunID) == "" {
 		add("run_id_missing")
 	}
+	if ev.InventoryProvenance != "live_discover" {
+		add("inventory_provenance_not_live_discover")
+	}
+	if ev.InventoryReportDigest == "" || ev.InventoryReportDigest != strings.TrimSpace(ev.InventoryReportDigest) {
+		add("inventory_report_digest_missing_or_noncanonical")
+	}
 	if exp := strings.TrimSpace(expect.ExpectedProjectID); exp != "" && exp != strings.TrimSpace(ev.ProjectID) {
 		add("expected_project_id_mismatch")
 	}
@@ -302,6 +336,14 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 		if !strings.EqualFold(normHex(ev.ContentDigest), normHex(want)) {
 			add("content_digest_mismatch")
 		}
+	}
+	if ev.DurableEvidenceDigest == "" {
+		add("durable_evidence_digest_missing")
+	} else if normHex(ev.DurableEvidenceDigest) != normHex(DigestDurableEvidence(ev)) {
+		add("durable_evidence_digest_mismatch")
+	}
+	for _, reason := range validateRawDurableEnvelope(ev) {
+		add(reason)
 	}
 
 	// Build counted real-child identity keys for provider-obs correspondence.
@@ -327,12 +369,15 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 		if !c.RealProviderExecuted {
 			continue
 		}
-		if !strings.EqualFold(strings.TrimSpace(c.Terminal), "succeeded") {
+		if c.Terminal != "succeeded" {
 			add("real_provider_not_succeeded:" + c.ChildID)
 			continue
 		}
 		// Identity required for production canary children.
-		if strings.TrimSpace(c.AccountRef) == "" || strings.TrimSpace(c.InstallRef) == "" || strings.TrimSpace(c.WindowKind) == "" {
+		if canonicalProviderCompany(c.Provider) == "" ||
+			c.AccountRef == "" || c.AccountRef != strings.TrimSpace(c.AccountRef) ||
+			c.InstallRef == "" || c.InstallRef != strings.TrimSpace(c.InstallRef) ||
+			c.WindowKind == "" || c.WindowKind != strings.TrimSpace(c.WindowKind) {
 			add("child_identity_incomplete:" + c.ChildID)
 			continue
 		}
@@ -343,7 +388,7 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 			if strings.TrimSpace(c.BeforeSource) == "" || isForbiddenCanarySource(c.BeforeSource) {
 				add("before_source_invalid:" + c.ChildID)
 			}
-			if !strings.EqualFold(strings.TrimSpace(c.BeforeFreshness), "fresh") {
+			if c.BeforeFreshness != "fresh" {
 				add("before_freshness_not_fresh:" + c.ChildID)
 			}
 			if c.BeforeCapturedAt.IsZero() {
@@ -359,9 +404,9 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 		if c.CapacityAfter == nil {
 			add("capacity_after_missing:" + c.ChildID)
 		} else {
-			state := strings.ToLower(strings.TrimSpace(c.AfterState))
-			src := strings.TrimSpace(c.AfterSource)
-			fr := strings.ToLower(strings.TrimSpace(c.AfterFreshness))
+			state := c.AfterState
+			src := c.AfterSource
+			fr := c.AfterFreshness
 			if state != "observed" {
 				add("capacity_after_not_observed:" + c.ChildID + ":" + state)
 			} else if src == "" {
@@ -393,18 +438,18 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 			add("capacity_actual_source_not_group_delta:" + c.ChildID)
 		} else if strings.TrimSpace(c.ActualConfidence) == "" {
 			add("capacity_actual_confidence_missing:" + c.ChildID)
-		} else if !strings.EqualFold(strings.TrimSpace(c.ActualConfidence), "estimated") {
+		} else if c.ActualConfidence != "estimated" {
 			// Window aggregate group deltas are always estimated.
 			add("capacity_actual_confidence_not_estimated:" + c.ChildID)
 		}
 
 		useful++
-		p := strings.ToLower(strings.TrimSpace(c.Provider))
-		if p != "" {
-			childProv[p] = true
+		company := canonicalProviderCompany(c.Provider)
+		if company != "" {
+			childProv[company] = true
 		}
 		realChildIDs[childIDKey{
-			p: p, acc: strings.TrimSpace(c.AccountRef),
+			p: company, acc: c.AccountRef,
 			inst: strings.TrimSpace(c.InstallRef), win: strings.TrimSpace(c.WindowKind),
 		}] = true
 		req := strings.ToLower(strings.TrimSpace(c.DepthRequired))
@@ -466,12 +511,12 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 	provSeen := map[string]bool{}
 	freshObs := 0
 	for _, o := range ev.ProviderObservations {
-		p := strings.ToLower(strings.TrimSpace(o.Provider))
+		p := canonicalProviderCompany(o.Provider)
 		if p == "" {
 			continue
 		}
-		src := strings.ToLower(strings.TrimSpace(o.Source))
-		fr := strings.ToLower(strings.TrimSpace(o.Freshness))
+		src := o.Source
+		fr := o.Freshness
 		if src == "" {
 			add("provider_obs_source_missing:" + p)
 			continue
@@ -480,8 +525,16 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 			add("provider_obs_forbidden_source:" + p + ":" + src)
 			continue
 		}
-		if strings.TrimSpace(o.AccountRef) == "" || strings.TrimSpace(o.InstallRef) == "" || strings.TrimSpace(o.WindowKind) == "" {
+		if o.AccountRef == "" || o.AccountRef != strings.TrimSpace(o.AccountRef) ||
+			o.InstallRef == "" || o.InstallRef != strings.TrimSpace(o.InstallRef) ||
+			o.WindowKind == "" || o.WindowKind != strings.TrimSpace(o.WindowKind) {
 			add("provider_obs_identity_incomplete:" + p)
+			continue
+		}
+		switch o.Confidence {
+		case "exact", "estimated", "unknown":
+		default:
+			add("provider_obs_confidence_invalid:" + p)
 			continue
 		}
 		if o.CapturedAt.IsZero() {
@@ -492,7 +545,11 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 			add("provider_obs_captured_at_outside_canary_run:" + p)
 			continue
 		}
-		k := childIDKey{p: p, acc: strings.TrimSpace(o.AccountRef), inst: strings.TrimSpace(o.InstallRef), win: strings.TrimSpace(o.WindowKind)}
+		if o.InventoryReportDigest == "" {
+			add("provider_obs_inventory_digest_missing:" + p)
+			continue
+		}
+		k := childIDKey{p: p, acc: o.AccountRef, inst: o.InstallRef, win: o.WindowKind}
 		if !realChildIDs[k] {
 			add("provider_obs_unrelated_to_real_child:" + p)
 			continue
@@ -507,10 +564,14 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 		}
 	}
 	if len(provSeen) < 2 {
-		add("providers_lt_2")
+		add("provider_companies_lt_2")
 	}
 	if freshObs < 2 {
 		add("fresh_provider_observations_lt_2")
+	}
+	rawCapacityOK, rawCapacityReasons := validateRawCapacityEvidence(ev)
+	for _, reason := range rawCapacityReasons {
+		add(reason)
 	}
 
 	v.UsefulChildren = useful
@@ -524,7 +585,7 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 		add("useful_children_lt_4")
 	}
 	if len(childProv) < 2 {
-		add("executed_providers_lt_2")
+		add("executed_provider_companies_lt_2")
 	}
 	// multi-depth: at least 2 distinct depths with real bind
 	if len(depths) < 2 || depthBindOK < 2 {
@@ -533,30 +594,23 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 		v.MultiDepthOK = true
 	}
 	v.MultiProviderOK = len(childProv) >= 2 && useful >= 4
-	if afterOK >= 4 && !hasReasonPrefix(v.Reasons, "capacity_after_missing") {
+	if rawCapacityOK && afterOK >= 4 && !hasReasonPrefix(v.Reasons, "capacity_after_missing") {
 		v.CapacityAfterOK = true
-	} else if afterOK >= useful && useful >= 4 {
+	} else if rawCapacityOK && afterOK >= useful && useful >= 4 {
 		v.CapacityAfterOK = true
 	}
 
-	// Unavailable retry — require evidence_ref binding (no bare true flags).
-	// eligible_not_chosen / soft non-winner diversity is NOT unavailability.
+	// Unavailable retry is recomputed from raw exact event, claim, and ledger
+	// evidence. Summary booleans and EvidenceRef never establish truth.
 	if ev.UnavailableRetry == nil {
 		add("unavailable_retry_missing")
 	} else {
 		u := ev.UnavailableRetry
-		reason := strings.ToLower(strings.TrimSpace(u.ExcludedReason))
-		if strings.TrimSpace(u.ExcludedProvider) == "" || reason == "" {
-			add("unavailable_retry_incomplete")
-		} else if !isCanaryUnavailableReason(reason) {
-			add("unavailable_retry_reason_not_unavailable")
-		} else if !u.NoDuplicateClaim || !u.NoDuplicateFiles || !u.NoDoubleCapacity {
-			add("unavailable_retry_dup_flags_false")
-		} else if strings.TrimSpace(u.EvidenceRef) == "" {
-			add("unavailable_retry_evidence_ref_missing")
-		} else if strings.Contains(strings.ToLower(u.EvidenceRef), "pending") {
-			add("unavailable_retry_pending_evidence")
-		} else {
+		rawOK, rawReasons := validateRawUnavailableRetry(ev, *u)
+		for _, reason := range rawReasons {
+			add(reason)
+		}
+		if rawOK {
 			v.UnavailableRetryOK = true
 		}
 	}
@@ -566,14 +620,31 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 		add("restart_evidence_missing")
 	} else {
 		r := ev.Restart
+		rawRestart := deriveForcedRestartEvidence(ev.RawEvents, r.ResumedFromDurable)
+		rawClaimsOK := validateRawRestartClaims(ev, rawRestart)
 		// Recompute ceilings/leaks/repo-local from transparent measured fields.
 		reProcessOK := r.ProcessPeak > 0 && r.ProcessLimit > 0 && r.ProcessPeak <= r.ProcessLimit
 		reWorktreeOK := r.WorktreePeak > 0 && r.WorktreeLimit > 0 && r.WorktreePeak <= r.WorktreeLimit
 		reNoLeaked := r.ActiveOccupancyMeasured && r.ProcessActive == 0 && r.WorktreeActive == 0
 		reNoRepoLocal := r.RepoLocalRuntimeChecked && !r.RepoLocalRuntimePresent
-		reExactlyOnce := r.Interrupted && r.ResumedFromDurable && r.LaterGenerationResume &&
-			r.AbortedAttemptCount > 0 && r.ReuseCountMeasured > 0 &&
-			!r.DuplicateLaunch && !r.DuplicateSuccessIntegrate && !r.AbortedAttemptSucceeded
+		reExactlyOnce := rawRestart.Interrupted && r.ResumedFromDurable &&
+			rawRestart.LaterGenerationResume && len(rawRestart.AbortedAttempts) == 1 &&
+			rawRestart.ReuseCount > 0 && rawClaimsOK &&
+			!rawRestart.DuplicateLaunch && !rawRestart.DuplicateSuccessIntegrate &&
+			!rawRestart.AbortedAttemptSucceeded
+
+		if r.Interrupted != rawRestart.Interrupted ||
+			r.LaterGenerationResume != rawRestart.LaterGenerationResume ||
+			r.AbortedAttemptCount != len(rawRestart.AbortedAttempts) ||
+			r.ReuseCountMeasured != rawRestart.ReuseCount ||
+			r.DuplicateLaunch != rawRestart.DuplicateLaunch ||
+			r.DuplicateSuccessIntegrate != rawRestart.DuplicateSuccessIntegrate ||
+			r.AbortedAttemptSucceeded != rawRestart.AbortedAttemptSucceeded {
+			add("restart_summary_not_bound_to_raw_events")
+		}
+		if !rawClaimsOK {
+			add("restart_raw_claim_evidence_invalid")
+		}
 
 		if r.ProcessCeilingOK != reProcessOK {
 			add("restart_process_ceiling_flag_mismatch")
@@ -591,7 +662,7 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 			add("restart_exactly_once_flag_mismatch")
 		}
 
-		if !r.Interrupted || !r.ResumedFromDurable || !reExactlyOnce {
+		if !rawRestart.Interrupted || !r.ResumedFromDurable || !reExactlyOnce {
 			add("restart_flags_incomplete")
 		} else if r.ChildCountUseful < 4 {
 			add("restart_useful_children_lt_4")
@@ -599,10 +670,6 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 			add("restart_ceilings_or_leaks_unmet")
 		} else if r.ProcessLimit != ProductionSequentialCeiling || r.WorktreeLimit != ProductionSequentialCeiling {
 			add("restart_limit_not_production_sequential_ceiling")
-		} else if strings.TrimSpace(r.EvidenceRef) == "" {
-			add("restart_evidence_ref_missing")
-		} else if !strings.Contains(r.EvidenceRef, "workflow-events") && !strings.Contains(r.EvidenceRef, "event") {
-			add("restart_evidence_ref_not_event_ledger")
 		} else {
 			v.RestartOK = true
 		}
@@ -649,6 +716,476 @@ func hasReasonPrefix(reasons []string, prefix string) bool {
 		}
 	}
 	return false
+}
+
+func canonicalProviderCompany(provider string) string {
+	if provider == "" || provider != strings.TrimSpace(provider) ||
+		provider != strings.ToLower(provider) {
+		return ""
+	}
+	p := provider
+	switch p {
+	case "codex", "openai", "chatgpt":
+		return "openai"
+	case "claude", "anthropic":
+		return "anthropic"
+	case "grok", "xai", "x.ai":
+		return "xai"
+	case "antigravity", "gemini", "google":
+		return "google"
+	case "kimi", "moonshot":
+		return "moonshot"
+	case "copilot", "github-copilot":
+		return "github"
+	default:
+		return p
+	}
+}
+
+func validateRawCapacityEvidence(ev CanaryEvidence) (bool, []string) {
+	var reasons []string
+	add := func(reason string) { reasons = append(reasons, reason) }
+	byAttempt := map[string]capacityledger.Entry{}
+	for _, entry := range ev.RawLedgerEntries {
+		if entry.Schema != capacityledger.SchemaEntry || entry.ProjectID != ev.ProjectID ||
+			entry.RunID != ev.RunID || entry.AttemptID == "" ||
+			entry.AttemptID != strings.TrimSpace(entry.AttemptID) {
+			add("raw_ledger_identity_invalid")
+			continue
+		}
+		if _, exists := byAttempt[entry.AttemptID]; exists {
+			add("raw_ledger_duplicate_attempt:" + entry.AttemptID)
+			continue
+		}
+		byAttempt[entry.AttemptID] = entry
+	}
+	type groupState struct {
+		before, after, reserved, actual float64
+		hasAfter, hasActual             bool
+	}
+	groups := map[string]*groupState{}
+	useful := 0
+	for _, child := range ev.Children {
+		if !child.RealProviderExecuted || child.Terminal != "succeeded" {
+			continue
+		}
+		useful++
+		entry, ok := byAttempt[child.AttemptID]
+		if !ok {
+			add("raw_ledger_attempt_missing:" + child.AttemptID)
+			continue
+		}
+		if entry.Provider != child.Provider || entry.Model != child.Model ||
+			entry.Depth != child.DepthInvocation || entry.AccountRef != child.AccountRef ||
+			entry.InstallRef != child.InstallRef || entry.WindowKind != child.WindowKind {
+			add("raw_ledger_route_identity_mismatch:" + child.AttemptID)
+		}
+		if entry.State != "reconciled" ||
+			entry.Freshness != child.BeforeFreshness ||
+			string(entry.Confidence) != child.BeforeConfidence ||
+			!child.BeforeCapturedAt.Equal(timeValue(entry.BeforeCapturedAt)) ||
+			!timesEqual(child.ResetAt, entry.ResetAt) {
+			add("raw_ledger_before_evidence_mismatch:" + child.AttemptID)
+		}
+		if entry.BeforeInventoryDigest == "" ||
+			entry.BeforeInventoryDigest != ev.InventoryReportDigest {
+			add("raw_ledger_before_inventory_digest_mismatch:" + child.AttemptID)
+		}
+		if child.CapacityBefore == nil || !floatEqual(*child.CapacityBefore, entry.Before) ||
+			child.CapacityReserved == nil || !floatEqual(*child.CapacityReserved, entry.Reserved) {
+			add("raw_ledger_before_reserved_mismatch:" + child.AttemptID)
+		}
+		if child.CapacityActual == nil || entry.Actual == nil ||
+			!floatEqual(*child.CapacityActual, *entry.Actual) ||
+			child.ActualSource != entry.ActualSource ||
+			child.ActualConfidence != string(entry.ActualConfidence) {
+			add("raw_ledger_actual_mismatch:" + child.AttemptID)
+		}
+		if child.CapacityAfter == nil || entry.After == nil ||
+			!floatEqual(*child.CapacityAfter, *entry.After) ||
+			child.AfterState != entry.AfterState ||
+			child.AfterSource != entry.AfterSource ||
+			child.AfterFreshness != entry.AfterFreshness ||
+			child.AfterConfidence != string(entry.AfterConfidence) ||
+			!child.AfterObservedAt.Equal(timeValue(entry.AfterObservedAt)) ||
+			entry.AfterInventoryDigest == "" {
+			add("raw_ledger_after_mismatch:" + child.AttemptID)
+		}
+		if entry.Before < 0 || entry.Before > 1 || entry.Reserved <= 0 ||
+			entry.Reserved > entry.Before || entry.Actual == nil ||
+			*entry.Actual < 0 || *entry.Actual > 1 || entry.After == nil ||
+			*entry.After < 0 || *entry.After > 1 {
+			add("raw_ledger_capacity_bounds_invalid:" + child.AttemptID)
+			continue
+		}
+		groupKey := entry.Provider + "\x00" + entry.AccountRef + "\x00" +
+			entry.InstallRef + "\x00" + entry.WindowKind + "\x00" +
+			entry.BeforeInventoryDigest + "\x00" + entry.BeforeSource + "\x00" +
+			timeValue(entry.BeforeCapturedAt).UTC().Format(time.RFC3339Nano)
+		group := groups[groupKey]
+		if group == nil {
+			group = &groupState{before: entry.Before, after: *entry.After, hasAfter: true}
+			groups[groupKey] = group
+		} else if !floatEqual(group.before, entry.Before) ||
+			!floatEqual(group.after, *entry.After) {
+			add("raw_ledger_group_before_after_conflict:" + child.AttemptID)
+		}
+		group.reserved += entry.Reserved
+		group.actual += *entry.Actual
+		group.hasActual = true
+	}
+	if useful == 0 {
+		add("raw_ledger_useful_children_missing")
+	}
+	for _, group := range groups {
+		if !group.hasAfter || !group.hasActual ||
+			!floatEqual(group.before-group.actual, group.after) {
+			add("raw_ledger_capacity_arithmetic_mismatch")
+		}
+		if group.reserved <= 0 || group.reserved > group.before+1e-9 {
+			add("raw_ledger_reserved_arithmetic_invalid")
+		}
+	}
+	for _, obs := range ev.ProviderObservations {
+		matched := false
+		for _, entry := range byAttempt {
+			if entry.Provider != obs.Provider || entry.AccountRef != obs.AccountRef ||
+				entry.InstallRef != obs.InstallRef || entry.WindowKind != obs.WindowKind {
+				continue
+			}
+			beforeMatch := obs.InventoryReportDigest == entry.BeforeInventoryDigest &&
+				obs.Source == entry.BeforeSource &&
+				obs.Freshness == entry.Freshness &&
+				obs.Confidence == string(entry.Confidence) &&
+				obs.CapturedAt.Equal(timeValue(entry.BeforeCapturedAt)) &&
+				timesEqual(obs.ResetAt, entry.ResetAt) &&
+				obs.Remaining != nil && floatEqual(*obs.Remaining, entry.Before)
+			afterMatch := entry.After != nil &&
+				obs.InventoryReportDigest == entry.AfterInventoryDigest &&
+				obs.Source == entry.AfterSource &&
+				obs.Freshness == entry.AfterFreshness &&
+				obs.Confidence == string(entry.AfterConfidence) &&
+				obs.CapturedAt.Equal(timeValue(entry.AfterObservedAt)) &&
+				timesEqual(obs.ResetAt, entry.ResetAt) &&
+				obs.Remaining != nil && floatEqual(*obs.Remaining, *entry.After)
+			if beforeMatch || afterMatch {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			add("provider_obs_not_bound_to_raw_ledger:" + obs.Provider)
+		}
+	}
+	return len(reasons) == 0, reasons
+}
+
+func validateRawUnavailableRetry(ev CanaryEvidence, summary CanaryUnavailableRetry) (bool, []string) {
+	var reasons []string
+	add := func(reason string) { reasons = append(reasons, reason) }
+	if summary.ExcludedProvider == "" || summary.ExcludedReason != "model_unavailable" ||
+		summary.RetryAttemptID == "" ||
+		summary.RetryAttemptID != strings.TrimSpace(summary.RetryAttemptID) {
+		add("unavailable_retry_exact_identity_incomplete")
+		return false, reasons
+	}
+	payload := func(event workflowrun.Event) map[string]string {
+		var fields map[string]string
+		if len(event.Payload) == 0 || json.Unmarshal(event.Payload, &fields) != nil {
+			return nil
+		}
+		return fields
+	}
+	var unavailable []workflowrun.Event
+	for _, event := range ev.RawEvents {
+		fields := payload(event)
+		if event.Kind == "model_unavailable" && event.FailureClass == "model_unavailable" &&
+			event.AttemptID != "" && event.WorkItemID != "" &&
+			fields != nil && fields["provider"] == summary.ExcludedProvider {
+			unavailable = append(unavailable, event)
+		}
+	}
+	if len(unavailable) != 1 {
+		add("unavailable_retry_raw_model_unavailable_count")
+		return false, reasons
+	}
+	failed := unavailable[0]
+	failedAttempt, retryAttempt, workItem := failed.AttemptID, summary.RetryAttemptID, failed.WorkItemID
+	failedFields := payload(failed)
+	if failedFields["attempt_id"] != failedAttempt ||
+		failedFields["work_item_id"] != workItem ||
+		failedFields["failure_class"] != "model_unavailable" ||
+		failedFields["provider"] != summary.ExcludedProvider ||
+		failedFields["model"] == "" {
+		add("unavailable_retry_model_unavailable_payload_mismatch")
+	}
+	if failedAttempt == retryAttempt {
+		add("unavailable_retry_attempts_not_distinct")
+	}
+	countEvent := func(kind, attempt string) int {
+		count := 0
+		for _, event := range ev.RawEvents {
+			if event.Kind == kind && event.AttemptID == attempt && event.WorkItemID == workItem {
+				count++
+			}
+		}
+		return count
+	}
+	findEvent := func(kind, attempt string) (workflowrun.Event, bool) {
+		for _, event := range ev.RawEvents {
+			if event.Kind == kind && event.AttemptID == attempt && event.WorkItemID == workItem {
+				return event, true
+			}
+		}
+		return workflowrun.Event{}, false
+	}
+	for _, required := range []struct {
+		kind, attempt string
+	}{
+		{"claim", failedAttempt}, {"launch", failedAttempt},
+		{"model_unavailable", failedAttempt}, {"terminal", failedAttempt},
+		{"claim", retryAttempt}, {"reroute", retryAttempt},
+		{"launch", retryAttempt}, {"terminal", retryAttempt},
+	} {
+		if countEvent(required.kind, required.attempt) != 1 {
+			add("unavailable_retry_raw_event_count:" + required.kind + ":" + required.attempt)
+		}
+	}
+	failedTerminal, failedTermOK := findEvent("terminal", failedAttempt)
+	retryClaim, retryClaimOK := findEvent("claim", retryAttempt)
+	retryTerminal, retryTermOK := findEvent("terminal", retryAttempt)
+	if !failedTermOK || failedTerminal.Terminal != "failed" ||
+		failedTerminal.FailureClass != "model_unavailable" ||
+		failedTerminal.Evidence == "" {
+		add("unavailable_retry_failed_terminal_invalid")
+	}
+	if !retryClaimOK || retryClaim.Generation <= failed.Generation {
+		add("unavailable_retry_generation_not_higher")
+	}
+	if !retryTermOK || retryTerminal.Terminal != "succeeded" || retryTerminal.Evidence == "" {
+		add("unavailable_retry_retry_terminal_invalid")
+	}
+	if retryClaimOK {
+		fields := payload(retryClaim)
+		if fields == nil || fields["supersedes_attempt_id"] != failedAttempt ||
+			fields["retry_attempt_id"] != retryAttempt {
+			add("unavailable_retry_claim_supersedes_mismatch")
+		}
+	}
+	claimsByAttempt := map[string][]workclaim.Claim{}
+	for _, claim := range ev.RawClaims {
+		if claim.ProjectID == ev.ProjectID && claim.WorkItemID == workItem {
+			claimsByAttempt[claim.AttemptID] = append(claimsByAttempt[claim.AttemptID], claim)
+		}
+	}
+	failedClaims, retryClaims := claimsByAttempt[failedAttempt], claimsByAttempt[retryAttempt]
+	noDuplicateClaim := len(failedClaims) == 1 && len(retryClaims) == 1
+	if noDuplicateClaim {
+		fc, rc := failedClaims[0], retryClaims[0]
+		noDuplicateClaim = fc.State == workclaim.StateClosed &&
+			string(fc.Terminal) == "failed" && fc.OutputEvidence == failedTerminal.Evidence &&
+			rc.State == workclaim.StateClosed && string(rc.Terminal) == "succeeded" &&
+			rc.OutputEvidence == retryTerminal.Evidence &&
+			rc.Generation > fc.Generation
+	}
+	if !noDuplicateClaim {
+		add("unavailable_retry_raw_claim_invalid_or_duplicate")
+	}
+	ledgerByAttempt := map[string][]capacityledger.Entry{}
+	for _, entry := range ev.RawLedgerEntries {
+		if entry.ProjectID == ev.ProjectID && entry.RunID == ev.RunID {
+			ledgerByAttempt[entry.AttemptID] = append(ledgerByAttempt[entry.AttemptID], entry)
+		}
+	}
+	failedLedger, retryLedger := ledgerByAttempt[failedAttempt], ledgerByAttempt[retryAttempt]
+	noDoubleCapacity := len(failedLedger) == 1 && len(retryLedger) == 1
+	if noDoubleCapacity {
+		fentry, rentry := failedLedger[0], retryLedger[0]
+		noDoubleCapacity = fentry.State == "released" && fentry.Actual == nil &&
+			fentry.ReservationID != "" && rentry.State == "reconciled" &&
+			rentry.Actual != nil && rentry.After != nil && rentry.ReservationID != "" &&
+			fentry.ReservationID != rentry.ReservationID &&
+			fentry.Provider == summary.ExcludedProvider &&
+			fentry.BeforeInventoryDigest == ev.InventoryReportDigest &&
+			rentry.BeforeInventoryDigest == ev.InventoryReportDigest
+	}
+	if !noDoubleCapacity {
+		add("unavailable_retry_raw_ledger_invalid_or_duplicate")
+	}
+	childrenByAttempt := map[string][]CanaryChild{}
+	for _, child := range ev.Children {
+		if child.WorkItemID == workItem {
+			childrenByAttempt[child.AttemptID] = append(childrenByAttempt[child.AttemptID], child)
+		}
+	}
+	noDuplicateFiles := len(childrenByAttempt[failedAttempt]) == 1 &&
+		len(childrenByAttempt[retryAttempt]) == 1
+	if noDuplicateFiles {
+		seen := map[string]bool{}
+		for _, path := range childrenByAttempt[failedAttempt][0].FilesTouched {
+			if path == "" || path != strings.TrimSpace(path) {
+				noDuplicateFiles = false
+			}
+			seen[path] = true
+		}
+		for _, path := range childrenByAttempt[retryAttempt][0].FilesTouched {
+			if path == "" || path != strings.TrimSpace(path) || seen[path] {
+				noDuplicateFiles = false
+			}
+		}
+	}
+	if !noDuplicateFiles {
+		add("unavailable_retry_raw_files_duplicate_or_missing")
+	}
+	if countEvent("integrate", failedAttempt) != 0 || countEvent("integrate", retryAttempt) != 1 {
+		add("unavailable_retry_integrate_count_invalid")
+	}
+	if summary.NoDuplicateClaim != noDuplicateClaim ||
+		summary.NoDuplicateFiles != noDuplicateFiles ||
+		summary.NoDoubleCapacity != noDoubleCapacity {
+		add("unavailable_retry_summary_flag_mismatch")
+	}
+	return len(reasons) == 0, reasons
+}
+
+func validateRawRestartClaims(ev CanaryEvidence, raw forcedRestartEvidence) bool {
+	if !raw.Interrupted || len(raw.AbortedAttempts) != 1 {
+		return false
+	}
+	for workItem, abortedAttempt := range raw.AbortedAttempts {
+		var aborted []workclaim.Claim
+		seenAttempts := map[string]bool{}
+		later := 0
+		abortedGeneration := workflowrun.ParseAttemptGeneration(abortedAttempt)
+		for _, claim := range ev.RawClaims {
+			if claim.ProjectID != ev.ProjectID || claim.WorkItemID != workItem {
+				continue
+			}
+			if claim.AttemptID == "" || claim.AttemptID != strings.TrimSpace(claim.AttemptID) ||
+				seenAttempts[claim.AttemptID] {
+				return false
+			}
+			seenAttempts[claim.AttemptID] = true
+			if claim.AttemptID == abortedAttempt {
+				aborted = append(aborted, claim)
+				continue
+			}
+			generation := workflowrun.ParseAttemptGeneration(claim.AttemptID)
+			if generation > abortedGeneration && claim.Generation == int64(generation+1) {
+				later++
+			}
+		}
+		if len(aborted) != 1 || aborted[0].State != workclaim.StateClosed ||
+			string(aborted[0].Terminal) != "cancelled" ||
+			aborted[0].Generation != int64(abortedGeneration+1) || later < 1 {
+			return false
+		}
+	}
+	// Every raw reuse line must bind to one exact closed succeeded claim. This
+	// proves durable sibling reuse instead of trusting a run-level counter.
+	reusedAttempts := map[string]bool{}
+	reuseCount := 0
+	for _, event := range ev.RawEvents {
+		if event.Kind != "reuse" {
+			continue
+		}
+		reuseCount++
+		if reusedAttempts[event.AttemptID] {
+			return false
+		}
+		reusedAttempts[event.AttemptID] = true
+		matches := 0
+		for _, claim := range ev.RawClaims {
+			if claim.ProjectID == ev.ProjectID &&
+				claim.WorkItemID == event.WorkItemID &&
+				claim.AttemptID == event.AttemptID &&
+				claim.State == workclaim.StateClosed &&
+				string(claim.Terminal) == "succeeded" &&
+				claim.OutputEvidence != "" &&
+				claim.OutputEvidence == event.Evidence &&
+				claim.Generation == int64(event.Generation) {
+				matches++
+			}
+		}
+		if matches != 1 {
+			return false
+		}
+	}
+	if reuseCount != raw.ReuseCount || reuseCount == 0 {
+		return false
+	}
+	return true
+}
+
+func validateRawDurableEnvelope(ev CanaryEvidence) []string {
+	var reasons []string
+	if len(ev.RawEvents) == 0 {
+		reasons = append(reasons, "raw_events_missing")
+	} else {
+		seenEvent := map[string]bool{}
+		for _, event := range ev.RawEvents {
+			if event.Schema != workflowrun.EventSchema ||
+				event.EventID == "" || event.EventID != strings.TrimSpace(event.EventID) ||
+				seenEvent[event.EventID] ||
+				event.ProjectID != ev.ProjectID || event.RunID != ev.RunID ||
+				event.At.IsZero() {
+				reasons = append(reasons, "raw_event_envelope_invalid")
+				break
+			}
+			seenEvent[event.EventID] = true
+			if err := workflowrun.ValidateChildEventIdentity(event); err != nil {
+				reasons = append(reasons, "raw_event_child_identity_invalid")
+				break
+			}
+		}
+		if err := workflowrun.ValidateEventStreamInvariants(ev.RawEvents); err != nil {
+			reasons = append(reasons, "raw_event_stream_invariants_invalid")
+		}
+	}
+	if len(ev.RawClaims) == 0 {
+		reasons = append(reasons, "raw_claims_missing")
+	} else {
+		seenClaimID := map[string]bool{}
+		seenAttempt := map[string]bool{}
+		for _, claim := range ev.RawClaims {
+			generation := workflowrun.ParseAttemptGeneration(claim.AttemptID)
+			if claim.Schema != workclaim.SchemaClaim ||
+				claim.ClaimID == "" || claim.ClaimID != strings.TrimSpace(claim.ClaimID) ||
+				seenClaimID[claim.ClaimID] ||
+				claim.ProjectID != ev.ProjectID ||
+				claim.GraphID == "" || claim.GraphID != strings.TrimSpace(claim.GraphID) ||
+				claim.GraphVersion <= 0 ||
+				claim.WorkItemID == "" || claim.WorkItemID != strings.TrimSpace(claim.WorkItemID) ||
+				claim.AttemptID == "" || claim.AttemptID != strings.TrimSpace(claim.AttemptID) ||
+				seenAttempt[claim.AttemptID] ||
+				claim.ExecutorID != workflowrun.WorkflowrunExecutorID ||
+				generation < 0 || claim.Generation != int64(generation+1) {
+				reasons = append(reasons, "raw_claim_envelope_invalid")
+				break
+			}
+			seenClaimID[claim.ClaimID] = true
+			seenAttempt[claim.AttemptID] = true
+		}
+	}
+	return reasons
+}
+
+func timeValue(value *time.Time) time.Time {
+	if value == nil {
+		return time.Time{}
+	}
+	return value.UTC()
+}
+
+func timesEqual(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Equal(*b)
+}
+
+func floatEqual(a, b float64) bool {
+	return math.Abs(a-b) <= 1e-9
 }
 
 // windowRequiresCapacityReset is true for finite/fixed quota windows.
@@ -771,21 +1308,6 @@ func isGroupDeltaActualSource(src string) bool {
 		strings.HasPrefix(s, "estimated_group_delta_empty:")
 }
 
-// isCanaryUnavailableReason is the closed set of unavailability classes that may
-// satisfy unavailable_retry.
-//
-// Rejected: eligible_not_chosen / not_chosen (diversity), soft_excluded (soft
-// policy), stale (freshness alone without typed failure).
-func isCanaryUnavailableReason(reason string) bool {
-	switch strings.ToLower(strings.TrimSpace(reason)) {
-	case "exhausted", "rate_limited", "unavailable",
-		"model_unavailable", "capacity_refused", "permission":
-		return true
-	default:
-		return false
-	}
-}
-
 // DigestCanaryBody hashes a stable subset for optional anti-tamper.
 func DigestCanaryBody(ev CanaryEvidence) string {
 	// Clear content digest field before hashing if present.
@@ -793,5 +1315,26 @@ func DigestCanaryBody(ev CanaryEvidence) string {
 	cp.ContentDigest = ""
 	b, _ := json.Marshal(cp)
 	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// DigestDurableEvidence binds the raw event, claim, capacity-ledger, and live
+// inventory evidence carried by the manifest.
+func DigestDurableEvidence(ev CanaryEvidence) string {
+	body := struct {
+		InventoryProvenance   string
+		InventoryReportDigest string
+		Events                []workflowrun.Event
+		Claims                []workclaim.Claim
+		Ledger                []capacityledger.Entry
+	}{
+		InventoryProvenance:   ev.InventoryProvenance,
+		InventoryReportDigest: ev.InventoryReportDigest,
+		Events:                ev.RawEvents,
+		Claims:                ev.RawClaims,
+		Ledger:                ev.RawLedgerEntries,
+	}
+	raw, _ := json.Marshal(body)
+	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }

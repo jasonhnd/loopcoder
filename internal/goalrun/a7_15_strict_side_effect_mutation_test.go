@@ -163,104 +163,6 @@ func parseJSONFile(t *testing.T, path string) map[string]any {
 	return m
 }
 
-// enrichA715Fixture ensures durable fields required by the mutation matrix exist.
-// Missing production fields after interrupt are fixture-filled with exact values
-// so one-field mutations always have a real path (never skip/not_run).
-func enrichA715Fixture(t *testing.T, partPath, elogPath string) {
-	t.Helper()
-	// Partial: actual_sources + capacity_transitions on first child / root.
-	mutateJSONMap(t, partPath, func(m map[string]any) {
-		kid := firstKid(t, m)
-		as, _ := kid["actual_sources"].(map[string]any)
-		if as == nil {
-			as = map[string]any{}
-		}
-		// Fill every ActualRouteSources field if empty.
-		for _, f := range []string{"model", "effort", "permission", "account", "install"} {
-			if s, _ := as[f].(string); s == "" {
-				as[f] = "src_" + f
-			}
-		}
-		kid["actual_sources"] = as
-		// Ensure identity fields present on kid for one-field mutations.
-		for k, v := range map[string]any{
-			"provider": "codex", "model": "gpt-5.5", "depth": "medium",
-			"permission": "bounded_write", "account_ref": "acct-codex",
-			"install_ref": "install-1", "window_kind": "five_hour",
-			"reservation_id": "res-1", "task_class": "tera",
-			"attempt_id": "att-enrich-g0", "generation": float64(1),
-			"terminal": "cancelled", "failure_class": "forced_interrupt",
-			"output_evidence": "ev-enrich", "child_contract_digest": "ccd-enrich",
-			"execution_plan_digest": "plan-enrich",
-		} {
-			if kid[k] == nil || kid[k] == "" || kid[k] == 0.0 {
-				if _, ok := kid[k]; !ok || kid[k] == "" || kid[k] == nil {
-					kid[k] = v
-				}
-			}
-		}
-		// Force known non-empty for mutation targets even if zero values existed.
-		if kid["provider"] == "" {
-			kid["provider"] = "codex"
-		}
-		setFirstKid(m, kid)
-		// capacity_transitions required
-		tr, _ := m["capacity_transitions"].([]any)
-		if len(tr) == 0 {
-			m["capacity_transitions"] = []any{
-				map[string]any{
-					"attempt_id": "att-enrich-g0", "role": "prior", "state": "released",
-					"provider": "codex", "model": "gpt-5.5", "depth": "medium",
-					"permission": "bounded_write", "account_ref": "acct-codex",
-					"install_ref": "install-1", "window_kind": "five_hour",
-					"reservation_id": "res-1",
-				},
-			}
-		}
-		// root identity
-		if m["project_id"] == nil || m["project_id"] == "" {
-			m["project_id"] = "proj-enrich"
-		}
-		if m["run_id"] == nil || m["run_id"] == "" {
-			m["run_id"] = "run-enrich"
-		}
-		if m["graph_id"] == nil || m["graph_id"] == "" {
-			m["graph_id"] = "g-enrich"
-		}
-		if m["graph_version"] == nil {
-			m["graph_version"] = float64(1)
-		}
-		if m["plan_digest"] == nil || m["plan_digest"] == "" {
-			m["plan_digest"] = "plan-enrich"
-		}
-		if m["execution_plan_digest"] == nil || m["execution_plan_digest"] == "" {
-			m["execution_plan_digest"] = "plan-enrich"
-		}
-		if m["graph_digest"] == nil || m["graph_digest"] == "" {
-			m["graph_digest"] = "gdig-enrich"
-		}
-	})
-	// Ensure last event has event_id + kind (should already).
-	raw, err := os.ReadFile(elogPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lines := nonEmptyLines(string(raw))
-	if len(lines) == 0 {
-		t.Fatal("empty event log in fixture")
-	}
-	var ev map[string]any
-	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &ev); err != nil {
-		t.Fatal(err)
-	}
-	if ev["event_id"] == nil || ev["event_id"] == "" {
-		t.Fatal("fixture event missing event_id")
-	}
-	if ev["kind"] == nil || ev["kind"] == "" {
-		t.Fatal("fixture event missing kind")
-	}
-}
-
 func nonEmptyLines(s string) []string {
 	var out []string
 	for _, ln := range strings.Split(s, "\n") {
@@ -352,7 +254,6 @@ func setupA715(t *testing.T, suffix string) (
 	env, home, projectID, runID, goal, oneChild, elogPath, partPath, cpPath, elogBefore, partBefore, cpBefore, now =
 		buildInterruptedBaseline(t, suffix)
 	restoreBaseline(t, elogPath, partPath, cpPath, elogBefore, partBefore, cpBefore)
-	enrichA715Fixture(t, partPath, elogPath)
 	claimPath = filepath.Join(home, "projects", projectID, "runs", runID, "workclaims.json")
 	return
 }
@@ -360,6 +261,7 @@ func setupA715(t *testing.T, suffix string) (
 func TestA715_OneFieldMutations_PostMutSnapshotExact(t *testing.T) {
 	type mc struct {
 		name     string
+		target   string
 		wantPath string
 		mut      func(t *testing.T, partPath, cpPath, elogPath string)
 	}
@@ -392,7 +294,10 @@ func TestA715_OneFieldMutations_PostMutSnapshotExact(t *testing.T) {
 			},
 		})
 	}
-	// ActualSources every field
+	// ActualSources every field. Production interruption emits the authoritative
+	// object empty when the provider did not report a dimension. Adding exactly
+	// one asserted source to only one durable row is therefore a real one-leaf
+	// contradiction, not fixture enrichment.
 	for _, f := range []string{"model", "effort", "permission", "account", "install"} {
 		f := f
 		cases = append(cases, mc{
@@ -404,9 +309,6 @@ func TestA715_OneFieldMutations_PostMutSnapshotExact(t *testing.T) {
 					if as == nil {
 						t.Fatal("fixture missing actual_sources")
 					}
-					if _, ok := as[f]; !ok {
-						t.Fatalf("fixture missing actual_sources.%s", f)
-					}
 					as[f] = "MUT_SRC_" + f
 					kid["actual_sources"] = as
 					setFirstKid(m, kid)
@@ -414,30 +316,39 @@ func TestA715_OneFieldMutations_PostMutSnapshotExact(t *testing.T) {
 			},
 		})
 	}
-	// Capacity transition identity fields
+	// Capacity evidence is emitted by production in checkpoint children. Mutate
+	// those real fields directly; never invent a fixture-only
+	// capacity_transitions object.
 	for _, f := range []string{
-		"attempt_id", "role", "state", "provider", "model", "depth",
-		"permission", "account_ref", "install_ref", "window_kind", "reservation_id",
+		"capacity_before", "capacity_reserved", "capacity_state",
+		"capacity_before_source", "capacity_before_captured_at",
+		"capacity_before_freshness", "capacity_before_confidence",
+		"capacity_reset_at", "capacity_group_id",
 	} {
 		f := f
 		cases = append(cases, mc{
-			name: "cap_tr_" + f, wantPath: "capacity_transitions[0]/" + f,
-			mut: func(t *testing.T, partPath, _, _ string) {
-				mutateJSONMap(t, partPath, func(m map[string]any) {
-					tr, ok := m["capacity_transitions"].([]any)
-					if !ok || len(tr) == 0 {
-						t.Fatal("fixture missing capacity_transitions")
+			name: "checkpoint_capacity_" + f, target: "checkpoint", wantPath: "children[0]/" + f,
+			mut: func(t *testing.T, _, cpPath, _ string) {
+				mutateJSONMap(t, cpPath, func(m map[string]any) {
+					children, ok := m["children"].([]any)
+					if !ok || len(children) == 0 {
+						t.Fatal("production checkpoint missing children")
 					}
-					t0, _ := tr[0].(map[string]any)
-					if t0 == nil {
-						t.Fatal("nil transition")
+					child, _ := children[0].(map[string]any)
+					if child == nil {
+						t.Fatal("production checkpoint child is nil")
 					}
-					if _, ok := t0[f]; !ok {
-						t.Fatalf("fixture transition missing %s", f)
+					if _, ok := child[f]; !ok {
+						t.Fatalf("production checkpoint child missing %s", f)
 					}
-					t0[f] = "MUT_TR_" + f
-					tr[0] = t0
-					m["capacity_transitions"] = tr
+					switch f {
+					case "capacity_before", "capacity_reserved":
+						child[f] = float64(0.123456)
+					default:
+						child[f] = "MUT_CAP_" + f
+					}
+					children[0] = child
+					m["children"] = children
 				})
 			},
 		})
@@ -496,6 +407,7 @@ func TestA715_OneFieldMutations_PostMutSnapshotExact(t *testing.T) {
 			env, home, projectID, runID, goal, oneChild, elogPath, partPath, cpPath, claimPath, now := setupA715(t, "of_"+tc.name)
 			// capture pre-mut for one-path proof
 			prePart := parseJSONFile(t, partPath)
+			preCP := parseJSONFile(t, cpPath)
 			preElog := readOpt(elogPath)
 			tc.mut(t, partPath, cpPath, elogPath)
 			// Prove mutation changed something real
@@ -504,8 +416,11 @@ func TestA715_OneFieldMutations_PostMutSnapshotExact(t *testing.T) {
 					t.Fatal("event mutation did not change log bytes")
 				}
 			} else {
-				postPart := parseJSONFile(t, partPath)
-				diffs := jsonPathDiff(prePart, postPart, "")
+				before, after := prePart, parseJSONFile(t, partPath)
+				if tc.target == "checkpoint" {
+					before, after = preCP, parseJSONFile(t, cpPath)
+				}
+				diffs := jsonPathDiff(before, after, "")
 				if len(diffs) == 0 {
 					t.Fatal("mutation did not change JSON")
 				}
@@ -513,6 +428,9 @@ func TestA715_OneFieldMutations_PostMutSnapshotExact(t *testing.T) {
 				if len(diffs) != 1 {
 					// generation float may only touch one path; fail if many
 					t.Fatalf("expected exactly 1 path change want~%s got %v", tc.wantPath, diffs)
+				}
+				if diffs[0] != tc.wantPath {
+					t.Fatalf("mutation changed wrong leaf: want %s got %v", tc.wantPath, diffs)
 				}
 			}
 			post := takeSnap(elogPath, partPath, cpPath, claimPath, env.LedgerPath)
@@ -645,12 +563,13 @@ func TestA715_PositiveBaseline_ThenContradictions(t *testing.T) {
 			OnHangEntry: func(string, int) { cancel() },
 		},
 	})
-	// Valid resume must spend (inv/ledger/executor) for real progress; never invent succeeded with zero work.
-	if err == nil && res.Status == "succeeded" && calls["wi_only"] == 0 {
-		t.Fatal("unmutated resume invented succeeded without executor work")
-	}
-	if ctr.inv.Load() == 0 && ctr.ledOpen.Load() == 0 && calls["wi_only"] == 0 && err == nil {
-		t.Fatal("unmutated resume made no progress (zero spend, nil err)")
+	// This is the positive control for the exact production-generated baseline
+	// used by every mutation case. It must cross every spend boundary and
+	// execute the child exactly once; an early validation error cannot satisfy
+	// the mutation matrix.
+	if ctr.inv.Load() != 1 || ctr.ledOpen.Load() != 1 || calls["wi_only"] != 1 {
+		t.Fatalf("production baseline did not execute exactly once: inv=%d led=%d calls=%+v status=%s err=%v",
+			ctr.inv.Load(), ctr.ledOpen.Load(), calls, res.Status, err)
 	}
 	t.Logf("positive baseline status=%s err=%v inv=%d led=%d calls=%+v", res.Status, err, ctr.inv.Load(), ctr.ledOpen.Load(), calls)
 	// Contradictions: terminal case aliases / failure class aliases must not green prior-succeeded
@@ -713,42 +632,82 @@ func TestA715_PositiveBaseline_ThenContradictions(t *testing.T) {
 }
 
 func TestA715_ArtifactqualConsumesDurableFacts(t *testing.T) {
-	// Real qualify boundary: canary evidence path missing / forged must fail closed
-	// without treating helper prose as success.
-	dir := t.TempDir()
-	// Missing canary evidence path → qualify fails closed in release-like unit mode
-	// when CanaryEvidencePath set to nonexistent.
-	ev, err := artifactqual.Qualify(artifactqual.Input{
-		Mode:               artifactqual.ModeUnit,
-		WorkDir:            dir,
-		CanaryEvidencePath: filepath.Join(dir, "missing-canary.json"),
-		SHA:                "sha",
-		Repository:         "o/r",
+	// Production boundary, not a hand-built canary helper: create a real
+	// interrupted goalrun, resume it through Execute, and consume the exact
+	// emitted event/claim/capacity-ledger evidence through the same strict
+	// LoadCanaryEvidence + ValidateCanaryEvidence path used by Qualify.
+	env, home, projectID, runID, goal, oneChild, elogPath, partPath, cpPath, elogBefore, partBefore, cpBefore, now :=
+		buildInterruptedBaseline(t, "artifactqual_boundary")
+	restoreBaseline(t, elogPath, partPath, cpPath, elogBefore, partBefore, cpBefore)
+	repo := initDisposableGitRepo(t)
+	canaryPath := filepath.Join(t.TempDir(), "canary_evidence.json")
+	archiveDigest := strings.Repeat("ab", 32)
+	preProdSHA := strings.Repeat("cd", 20)
+	res, runErr := goalrun.Execute(context.Background(), goalrun.Request{
+		ProjectID: projectID, RunID: runID, Resume: true,
+		Goal: goal, Issue: "1397", Actor: "owner", Owner: "worker",
+		Provider: "codex", Model: "gpt-5.5",
+		InventoryProvenance: goalrun.InventoryProvenanceLiveDiscover,
+		HomeDir:             home, RepoPath: repo, Now: func() time.Time { return now.Add(time.Minute) },
+		Decompose: oneChild, LoadInventory: env.loadInv(), OpenLedger: env.openLed(),
+		Executor: testspawn.Executor{
+			HomeDir: home, Now: func() time.Time { return now.Add(time.Minute) },
+		},
+		CanaryEmit: &goalrun.CanaryEmitOptions{
+			OutPath: canaryPath, HomeDir: home, RepoPath: repo,
+			ArchiveDigest: archiveDigest, PreProdSHA: preProdSHA,
+			BinaryVersion: "0.9.0-a715", BinaryCommit: preProdSHA,
+			InventoryProvenance: goalrun.InventoryProvenanceLiveDiscover,
+		},
 	})
-	if err == nil && ev.Passed {
-		t.Fatal("qualify must not pass with missing canary evidence")
+	if runErr != nil {
+		t.Fatalf("production resume/canary boundary: %v status=%s msg=%s", runErr, res.Status, res.Message)
 	}
-	// Write empty invalid canary
-	bad := filepath.Join(dir, "bad-canary.json")
-	if err := os.WriteFile(bad, []byte(`{"schema":"not-canary"}`), 0o600); err != nil {
-		t.Fatal(err)
+	if res.CanaryEvidencePath != canaryPath {
+		t.Fatalf("production result canary path = %q, want exact %q", res.CanaryEvidencePath, canaryPath)
 	}
-	ev, err = artifactqual.Qualify(artifactqual.Input{
-		Mode:               artifactqual.ModeUnit,
-		WorkDir:            dir,
-		CanaryEvidencePath: bad,
-		SHA:                "sha",
-		Repository:         "o/r",
-	})
-	if err == nil && ev.Passed {
-		t.Fatal("qualify must not pass with forged canary schema")
+	produced, loadErr := artifactqual.LoadCanaryEvidence(canaryPath)
+	if loadErr != nil {
+		t.Fatal(loadErr)
 	}
-	// Mutated durable run identity binding: ExpectedDigest mismatch style
-	// (unit mode may not require archive; still must not invent dual-green).
-	if ev.Passed {
-		t.Fatal("unexpected pass")
+	v := artifactqual.ValidateCanaryEvidence(
+		produced, archiveDigest, preProdSHA, produced.ProducedAt,
+	)
+	for _, reason := range v.Reasons {
+		if strings.HasPrefix(reason, "raw_event_") ||
+			strings.HasPrefix(reason, "raw_claim_") ||
+			strings.HasPrefix(reason, "durable_evidence_digest_") {
+			t.Fatalf("production artifactqual durable boundary rejected: %v", v.Reasons)
+		}
 	}
-	t.Logf("artifactqual boundary err=%v passed=%v reasons=%v", err, ev.Passed, ev.Reasons)
+	if len(produced.RawEvents) == 0 || len(produced.RawClaims) == 0 ||
+		len(produced.RawLedgerEntries) == 0 {
+		t.Fatalf("production canary omitted raw durable facts: events=%d claims=%d ledger=%d",
+			len(produced.RawEvents), len(produced.RawClaims), len(produced.RawLedgerEntries))
+	}
+
+	// One-field mutation after emission must be caught even when both manifest
+	// digests are recomputed. Persist and reload it so the assertion crosses the
+	// exact file boundary rather than validating an in-memory helper object.
+	produced.RawClaims[0].Generation++
+	produced.DurableEvidenceDigest = artifactqual.DigestDurableEvidence(produced)
+	produced.ContentDigest = artifactqual.DigestCanaryBody(produced)
+	mutatedPath := filepath.Join(t.TempDir(), "mutated_canary_evidence.json")
+	if writeErr := artifactqual.WriteCanaryEvidence(mutatedPath, produced); writeErr != nil {
+		t.Fatal(writeErr)
+	}
+	mutatedLoaded, mutatedLoadErr := artifactqual.LoadCanaryEvidence(mutatedPath)
+	if mutatedLoadErr != nil {
+		t.Fatal(mutatedLoadErr)
+	}
+	mutated := artifactqual.ValidateCanaryEvidence(
+		mutatedLoaded, archiveDigest, preProdSHA, produced.ProducedAt,
+	)
+	if !strings.Contains(strings.Join(mutated.Reasons, ";"), "raw_claim_envelope_invalid") {
+		t.Fatalf("mutated production claim escaped artifactqual: %v", mutated.Reasons)
+	}
+	t.Logf("artifactqual production file boundary baseline_raw_ok=true mutated_reason=raw_claim_envelope_invalid production_raw=%d/%d/%d",
+		len(produced.RawEvents), len(produced.RawClaims), len(produced.RawLedgerEntries))
 }
 
 func TestA715_TrimSpaceEqualFold_AuditEvidence(t *testing.T) {

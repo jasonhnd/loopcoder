@@ -143,20 +143,22 @@ type ChildReport struct {
 	CapacityState    string   `json:"capacity_state,omitempty"`
 	CapacityNote     string   `json:"capacity_note,omitempty"`
 	// Structured before-window evidence at Reserve (never invented from note prose).
-	CapacityBeforeSource     string    `json:"capacity_before_source,omitempty"`
-	CapacityBeforeCapturedAt time.Time `json:"capacity_before_captured_at,omitempty"`
-	CapacityBeforeFreshness  string    `json:"capacity_before_freshness,omitempty"`
-	CapacityBeforeConfidence string    `json:"capacity_before_confidence,omitempty"`
+	CapacityBeforeSource          string    `json:"capacity_before_source,omitempty"`
+	CapacityBeforeCapturedAt      time.Time `json:"capacity_before_captured_at,omitempty"`
+	CapacityBeforeFreshness       string    `json:"capacity_before_freshness,omitempty"`
+	CapacityBeforeConfidence      string    `json:"capacity_before_confidence,omitempty"`
+	CapacityBeforeInventoryDigest string    `json:"capacity_before_inventory_digest,omitempty"`
 	// CapacityResetAt is the exact reserved/observed window reset identity (UTC).
 	// Required for finite/fixed windows; empty for unbounded/non-reset capacity.
 	CapacityResetAt *time.Time `json:"capacity_reset_at,omitempty"`
 	// Structured after evidence: observed (fresh same-window) vs derived (Before−Actual).
 	// Derived never qualifies as fresh capacity-after.
-	CapacityAfterSource     string    `json:"capacity_after_source,omitempty"`
-	CapacityAfterObservedAt time.Time `json:"capacity_after_observed_at,omitempty"`
-	CapacityAfterFreshness  string    `json:"capacity_after_freshness,omitempty"`
-	CapacityAfterConfidence string    `json:"capacity_after_confidence,omitempty"`
-	CapacityAfterState      string    `json:"capacity_after_state,omitempty"` // observed|derived
+	CapacityAfterSource          string    `json:"capacity_after_source,omitempty"`
+	CapacityAfterObservedAt      time.Time `json:"capacity_after_observed_at,omitempty"`
+	CapacityAfterFreshness       string    `json:"capacity_after_freshness,omitempty"`
+	CapacityAfterConfidence      string    `json:"capacity_after_confidence,omitempty"`
+	CapacityAfterState           string    `json:"capacity_after_state,omitempty"` // observed|derived
+	CapacityAfterInventoryDigest string    `json:"capacity_after_inventory_digest,omitempty"`
 	// CapacityActualConfidence is always estimated for group window aggregates
 	// (concurrent external use cannot be excluded), even when before/after are exact.
 	CapacityActualConfidence string `json:"capacity_actual_confidence,omitempty"`
@@ -175,6 +177,7 @@ type ChildReport struct {
 	ArgvDigest     string                         `json:"argv_digest,omitempty"`
 	AttemptID      string                         `json:"attempt_id,omitempty"`
 	OutputEvidence string                         `json:"output_evidence,omitempty"`
+	FilesTouched   []string                       `json:"files_touched,omitempty"`
 	WorktreePath   string                         `json:"worktree_path,omitempty"`
 	Terminal       string                         `json:"terminal,omitempty"`
 	// FailureClass is the structured failure class (e.g. model_unavailable) when
@@ -236,6 +239,13 @@ type Result struct {
 	// RouteExcludes are measured hard/soft excludes from the live candidate set
 	// (unavailable_retry evidence; Claimed=false for pure exclude).
 	RouteExcludes []RouteExclude `json:"route_excludes,omitempty"`
+	// InventoryReportDigest is the exact immutable inventory snapshot used for
+	// route/reserve decisions in this run.
+	InventoryReportDigest string `json:"inventory_report_digest,omitempty"`
+	// CapacityLedgerEntries are exact read-backs for this run's attempts. Canary
+	// emission serializes them as raw qualification proof; they contain no
+	// credentials.
+	CapacityLedgerEntries []capacityledger.Entry `json:"capacity_ledger_entries,omitempty"`
 	// CanaryEvidencePath is set when CanaryEmit succeeds.
 	CanaryEvidencePath string `json:"canary_evidence_path,omitempty"`
 }
@@ -505,6 +515,7 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 	var inv *autoroute.Inventory
 	var snap *capacitysnapshot.Snapshot
 	var ledger *capacityledger.Ledger
+	var inventoryReportDigest string
 	// Product path (auto-route OR explicit pin): load inventory + ledger.
 	needInvLedger := wantAuto || (pinProv != "" && pinModel != "")
 	if needInvLedger {
@@ -529,6 +540,7 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 			return out, lerr
 		}
 		inv, snap = &i, &s
+		inventoryReportDigest = s.Digest
 		// Ledger Open is mandatory for product spend (auto and explicit pin).
 		led, oerr := openLed(nowFn)
 		if oerr != nil {
@@ -1257,6 +1269,7 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		GraphID: g.GraphID, PlanDigest: execPlanDigest, GraphDigest: graphDigest,
 		RunID: runID, ProjectID: projectID,
 		Children: children, Workflow: wres, Resumed: resumed,
+		InventoryReportDigest: inventoryReportDigest,
 	}
 	out.ReuseCount = wres.ReuseCount
 	out.WorktreePeak = wres.WorktreePeak
@@ -1438,6 +1451,9 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		// Capacity already finalized inside merge when a pair exists; if merge
 		// found no pair, keep existing seed finalize from above.
 	}
+	out.CapacityLedgerEntries = capacityLedgerEvidenceForResult(
+		ledger, projectID, runID, out.Children, out.Workflow.Children,
+	)
 
 	// Always persist durable checkpoint (partial or complete) for forced restart.
 	// Fail closed: no restart proof or success claim without a durable checkpoint.
@@ -1588,6 +1604,9 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 
 	// Exact-binary canary evidence emission (derived from events/PR/children).
 	if req.CanaryEmit != nil {
+		out.CapacityLedgerEntries = capacityLedgerEvidenceForResult(
+			ledger, projectID, runID, out.Children, out.Workflow.Children,
+		)
 		opts := *req.CanaryEmit
 		if opts.HomeDir == "" {
 			opts.HomeDir = req.HomeDir
@@ -1599,13 +1618,10 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		if opts.InventoryProvenance == "" {
 			opts.InventoryProvenance = req.InventoryProvenance
 		}
-		// Default canary emission requires live inventory provenance when marked.
-		if opts.InventoryProvenance == InventoryProvenanceCapacitySnapshot ||
-			opts.InventoryProvenance == InventoryProvenanceInjected {
-			opts.RequireLiveInventory = true
-		}
-		if req.InventoryProvenance == InventoryProvenanceCapacitySnapshot ||
-			req.InventoryProvenance == InventoryProvenanceInjected {
+		// Exact-artifact canary emission always requires the production live
+		// discovery path. Unspecified is not evidence of live discovery.
+		opts.RequireLiveInventory = true
+		if req.InventoryProvenance != InventoryProvenanceLiveDiscover {
 			return out, fmt.Errorf("goalrun: canary emit rejects inventory provenance %q", req.InventoryProvenance)
 		}
 		if _, eerr := EmitCanaryFromResult(out, opts); eerr != nil {
@@ -1624,6 +1640,40 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		emitChild(req.ReportOut, cr)
 	}
 	return out, nil
+}
+
+func capacityLedgerEvidenceForResult(
+	ledger *capacityledger.Ledger,
+	projectID, runID string,
+	reports []ChildReport,
+	outcomes []workflowrun.ChildOutcome,
+) []capacityledger.Entry {
+	if ledger == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var attempts []string
+	add := func(att string) {
+		if att == "" || att != strings.TrimSpace(att) || seen[att] {
+			return
+		}
+		seen[att] = true
+		attempts = append(attempts, att)
+	}
+	for _, c := range reports {
+		add(c.AttemptID)
+	}
+	for _, c := range outcomes {
+		add(c.AttemptID)
+	}
+	sort.Strings(attempts)
+	out := make([]capacityledger.Entry, 0, len(attempts))
+	for _, att := range attempts {
+		if entry, ok := ledger.Get(projectID, runID, att); ok {
+			out = append(out, entry)
+		}
+	}
+	return out
 }
 
 func parseIssueNumber(s string) (int, error) {
@@ -1974,6 +2024,7 @@ func applyOutcomeRouteFields(cr *ChildReport, co workflowrun.ChildOutcome) {
 	cr.Terminal = co.Terminal
 	cr.AttemptID = co.AttemptID
 	cr.OutputEvidence = co.OutputEvidence
+	cr.FilesTouched = append([]string(nil), co.FilesTouched...)
 	cr.WorktreePath = co.WorktreePath
 	cr.ActualSource = co.ActualSource
 	cr.ActualSources = co.ActualSources
@@ -2061,6 +2112,7 @@ func appendMUFailedChildReports(
 				WindowKind: co.WindowKind, ReservationID: co.ReservationID,
 				RouteReason: co.RouteReason, Terminal: co.Terminal, AttemptID: att,
 				OutputEvidence: co.OutputEvidence, WorktreePath: co.WorktreePath,
+				FilesTouched: append([]string(nil), co.FilesTouched...),
 				FailureClass: co.FailureClass, Stage: "terminal", NextAction: "inspect_model_unavailable",
 				ActualSource: co.ActualSource, ActualSources: co.ActualSources,
 				ArgvDigest: co.ArgvDigest,
@@ -3225,6 +3277,7 @@ func reconcileCapacityGroups(children []ChildReport, ledger *capacityledger.Ledg
 		opts := capacityledger.ObserveAfterOpts{
 			AccountRef: acc, WindowKind: win, InstallRef: install,
 			ObservedAt: capAt, Confidence: conf, ObservationID: obsID,
+			InventoryDigest: postSnap.Digest,
 		}
 		if resetEv != "" {
 			opts.ResetObserved = true
@@ -3398,6 +3451,7 @@ func applyCapacityBeforeFromEntry(cr *ChildReport, entry capacityledger.Entry) {
 	if entry.Confidence != "" {
 		cr.CapacityBeforeConfidence = string(entry.Confidence)
 	}
+	cr.CapacityBeforeInventoryDigest = entry.BeforeInventoryDigest
 	// Exact window reset identity from ledger — never prose parse.
 	if entry.ResetAt != nil {
 		t := entry.ResetAt.UTC()
@@ -3421,6 +3475,7 @@ func applyCapacityAfterFromEntry(cr *ChildReport, entry capacityledger.Entry) {
 	cr.CapacityAfterFreshness = entry.AfterFreshness
 	cr.CapacityAfterConfidence = string(entry.AfterConfidence)
 	cr.CapacityAfterState = entry.AfterState
+	cr.CapacityAfterInventoryDigest = entry.AfterInventoryDigest
 	if entry.AfterObservedAt != nil {
 		cr.CapacityAfterObservedAt = entry.AfterObservedAt.UTC()
 	} else {
@@ -3438,6 +3493,9 @@ func applyCapacityAfterFromEntry(cr *ChildReport, entry capacityledger.Entry) {
 	}
 	if entry.Confidence != "" && cr.CapacityBeforeConfidence == "" {
 		cr.CapacityBeforeConfidence = string(entry.Confidence)
+	}
+	if cr.CapacityBeforeInventoryDigest == "" {
+		cr.CapacityBeforeInventoryDigest = entry.BeforeInventoryDigest
 	}
 	// Keep CapacityResetAt identical to reserved window identity (UTC).
 	if entry.ResetAt != nil {
@@ -4126,30 +4184,32 @@ func finalizeCapacityTransitions(
 		}
 		// Ledger is capacity truth; seed retains Permission (not on ledger Entry).
 		final := workflowrun.CapacityTransition{
-			AttemptID:        ent.AttemptID,
-			Role:             role,
-			State:            ent.State,
-			Provider:         ent.Provider,
-			Model:            ent.Model,
-			Depth:            ent.Depth,
-			Permission:       firstNonEmpty(seed.Permission, ""),
-			AccountRef:       ent.AccountRef,
-			InstallRef:       ent.InstallRef,
-			WindowKind:       ent.WindowKind,
-			ReservationID:    ent.ReservationID,
-			Before:           ent.Before,
-			Reserved:         ent.Reserved,
-			Actual:           ent.Actual,
-			After:            ent.After,
-			Source:           strings.TrimSpace(ent.ActualSource),
-			BeforeSource:     ent.BeforeSource,
-			BeforeFreshness:  ent.Freshness,
-			BeforeConfidence: string(ent.Confidence),
-			AfterSource:      ent.AfterSource,
-			AfterFreshness:   ent.AfterFreshness,
-			AfterConfidence:  string(ent.AfterConfidence),
-			AfterState:       ent.AfterState,
-			ActualConfidence: string(ent.ActualConfidence),
+			AttemptID:             ent.AttemptID,
+			Role:                  role,
+			State:                 ent.State,
+			Provider:              ent.Provider,
+			Model:                 ent.Model,
+			Depth:                 ent.Depth,
+			Permission:            firstNonEmpty(seed.Permission, ""),
+			AccountRef:            ent.AccountRef,
+			InstallRef:            ent.InstallRef,
+			WindowKind:            ent.WindowKind,
+			ReservationID:         ent.ReservationID,
+			Before:                ent.Before,
+			Reserved:              ent.Reserved,
+			Actual:                ent.Actual,
+			After:                 ent.After,
+			Source:                strings.TrimSpace(ent.ActualSource),
+			BeforeSource:          ent.BeforeSource,
+			BeforeFreshness:       ent.Freshness,
+			BeforeConfidence:      string(ent.Confidence),
+			BeforeInventoryDigest: ent.BeforeInventoryDigest,
+			AfterSource:           ent.AfterSource,
+			AfterFreshness:        ent.AfterFreshness,
+			AfterConfidence:       string(ent.AfterConfidence),
+			AfterState:            ent.AfterState,
+			AfterInventoryDigest:  ent.AfterInventoryDigest,
+			ActualConfidence:      string(ent.ActualConfidence),
 		}
 		if ent.BeforeCapturedAt != nil {
 			t := ent.BeforeCapturedAt.UTC()

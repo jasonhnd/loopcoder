@@ -2,6 +2,8 @@ package goalrun_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -173,6 +175,7 @@ func TestResumeEnvelopeTamperMatrix(t *testing.T) {
 					t.Fatal(err)
 				}
 				tc.mut(&cp, nil)
+				refreshCheckpointContentDigest(t, &cp)
 				raw, mErr := json.MarshalIndent(cp, "", "  ")
 				if mErr != nil {
 					t.Fatal(mErr)
@@ -260,6 +263,17 @@ func TestResumeEnvelopeTamperMatrix(t *testing.T) {
 			_ = before
 		})
 	}
+}
+
+func refreshCheckpointContentDigest(t *testing.T, cp *goalrun.Checkpoint) {
+	t.Helper()
+	cp.ContentDigest = ""
+	raw, err := json.Marshal(*cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(raw)
+	cp.ContentDigest = "sha256:" + hex.EncodeToString(sum[:])
 }
 
 func fileExists(p string) bool {

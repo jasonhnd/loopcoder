@@ -95,7 +95,8 @@ func TestForcedInterruptProductionProof_KillMidChildResumeEmitCanary(t *testing.
 		Goal: goal, Issue: "1397",
 		Actor: "owner", Owner: "worker",
 		Provider: "codex", Model: "gpt-5.5",
-		HomeDir: home, RepoPath: repoPath, Now: func() time.Time { return now },
+		InventoryProvenance: goalrun.InventoryProvenanceLiveDiscover,
+		HomeDir:             home, RepoPath: repoPath, Now: func() time.Time { return now },
 		Decompose:     fiveChild,
 		LoadInventory: env.loadInv(), OpenLedger: env.openLed(),
 		Executor: testspawn.Executor{
@@ -292,7 +293,8 @@ func TestForcedInterruptProductionProof_KillMidChildResumeEmitCanary(t *testing.
 		Goal: goal, Issue: "1397",
 		Actor: "owner", Owner: "worker",
 		Provider: "codex", Model: "gpt-5.5",
-		HomeDir: home, RepoPath: repoPath, Now: func() time.Time { return now.Add(time.Minute) },
+		InventoryProvenance: goalrun.InventoryProvenanceLiveDiscover,
+		HomeDir:             home, RepoPath: repoPath, Now: func() time.Time { return now.Add(time.Minute) },
 		Decompose:     fiveChild,
 		LoadInventory: env.loadInv(), OpenLedger: env.openLed(),
 		Executor: testspawn.Executor{
@@ -303,6 +305,7 @@ func TestForcedInterruptProductionProof_KillMidChildResumeEmitCanary(t *testing.
 			OutPath: canaryOut, HomeDir: home, RepoPath: repoPath,
 			ArchiveDigest: archiveDig, PreProdSHA: preProdSHA,
 			BinaryVersion: "0.9.0-a76b", BinaryCommit: preProdSHA,
+			InventoryProvenance: goalrun.InventoryProvenanceLiveDiscover,
 		},
 	})
 	if err2 != nil {

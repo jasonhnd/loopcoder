@@ -22,8 +22,9 @@ func TestEmit_ProductionForcedInterruptCancelledTerminal(t *testing.T) {
 	rem := 0.8
 	payload := []byte(`{"failure_class":"forced_interrupt","interrupt_class":"service_forced_interrupt","interrupt_id":"iint_prod1","terminal":"cancelled"}`)
 	ev, err := artifactqual.EmitCanaryEvidence(artifactqual.EmitInput{
-		ArchiveDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		PreProdSHA:    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		ArchiveDigest:       "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		PreProdSHA:          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		InventoryProvenance: "live_discover", InventoryReportDigest: "sha256:inventory",
 		BinaryVersion: "0.9.0", BinaryCommit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		ProjectID: "disp-forced-1", RunID: "run_forced_1", EventLogPath: logPath,
 		Events: []workflowrun.Event{
@@ -91,6 +92,7 @@ func TestEmit_ProductionForcedInterruptCancelledTerminal(t *testing.T) {
 		IndependentVerifier: "codex", VerifierProvider: "codex", VerifierAttemptID: "att-v",
 		VerifierEvidenceRef: verEvid + "@head:" + sha,
 	}
+	completeRawCanaryEvidence(&ev, now)
 	ev.ContentDigest = artifactqual.DigestCanaryBody(ev)
 	live := &artifactqual.PRLiveState{
 		Repository: "jasonhnd/loopcoder", Number: 1, URL: ev.PR.URL,
@@ -112,6 +114,7 @@ func TestEmit_AbortedSucceededRejected(t *testing.T) {
 	// Succeeded terminal on same attempt as interrupt — must not ExactlyOnce.
 	ev, err := artifactqual.EmitCanaryEvidence(artifactqual.EmitInput{
 		ArchiveDigest: "aa", PreProdSHA: "bb", ProjectID: "disp-x", RunID: "r1",
+		InventoryProvenance: "live_discover", InventoryReportDigest: "sha256:inventory",
 		BinaryVersion: "v", BinaryCommit: "bb",
 		Events: []workflowrun.Event{
 			{Kind: "launch", WorkItemID: "wi", AttemptID: "att-wi-g0"},

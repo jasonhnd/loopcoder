@@ -1,8 +1,12 @@
 package goalrun
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,6 +58,14 @@ type Checkpoint struct {
 	// CapacityTransitions are final ledger-backed prior/alternate transitions
 	// (post applyChildOutcomes). Required for model_unavailable canary proof on resume.
 	CapacityTransitions []workflowrun.CapacityTransition `json:"capacity_transitions,omitempty"`
+	// ClaimStoreDigest binds the exact raw claim ledger present when this
+	// checkpoint was persisted. Resume rejects any later byte mutation before
+	// inventory, ledger, claim, reserve, or executor work.
+	ClaimStoreDigest string `json:"claim_store_digest,omitempty"`
+	// ContentDigest binds the complete checkpoint document except this field.
+	// It prevents one-field edits to child capacity and other durable evidence
+	// from being silently accepted or repaired during resume.
+	ContentDigest string `json:"content_digest"`
 }
 
 // CheckpointPath returns the durable write path and ensures parent directories exist.
@@ -124,6 +136,19 @@ func SaveCheckpoint(homeDir string, cp Checkpoint) (string, error) {
 	if cp.PriorSucceeded == nil {
 		cp.PriorSucceeded = PriorSucceededFrom(cp.WorkflowKids, cp.Children)
 	}
+	cp.ClaimStoreDigest = ""
+	claimPath := filepath.Join(filepath.Dir(path), "workclaims.json")
+	if claimRaw, claimErr := os.ReadFile(claimPath); claimErr == nil {
+		cp.ClaimStoreDigest = checkpointSHA256(claimRaw)
+	} else if !os.IsNotExist(claimErr) {
+		return "", fmt.Errorf("goalrun: checkpoint read claim store for digest: %w", claimErr)
+	}
+	cp.ContentDigest = ""
+	contentDigest, err := checkpointContentDigest(cp)
+	if err != nil {
+		return "", err
+	}
+	cp.ContentDigest = contentDigest
 	raw, err := json.MarshalIndent(cp, "", "  ")
 	if err != nil {
 		return "", err
@@ -154,12 +179,56 @@ func LoadCheckpoint(homeDir, projectID, runID string) (Checkpoint, string, error
 		return Checkpoint{}, path, err
 	}
 	var cp Checkpoint
-	if err := json.Unmarshal(raw, &cp); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cp); err != nil {
 		return Checkpoint{}, path, err
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("multiple JSON values")
+		}
+		return Checkpoint{}, path, err
+	}
+	if cp.ContentDigest == "" {
+		return Checkpoint{}, path, fmt.Errorf("goalrun: checkpoint missing content_digest")
+	}
+	wantContent := cp.ContentDigest
+	cp.ContentDigest = ""
+	gotContent, err := checkpointContentDigest(cp)
+	if err != nil {
+		return Checkpoint{}, path, err
+	}
+	if wantContent != gotContent {
+		return Checkpoint{}, path, fmt.Errorf("goalrun: checkpoint content_digest mismatch")
+	}
+	cp.ContentDigest = wantContent
+	if cp.ClaimStoreDigest != "" {
+		claimRaw, claimErr := os.ReadFile(filepath.Join(filepath.Dir(path), "workclaims.json"))
+		if claimErr != nil {
+			return Checkpoint{}, path, fmt.Errorf("goalrun: checkpoint claim_store_digest read: %w", claimErr)
+		}
+		if got := checkpointSHA256(claimRaw); got != cp.ClaimStoreDigest {
+			return Checkpoint{}, path, fmt.Errorf("goalrun: checkpoint claim_store_digest mismatch")
+		}
 	}
 	// Do not derive or repair PriorSucceeded on load — reusable seed must already
 	// be durable. Legacy derivation is audit-only via AuditPriorSucceededFrom.
 	return cp, path, nil
+}
+
+func checkpointContentDigest(cp Checkpoint) (string, error) {
+	cp.ContentDigest = ""
+	raw, err := json.Marshal(cp)
+	if err != nil {
+		return "", fmt.Errorf("goalrun: checkpoint content digest: %w", err)
+	}
+	return checkpointSHA256(raw), nil
+}
+
+func checkpointSHA256(raw []byte) string {
+	sum := sha256.Sum256(raw)
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 // PriorSucceededFrom builds a resume seed from terminal outcomes (write-side /

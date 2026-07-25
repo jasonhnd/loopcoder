@@ -176,18 +176,20 @@ type CapacityTransition struct {
 	// Source is ActualSource (never prose). Empty when Actual is nil.
 	Source string `json:"source,omitempty"`
 	// Structured before-window evidence (exact|estimated|unknown + freshness + reset).
-	BeforeSource     string     `json:"before_source,omitempty"`
-	BeforeCapturedAt *time.Time `json:"before_captured_at,omitempty"`
-	BeforeFreshness  string     `json:"before_freshness,omitempty"`
-	BeforeConfidence string     `json:"before_confidence,omitempty"`
-	ResetAt          *time.Time `json:"reset_at,omitempty"`
+	BeforeSource          string     `json:"before_source,omitempty"`
+	BeforeCapturedAt      *time.Time `json:"before_captured_at,omitempty"`
+	BeforeInventoryDigest string     `json:"before_inventory_digest,omitempty"`
+	BeforeFreshness       string     `json:"before_freshness,omitempty"`
+	BeforeConfidence      string     `json:"before_confidence,omitempty"`
+	ResetAt               *time.Time `json:"reset_at,omitempty"`
 	// Structured after evidence (observed|derived); derived never greens runtime freshness.
-	AfterSource      string     `json:"after_source,omitempty"`
-	AfterObservedAt  *time.Time `json:"after_observed_at,omitempty"`
-	AfterFreshness   string     `json:"after_freshness,omitempty"`
-	AfterConfidence  string     `json:"after_confidence,omitempty"`
-	AfterState       string     `json:"after_state,omitempty"`
-	ActualConfidence string     `json:"actual_confidence,omitempty"`
+	AfterSource          string     `json:"after_source,omitempty"`
+	AfterObservedAt      *time.Time `json:"after_observed_at,omitempty"`
+	AfterFreshness       string     `json:"after_freshness,omitempty"`
+	AfterConfidence      string     `json:"after_confidence,omitempty"`
+	AfterState           string     `json:"after_state,omitempty"`
+	AfterInventoryDigest string     `json:"after_inventory_digest,omitempty"`
+	ActualConfidence     string     `json:"actual_confidence,omitempty"`
 }
 
 // CapacityRerouteResult binds the alternate reservation (account must not cross companies)

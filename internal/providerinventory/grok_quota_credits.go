@@ -28,7 +28,9 @@ const (
 
 var (
 	ErrGrokCreditsAuthMissing   = errors.New("ErrGrokCreditsAuthMissing")
+	ErrGrokCreditsEndpoint      = errors.New("ErrGrokCreditsEndpoint")
 	ErrGrokCreditsHTTP          = errors.New("ErrGrokCreditsHTTP")
+	ErrGrokCreditsRedirect      = errors.New("ErrGrokCreditsRedirect")
 	ErrGrokCreditsMalformed     = errors.New("ErrGrokCreditsMalformed")
 	ErrGrokCreditsCredentialMat = errors.New("ErrQuotaCredentialMaterial")
 )
@@ -42,6 +44,9 @@ type GrokCreditsBillingRequest struct {
 	Timeout time.Duration
 	// MaxBodyBytes caps response body retained for parse (raw never stored on snapshot).
 	MaxBodyBytes int
+	// Transport is injectable for tests. Production leaves it nil and always
+	// uses the exact official HTTPS endpoint above.
+	Transport http.RoundTripper
 }
 
 // GrokCreditsBillingResult is the redacted-safe transport result.
@@ -79,9 +84,13 @@ func loadGrokCLIAuthToken(home string, getenv func(string) string) (token string
 // runGrokCreditsBilling performs the bounded official billing HTTP GET.
 // Token is used only for the Authorization header and is not returned.
 func runGrokCreditsBilling(ctx context.Context, req GrokCreditsBillingRequest) (GrokCreditsBillingResult, error) {
-	url := strings.TrimSpace(req.URL)
-	if url == "" {
-		url = grokCreditsBillingURL
+	endpoint := req.URL
+	if endpoint == "" {
+		endpoint = grokCreditsBillingURL
+	} else if endpoint != grokCreditsBillingURL {
+		// Bearer authority is an exact URL, not merely a broadly related host.
+		// Refuse scheme/host/path/query changes before constructing a request.
+		return GrokCreditsBillingResult{}, ErrGrokCreditsEndpoint
 	}
 	tok := strings.TrimSpace(req.Token)
 	if tok == "" {
@@ -97,7 +106,7 @@ func runGrokCreditsBilling(ctx context.Context, req GrokCreditsBillingRequest) (
 	}
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	httpReq, err := http.NewRequestWithContext(runCtx, http.MethodGet, url, nil)
+	httpReq, err := http.NewRequestWithContext(runCtx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return GrokCreditsBillingResult{}, fmt.Errorf("%w: build request", ErrGrokCreditsHTTP)
 	}
@@ -106,10 +115,21 @@ func runGrokCreditsBilling(ctx context.Context, req GrokCreditsBillingRequest) (
 	httpReq.Header.Set("User-Agent", "loopcoder-quota-probe/0.9.0")
 	// Clear tok from local after header set — GC will reclaim; avoid lingering copies in logs.
 	tok = ""
-	client := &http.Client{Timeout: timeout}
+	client := &http.Client{
+		Timeout:   timeout,
+		Transport: req.Transport,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			// Never forward the bearer credential to a redirected request. The
+			// billing endpoint is exact-host authority; redirects are not.
+			return ErrGrokCreditsRedirect
+		},
+	}
 	start := time.Now()
 	resp, err := client.Do(httpReq)
 	if err != nil {
+		if errors.Is(err, ErrGrokCreditsRedirect) {
+			return GrokCreditsBillingResult{}, fmt.Errorf("%w: %w", ErrGrokCreditsHTTP, ErrGrokCreditsRedirect)
+		}
 		return GrokCreditsBillingResult{}, fmt.Errorf("%w: %v", ErrGrokCreditsHTTP, err)
 	}
 	defer resp.Body.Close()
@@ -132,8 +152,8 @@ func grokCreditsBillingSource(now time.Time) QuotaTelemetrySource {
 	now = now.UTC()
 	return normalizeQuotaTelemetrySource(QuotaTelemetrySource{
 		AdapterID:              "grok",
-		SourceKind:             QuotaSourceOfficialCLICommand,
-		SourceKey:              "grok-cli-credits-billing-v1",
+		SourceKind:             QuotaSourceOfficialAPI,
+		SourceKey:              "grok-official-credits-billing-api-v1",
 		SourceSchemaVersion:    grokCreditsBillingSourceSchema,
 		SupportedQuantities:    []QuantityKind{QuantityProviderDefined},
 		SupportedWindows:       []WindowKind{WindowFixedWeek, WindowProviderDefined, WindowUnknown},
@@ -141,11 +161,11 @@ func grokCreditsBillingSource(now time.Time) QuotaTelemetrySource {
 		ConfidenceContract:     map[string]Confidence{"limit_value": ConfidenceExact, "used_value": ConfidenceExact, "remaining_value": ConfidenceExact, "reset_at": ConfidenceExact},
 		NetworkDeclared:        true,
 		NetworkPermissionScope: "provider:grok/action:quota-read/side-effect:read/freshness:interactive",
-		Argv:                   []string{"official-cli-owned-http", "GET", "/v1/billing?format=credits"},
+		Argv:                   []string{},
 		EnvironmentKeys:        []string{"HOME", "GROK_HOME"},
 		TimeoutMS:              int(grokCreditsBillingTimeout / time.Millisecond),
 		OutputLimits:           OutputLimits{StdoutBytes: grokCreditsBillingMaxBody, StderrBytes: 4096, CombinedBytes: grokCreditsBillingMaxBody + 4096, DecodedBytes: grokCreditsBillingMaxBody},
-		ClassificationRules:    []string{"official-cli-billing-endpoint", "auth-from-cli-auth-json", "redact-before-retain", "no-credential-material", "no-refresh-token-as-bearer"},
+		ClassificationRules:    []string{"official-machine-readable-api", "exact-host-no-redirect", "auth-from-cli-auth-json", "redact-before-retain", "no-credential-material", "no-refresh-token-as-bearer"},
 		CreatedAt:              formatTime(now),
 		UpdatedAt:              formatTime(now),
 		PolicyVersion:          PolicyVersion,
@@ -179,8 +199,8 @@ func collectGrokCreditsBilling(
 	probe.NetworkPermission = grokQuotaNetworkPermissionFor(discovery, adapter)
 	probe.Argv = redactArgv([]string{"GET", "/v1/billing?format=credits"})
 	probe.EnvironmentKeys = []string{"HOME", "GROK_HOME"}
-	probe.Source = SourceDescriptor{Kind: "command", AdapterID: adapter.AdapterID, ProbeCommandID: probe.ProbeCommandID, DiscoverySource: "official-cli-billing-endpoint", ExecutableName: "cli-chat-proxy"}
-	probe.Evidence = EvidenceSummary{Kind: "bounded-grok-cli-credits-billing-http", CommandBounded: true, NoShell: true, RepositoryMutation: false, SecretMaterialRetained: false}
+	probe.Source = SourceDescriptor{Kind: "official-machine-readable-api", AdapterID: adapter.AdapterID, ProbeCommandID: probe.ProbeCommandID, DiscoverySource: "grok-official-credits-billing-api"}
+	probe.Evidence = EvidenceSummary{Kind: "bounded-grok-official-credits-billing-http", CommandBounded: false, NoShell: true, RepositoryMutation: false, SecretMaterialRetained: false}
 	probe.SideEffectClass = "network-read"
 
 	fail := func(reason, terminal string) (QuotaTelemetrySource, []QuotaSnapshot, ProbeResult, error) {
@@ -190,7 +210,7 @@ func collectGrokCreditsBilling(
 		probe.FreshnessState = FreshnessNotApplicable
 		probe.GapReasons = []string{reason}
 		probe.TerminalErrorCode = terminal
-		return source, []QuotaSnapshot{snap}, probe, fmt.Errorf("%s", reason)
+		return source, []QuotaSnapshot{snap}, probe, fmt.Errorf("%w: %s", grokCreditsErrorForTerminal(terminal), reason)
 	}
 
 	if probe.NetworkPermission != NetworkGranted {
@@ -289,7 +309,12 @@ func grokCreditsReason(err error) string {
 		return "unknown"
 	case errors.Is(err, ErrGrokCreditsAuthMissing):
 		return "credits-auth-missing"
+	case errors.Is(err, ErrGrokCreditsEndpoint):
+		return "credits-endpoint-rejected"
 	case errors.Is(err, ErrGrokCreditsHTTP):
+		if errors.Is(err, ErrGrokCreditsRedirect) {
+			return "credits-redirect-rejected"
+		}
 		return "credits-http-failed"
 	case errors.Is(err, ErrGrokCreditsMalformed):
 		return "credits-malformed"
@@ -312,7 +337,12 @@ func grokCreditsTerminal(err error) string {
 	switch {
 	case errors.Is(err, ErrGrokCreditsAuthMissing):
 		return "ErrGrokCreditsAuthMissing"
+	case errors.Is(err, ErrGrokCreditsEndpoint):
+		return "ErrGrokCreditsEndpoint"
 	case errors.Is(err, ErrGrokCreditsHTTP):
+		if errors.Is(err, ErrGrokCreditsRedirect) {
+			return "ErrGrokCreditsRedirect"
+		}
 		return "ErrGrokCreditsHTTP"
 	case errors.Is(err, ErrGrokCreditsMalformed):
 		return "ErrGrokCreditsMalformed"
@@ -320,6 +350,23 @@ func grokCreditsTerminal(err error) string {
 		return "ErrQuotaCredentialMaterial"
 	default:
 		return "ErrGrokCreditsHTTP"
+	}
+}
+
+func grokCreditsErrorForTerminal(terminal string) error {
+	switch terminal {
+	case "ErrGrokCreditsAuthMissing":
+		return ErrGrokCreditsAuthMissing
+	case "ErrGrokCreditsEndpoint":
+		return ErrGrokCreditsEndpoint
+	case "ErrGrokCreditsRedirect":
+		return ErrGrokCreditsRedirect
+	case "ErrGrokCreditsMalformed":
+		return ErrGrokCreditsMalformed
+	case "ErrQuotaCredentialMaterial":
+		return ErrQuotaCredentialMaterial
+	default:
+		return ErrGrokCreditsHTTP
 	}
 }
 
@@ -380,11 +427,16 @@ func snapshotsFromGrokCreditsBilling(
 	resetAt := firstNonEmpty(cfg.CurrentPeriod.End, cfg.BillingPeriodEnd)
 	periodStart := firstNonEmpty(cfg.CurrentPeriod.Start, cfg.BillingPeriodStart)
 
-	// Normalize period bounds to RFC3339 when parseable. ValidateQuotaSnapshot
-	// requires window_start+window_end for fixed-week; without them Refresh
-	// rejects the whole inventory report and Grok installs never persist.
-	windowStart := normalizeGrokRFC3339(periodStart)
-	resetNorm := normalizeGrokRFC3339(resetAt)
+	// Non-empty invalid provider timestamps are not durable reset evidence.
+	// Reject the payload rather than passing invalid text through as exact.
+	windowStart, err := normalizeGrokRFC3339(periodStart)
+	if err != nil {
+		return nil, fmt.Errorf("%w: current period start is not RFC3339", ErrGrokCreditsMalformed)
+	}
+	resetNorm, err := normalizeGrokRFC3339(resetAt)
+	if err != nil {
+		return nil, fmt.Errorf("%w: current period end/reset is not RFC3339", ErrGrokCreditsMalformed)
+	}
 
 	windowKind := WindowProviderDefined
 	if strings.Contains(strings.ToUpper(periodType), "WEEKLY") {
@@ -419,21 +471,7 @@ func snapshotsFromGrokCreditsBilling(
 		if resetNorm != "" {
 			fieldConf["reset_at"] = ConfidenceExact
 		}
-		gaps := []string{}
-		if resetNorm == "" {
-			gaps = append(gaps, "missing-reset-at")
-		}
-		if windowKind == WindowFixedWeek && (windowStart == "" || resetNorm == "") {
-			gaps = append(gaps, "missing-fixed-window-bounds")
-		}
-		if accountProfileIDPtr == nil {
-			gaps = append(gaps, "missing-exact-account-identity")
-		}
-		terminal := ""
-		if remI <= 0 {
-			terminal = "ErrQuotaExhausted"
-			gaps = append(gaps, "quota-exhausted")
-		}
+		gaps, terminal := grokCreditsGaps(periodType, windowStart, resetNorm, accountProfileIDPtr, remI)
 		// Interactive freshness TTL (30m); ResetAt preserved separately (not as StaleAfter alone).
 		staleAfter := formatTime(now.Add(30 * time.Minute))
 		snaps = append(snaps, normalizeQuotaSnapshot(QuotaSnapshot{
@@ -501,6 +539,7 @@ func snapshotsFromGrokCreditsBilling(
 		if resetNorm != "" {
 			fieldConf["reset_at"] = ConfidenceExact
 		}
+		gaps, terminal := grokCreditsGaps(periodType, windowStart, resetNorm, accountProfileIDPtr, remI)
 		snaps = append(snaps, normalizeQuotaSnapshot(QuotaSnapshot{
 			QuotaSnapshotID:        quotaSnapshotID("grok", source.QuotaSourceID, scope, "product_usage_percent", formatTime(now)),
 			QuotaSourceID:          source.QuotaSourceID,
@@ -530,7 +569,8 @@ func snapshotsFromGrokCreditsBilling(
 			RawSourceHash:          rawHash,
 			RedactedDiagnostics:    fmt.Sprintf("grok official CLI credits billing product %s parser %s", safeSummary(product), grokCreditsBillingSourceSchema),
 			ConflictSet:            []string{},
-			GapReasons:             []string{},
+			GapReasons:             gaps,
+			TerminalErrorCode:      terminal,
 			CreatedAt:              formatTime(now),
 			UpdatedAt:              formatTime(now),
 			PolicyVersion:          PolicyVersion,
@@ -589,21 +629,39 @@ func snapshotsFromGrokCreditsBilling(
 	return snaps, nil
 }
 
-// normalizeGrokRFC3339 parses common RFC3339/RFC3339Nano timestamps and
-// rewrites them in UTC RFC3339Nano. Unparseable non-empty values are returned
-// as-is for diagnostics; empty input stays empty.
-func normalizeGrokRFC3339(value string) string {
+func grokCreditsGaps(periodType, windowStart, resetAt string, accountProfileID *string, remaining int64) ([]string, string) {
+	gaps := []string{}
+	if resetAt == "" {
+		gaps = append(gaps, "missing-reset-at")
+	}
+	if strings.Contains(strings.ToUpper(periodType), "WEEKLY") && (windowStart == "" || resetAt == "") {
+		gaps = append(gaps, "missing-fixed-window-bounds")
+	}
+	if accountProfileID == nil {
+		gaps = append(gaps, "missing-exact-account-identity")
+	}
+	terminal := ""
+	if remaining <= 0 {
+		terminal = "ErrQuotaExhausted"
+		gaps = append(gaps, "quota-exhausted")
+	}
+	return gaps, terminal
+}
+
+// normalizeGrokRFC3339 parses RFC3339/RFC3339Nano timestamps and rewrites
+// them in UTC. Empty is a truthful absence; non-empty invalid text is rejected.
+func normalizeGrokRFC3339(value string) (string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return ""
+		return "", nil
 	}
 	if t, err := time.Parse(time.RFC3339Nano, value); err == nil {
-		return t.UTC().Format(time.RFC3339Nano)
+		return t.UTC().Format(time.RFC3339Nano), nil
 	}
 	if t, err := time.Parse(time.RFC3339, value); err == nil {
-		return t.UTC().Format(time.RFC3339Nano)
+		return t.UTC().Format(time.RFC3339Nano), nil
 	}
-	return value
+	return "", fmt.Errorf("%w: invalid RFC3339 timestamp", ErrGrokCreditsMalformed)
 }
 
 // validatePercentPair rejects NaN/Inf and out-of-range [0,100] values.

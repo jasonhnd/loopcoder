@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jasonhnd/loopcoder/internal/artifactqual"
+	"github.com/jasonhnd/loopcoder/internal/workflowrun"
 )
 
 // validPR is defined in canary_evidence_test.go (same package).
@@ -42,7 +43,7 @@ func baseValidCanary(now time.Time) (artifactqual.CanaryEvidence, string, string
 			CreatedByLoopCoder: true,
 		},
 	}
-	ev.ContentDigest = artifactqual.DigestCanaryBody(ev)
+	completeRawCanaryEvidence(&ev, now)
 	return ev, digest, sha
 }
 
@@ -174,5 +175,89 @@ func TestValidateCanary_MissingContentDigestRejected(t *testing.T) {
 	joined := strings.Join(v.Reasons, ";")
 	if !strings.Contains(joined, "content_digest_missing") {
 		t.Fatalf("want content_digest_missing, got %v", v.Reasons)
+	}
+}
+
+func TestValidateCanary_RawCapacityArithmeticMutationRejected(t *testing.T) {
+	now := time.Date(2026, 7, 22, 21, 0, 0, 0, time.UTC)
+	ev, dig, sha := baseValidCanary(now)
+	if len(ev.RawLedgerEntries) == 0 || ev.RawLedgerEntries[0].Actual == nil {
+		t.Fatal("positive fixture must carry raw actual")
+	}
+	mutated := *ev.RawLedgerEntries[0].Actual + 0.01
+	ev.RawLedgerEntries[0].Actual = &mutated
+	ev.DurableEvidenceDigest = artifactqual.DigestDurableEvidence(ev)
+	ev.ContentDigest = artifactqual.DigestCanaryBody(ev)
+	v := artifactqual.ValidateCanaryEvidence(ev, dig, sha, now)
+	if v.CapacityAfterOK {
+		t.Fatal("one-field raw actual mutation must fail capacity arithmetic")
+	}
+	if !strings.Contains(strings.Join(v.Reasons, ";"), "raw_ledger") {
+		t.Fatalf("want raw ledger rejection: %v", v.Reasons)
+	}
+}
+
+func TestValidateCanary_UnavailableSummaryCannotReplaceRawEvidence(t *testing.T) {
+	now := time.Date(2026, 7, 22, 21, 0, 0, 0, time.UTC)
+	ev, dig, sha := baseValidCanary(now)
+	ev.RawEvents = append([]workflowrun.Event(nil), ev.RawEvents...)
+	for i, event := range ev.RawEvents {
+		if event.Kind == "model_unavailable" {
+			ev.RawEvents = append(ev.RawEvents[:i], ev.RawEvents[i+1:]...)
+			break
+		}
+	}
+	// Leave all three hand-written summary booleans true.
+	ev.DurableEvidenceDigest = artifactqual.DigestDurableEvidence(ev)
+	ev.ContentDigest = artifactqual.DigestCanaryBody(ev)
+	v := artifactqual.ValidateCanaryEvidence(ev, dig, sha, now)
+	if v.UnavailableRetryOK {
+		t.Fatal("summary booleans must not green missing raw model_unavailable")
+	}
+}
+
+func TestValidateCanary_ForcedInterruptClassIsByteExact(t *testing.T) {
+	now := time.Date(2026, 7, 22, 21, 0, 0, 0, time.UTC)
+	ev, dig, sha := baseValidCanary(now)
+	for i := range ev.RawEvents {
+		if ev.RawEvents[i].Kind == "interrupt" {
+			ev.RawEvents[i].Payload = []byte(`{"attempt_id":"att-wi_restart-g0","failure_class":"forced_interrupt","generation":"1","interrupt_class":" service_forced_interrupt","interrupt_id":"iint-exact","terminal":"cancelled","work_item_id":"wi_restart"}`)
+			break
+		}
+	}
+	ev.DurableEvidenceDigest = artifactqual.DigestDurableEvidence(ev)
+	ev.ContentDigest = artifactqual.DigestCanaryBody(ev)
+	v := artifactqual.ValidateCanaryEvidence(ev, dig, sha, now)
+	if v.RestartOK {
+		t.Fatal("padded interrupt_class must not qualify")
+	}
+}
+
+func TestValidateCanary_ProviderAliasesCountCanonicalCompanies(t *testing.T) {
+	now := time.Date(2026, 7, 22, 21, 0, 0, 0, time.UTC)
+	ev, dig, sha := baseValidCanary(now)
+	for i := range ev.Children {
+		if ev.Children[i].Provider == "antigravity" {
+			ev.Children[i].Provider = "openai"
+		}
+	}
+	for i := range ev.ProviderObservations {
+		if ev.ProviderObservations[i].Provider == "antigravity" {
+			ev.ProviderObservations[i].Provider = "openai"
+		}
+	}
+	for i := range ev.RawLedgerEntries {
+		if ev.RawLedgerEntries[i].Provider == "antigravity" {
+			ev.RawLedgerEntries[i].Provider = "openai"
+		}
+	}
+	ev.DurableEvidenceDigest = artifactqual.DigestDurableEvidence(ev)
+	ev.ContentDigest = artifactqual.DigestCanaryBody(ev)
+	v := artifactqual.ValidateCanaryEvidence(ev, dig, sha, now)
+	if v.MultiProviderOK {
+		t.Fatalf("codex+openai aliases are one company: %v", v.Providers)
+	}
+	if !strings.Contains(strings.Join(v.Reasons, ";"), "executed_provider_companies_lt_2") {
+		t.Fatalf("want canonical company rejection: %v", v.Reasons)
 	}
 }

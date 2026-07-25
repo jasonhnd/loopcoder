@@ -188,6 +188,7 @@ func TestGoalrunModelUnavailable_UnavailableRetryProductionProof(t *testing.T) {
 	res1, err1 := Execute(ctx1, Request{
 		ProjectID: projectID, RunID: runID,
 		Goal: goal, Issue: "1397", Actor: "owner", Owner: "worker",
+		InventoryProvenance: InventoryProvenanceLiveDiscover,
 		// Auto-route so both providers participate in decision set / same-depth alts.
 		HomeDir: home, RepoPath: repo, Now: func() time.Time { return now },
 		Decompose:     linear5,
@@ -386,7 +387,8 @@ func TestGoalrunModelUnavailable_UnavailableRetryProductionProof(t *testing.T) {
 	res2, err2 := Execute(context.Background(), Request{
 		ProjectID: projectID, RunID: runID, Resume: true,
 		Goal: goal, Issue: "1397", Actor: "owner", Owner: "worker",
-		HomeDir: home, RepoPath: repo, Now: func() time.Time { return now.Add(time.Minute) },
+		InventoryProvenance: InventoryProvenanceLiveDiscover,
+		HomeDir:             home, RepoPath: repo, Now: func() time.Time { return now.Add(time.Minute) },
 		Decompose:     linear5,
 		LoadInventory: loadInv, OpenLedger: openLed,
 		Executor: testspawn.Executor{
@@ -398,6 +400,7 @@ func TestGoalrunModelUnavailable_UnavailableRetryProductionProof(t *testing.T) {
 			OutPath: canaryOut, HomeDir: home, RepoPath: repo,
 			ArchiveDigest: archiveDig, PreProdSHA: preProdSHA,
 			BinaryVersion: "0.9.0-a77", BinaryCommit: preProdSHA,
+			InventoryProvenance: InventoryProvenanceLiveDiscover,
 		},
 	})
 	if err2 != nil {

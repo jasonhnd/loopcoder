@@ -379,6 +379,7 @@ func TestFinalContract_CanaryAntiReuseRejectsArchiveMismatch(t *testing.T) {
 	payload := []byte(`{"failure_class":"forced_interrupt","interrupt_class":"service_forced_interrupt","interrupt_id":"iint_x","terminal":"cancelled"}`)
 	ev, err := artifactqual.EmitCanaryEvidence(artifactqual.EmitInput{
 		ArchiveDigest: dig, PreProdSHA: sha, BinaryVersion: "0.9.0", BinaryCommit: sha,
+		InventoryProvenance: "live_discover", InventoryReportDigest: "sha256:inventory",
 		ProjectID: "disp-anti-reuse", RunID: "run_anti_1",
 		Events: []workflowrun.Event{
 			{Kind: "launch", WorkItemID: "wi", AttemptID: "att-wi-g0", Generation: 1},
