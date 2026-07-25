@@ -379,6 +379,25 @@ func TestA714_ExecuteResume_AuthorityMutations_StrictZeroSideEffects(t *testing.
 			restoreBaseline(t, elogPath, partPath, cpPath, elogBefore, partBefore, cpBefore)
 			tc.mut(t, partPath, cpPath)
 
+			// Post-mutation pre-Execute immutable snapshots (A7-15: not pristine baseline).
+			elogPostMut, err := os.ReadFile(elogPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			partPostMut, err := os.ReadFile(partPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var cpPostMut []byte
+			if _, err := os.Stat(cpPath); err == nil {
+				cpPostMut, _ = os.ReadFile(cpPath)
+			}
+			claimPath := filepath.Join(home, "projects", projectID, "runs", runID, "workclaims.json")
+			var claimPostMut []byte
+			if b, err := os.ReadFile(claimPath); err == nil {
+				claimPostMut = b
+			}
+
 			var ctr sideEffectCounters
 			calls := map[string]int{}
 			baseInv := env.loadInv()
@@ -414,24 +433,35 @@ func TestA714_ExecuteResume_AuthorityMutations_StrictZeroSideEffects(t *testing.
 			if calls["wi_only"] != 0 {
 				t.Fatalf("executor launched: %+v", calls)
 			}
+			// A7-15: exact bytes vs post-mutation pre-Execute snapshot (not pristine baseline).
 			elogAfter, _ := os.ReadFile(elogPath)
-			if string(elogAfter) != string(elogBefore) {
-				t.Fatalf("event log mutated despite zero preflight spend: before=%d after=%d",
-					len(elogBefore), len(elogAfter))
+			if string(elogAfter) != string(elogPostMut) {
+				t.Fatalf("event log mutated by Execute: before=%d after=%d", len(elogPostMut), len(elogAfter))
 			}
 			partAfter, _ := os.ReadFile(partPath)
-			// Partial may be rewritten only if spend path ran — with zero inv/led it must not.
-			if string(partAfter) != string(partBefore) {
-				// Allow only if mutation itself is still the only delta vs pristine baseline write.
-				// After restore + mut, partAfter should equal mutated content not baseline;
-				// ensure no second write from Execute by comparing size growth not applicable.
-				// Detect append-style growth of events only above.
+			if string(partAfter) != string(partPostMut) {
+				t.Fatalf("partial mutated by Execute: before=%d after=%d", len(partPostMut), len(partAfter))
+			}
+			if cpPostMut != nil {
+				cpAfter, _ := os.ReadFile(cpPath)
+				if string(cpAfter) != string(cpPostMut) {
+					t.Fatalf("checkpoint mutated by Execute: before=%d after=%d", len(cpPostMut), len(cpAfter))
+				}
+			}
+			claimAfter, claimErr := os.ReadFile(claimPath)
+			if claimPostMut == nil {
+				if claimErr == nil {
+					t.Fatalf("workclaims.json created by Execute (spend): %d bytes", len(claimAfter))
+				}
+			} else if string(claimAfter) != string(claimPostMut) {
+				t.Fatalf("workclaims mutated by Execute: before=%d after=%d", len(claimPostMut), len(claimAfter))
 			}
 			if err == nil && res.Status == "succeeded" {
 				t.Fatalf("unexpected succeeded status on authority mutation")
 			}
 		})
 	}
+
 }
 
 // TestA714_AuditPriorSucceeded_ExactOnly remains a non-spend unit gate.

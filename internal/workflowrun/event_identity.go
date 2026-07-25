@@ -111,7 +111,14 @@ func ValidateChildEventIdentity(ev Event) error {
 		return fmt.Errorf("workflowrun: child event kind has whitespace padding %q", kind)
 	}
 	if !ChildLifecycleKinds[kind] {
-		return nil
+		// Unknown kinds are not silently ignored: durable logs must not invent aliases.
+		if ParentOnlyEventKinds[kind] {
+			return nil
+		}
+		if kind == "" {
+			return nil
+		}
+		return fmt.Errorf("workflowrun: unknown child event kind %q (fail closed)", kind)
 	}
 	id := ev.WorkItemID
 	att := ev.AttemptID

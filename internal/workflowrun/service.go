@@ -3007,7 +3007,7 @@ func reconcileClaimsWithEventLog(cs *workclaim.Store, elog *EventLog, projectID,
 	}
 	termByAttempt := map[string]Event{}
 	for _, ev := range events {
-		if !strings.EqualFold(strings.TrimSpace(ev.Kind), "terminal") {
+		if ev.Kind != "terminal" { // exact durable kind — no EqualFold alias
 			continue
 		}
 		att := strings.TrimSpace(ev.AttemptID)

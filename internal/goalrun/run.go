@@ -3758,7 +3758,8 @@ func childActuallyExecutedProvider(c ChildReport) bool {
 	if c.Unavailable {
 		return false
 	}
-	if !strings.EqualFold(strings.TrimSpace(c.Terminal), "succeeded") {
+	// Exact durable terminal only — aliases (Succeeded, padding) never count.
+	if c.Terminal != "succeeded" {
 		return false
 	}
 	return hasRealProviderLaunchProof(c.ArgvDigest, c.ActualSources)
@@ -4248,7 +4249,8 @@ func recordModelUnavailableExcludes(wres workflowrun.Result, record func(childID
 	eventRef := ""
 	var failedProv, failedChild string
 	for _, co := range wres.Children {
-		if strings.EqualFold(strings.TrimSpace(co.FailureClass), "model_unavailable") {
+		// Exact FailureClass literal — no EqualFold alias into durable MU authority.
+		if co.FailureClass == "model_unavailable" {
 			failedProv = co.Provider
 			failedChild = co.WorkItemID
 		}
@@ -4280,14 +4282,14 @@ func bindOpenPRVerifierFromChildren(children []workflowrun.ChildOutcome) (provid
 		// Exact WorkItemID literals only — whitespace-altered IDs never match.
 		switch c.WorkItemID {
 		case "wi_verify":
-			// Exact class; wrong class on exact ID fails closed (counted as invalid verify).
-			if c.TaskClass != "soul" || !strings.EqualFold(c.Terminal, "succeeded") {
+			// Exact class + exact terminal literal — no EqualFold alias.
+			if c.TaskClass != "soul" || c.Terminal != "succeeded" {
 				verifyKids = append(verifyKids, c) // mark slot; rejected below
 				continue
 			}
 			verifyKids = append(verifyKids, c)
 		case "wi_implement":
-			if c.TaskClass != "tera" || !strings.EqualFold(c.Terminal, "succeeded") {
+			if c.TaskClass != "tera" || c.Terminal != "succeeded" {
 				implementKids = append(implementKids, c)
 				continue
 			}
@@ -4302,10 +4304,10 @@ func bindOpenPRVerifierFromChildren(children []workflowrun.ChildOutcome) (provid
 	imp := implementKids[0]
 	// Re-check exact success + class (invalid exact-ID rows already length-gated
 	// when mixed with valid ones via count!=1; single invalid still fails here).
-	if v.TaskClass != "soul" || !strings.EqualFold(v.Terminal, "succeeded") {
+	if v.TaskClass != "soul" || v.Terminal != "succeeded" {
 		return "", "", false
 	}
-	if imp.TaskClass != "tera" || !strings.EqualFold(imp.Terminal, "succeeded") {
+	if imp.TaskClass != "tera" || imp.Terminal != "succeeded" {
 		return "", "", false
 	}
 	if v.Provider == "" || v.AttemptID == "" {
@@ -4317,6 +4319,9 @@ func bindOpenPRVerifierFromChildren(children []workflowrun.ChildOutcome) (provid
 	if !openPRIsExactSHA256Digest(v.OutputEvidence) {
 		return "", "", false
 	}
+	// Distinct providers: case-insensitive equality fails closed (same account/provider
+	// under casing aliases must not green dual-provider). This is not EqualFold
+	// acceptance of durable success terminals.
 	if strings.EqualFold(v.Provider, imp.Provider) {
 		return "", "", false
 	}
