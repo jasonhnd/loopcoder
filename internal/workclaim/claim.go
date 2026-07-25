@@ -1,11 +1,13 @@
 package workclaim
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -236,7 +238,15 @@ func (s *Store) load() error {
 		return err
 	}
 	var doc fileDoc
-	if err := json.Unmarshal(b, &doc); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&doc); err != nil {
+		return fmt.Errorf("%w: corrupt claim store JSON: %v", ErrInvalid, err)
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("multiple JSON values")
+		}
 		return fmt.Errorf("%w: corrupt claim store JSON: %v", ErrInvalid, err)
 	}
 	// Schema required and exact — no silent upgrade of empty/wrong schema.

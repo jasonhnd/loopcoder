@@ -23,13 +23,9 @@ func TestCodexMachineReadableCatalog_RoutesHighAndLow(t *testing.T) {
 
 	rep := providerinventory.Report{
 		InventoryFingerprint: "fp-codex-mr",
-		Installations: []providerinventory.ProviderInstallation{{
-			ProviderInstallationID: inst, AdapterID: "codex",
-			InstallationState:   providerinventory.InstallationInstalled,
-			UsableForInvocation: "yes",
-			FreshnessState:      providerinventory.FreshnessFresh,
-			Confidence:          providerinventory.ConfidenceExact,
-		}},
+		Installations: []providerinventory.ProviderInstallation{
+			exactFreshInstall("codex", inst, "sha256:codex-mr-resolved", "sha256:codex-mr-path"),
+		},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
 			AccountProfileID: ptr(acct), ProviderInstallationID: ptr(inst),

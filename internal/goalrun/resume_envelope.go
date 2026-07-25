@@ -2,6 +2,8 @@ package goalrun
 
 import (
 	"fmt"
+	"os"
+	"reflect"
 	"strings"
 
 	"github.com/jasonhnd/loopcoder/internal/workflowrun"
@@ -35,8 +37,9 @@ func validateCheckpointEnvelope(cp Checkpoint, projectID, runID, graphID, planDi
 	return nil
 }
 
-// validatePartialEnvelope requires exact parent identity on mid-run partial.
-func validatePartialEnvelope(part workflowrun.PartialCheckpoint, projectID, runID, planDigest, graphDigest string) error {
+// validatePartialEnvelope requires exact parent identity on mid-run partial,
+// including graph_id and graph_version matching the current graph.
+func validatePartialEnvelope(part workflowrun.PartialCheckpoint, projectID, runID, graphID, planDigest, graphDigest string, graphVersion int) error {
 	if strings.TrimSpace(part.Schema) == "" {
 		return fmt.Errorf("goalrun: resume partial schema empty (fail closed)")
 	}
@@ -65,62 +68,27 @@ func validatePartialEnvelope(part workflowrun.PartialCheckpoint, projectID, runI
 	if strings.TrimSpace(part.GraphDigest) == "" || part.GraphDigest != graphDigest {
 		return fmt.Errorf("goalrun: resume partial graph_digest %q != current %q", part.GraphDigest, graphDigest)
 	}
+	if strings.TrimSpace(graphID) == "" {
+		return fmt.Errorf("goalrun: resume partial current graph_id empty (fail closed)")
+	}
+	if strings.TrimSpace(part.GraphID) == "" || part.GraphID != graphID {
+		return fmt.Errorf("goalrun: resume partial graph_id %q != current %q", part.GraphID, graphID)
+	}
+	if graphVersion <= 0 {
+		return fmt.Errorf("goalrun: resume partial current graph_version invalid: %d", graphVersion)
+	}
+	if part.GraphVersion <= 0 || part.GraphVersion != graphVersion {
+		return fmt.Errorf("goalrun: resume partial graph_version %d != current %d", part.GraphVersion, graphVersion)
+	}
 	return nil
 }
 
-// childOutcomesExactlyEqual requires full equality on identity fields for seed
-// overlap. Contradiction is an error; never first-wins.
+// childOutcomesExactlyEqual requires whole-struct equality (reflect.DeepEqual)
+// for seed/PriorSucceeded overlap. Contradiction is an error; never first-wins
+// or capacity refresh.
 func childOutcomesExactlyEqual(a, b workflowrun.ChildOutcome, label string) error {
-	check := func(name, av, bv string) error {
-		if av != bv {
-			return fmt.Errorf("goalrun: seed overlap conflict on %s %s: %q != %q", label, name, av, bv)
-		}
-		return nil
-	}
-	if err := check("work_item_id", a.WorkItemID, b.WorkItemID); err != nil {
-		return err
-	}
-	if err := check("terminal", a.Terminal, b.Terminal); err != nil {
-		return err
-	}
-	if err := check("output_evidence", a.OutputEvidence, b.OutputEvidence); err != nil {
-		return err
-	}
-	if err := check("task_class", a.TaskClass, b.TaskClass); err != nil {
-		return err
-	}
-	if err := check("execution_plan_digest", a.ExecutionPlanDigest, b.ExecutionPlanDigest); err != nil {
-		return err
-	}
-	if err := check("child_contract_digest", a.ChildContractDigest, b.ChildContractDigest); err != nil {
-		return err
-	}
-	if err := check("attempt_id", a.AttemptID, b.AttemptID); err != nil {
-		return err
-	}
-	if a.Generation != b.Generation {
-		return fmt.Errorf("goalrun: seed overlap conflict on %s generation: %d != %d", label, a.Generation, b.Generation)
-	}
-	if err := check("provider", a.Provider, b.Provider); err != nil {
-		return err
-	}
-	if err := check("model", a.Model, b.Model); err != nil {
-		return err
-	}
-	if err := check("depth", a.Depth, b.Depth); err != nil {
-		return err
-	}
-	if err := check("permission", a.Permission, b.Permission); err != nil {
-		return err
-	}
-	if err := check("account_ref", a.AccountRef, b.AccountRef); err != nil {
-		return err
-	}
-	if err := check("install_ref", a.InstallRef, b.InstallRef); err != nil {
-		return err
-	}
-	if err := check("window_kind", a.WindowKind, b.WindowKind); err != nil {
-		return err
+	if !reflect.DeepEqual(a, b) {
+		return fmt.Errorf("goalrun: seed overlap conflict on %s (full ChildOutcome DeepEqual required)", label)
 	}
 	return nil
 }
@@ -174,9 +142,15 @@ func requireCanonicalPriorAttempt(prior workflowrun.ChildOutcome, workItemID, pl
 // for some g = ParseAttemptGeneration(att) >= 0. Returns that g or error.
 // Cross-plan / malformed / empty IDs fail closed (never invent next gen).
 func parseAndValidateAbortedAttempt(workItemID, att, planDigest, runID string) (int, error) {
-	att = strings.TrimSpace(att)
+	// Durable identity is byte-exact: reject whitespace padding; never TrimSpace-normalize.
 	if att == "" {
 		return -1, fmt.Errorf("goalrun: aborted %s empty attempt_id (fail closed)", workItemID)
+	}
+	if att != strings.TrimSpace(att) {
+		return -1, fmt.Errorf("goalrun: aborted %s attempt_id has surrounding whitespace %q (byte-nonexact; fail closed)", workItemID, att)
+	}
+	if workItemID != strings.TrimSpace(workItemID) {
+		return -1, fmt.Errorf("goalrun: aborted work_item_id has surrounding whitespace %q (byte-nonexact; fail closed)", workItemID)
 	}
 	g := workflowrun.ParseAttemptGeneration(att)
 	if g < 0 {
@@ -247,7 +221,7 @@ func validateAttemptGenerationEntries(gens map[string]int, aborted map[string]st
 		}
 		// next is the 0-indexed attempt suffix used for the next launch.
 		nextID := workflowrun.AttemptID(id, planDigest, runID, next)
-		if strings.TrimSpace(att) != "" && att == nextID {
+		if att != "" && att == nextID {
 			return fmt.Errorf("goalrun: aborted %s would relaunch same attempt_id %q", id, att)
 		}
 	}
@@ -302,13 +276,14 @@ func validateParentResumeAgainstGraph(
 		if p.WorkItemID != id {
 			return fmt.Errorf("goalrun: parent preflight PriorSucceeded key %q != work_item_id %q (fail closed before eventlog/inventory)", id, p.WorkItemID)
 		}
-		if !strings.EqualFold(strings.TrimSpace(p.Terminal), "succeeded") {
+		// Exact durable terminal identity (no EqualFold / TrimSpace normalize).
+		if p.Terminal != string(workgraph.TermSucceeded) {
 			return fmt.Errorf("goalrun: parent preflight prior %s terminal %q != succeeded", id, p.Terminal)
 		}
-		if strings.TrimSpace(p.OutputEvidence) == "" {
+		if p.OutputEvidence == "" {
 			return fmt.Errorf("goalrun: parent preflight prior %s missing output_evidence", id)
 		}
-		if strings.TrimSpace(p.Provider) == "" || strings.TrimSpace(p.Model) == "" {
+		if p.Provider == "" || p.Model == "" {
 			return fmt.Errorf("goalrun: parent preflight prior %s missing provider/model", id)
 		}
 		pr, ok := routeByID[id]
@@ -345,20 +320,23 @@ func validateParentResumeAgainstGraph(
 }
 
 // loadAndValidateResumeSeeds performs read-only durable loads, envelope
-// validation, and seed merge BEFORE any eventlog/claim/reserve/launch side effect.
+// validation, seed merge, and full WorkflowKids → PriorOutcomes validation
+// (cross-bound to the existing event log) BEFORE any inventory/ledger/
+// eventlog-open/claim/reserve/launch side effect.
 //
 // Resume=true with no valid durable checkpoint/partial fails closed.
 // Caller PriorSucceeded must not bypass the parent envelope: only merge when
 // exact-equal to durable, or fail as unbound.
 //
-// Aborted attempt IDs are parsed and validated against AttemptID(workItem,
-// currentPlan, runID, g); next generation is always g+1. Final validation runs
-// AFTER all durable sources are merged. Never relaunch an aborted attempt ID.
+// priorOutcomes is the complete validated attempt set for Request.PriorOutcomes.
+// AbortedAttempts entries must appear in that set (legacy partial without
+// WorkflowKids cannot qualify history-rich resume). Never invent kids from events.
 func loadAndValidateResumeSeeds(
 	homeDir, projectID, runID, graphID, planDigest, graphDigest string,
+	graphVersion int,
 	resume bool,
 	callerPrior map[string]workflowrun.ChildOutcome,
-) (prior map[string]workflowrun.ChildOutcome, attemptGen map[string]int, loadedCP Checkpoint, hasCP bool, err error) {
+) (prior map[string]workflowrun.ChildOutcome, attemptGen map[string]int, priorOutcomes []workflowrun.ChildOutcome, loadedCP Checkpoint, hasCP bool, loadedPart workflowrun.PartialCheckpoint, hasPart bool, err error) {
 	attemptGen = map[string]int{}
 	var (
 		cpOK    bool
@@ -374,7 +352,7 @@ func loadAndValidateResumeSeeds(
 	switch {
 	case cpErr == nil:
 		if vErr := validateCheckpointEnvelope(cp, projectID, runID, graphID, planDigest, graphDigest); vErr != nil {
-			return nil, nil, Checkpoint{}, false, vErr
+			return nil, nil, nil, Checkpoint{}, false, workflowrun.PartialCheckpoint{}, false, vErr
 		}
 		cpOK = true
 		loadedCP = cp
@@ -382,24 +360,26 @@ func loadAndValidateResumeSeeds(
 	case osIsNotExist(cpErr):
 		// absent is ok unless Resume requires a durable envelope
 	default:
-		return nil, nil, Checkpoint{}, false, fmt.Errorf("goalrun: resume load checkpoint: %w", cpErr)
+		return nil, nil, nil, Checkpoint{}, false, workflowrun.PartialCheckpoint{}, false, fmt.Errorf("goalrun: resume load checkpoint: %w", cpErr)
 	}
 
 	part, partErr := workflowrun.LoadPartialPrior(homeDir, projectID, runID)
 	switch {
 	case partErr == nil:
-		if vErr := validatePartialEnvelope(part, projectID, runID, planDigest, graphDigest); vErr != nil {
-			return nil, nil, Checkpoint{}, false, vErr
+		if vErr := validatePartialEnvelope(part, projectID, runID, graphID, planDigest, graphDigest, graphVersion); vErr != nil {
+			return nil, nil, nil, Checkpoint{}, false, workflowrun.PartialCheckpoint{}, false, vErr
 		}
 		partOK = true
+		loadedPart = part
+		hasPart = true
 	case osIsNotExist(partErr):
 		// absent ok
 	default:
-		return nil, nil, Checkpoint{}, false, fmt.Errorf("goalrun: resume load partial: %w", partErr)
+		return nil, nil, nil, Checkpoint{}, false, workflowrun.PartialCheckpoint{}, false, fmt.Errorf("goalrun: resume load partial: %w", partErr)
 	}
 
 	if resume && !cpOK && !partOK {
-		return nil, nil, Checkpoint{}, false, fmt.Errorf(
+		return nil, nil, nil, Checkpoint{}, false, workflowrun.PartialCheckpoint{}, false, fmt.Errorf(
 			"goalrun: resume requires valid durable checkpoint or partial (none present or readable); fail closed before eventlog/spend")
 	}
 
@@ -407,17 +387,17 @@ func loadAndValidateResumeSeeds(
 	if cpOK {
 		durable, err = mergePriorSucceededMaps(nil, cp.PriorSucceeded, "checkpoint")
 		if err != nil {
-			return nil, nil, Checkpoint{}, false, err
+			return nil, nil, nil, Checkpoint{}, false, workflowrun.PartialCheckpoint{}, false, err
 		}
 		aborted, err = mergeAbortedMaps(nil, cp.AbortedAttempts, "checkpoint")
 		if err != nil {
-			return nil, nil, Checkpoint{}, false, err
+			return nil, nil, nil, Checkpoint{}, false, workflowrun.PartialCheckpoint{}, false, err
 		}
 		// Checkpoint AttemptGeneration (if present) seeds nonnegative floors;
 		// aborted IDs still override via parse→g+1 after full merge.
 		for id, g0 := range cp.AttemptGeneration {
 			if g0 < 0 {
-				return nil, nil, Checkpoint{}, false, fmt.Errorf("goalrun: attempt_generation[%s]=%d negative", id, g0)
+				return nil, nil, nil, Checkpoint{}, false, workflowrun.PartialCheckpoint{}, false, fmt.Errorf("goalrun: attempt_generation[%s]=%d negative", id, g0)
 			}
 			attemptGen[id] = g0
 		}
@@ -425,36 +405,29 @@ func loadAndValidateResumeSeeds(
 	if partOK {
 		durable, err = mergePriorSucceededMaps(durable, part.PriorSucceeded, "checkpoint-vs-partial")
 		if err != nil {
-			return nil, nil, Checkpoint{}, false, err
+			return nil, nil, nil, Checkpoint{}, false, workflowrun.PartialCheckpoint{}, false, err
 		}
 		aborted, err = mergeAbortedMaps(aborted, part.Aborted, "checkpoint-vs-partial")
 		if err != nil {
-			return nil, nil, Checkpoint{}, false, err
+			return nil, nil, nil, Checkpoint{}, false, workflowrun.PartialCheckpoint{}, false, err
 		}
 	}
 
 	// --- parse every aborted ID AFTER merge; next = g+1 (never hardcode 1) ---
-	// Build attemptGen from aborted as authoritative next launch generation.
-	// Start fresh for aborted-driven next so checkpoint AttemptGeneration floors
-	// cannot force relaunch of a higher aborted g.
 	fromAborted := map[string]int{}
 	if err := mergeAbortedIntoAttemptGen(fromAborted, aborted, planDigest, runID, "aborted"); err != nil {
-		return nil, nil, Checkpoint{}, false, err
+		return nil, nil, nil, Checkpoint{}, false, workflowrun.PartialCheckpoint{}, false, err
 	}
-	// Merge: max(next from aborted, checkpoint AttemptGeneration floors).
 	for id, next := range fromAborted {
 		if prev, ok := attemptGen[id]; ok && prev > next {
-			// Higher floor already set — still must not equal aborted ID.
 			continue
 		}
 		attemptGen[id] = next
 	}
-	// For aborted keys only in fromAborted, ensure present.
 	for id, next := range fromAborted {
 		if _, ok := attemptGen[id]; !ok {
 			attemptGen[id] = next
 		}
-		// Prefer aborted-derived next when it is higher (safer no-relaunch).
 		if attemptGen[id] < next {
 			attemptGen[id] = next
 		}
@@ -463,35 +436,77 @@ func loadAndValidateResumeSeeds(
 	// Caller PriorSucceeded: no unbound product resume seeds.
 	if len(callerPrior) > 0 {
 		if resume && !cpOK && !partOK {
-			return nil, nil, Checkpoint{}, false, fmt.Errorf(
+			return nil, nil, nil, Checkpoint{}, false, workflowrun.PartialCheckpoint{}, false, fmt.Errorf(
 				"goalrun: caller PriorSucceeded unbound without validated durable envelope (fail closed)")
 		}
 		if len(durable) == 0 {
-			return nil, nil, Checkpoint{}, false, fmt.Errorf(
+			return nil, nil, nil, Checkpoint{}, false, workflowrun.PartialCheckpoint{}, false, fmt.Errorf(
 				"goalrun: caller PriorSucceeded unbound without durable checkpoint/partial envelope (fail closed)")
 		}
-		// Every caller id must exist in durable and exact-equal.
 		for id, c := range callerPrior {
 			d, ok := durable[id]
 			if !ok {
-				return nil, nil, Checkpoint{}, false, fmt.Errorf(
+				return nil, nil, nil, Checkpoint{}, false, workflowrun.PartialCheckpoint{}, false, fmt.Errorf(
 					"goalrun: caller PriorSucceeded[%s] unbound (not in durable envelope)", id)
 			}
 			if err := childOutcomesExactlyEqual(d, c, "caller-vs-durable:"+id); err != nil {
-				return nil, nil, Checkpoint{}, false, err
+				return nil, nil, nil, Checkpoint{}, false, workflowrun.PartialCheckpoint{}, false, err
 			}
 		}
 	}
 
-	// --- final validation AFTER all durable sources merged ---
+	// --- final PriorSucceeded validation ---
 	for id, p := range durable {
 		if err := requireCanonicalPriorAttempt(p, id, planDigest, runID); err != nil {
-			return nil, nil, Checkpoint{}, false, err
+			return nil, nil, nil, Checkpoint{}, false, workflowrun.PartialCheckpoint{}, false, err
 		}
 	}
 	if err := validateAttemptGenerationEntries(attemptGen, aborted, planDigest, runID); err != nil {
-		return nil, nil, Checkpoint{}, false, err
+		return nil, nil, nil, Checkpoint{}, false, workflowrun.PartialCheckpoint{}, false, err
 	}
 
-	return durable, attemptGen, loadedCP, hasCP, nil
+	// --- PriorOutcomes: merge durable WorkflowKids, cross-bind event log (read-only) ---
+	// BEFORE inventory/ledger/OpenEventLog/claim/reserve/launch.
+	id := lifecycleBindIdentity{
+		ProjectID: projectID, RunID: runID,
+		PlanDigest: planDigest, GraphDigest: graphDigest,
+		GraphID: graphID, GraphVersion: graphVersion,
+	}
+	var rawKids []workflowrun.ChildOutcome
+	if cpOK {
+		rawKids = append(rawKids, cp.WorkflowKids...)
+	}
+	if partOK {
+		rawKids = append(rawKids, part.WorkflowKids...)
+	}
+	cpElog, partElog := "", ""
+	if cpOK {
+		cpElog = cp.EventLogPath
+	}
+	if partOK {
+		partElog = part.EventLogPath
+	}
+	// Canonical path only; durable stamps must exact-match when present.
+	// Path/symlink/mismatch errors are always authority failures (never swallowed).
+	elogPath, eperr := resolveCanonicalEventLogPath(homeDir, projectID, runID, cpElog, partElog)
+	if eperr != nil {
+		return nil, nil, nil, Checkpoint{}, false, workflowrun.PartialCheckpoint{}, false, eperr
+	}
+	// If kids/aborted present, event log file must exist at canonical path.
+	if len(rawKids) > 0 || len(aborted) > 0 {
+		if st, serr := os.Stat(elogPath); serr != nil || st.IsDir() || st.Size() == 0 {
+			return nil, nil, nil, Checkpoint{}, false, workflowrun.PartialCheckpoint{}, false, fmt.Errorf(
+				"goalrun: PriorOutcomes requires existing non-empty canonical event log at %s (fail closed before spend): %v", elogPath, serr)
+		}
+	}
+	priorOutcomes, err = validateAndMergePriorOutcomes(rawKids, aborted, elogPath, id)
+	if err != nil {
+		return nil, nil, nil, Checkpoint{}, false, workflowrun.PartialCheckpoint{}, false, err
+	}
+	// PriorSucceeded must be full-row exact subset of PriorOutcomes when outcomes exist.
+	if err := requirePriorSucceededExactSubset(durable, priorOutcomes); err != nil {
+		return nil, nil, nil, Checkpoint{}, false, workflowrun.PartialCheckpoint{}, false, err
+	}
+
+	return durable, attemptGen, priorOutcomes, loadedCP, hasCP, loadedPart, hasPart, nil
 }

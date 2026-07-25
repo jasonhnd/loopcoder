@@ -306,18 +306,28 @@ func agWindowToSnapshot(w *agUsageWindow, source QuotaTelemetrySource, installID
 	windowKind := WindowProviderDefined
 	_ = w.WindowMinutes
 
+	gaps := []string{"remaining-derived-from-used-percent", "missing-exact-account-identity"}
 	resetAt := strings.TrimSpace(w.ResetsAt)
+	resetSemantics := ResetUnknown
 	if resetAt != "" {
 		if t, err := time.Parse(time.RFC3339, resetAt); err == nil {
 			resetAt = t.UTC().Format(time.RFC3339)
+			resetSemantics = ResetWindowBoundary
 		} else {
 			resetAt = ""
+			gaps = append(gaps, "invalid-reset-at")
 		}
+	} else {
+		gaps = append(gaps, "missing-reset-at")
 	}
 	captured := now
 	if u := strings.TrimSpace(updatedAt); u != "" {
 		if t, err := time.Parse(time.RFC3339, u); err == nil {
 			captured = t.UTC()
+		} else {
+			// The command response is still observed now, but the provider's
+			// own updatedAt cannot be asserted as its observation timestamp.
+			gaps = append(gaps, "invalid-observed-at")
 		}
 	}
 
@@ -330,6 +340,11 @@ func agWindowToSnapshot(w *agUsageWindow, source QuotaTelemetrySource, installID
 	resetConf := ConfidenceUnknown
 	if resetAt != "" {
 		resetConf = ConfidenceExact
+	}
+	terminal := ""
+	if remaining == 0 {
+		terminal = "ErrQuotaExhausted"
+		gaps = append(gaps, "quota-exhausted")
 	}
 
 	name = safeProviderQuantityName(name)
@@ -347,7 +362,7 @@ func agWindowToSnapshot(w *agUsageWindow, source QuotaTelemetrySource, installID
 		WindowKind:             windowKind,
 		RollingDurationMS:      int64(w.WindowMinutes) * 60 * 1000,
 		ResetAt:                resetAt,
-		ResetSemantics:         ResetWindowBoundary,
+		ResetSemantics:         resetSemantics,
 		LimitValue:             &limit,
 		UsedValue:              &used,
 		RemainingValue:         &remaining,
@@ -366,10 +381,11 @@ func agWindowToSnapshot(w *agUsageWindow, source QuotaTelemetrySource, installID
 			"antigravity codexbar usage window %s used %d percent remaining derived %d percent window minutes %d",
 			name, used, remaining, w.WindowMinutes,
 		),
-		GapReasons:    []string{"remaining-derived-from-used-percent"},
-		CreatedAt:     formatTime(now),
-		UpdatedAt:     formatTime(now),
-		PolicyVersion: PolicyVersion,
+		GapReasons:        gaps,
+		TerminalErrorCode: terminal,
+		CreatedAt:         formatTime(now),
+		UpdatedAt:         formatTime(now),
+		PolicyVersion:     PolicyVersion,
 	})
 	return snap, true
 }

@@ -93,11 +93,23 @@ func TestExecute_DiversifyUsedProvider_AtomicAlternateIdentity(t *testing.T) {
 		t.Fatalf("need multi-child plan, got %d", len(res.Children))
 	}
 
-	// Product path must produce provider diversity when inventory has two companies.
-	if len(res.ProvidersUsed) < 2 {
-		t.Fatalf("want multi-provider diversification (usedProviders), got providers=%v children=%+v",
-			res.ProvidersUsed, res.Children)
+	// FakeChildExecutor cannot satisfy actual ProvidersUsed/MultiProviderOK.
+	// Structural diversification is Planned* only — actual usage stays empty/false.
+	if res.MultiProviderOK || res.MultiModelOrDepthOK || len(res.ProvidersUsed) > 0 || len(res.ModelsUsed) > 0 || len(res.DepthsUsed) > 0 {
+		t.Fatalf("fake executor must not claim actual multi-provider/usage: MultiProviderOK=%v MultiModelOrDepthOK=%v ProvidersUsed=%v ModelsUsed=%v DepthsUsed=%v",
+			res.MultiProviderOK, res.MultiModelOrDepthOK, res.ProvidersUsed, res.ModelsUsed, res.DepthsUsed)
 	}
+	planProvs := map[string]bool{}
+	for _, c := range res.Children {
+		if c.Provider != "" && !c.Unavailable {
+			planProvs[c.Provider] = true
+		}
+	}
+	if len(planProvs) < 2 {
+		t.Fatalf("want multi-provider route plans, got planned=%v children=%+v", planProvs, res.Children)
+	}
+	// Non-dry-run still records Planned* only when collectPlanned runs on dry-run;
+	// child plan providers remain the structural proof for executed fake path.
 
 	// Atomic identity: provider-bound account must not cross-wire to the other company.
 	for _, c := range res.Children {

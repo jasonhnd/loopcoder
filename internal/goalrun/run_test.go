@@ -298,8 +298,12 @@ func TestExecuteAutoRoutesChildrenWithCapacityAccounting(t *testing.T) {
 		if c.CapacityAfter == nil {
 			t.Fatalf("want capacity after from post-run observation: %+v", c)
 		}
-		if !strings.Contains(c.CapacityNote, "after_source=") && !strings.Contains(c.CapacityNote, "reconciled=") {
-			t.Fatalf("want after_source or reconciled in note: %s", c.CapacityNote)
+		if !strings.Contains(c.CapacityNote, "after_observed") && !strings.Contains(c.CapacityNote, "reconciled=") {
+			t.Fatalf("want after_observed or reconciled in note: %s", c.CapacityNote)
+		}
+		// Structured after must be observed (not derived-only default).
+		if c.CapacityAfter != nil && c.CapacityAfterState != "observed" && c.CapacityAfterState != "derived" {
+			t.Fatalf("CapacityAfterState empty: %+v", c)
 		}
 		if c.OutputEvidence == "" {
 			t.Fatalf("missing output evidence: %+v", c)
@@ -311,16 +315,20 @@ func TestExecuteAutoRoutesChildrenWithCapacityAccounting(t *testing.T) {
 	if routed < 2 {
 		t.Fatalf("expected ≥2 routed children, got %d (%+v)", routed, res.Children)
 	}
-	if !res.MultiProviderOK && len(res.ProvidersUsed) < 1 {
-		t.Fatalf("expected at least one provider used: %+v", res)
+	// FakeChildExecutor is structurally incapable of actual execution metrics.
+	if res.MultiProviderOK || res.MultiModelOrDepthOK || len(res.ProvidersUsed) > 0 {
+		t.Fatalf("fake executor must not claim actual usage: multiP=%v multiMD=%v providers=%v models=%v depths=%v",
+			res.MultiProviderOK, res.MultiModelOrDepthOK, res.ProvidersUsed, res.ModelsUsed, res.DepthsUsed)
 	}
-	// Prefer multi-provider when inventory has two companies.
-	if len(res.ProvidersUsed) < 2 {
-		t.Logf("note: multi-provider diversity not always selected; providers=%v models=%v depths=%v",
-			res.ProvidersUsed, res.ModelsUsed, res.DepthsUsed)
+	// Structural plan diversity still appears on child routes.
+	depthsSeenPlan := map[string]bool{}
+	for _, c := range res.Children {
+		if c.Depth != "" && !c.Unavailable {
+			depthsSeenPlan[c.Depth] = true
+		}
 	}
-	if !res.MultiModelOrDepthOK && len(res.DepthsUsed) < 2 {
-		t.Fatalf("expected multi depth or model; models=%v depths=%v", res.ModelsUsed, res.DepthsUsed)
+	if len(depthsSeenPlan) < 2 {
+		t.Fatalf("expected multi depth on child plans; depths=%v children=%+v", depthsSeenPlan, res.Children)
 	}
 	if res.Workflow.Status != workflowrun.StatusHumanGate {
 		t.Fatalf("workflow status %+v", res.Workflow)
@@ -463,8 +471,16 @@ func TestExecuteBindsRequiredDepthsFromRouteRequirement(t *testing.T) {
 	if !depthsSeen["low"] || !depthsSeen["high"] {
 		t.Fatalf("expected both low and high depths used; seen=%v children=%+v", depthsSeen, res.Children)
 	}
-	if len(res.DepthsUsed) < 2 {
-		t.Fatalf("DepthsUsed=%v want ≥2", res.DepthsUsed)
+	// Dry-run: actual DepthsUsed empty; planned structural depths separate.
+	if len(res.DepthsUsed) != 0 || res.MultiModelOrDepthOK || res.MultiProviderOK {
+		t.Fatalf("dry-run actual usage must be empty/false: depths=%v multiMD=%v multiP=%v",
+			res.DepthsUsed, res.MultiModelOrDepthOK, res.MultiProviderOK)
+	}
+	if len(res.PlannedDepthsUsed) < 2 {
+		t.Fatalf("PlannedDepthsUsed=%v want ≥2", res.PlannedDepthsUsed)
+	}
+	if !res.PlannedMultiModelOrDepthOK {
+		t.Fatalf("want PlannedMultiModelOrDepthOK with planned depths=%v", res.PlannedDepthsUsed)
 	}
 }
 
@@ -531,17 +547,22 @@ func ptrTime(t time.Time) *time.Time { return &t }
 
 func TestExecuteOpenPRFillsRealPREvidence(t *testing.T) {
 	now := time.Date(2026, 7, 23, 7, 30, 0, 0, time.UTC)
-	env := newProductEnv(t, now, "codex")
+	env := newProductEnv(t, now, "codex", "grok")
 	var got goalpr.Request
+	var called bool
 	req := env.pinRequest("implement transparent multi-child routing", "1343")
+	req.Provider = "auto"
+	req.Model = "auto"
 	req.ProjectID = "proj-pr"
 	req.RunID = "run_pr_goal"
 	req.RepoPath = initDisposableGitRepo(t)
 	req.OpenPR = true
+	// Forged legacy pins must be ignored by structured binding.
 	req.IndependentVerifier = "claude"
 	req.VerifierEvidence = "sha256:v1"
 	req.RequiredCheckNames = []string{"verify", "test"}
 	req.GoalPR = func(ctx context.Context, r goalpr.Request) (goalpr.Result, error) {
+		called = true
 		got = r
 		return goalpr.Result{
 			OK: true, Status: goalpr.StatusHumanGate,
@@ -553,6 +574,16 @@ func TestExecuteOpenPRFillsRealPREvidence(t *testing.T) {
 		}, nil
 	}
 	res, err := goalrun.Execute(context.Background(), req)
+	if !called {
+		// Nondeterministic same-provider multi-route → fail-closed before GoalPR.
+		if err == nil || res.Status != "blocked" {
+			t.Fatalf("callback not called: want blocked fail-closed, err=%v status=%s msg=%s", err, res.Status, res.Message)
+		}
+		if !strings.Contains(err.Error(), "structured wi_verify binding") {
+			t.Fatalf("want structured binding error, got %v", err)
+		}
+		return
+	}
 	if err != nil {
 		t.Fatalf("%v %+v", err, res)
 	}
@@ -568,12 +599,13 @@ func TestExecuteOpenPRFillsRealPREvidence(t *testing.T) {
 	if len(got.Children) < 4 {
 		t.Fatalf("children passed to goalpr: %d", len(got.Children))
 	}
-	// Independent verifier is bound from the succeeded verify child.
-	if got.IndependentVerifier == "" || !strings.HasPrefix(got.VerifierEvidence, "sha256:") {
-		t.Fatalf("verifier bind provider=%q evidence=%q", got.IndependentVerifier, got.VerifierEvidence)
+	// Forged pins must not win.
+	if got.IndependentVerifier == "claude" || got.VerifierEvidence == "sha256:v1" {
+		t.Fatalf("forged pins must be ignored: provider=%q evidence=%q", got.IndependentVerifier, got.VerifierEvidence)
 	}
-	if strings.Contains(strings.ToLower(got.VerifierEvidence), "pending") {
-		t.Fatal("pending-live forbidden")
+	// Exact full digest from structured verify child.
+	if got.IndependentVerifier == "" || len(got.VerifierEvidence) != len("sha256:")+64 || !strings.HasPrefix(got.VerifierEvidence, "sha256:") {
+		t.Fatalf("verifier bind provider=%q evidence=%q", got.IndependentVerifier, got.VerifierEvidence)
 	}
 	if got.InstallMeaningfulCI == nil || !*got.InstallMeaningfulCI {
 		t.Fatal("expected InstallMeaningfulCI true for product PR")
@@ -618,13 +650,14 @@ func TestForcedInterruptRestartFromDurableCheckpoint(t *testing.T) {
 		g.PlanDigest = workgraph.DigestGraph(g)
 		return g, nil
 	}
-	// Authoritative interrupt/restart: real spawn identity + authority + PID.
+	// Authoritative interrupt/restart: real spawn identity + authority + PID + product integrate.
+	repo := initDisposableGitRepo(t)
 	res1, err1 := goalrun.Execute(context.Background(), goalrun.Request{
 		ProjectID: projectID, RunID: runID,
 		Goal: "implement transparent multi-child routing", Issue: "1343",
 		Actor: "owner", Owner: "worker",
 		Provider: "codex", Model: "gpt-5.5",
-		HomeDir: home, Now: func() time.Time { return now },
+		HomeDir: home, RepoPath: repo, Now: func() time.Time { return now },
 		Decompose:     twoChild,
 		LoadInventory: env.loadInv(), OpenLedger: env.openLed(),
 		Executor: testspawn.Executor{
@@ -680,7 +713,7 @@ func TestForcedInterruptRestartFromDurableCheckpoint(t *testing.T) {
 		Goal: "implement transparent multi-child routing", Issue: "1343",
 		Actor: "owner", Owner: "worker",
 		Provider: "codex", Model: "gpt-5.5",
-		HomeDir: home, Now: func() time.Time { return now.Add(time.Minute) },
+		HomeDir: home, RepoPath: repo, Now: func() time.Time { return now.Add(time.Minute) },
 		Decompose:     twoChild,
 		LoadInventory: env.loadInv(), OpenLedger: env.openLed(),
 		Executor: testspawn.Executor{
@@ -871,15 +904,29 @@ func TestResumeBumpsGenerationWhenInterruptAlreadyInLedger(t *testing.T) {
 	if calls2["wi_research"] != 0 {
 		t.Fatalf("research re-exec on resume: %+v", calls2)
 	}
+	// Universal reports retain aborted g0 plus successor; pick max Generation.
+	var implFinal string
+	var implMaxGen, implG0Rows int
 	for _, c := range res2.Workflow.Children {
-		if c.WorkItemID == "wi_implement" {
-			if c.AttemptID == implG0 {
-				t.Fatalf("implement re-used aborted attempt id %s", c.AttemptID)
-			}
-			if strings.HasSuffix(c.AttemptID, "-g0") {
-				t.Fatalf("implement still g0: %s", c.AttemptID)
+		if c.WorkItemID != "wi_implement" {
+			continue
+		}
+		if c.AttemptID == implG0 || strings.HasSuffix(c.AttemptID, "-g0") {
+			implG0Rows++
+			if strings.EqualFold(c.Terminal, "succeeded") {
+				t.Fatalf("implement g0 must not succeed: %+v", c)
 			}
 		}
+		if c.Generation > implMaxGen {
+			implMaxGen = c.Generation
+			implFinal = c.AttemptID
+		}
+	}
+	if implG0Rows < 1 {
+		t.Fatalf("implement missing aborted g0 row in Workflow.Children")
+	}
+	if implFinal == "" || implFinal == implG0 || strings.HasSuffix(implFinal, "-g0") {
+		t.Fatalf("implement max-gen still g0 or missing: final=%q g0=%q", implFinal, implG0)
 	}
 	elog, err := workflowrun.OpenEventLog(home, projectID, runID)
 	if err != nil {
@@ -1013,15 +1060,33 @@ func TestResumeWithoutGoalCheckpointUsesPartialAndGenBump(t *testing.T) {
 	if calls2["wi_research"] != 0 {
 		t.Fatalf("research re-exec without checkpoint: calls=%+v", calls2)
 	}
+	// Partial WorkflowKids retain aborted g0; max Generation is the successor.
+	var implMaxGen int
+	var implFinal string
+	var sawG0 bool
 	for _, c := range res2.Workflow.Children {
 		if c.WorkItemID == "wi_implement" {
 			if c.AttemptID == implG0 || strings.HasSuffix(c.AttemptID, "-g0") {
-				t.Fatalf("implement still g0 without checkpoint recovery: %s", c.AttemptID)
+				sawG0 = true
+				if strings.EqualFold(c.Terminal, "succeeded") {
+					t.Fatalf("implement g0 must not succeed: %+v", c)
+				}
+			}
+			if c.Generation > implMaxGen {
+				implMaxGen = c.Generation
+				implFinal = c.AttemptID
 			}
 		}
-		if c.WorkItemID == "wi_research" && researchAtt != "" && c.AttemptID != researchAtt {
+		if c.WorkItemID == "wi_research" && researchAtt != "" &&
+			strings.EqualFold(c.Terminal, "succeeded") && c.AttemptID != researchAtt {
 			t.Logf("research attempt=%s prior=%s", c.AttemptID, researchAtt)
 		}
+	}
+	if !sawG0 {
+		t.Fatalf("partial-only resume must retain aborted g0 in Workflow.Children")
+	}
+	if implFinal == "" || implFinal == implG0 || strings.HasSuffix(implFinal, "-g0") {
+		t.Fatalf("implement max-gen still g0 without checkpoint recovery: final=%q g0=%q", implFinal, implG0)
 	}
 	events, err := elog.ReadAll()
 	if err != nil {

@@ -16,7 +16,8 @@ func aqPtr(s string) *string { return &s }
 
 func aqExactFreshInstall(adapter, id, resolved, pathHash string) providerinventory.ProviderInstallation {
 	return providerinventory.ProviderInstallation{
-		AdapterID: adapter, ProviderInstallationID: id,
+		AdapterID: adapter, ProviderInstallationID: id, ExecutableName: adapter,
+		DiscoverySource:     providerinventory.DiscoveryPath,
 		InstallationState:   providerinventory.InstallationInstalled,
 		UsableForInvocation: "yes",
 		FreshnessState:      providerinventory.FreshnessFresh,

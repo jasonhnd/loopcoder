@@ -31,7 +31,18 @@ type CROMeasurement struct {
 	ChildCount          int
 	EvidenceRefs        map[string]string
 	Probes              []Probe
-	MultiProviderOK     bool // catalog/status presence only (structural)
+	// MultiProviderOK is catalog/status structural presence only — never actual
+	// execution. Prefer Planned* from dry-run goal JSON when present.
+	MultiProviderOK bool
+	// Planned* from workflow goal --dry-run JSON (goalrun.Result). Actual
+	// providers_used / multi_provider_ok must stay empty/false on dry-run.
+	PlannedProvidersUsed       []string
+	PlannedModelsUsed          []string
+	PlannedDepthsUsed          []string
+	PlannedMultiProviderOK     bool
+	PlannedMultiModelOrDepthOK bool
+	// ActualUsageEmpty is true when dry-run JSON has empty actual usage fields.
+	ActualUsageEmpty bool
 }
 
 // MeasureCROFromBinary runs the extracted binary for workflow plan + auto-route
@@ -133,15 +144,44 @@ func MeasureCROFromBinary(bin, workDir string, envBase []string) (CROMeasurement
 	t3 := time.Now()
 	goalOut, goalErr, goalCode := runBin(bin, env, workDir, "workflow", "goal",
 		"--goal", "implement multi-provider capacity-aware routing with tests and verification",
-		"--issue", "1343", "--format", "human", "--dry-run",
+		"--issue", "1343", "--format", "json", "--dry-run",
 		"--repo", workDir,
 		"--capacity-snapshot", snapPath)
 	goalCombined := string(goalOut) + string(goalErr)
-	// Structural probe only — never claim real multi-depth runtime.
+	// Parse Planned* structural fields; actual usage must stay empty on dry-run.
+	var goalJSON map[string]any
+	if json.Unmarshal(goalOut, &goalJSON) == nil {
+		out.PlannedProvidersUsed = stringSliceField(goalJSON, "planned_providers_used")
+		out.PlannedModelsUsed = stringSliceField(goalJSON, "planned_models_used")
+		out.PlannedDepthsUsed = stringSliceField(goalJSON, "planned_depths_used")
+		if v, ok := goalJSON["planned_multi_provider_ok"].(bool); ok {
+			out.PlannedMultiProviderOK = v
+		}
+		if v, ok := goalJSON["planned_multi_model_or_depth_ok"].(bool); ok {
+			out.PlannedMultiModelOrDepthOK = v
+		}
+		actualProv := stringSliceField(goalJSON, "providers_used")
+		actualModels := stringSliceField(goalJSON, "models_used")
+		actualDepths := stringSliceField(goalJSON, "depths_used")
+		multiP, _ := goalJSON["multi_provider_ok"].(bool)
+		multiMD, _ := goalJSON["multi_model_or_depth_ok"].(bool)
+		out.ActualUsageEmpty = len(actualProv) == 0 && len(actualModels) == 0 && len(actualDepths) == 0 && !multiP && !multiMD
+		if len(out.PlannedProvidersUsed) > 0 {
+			out.ProvidersSeen = uniqueStrings(append(out.ProvidersSeen, out.PlannedProvidersUsed...))
+		}
+		if len(out.PlannedDepthsUsed) > 0 {
+			out.DepthsSeen = uniqueStrings(append(out.DepthsSeen, out.PlannedDepthsUsed...))
+			out.EvidenceRefs["planned_depths"] = "probe:goal_dry_run_planned_depths"
+		}
+		if out.PlannedMultiProviderOK {
+			out.EvidenceRefs["planned_multi_provider"] = "probe:goal_dry_run_planned_multi_provider"
+		}
+	}
+	// Structural probe only — never claim real multi-depth runtime from dry-run.
 	out.Probes = append(out.Probes, Probe{
 		Name: "structural_goal_dry_run", ExitCode: goalCode, Passed: goalCode == 0 || goalCode == 1,
 		Duration: time.Since(t3), OutputDigest: digestBytes([]byte(goalCombined)),
-		Reasons: []string{"structural_only: dry-run cannot satisfy real_runtime multi_depth/capacity_after/PR metrics"},
+		Reasons: []string{"structural_only: dry-run Planned* only; actual multi_provider/multi_depth stay false"},
 	})
 
 	// 5) Structural only: injected exhausted snapshot routing (deterministic).
@@ -217,6 +257,25 @@ func digestBytes(b []byte) string {
 	}
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
+}
+
+// stringSliceField extracts a JSON string array field from an untyped map.
+func stringSliceField(m map[string]any, key string) []string {
+	raw, ok := m[key]
+	if !ok || raw == nil {
+		return nil
+	}
+	arr, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, v := range arr {
+		if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func uniqueStrings(in []string) []string {

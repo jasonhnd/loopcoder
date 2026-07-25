@@ -71,8 +71,10 @@ func TestWorkflowRunChainDevFixture(t *testing.T) {
 	if wrap.ClaimCount != 3 {
 		t.Fatalf("%+v", wrap)
 	}
-	if strings.Join(wrap.Integrated, ",") != "a,b,c" {
-		t.Fatalf("integrated %v", wrap.Integrated)
+	// Dev fixtures have no repository or real integrate commit. They must not
+	// fabricate product integration membership from terminal success.
+	if len(wrap.Integrated) != 0 || strings.Contains(stdout.String(), `"integrated"`) {
+		t.Fatalf("dev fixture fabricated integrated product evidence: %s", stdout.String())
 	}
 	if strings.Contains(stdout.String(), `"human_gate"`) {
 		t.Fatal("chain dev fixture must not contain human_gate")

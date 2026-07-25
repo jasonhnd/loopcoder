@@ -134,7 +134,7 @@ func TestObserveAfterWithoutInventingActual(t *testing.T) {
 		t.Fatal(err)
 	}
 	// after must be <= before unless reset evidence is supplied
-	e, err := l.ObserveAfter("p", "run-obs", "att-obs", 0.75, "codexbar", "fresh")
+	e, err := l.ObserveAfter("p", "run-obs", "att-obs", 0.75, "codexbar", "fresh", t0())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,6 +143,15 @@ func TestObserveAfterWithoutInventingActual(t *testing.T) {
 	}
 	if e.After == nil || *e.After != 0.75 {
 		t.Fatalf("after=%v want 0.75", e.After)
+	}
+	if e.AfterState != capacityledger.AfterStateObserved {
+		t.Fatalf("AfterState=%q want observed", e.AfterState)
+	}
+	if e.AfterSource != "codexbar" || e.AfterFreshness != "fresh" {
+		t.Fatalf("after meta source=%q fresh=%q", e.AfterSource, e.AfterFreshness)
+	}
+	if e.AfterObservedAt == nil || e.AfterObservedAt.IsZero() {
+		t.Fatal("AfterObservedAt required for observed after")
 	}
 	if e.Freshness != "fresh" {
 		t.Fatalf("freshness=%q", e.Freshness)
@@ -391,7 +400,7 @@ func TestObserveAfterRejectsRiseWithoutReset(t *testing.T) {
 	// after 0.98 > before without reset → fail closed
 	_, err = l.ObserveAfterBound("p", "r", "a1", 0.98, "cli", "fresh", capacityledger.ObserveAfterOpts{
 		AccountRef: e.AccountRef, WindowKind: e.WindowKind,
-		InstallRef: "i-test",
+		InstallRef: "i-test", ObservedAt: t0(),
 	})
 	if err == nil {
 		t.Fatal("want reject rise without reset")
@@ -399,7 +408,7 @@ func TestObserveAfterRejectsRiseWithoutReset(t *testing.T) {
 	// with reset evidence OK
 	e2, err := l.ObserveAfterBound("p", "r", "a1", 0.98, "cli", "fresh", capacityledger.ObserveAfterOpts{
 		AccountRef: e.AccountRef, WindowKind: e.WindowKind,
-		InstallRef:    "i-test",
+		InstallRef: "i-test", ObservedAt: t0(),
 		ResetObserved: true, ResetEvidence: "window_reset_observed",
 	})
 	if err != nil {
@@ -407,6 +416,9 @@ func TestObserveAfterRejectsRiseWithoutReset(t *testing.T) {
 	}
 	if e2.After == nil || *e2.After != 0.98 {
 		t.Fatalf("%+v", e2)
+	}
+	if e2.AfterState != capacityledger.AfterStateObserved {
+		t.Fatalf("AfterState=%q", e2.AfterState)
 	}
 }
 
@@ -428,7 +440,7 @@ func TestObserveAfterRejectsWindowMismatch(t *testing.T) {
 	}
 	_, err = l.ObserveAfterBound("p", "r", "a2", 0.75, "cli", "fresh", capacityledger.ObserveAfterOpts{
 		AccountRef: e.AccountRef, WindowKind: "daily", // wrong window
-		InstallRef: "i-test",
+		InstallRef: "i-test", ObservedAt: t0(),
 	})
 	if err == nil {
 		t.Fatal("want window mismatch")

@@ -2,7 +2,6 @@ package workflowrun
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -61,19 +60,37 @@ func ClassifyTaskRole(workItemID, intent, owner string) TaskRole {
 func AcceptSucceededChild(workItemID, intent, owner string, files []string, worktree, evidence string) error {
 	role := ClassifyTaskRole(workItemID, intent, owner)
 	product := filterProductFiles(files)
-	// Greenfield research surveys often say "no existing tests/implementation" —
-	// that is legitimate scope finding, not empty clarification. Only apply the
-	// clarification gate to research when there is no substantial findings product
-	// (## Provider survey / findings.md body). Implement/tests/verify stay strict.
-	if role == RoleResearch {
+	// Read-only / summary-materialized roles: require durable product first, then
+	// refuse clarification-only bodies even when LoopCoder headers make them long.
+	switch role {
+	case RoleResearch:
 		if len(product) == 0 && !hasAnyFindings(worktree) {
 			return fmt.Errorf("workflowrun: research child %s produced no findings product", workItemID)
 		}
-		if hasSubstantialResearchFindings(worktree, product) {
-			return nil
+		if !hasSubstantialResearchFindings(worktree, product) {
+			if looksLikeClarification(evidence, worktree, product) {
+				return fmt.Errorf("workflowrun: acceptance refused for %s: clarification/empty work is not success", workItemID)
+			}
+			return fmt.Errorf("workflowrun: research child %s findings are not substantial survey product", workItemID)
 		}
-		if looksLikeClarification(evidence, worktree, product) {
-			return fmt.Errorf("workflowrun: acceptance refused for %s: clarification/empty work is not success", workItemID)
+		return nil
+	case RoleVerify:
+		if !hasVerifierVerdict(product, worktree, evidence) {
+			return fmt.Errorf("workflowrun: verify child %s must produce independent verdict with digest over integrated head; clarification refused", workItemID)
+		}
+		return nil
+	case RoleDocs:
+		// Fail closed: filename-only hasDocsProduct is insufficient. At least one
+		// docs leaf must secure-read as non-clarification substantial prose.
+		// Symlink root/parent/leaf or missing nested paths must not pseudo-green.
+		if !hasSubstantialDocsProduct(worktree, product) {
+			if looksLikeClarification(evidence, worktree, product) {
+				return fmt.Errorf("workflowrun: acceptance refused for %s: clarification/empty work is not success", workItemID)
+			}
+			if !hasDocsProduct(product) && len(product) == 0 {
+				return fmt.Errorf("workflowrun: docs child %s produced no docs product", workItemID)
+			}
+			return fmt.Errorf("workflowrun: docs child %s docs product is not securely readable substantial documentation (symlink/unreadable/empty refused)", workItemID)
 		}
 		return nil
 	}
@@ -82,152 +99,159 @@ func AcceptSucceededChild(workItemID, intent, owner string, files []string, work
 	}
 	switch role {
 	case RoleTests:
-		// Require test files in the child's FilesTouched list — do not count
-		// pre-existing base *_test.go via full worktree walk (false green).
-		if !hasTestProductInList(product) {
-			return fmt.Errorf("workflowrun: tests child %s must add/adjust real test files (*_test.go or tests/); got %v", workItemID, product)
+		// Role-specific: matching test paths only; must be secure regular leaves
+		// (not filename-only, not worktree walk of pre-existing base tests).
+		if !hasSecureTestProduct(worktree, product) {
+			if !hasTestProductInList(product) {
+				return fmt.Errorf("workflowrun: tests child %s must add/adjust real test files (*_test.go or tests/); got %v", workItemID, product)
+			}
+			return fmt.Errorf("workflowrun: tests child %s test product is not securely readable regular files (symlink/unreadable refused); got %v", workItemID, product)
 		}
 	case RoleImplement:
-		if !hasSourceProduct(product) {
-			return fmt.Errorf("workflowrun: implement child %s must produce product source (not meta/clarification only); got %v", workItemID, product)
-		}
 		// child-output-*.md alone is never enough even if worktree has base sources.
 		if onlyChildOutputStubs(product) {
 			return fmt.Errorf("workflowrun: implement child %s produced only child-output stubs, not product source; got %v", workItemID, product)
 		}
-	case RoleVerify:
-		if !hasVerifierVerdict(product, worktree, evidence) {
-			return fmt.Errorf("workflowrun: verify child %s must produce independent verdict with digest over integrated head; clarification refused", workItemID)
-		}
-	case RoleDocs:
-		if !hasDocsProduct(product) && len(product) == 0 {
-			return fmt.Errorf("workflowrun: docs child %s produced no docs product", workItemID)
+		if !hasSecureSourceProduct(worktree, product) {
+			if !hasSourceProduct(product) {
+				return fmt.Errorf("workflowrun: implement child %s must produce product source (not meta/clarification only); got %v", workItemID, product)
+			}
+			return fmt.Errorf("workflowrun: implement child %s source product is not securely readable regular files (symlink/unreadable refused); got %v", workItemID, product)
 		}
 	default:
-		if len(product) == 0 {
-			return fmt.Errorf("workflowrun: child %s success requires product files", workItemID)
+		if !hasSecureAnyProduct(worktree, product) {
+			if len(product) == 0 {
+				return fmt.Errorf("workflowrun: child %s success requires product files", workItemID)
+			}
+			return fmt.Errorf("workflowrun: child %s product is not securely readable regular files (symlink/unreadable refused); got %v", workItemID, product)
 		}
 	}
 	return nil
 }
 
+// looksLikeClarification scans durable product text for empty-work shells.
+// Never follows symlinks (secure Lstat+SameFile reads only). Never treats the
+// evidence digest string as prose. LoopCoder materialize headers are stripped
+// before evaluation so long scaffolding cannot wash clarification-only bodies.
 func looksLikeClarification(evidence, worktree string, product []string) bool {
-	blobs := []string{strings.ToLower(evidence)}
-	// Scan small product/md files for clarification language.
-	for _, rel := range product {
-		if !strings.HasSuffix(rel, ".md") && !strings.HasSuffix(rel, ".txt") {
-			continue
-		}
-		if worktree == "" {
-			continue
-		}
-		raw, err := os.ReadFile(filepath.Join(worktree, rel))
-		if err != nil || len(raw) > 32<<10 {
-			continue
-		}
-		blobs = append(blobs, strings.ToLower(string(raw)))
+	_ = evidence // digest is not prose; ignore for phrase matching
+	// Real secure source/test product exempts implement/test paths from phrase gates.
+	// Filename-only or symlink leaves do not exempt.
+	if hasSecureTestProduct(worktree, product) || hasSecureSourceProduct(worktree, product) {
+		return false
 	}
-	// Also check child-output stub.
-	if worktree != "" {
-		entries, _ := os.ReadDir(worktree)
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			name := e.Name()
-			if strings.HasPrefix(name, "child-output-") || strings.HasSuffix(name, ".md") {
-				raw, err := os.ReadFile(filepath.Join(worktree, name))
-				if err == nil && len(raw) < 32<<10 {
-					blobs = append(blobs, strings.ToLower(string(raw)))
-				}
-			}
+	for _, blob := range collectSecureTextBlobs(worktree, product) {
+		if isExplicitClarificationOnly(blob) {
+			return true
 		}
 	}
-	phrases := []string{
-		"please clarify", "need clarification", "need more information",
-		"cannot find implementation", "no implementation", "no test suite",
-		"repository contains no", "nothing to review", "awaiting clarification",
-		"what should i", "please provide more", "unclear requirements",
-		"no code changes", "no files changed",
+	return false
+}
+
+func isTestProductRel(rel string) bool {
+	cleaned, err := cleanWorktreeRelPath(rel)
+	if err != nil {
+		// Fall back to raw slash form for list-only classification.
+		cleaned = filepath.ToSlash(strings.TrimSpace(rel))
 	}
-	for _, b := range blobs {
-		if b == "" {
-			continue
-		}
-		// If text is only clarification with no concrete deliverable markers.
-		for _, p := range phrases {
-			if strings.Contains(b, p) {
-				// Allow if product also has real tests/source.
-				if hasTestProduct(product, worktree) || hasSourceProduct(product) {
-					continue
-				}
-				return true
-			}
-		}
+	base := filepath.Base(cleaned)
+	if strings.HasPrefix(base, "child-output-") {
+		return false
+	}
+	slash := filepath.ToSlash(cleaned)
+	if strings.HasSuffix(base, "_test.go") || strings.HasSuffix(base, "_test.py") ||
+		strings.HasSuffix(base, ".test.ts") || strings.HasSuffix(base, ".spec.ts") ||
+		strings.Contains(slash, "/tests/") || strings.HasPrefix(slash, "tests/") ||
+		strings.Contains(slash, "/testdata/") {
+		return true
+	}
+	return false
+}
+
+func isSourceProductRel(rel string) bool {
+	cleaned, err := cleanWorktreeRelPath(rel)
+	if err != nil {
+		cleaned = filepath.ToSlash(strings.TrimSpace(rel))
+	}
+	base := filepath.Base(cleaned)
+	if strings.HasPrefix(base, "child-output-") {
+		return false
+	}
+	if strings.HasSuffix(base, "_test.go") || strings.HasSuffix(base, "_test.py") {
+		return false
+	}
+	switch {
+	case strings.HasSuffix(base, ".go"), strings.HasSuffix(base, ".py"),
+		strings.HasSuffix(base, ".ts"), strings.HasSuffix(base, ".tsx"),
+		strings.HasSuffix(base, ".js"), strings.HasSuffix(base, ".rs"),
+		strings.HasSuffix(base, ".java"), strings.HasSuffix(base, ".c"),
+		strings.HasSuffix(base, ".h"), strings.HasSuffix(base, ".cpp"):
+		return true
 	}
 	return false
 }
 
 func hasTestProductInList(product []string) bool {
 	for _, f := range product {
-		base := filepath.Base(f)
-		if strings.HasPrefix(base, "child-output-") {
-			continue
-		}
-		if strings.HasSuffix(base, "_test.go") || strings.HasSuffix(base, "_test.py") ||
-			strings.HasSuffix(base, ".test.ts") || strings.HasSuffix(base, ".spec.ts") ||
-			strings.Contains(f, "/tests/") || strings.HasPrefix(f, "tests/") ||
-			strings.Contains(f, "/testdata/") {
+		if isTestProductRel(f) {
 			return true
 		}
 	}
 	return false
-}
-
-func hasTestProduct(product []string, worktree string) bool {
-	if hasTestProductInList(product) {
-		return true
-	}
-	if worktree == "" {
-		return false
-	}
-	found := false
-	_ = filepath.Walk(worktree, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info == nil || info.IsDir() {
-			if info != nil && info.IsDir() && (filepath.Base(path) == ".git" || filepath.Base(path) == ".loopcoder") {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		base := filepath.Base(path)
-		if strings.HasSuffix(base, "_test.go") || strings.HasSuffix(base, "_test.py") {
-			found = true
-			return filepath.SkipAll
-		}
-		return nil
-	})
-	return found
 }
 
 func hasSourceProduct(product []string) bool {
 	for _, f := range product {
-		base := filepath.Base(f)
-		if strings.HasPrefix(base, "child-output-") {
-			continue
-		}
-		if strings.HasSuffix(base, "_test.go") {
-			continue
-		}
-		switch {
-		case strings.HasSuffix(base, ".go"), strings.HasSuffix(base, ".py"),
-			strings.HasSuffix(base, ".ts"), strings.HasSuffix(base, ".tsx"),
-			strings.HasSuffix(base, ".js"), strings.HasSuffix(base, ".rs"),
-			strings.HasSuffix(base, ".java"), strings.HasSuffix(base, ".c"),
-			strings.HasSuffix(base, ".h"), strings.HasSuffix(base, ".cpp"):
+		if isSourceProductRel(f) {
 			return true
 		}
 	}
 	return false
+}
+
+// hasSecureRegularMatchingProduct is true when at least one product path both
+// matches role classification and proves as a secure regular non-empty leaf
+// under worktree (≥1 byte; zero-byte empty.go / empty_test.go refused).
+func hasSecureRegularMatchingProduct(worktree string, product []string, match func(string) bool) bool {
+	if worktree == "" || len(product) == 0 {
+		return false
+	}
+	wtAbs, err := filepath.Abs(worktree)
+	if err != nil {
+		return false
+	}
+	if err := requireNonSymlinkDir(wtAbs); err != nil {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, rel := range product {
+		cleaned, cerr := cleanWorktreeRelPath(rel)
+		if cerr != nil || seen[cleaned] {
+			continue
+		}
+		seen[cleaned] = true
+		if !match(cleaned) {
+			continue
+		}
+		if err := proveSecureRegularProduct(wtAbs, cleaned); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSecureSourceProduct(worktree string, product []string) bool {
+	return hasSecureRegularMatchingProduct(worktree, product, isSourceProductRel)
+}
+
+func hasSecureTestProduct(worktree string, product []string) bool {
+	return hasSecureRegularMatchingProduct(worktree, product, isTestProductRel)
+}
+
+// hasSecureAnyProduct requires at least one listed product path that is a
+// secure regular leaf (generic role — no suffix specialization).
+func hasSecureAnyProduct(worktree string, product []string) bool {
+	return hasSecureRegularMatchingProduct(worktree, product, func(string) bool { return true })
 }
 
 // onlyChildOutputStubs is true when every product path is a child-output-*.md stub.
@@ -256,13 +280,80 @@ func hasDocsProduct(product []string) bool {
 	return false
 }
 
+// isDocsProductRel reports whether a clean relative path is a docs product leaf
+// (markdown or under docs/), excluding child-output stubs.
+func isDocsProductRel(rel string) bool {
+	cleaned, err := cleanWorktreeRelPath(rel)
+	if err != nil {
+		return false
+	}
+	base := filepath.Base(cleaned)
+	if strings.HasPrefix(base, "child-output-") {
+		return false
+	}
+	if strings.HasPrefix(filepath.ToSlash(cleaned), "docs/") {
+		return true
+	}
+	return strings.HasSuffix(strings.ToLower(base), ".md")
+}
+
+// hasSubstantialDocsProduct is true when at least one docs product leaf can be
+// secure-read (non-symlink root/parents/leaf, clean relative path) and the body
+// after scaffold strip is non-clarification substantial prose. Filename presence
+// alone (hasDocsProduct) never greens — unreadable/symlink candidates fail closed.
+func hasSubstantialDocsProduct(worktree string, product []string) bool {
+	check := func(raw []byte) bool {
+		if len(raw) == 0 {
+			return false
+		}
+		if isExplicitClarificationOnly(string(raw)) {
+			return false
+		}
+		body := strings.TrimSpace(bodyAfterMaterializeScaffold(string(raw)))
+		return len(body) >= 80
+	}
+	if worktree == "" {
+		return false
+	}
+	wtAbs, err := filepath.Abs(worktree)
+	if err != nil {
+		return false
+	}
+	if err := requireNonSymlinkDir(wtAbs); err != nil {
+		return false
+	}
+	seen := map[string]bool{}
+	try := func(rel string) bool {
+		cleaned, err := cleanWorktreeRelPath(rel)
+		if err != nil || seen[cleaned] {
+			return false
+		}
+		seen[cleaned] = true
+		raw, ok := readRegularFindingsFile(wtAbs, cleaned)
+		return ok && check(raw)
+	}
+	for _, rel := range product {
+		if isDocsProductRel(rel) && try(rel) {
+			return true
+		}
+	}
+	// Materialize leaf at worktree root (writeProductFileSecurely docs-notes.md).
+	if try("docs-notes.md") {
+		return true
+	}
+	return false
+}
+
 // hasSubstantialResearchFindings is true when durable research product has a
-// real survey body (materializeResearchFindings "## Provider survey" section or
-// equivalent lengthy findings). Used so greenfield "no existing tests" language
-// in a survey does not trip looksLikeClarification.
+// real survey body. LoopCoder "## Provider survey" headers alone are insufficient:
+// the body after scaffold strip must not be clarification-only.
 func hasSubstantialResearchFindings(worktree string, product []string) bool {
 	check := func(raw []byte) bool {
-		if len(raw) < 200 {
+		if isExplicitClarificationOnly(string(raw)) {
+			return false
+		}
+		body := strings.TrimSpace(bodyAfterMaterializeScaffold(string(raw)))
+		if len(body) < 80 {
 			return false
 		}
 		low := strings.ToLower(string(raw))
@@ -270,27 +361,58 @@ func hasSubstantialResearchFindings(worktree string, product []string) bool {
 			return true
 		}
 		// Long structured findings without the exact header still count.
-		return strings.Count(low, "\n") >= 10 && len(raw) >= 400 &&
-			(strings.Contains(low, "scope") || strings.Contains(low, "constraint") ||
-				strings.Contains(low, "survey") || strings.Contains(low, "findings"))
+		return strings.Count(strings.ToLower(body), "\n") >= 8 && len(body) >= 200 &&
+			(strings.Contains(strings.ToLower(body), "scope") || strings.Contains(strings.ToLower(body), "constraint") ||
+				strings.Contains(strings.ToLower(body), "survey") || strings.Contains(strings.ToLower(body), "findings"))
 	}
-	for _, rel := range product {
-		base := filepath.Base(rel)
-		if base != "findings.md" && base != "FINDINGS.md" && !strings.HasPrefix(base, "child-output-") {
-			continue
-		}
-		if worktree == "" {
-			continue
-		}
-		if raw, ok := readRegularFindingsFile(worktree, base); ok && check(raw) {
-			return true
-		}
-	}
+	return anySecureLeaf(worktree, product, []string{"findings.md", "FINDINGS.md"}, true, check)
+}
+
+// anySecureLeaf evaluates check on secure-read product leaves (optional child-output).
+// Preserves clean relative paths (docs/findings.md stays nested); never collapses
+// to filepath.Base. Rejects abs/../empty and symlink root/parents via secure reader.
+func anySecureLeaf(worktree string, product []string, names []string, includeChildOutput bool, check func([]byte) bool) bool {
 	if worktree == "" {
 		return false
 	}
-	for _, name := range []string{"findings.md", "FINDINGS.md"} {
-		if raw, ok := readRegularFindingsFile(worktree, name); ok && check(raw) {
+	wtAbs, err := filepath.Abs(worktree)
+	if err != nil {
+		return false
+	}
+	if err := requireNonSymlinkDir(wtAbs); err != nil {
+		return false
+	}
+	wantBase := map[string]bool{}
+	for _, n := range names {
+		if b := filepath.Base(strings.TrimSpace(n)); b != "" {
+			wantBase[b] = true
+		}
+	}
+	seen := map[string]bool{}
+	try := func(rel string) bool {
+		cleaned, err := cleanWorktreeRelPath(rel)
+		if err != nil || seen[cleaned] {
+			return false
+		}
+		seen[cleaned] = true
+		raw, ok := readRegularFindingsFile(wtAbs, cleaned)
+		return ok && check(raw)
+	}
+	for _, rel := range product {
+		cleaned, err := cleanWorktreeRelPath(rel)
+		if err != nil {
+			continue
+		}
+		base := filepath.Base(cleaned)
+		if wantBase[base] && try(cleaned) {
+			return true
+		}
+		if includeChildOutput && strings.HasPrefix(base, "child-output-") && try(cleaned) {
+			return true
+		}
+	}
+	for _, n := range names {
+		if try(n) {
 			return true
 		}
 	}
@@ -308,7 +430,7 @@ func hasAnyFindings(worktree string) bool {
 	// findings.md or child-output with substantial body (not route-metadata stubs alone).
 	// Security: Lstat only — never follow symlinks (external file must not count).
 	for _, name := range []string{"findings.md", "FINDINGS.md"} {
-		if raw, ok := readRegularFindingsFile(wtAbs, name); ok && len(raw) > 40 {
+		if raw, ok := readRegularFindingsFile(wtAbs, name); ok && len(raw) > 40 && !isExplicitClarificationOnly(string(raw)) {
 			return true
 		}
 	}
@@ -335,88 +457,6 @@ func hasAnyFindings(worktree string) bool {
 	return false
 }
 
-// readRegularFindingsFile Lstats then reads a leaf under worktree. Rejects
-// symlinks, directories, FIFOs, and any path escape.
-//
-// Identity chain (fail closed on race):
-//  1. preLstat path — must be regular non-symlink under worktree
-//  2. Open path
-//  3. f.Stat() — must be regular; os.SameFile(preLstat, fdStat)
-//  4. read from fd
-//  5. postLstat path — must be regular non-symlink; os.SameFile(fdStat, postLstat)
-//
-// Without SameFile, Lstat→Open can follow a swapped symlink and leak external
-// content into acceptance while path Lstats still look clean.
-func readRegularFindingsFile(worktreeAbs, name string) ([]byte, bool) {
-	return readRegularFindingsFileChecked(worktreeAbs, name)
-}
-
-// readRegularFindingsFileChecked is the testable implementation. Returns
-// (nil, false) on any identity/safety failure.
-func readRegularFindingsFileChecked(worktreeAbs, name string) ([]byte, bool) {
-	raw, err := readRegularFindingsFileErr(worktreeAbs, name)
-	return raw, err == nil
-}
-
-// readRegularFindingsFileErr returns a non-nil error describing identity/safety
-// failures (used by unit tests). Callers that only need bool use Checked.
-func readRegularFindingsFileErr(worktreeAbs, name string) ([]byte, error) {
-	name = filepath.Base(strings.TrimSpace(name))
-	if name == "" || name == "." || name == ".." {
-		return nil, fmt.Errorf("findings leaf name invalid")
-	}
-	full := filepath.Join(worktreeAbs, name)
-	if err := requirePathUnderRoot(worktreeAbs, full); err != nil {
-		return nil, err
-	}
-	pre, err := os.Lstat(full)
-	if err != nil {
-		return nil, err
-	}
-	if pre.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("%s is a symlink", name)
-	}
-	if !pre.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s is not a regular file (mode=%v)", name, pre.Mode())
-	}
-	const maxFindings = 1 << 20
-	f, err := os.Open(full)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	fdStat, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !fdStat.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s fd is not a regular file", name)
-	}
-	// Opened fd must be the same inode as the pre-open Lstat (no symlink swap).
-	if !os.SameFile(pre, fdStat) {
-		return nil, fmt.Errorf("%s identity mismatch: pre-lstat vs open fd", name)
-	}
-	raw, err := io.ReadAll(io.LimitReader(f, maxFindings+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(raw) > maxFindings {
-		return nil, fmt.Errorf("%s exceeds max findings size", name)
-	}
-	post, err := os.Lstat(full)
-	if err != nil {
-		return nil, err
-	}
-	if post.Mode()&os.ModeSymlink != 0 || !post.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s post-read node is not a regular non-symlink file", name)
-	}
-	// Path node after read must still be the same file as the opened fd.
-	if !os.SameFile(fdStat, post) {
-		return nil, fmt.Errorf("%s identity mismatch: open fd vs post-lstat", name)
-	}
-	return raw, nil
-}
-
 func hasVerifierVerdict(product []string, worktree, evidence string) bool {
 	// Must have non-empty evidence digest and not be clarification.
 	if strings.TrimSpace(evidence) == "" || !strings.HasPrefix(evidence, "sha256:") {
@@ -425,28 +465,34 @@ func hasVerifierVerdict(product []string, worktree, evidence string) bool {
 	if looksLikeClarification(evidence, worktree, product) {
 		return false
 	}
-	// Prefer an explicit verification artifact when present.
-	for _, f := range product {
-		base := strings.ToLower(filepath.Base(f))
-		if strings.Contains(base, "verif") || strings.Contains(base, "verdict") || strings.Contains(base, "review") {
-			return true
+	// Prefer explicit verdict.md / review artifact with substantial non-clarification body.
+	check := func(raw []byte) bool {
+		if isExplicitClarificationOnly(string(raw)) {
+			return false
 		}
+		body := strings.TrimSpace(bodyAfterMaterializeScaffold(string(raw)))
+		if len(body) < 80 {
+			return false
+		}
+		low := strings.ToLower(string(raw))
+		return strings.Contains(low, "## adversarial review") ||
+			strings.Contains(low, "verdict") || strings.Contains(low, "review") ||
+			len(body) >= 120
 	}
-	// child-output with adversarial review content + digest is acceptable when
-	// integrated head was available (caller ensures materialize from goal branch).
+	if anySecureLeaf(worktree, product, []string{"verdict.md"}, true, check) {
+		return true
+	}
+	// Filename hint on product list only if the nested leaf also securely reads as substantial.
+	// Preserve clean relative path (docs/review.md), never filepath.Base collapse.
 	if worktree != "" {
-		entries, _ := os.ReadDir(worktree)
-		for _, e := range entries {
-			if strings.HasPrefix(e.Name(), "child-output-") {
-				raw, err := os.ReadFile(filepath.Join(worktree, e.Name()))
-				if err != nil {
-					continue
-				}
-				low := strings.ToLower(string(raw))
-				if strings.Contains(low, "no implementation") || strings.Contains(low, "nothing to review") {
-					return false
-				}
-				if len(raw) > 80 {
+		for _, f := range product {
+			cleaned, err := cleanWorktreeRelPath(f)
+			if err != nil {
+				continue
+			}
+			base := strings.ToLower(filepath.Base(cleaned))
+			if strings.Contains(base, "verif") || strings.Contains(base, "verdict") || strings.Contains(base, "review") {
+				if raw, ok := readRegularFindingsFile(worktree, cleaned); ok && check(raw) {
 					return true
 				}
 			}

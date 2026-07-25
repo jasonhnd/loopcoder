@@ -149,8 +149,9 @@ func TestUnitPath_SyntheticInventoryToReserveToFakeRunner(t *testing.T) {
 	}
 	// Fresh after observation (same account/window) — not reserved-as-actual.
 	after := 0.76 // before was ~0.80, actual ~0.04
-	re, err := lg.ObserveAfterBound("product-path", "run-pp-1", "att-1", after, "fresh_inventory:test", "fresh", capacityledger.ObserveAfterOpts{
+	re, err := lg.ObserveAfterBound("product-path", "run-pp-1", "att-1", after, "codexbar", "fresh", capacityledger.ObserveAfterOpts{
 		AccountRef: acc, WindowKind: res.WindowKind, InstallRef: installRef,
+		ObservedAt: time.Date(2026, 7, 22, 19, 0, 0, 0, time.UTC),
 	})
 	if err != nil {
 		t.Fatalf("observe after: %v", err)

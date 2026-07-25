@@ -1,8 +1,12 @@
 package goalrun
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +14,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/workflowrun"
+	"github.com/jasonhnd/loopcoder/internal/workgraph"
 )
 
 // CheckpointSchema is the durable forced-restart document for a goal run.
@@ -53,6 +58,14 @@ type Checkpoint struct {
 	// CapacityTransitions are final ledger-backed prior/alternate transitions
 	// (post applyChildOutcomes). Required for model_unavailable canary proof on resume.
 	CapacityTransitions []workflowrun.CapacityTransition `json:"capacity_transitions,omitempty"`
+	// ClaimStoreDigest binds the exact raw claim ledger present when this
+	// checkpoint was persisted. Resume rejects any later byte mutation before
+	// inventory, ledger, claim, reserve, or executor work.
+	ClaimStoreDigest string `json:"claim_store_digest,omitempty"`
+	// ContentDigest binds the complete checkpoint document except this field.
+	// It prevents one-field edits to child capacity and other durable evidence
+	// from being silently accepted or repaired during resume.
+	ContentDigest string `json:"content_digest"`
 }
 
 // CheckpointPath returns the durable write path and ensures parent directories exist.
@@ -123,6 +136,19 @@ func SaveCheckpoint(homeDir string, cp Checkpoint) (string, error) {
 	if cp.PriorSucceeded == nil {
 		cp.PriorSucceeded = PriorSucceededFrom(cp.WorkflowKids, cp.Children)
 	}
+	cp.ClaimStoreDigest = ""
+	claimPath := filepath.Join(filepath.Dir(path), "workclaims.json")
+	if claimRaw, claimErr := os.ReadFile(claimPath); claimErr == nil {
+		cp.ClaimStoreDigest = checkpointSHA256(claimRaw)
+	} else if !os.IsNotExist(claimErr) {
+		return "", fmt.Errorf("goalrun: checkpoint read claim store for digest: %w", claimErr)
+	}
+	cp.ContentDigest = ""
+	contentDigest, err := checkpointContentDigest(cp)
+	if err != nil {
+		return "", err
+	}
+	cp.ContentDigest = contentDigest
 	raw, err := json.MarshalIndent(cp, "", "  ")
 	if err != nil {
 		return "", err
@@ -153,12 +179,56 @@ func LoadCheckpoint(homeDir, projectID, runID string) (Checkpoint, string, error
 		return Checkpoint{}, path, err
 	}
 	var cp Checkpoint
-	if err := json.Unmarshal(raw, &cp); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cp); err != nil {
 		return Checkpoint{}, path, err
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("multiple JSON values")
+		}
+		return Checkpoint{}, path, err
+	}
+	if cp.ContentDigest == "" {
+		return Checkpoint{}, path, fmt.Errorf("goalrun: checkpoint missing content_digest")
+	}
+	wantContent := cp.ContentDigest
+	cp.ContentDigest = ""
+	gotContent, err := checkpointContentDigest(cp)
+	if err != nil {
+		return Checkpoint{}, path, err
+	}
+	if wantContent != gotContent {
+		return Checkpoint{}, path, fmt.Errorf("goalrun: checkpoint content_digest mismatch")
+	}
+	cp.ContentDigest = wantContent
+	if cp.ClaimStoreDigest != "" {
+		claimRaw, claimErr := os.ReadFile(filepath.Join(filepath.Dir(path), "workclaims.json"))
+		if claimErr != nil {
+			return Checkpoint{}, path, fmt.Errorf("goalrun: checkpoint claim_store_digest read: %w", claimErr)
+		}
+		if got := checkpointSHA256(claimRaw); got != cp.ClaimStoreDigest {
+			return Checkpoint{}, path, fmt.Errorf("goalrun: checkpoint claim_store_digest mismatch")
+		}
 	}
 	// Do not derive or repair PriorSucceeded on load — reusable seed must already
 	// be durable. Legacy derivation is audit-only via AuditPriorSucceededFrom.
 	return cp, path, nil
+}
+
+func checkpointContentDigest(cp Checkpoint) (string, error) {
+	cp.ContentDigest = ""
+	raw, err := json.Marshal(cp)
+	if err != nil {
+		return "", fmt.Errorf("goalrun: checkpoint content digest: %w", err)
+	}
+	return checkpointSHA256(raw), nil
+}
+
+func checkpointSHA256(raw []byte) string {
+	sum := sha256.Sum256(raw)
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 // PriorSucceededFrom builds a resume seed from terminal outcomes (write-side /
@@ -171,23 +241,29 @@ func PriorSucceededFrom(wf []workflowrun.ChildOutcome, reports []ChildReport) ma
 // AuditPriorSucceededFrom is the explicit audit-only derivation of prior
 // succeeded outcomes from workflow kids + child reports. Never used as a
 // product resume seed path (LoadCheckpoint does not call it).
+// Only exact succeeded + nonempty exact attempt/evidence qualify — padded or
+// case-mutated terminal/attempt/evidence never become canonical succeeded.
 func AuditPriorSucceededFrom(wf []workflowrun.ChildOutcome, reports []ChildReport) map[string]workflowrun.ChildOutcome {
 	out := map[string]workflowrun.ChildOutcome{}
 	for _, c := range wf {
-		if !isResumeEligible(c.Terminal, c.AttemptID, c.OutputEvidence) {
+		if !isResumeEligibleExact(c.Terminal, c.AttemptID, c.OutputEvidence) {
 			continue
 		}
-		// Copy without mutating the caller's slice element identity fields
-		// beyond terminal normalization for the audit map value.
+		if c.WorkItemID == "" || c.WorkItemID != strings.TrimSpace(c.WorkItemID) {
+			continue
+		}
+		// Preserve exact durable terminal (already exact succeeded); never rewrite.
 		cc := c
-		cc.Terminal = "succeeded"
 		out[c.WorkItemID] = cc
 	}
 	for _, r := range reports {
 		if _, ok := out[r.ChildID]; ok {
 			continue
 		}
-		if !isResumeEligible(r.Terminal, r.AttemptID, r.OutputEvidence) {
+		if !isResumeEligibleExact(r.Terminal, r.AttemptID, r.OutputEvidence) {
+			continue
+		}
+		if r.ChildID == "" || r.ChildID != strings.TrimSpace(r.ChildID) {
 			continue
 		}
 		out[r.ChildID] = workflowrun.ChildOutcome{
@@ -196,7 +272,7 @@ func AuditPriorSucceededFrom(wf []workflowrun.ChildOutcome, reports []ChildRepor
 			Permission: r.Permission, RouteReason: r.RouteReason,
 			TaskClass: r.TaskClass, ExecutionPlanDigest: r.ExecutionPlanDigest,
 			ChildContractDigest: r.ChildContractDigest, Generation: r.Generation,
-			Terminal: "succeeded", OutputEvidence: r.OutputEvidence,
+			Terminal: string(workgraph.TermSucceeded), OutputEvidence: r.OutputEvidence,
 			WorktreePath: r.WorktreePath, AttemptID: r.AttemptID,
 			ActualCapacity: r.CapacityActual, ActualSource: r.ActualSource,
 		}
@@ -205,12 +281,6 @@ func AuditPriorSucceededFrom(wf []workflowrun.ChildOutcome, reports []ChildRepor
 		return nil
 	}
 	return out
-}
-
-func isResumeEligible(terminal, attemptID, evidence string) bool {
-	return strings.EqualFold(strings.TrimSpace(terminal), "succeeded") &&
-		strings.TrimSpace(attemptID) != "" &&
-		strings.TrimSpace(evidence) != ""
 }
 
 func sanitizeRunKey(runID string) string {

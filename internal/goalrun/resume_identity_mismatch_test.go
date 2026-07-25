@@ -76,9 +76,9 @@ func TestResumePriorIdentityMismatchFailClosed(t *testing.T) {
 				GraphID: graphID, PlanDigest: planDig, GraphDigest: graphDig,
 				Goal: goal, Issue: "1397", Actor: "owner",
 				Status: "blocked", Interrupted: true,
-				PriorSucceeded:  map[string]workflowrun.ChildOutcome{"wi_research": prior},
-				AbortedAttempts: map[string]string{"wi_implement": workflowrun.AttemptID("wi_implement", planDig, thisRun, 0)},
-				SavedAt:         now,
+				PriorSucceeded: map[string]workflowrun.ChildOutcome{"wi_research": prior},
+				// No unbound AbortedAttempts without WorkflowKids (forgeable gen seed).
+				SavedAt: now,
 			}
 			if _, err := goalrun.SaveCheckpoint(home, cp); err != nil {
 				t.Fatal(err)

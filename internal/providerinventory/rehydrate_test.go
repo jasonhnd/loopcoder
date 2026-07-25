@@ -156,13 +156,14 @@ func TestRehydrateTranslatesDurableAliasInstallToSoleLiveTarget(t *testing.T) {
 	rem := int64(35)
 	live := providerinventory.Report{
 		Installations: []providerinventory.ProviderInstallation{{
-			AdapterID: "grok", ProviderInstallationID: instA,
+			AdapterID: "grok", ProviderInstallationID: instA, ExecutableName: "grok",
+			DiscoverySource: providerinventory.DiscoveryPath, DiscoveryOrder: 0,
 			InstallationState:   providerinventory.InstallationInstalled,
 			UsableForInvocation: "yes",
 			FreshnessState:      providerinventory.FreshnessFresh,
 			Confidence:          providerinventory.ConfidenceExact,
 			ExecutableIdentity: providerinventory.ExecutableIdentity{
-				ResolvedPathHash: rhash, PathHash: "sha256:path-a",
+				Basename: "grok", ResolvedPathHash: rhash, PathHash: "sha256:path-a",
 			},
 		}},
 		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
@@ -175,13 +176,14 @@ func TestRehydrateTranslatesDurableAliasInstallToSoleLiveTarget(t *testing.T) {
 	}
 	durable := providerinventory.Report{
 		Installations: []providerinventory.ProviderInstallation{{
-			AdapterID: "grok", ProviderInstallationID: instB,
+			AdapterID: "grok", ProviderInstallationID: instB, ExecutableName: "grok",
+			DiscoverySource: providerinventory.DiscoveryPath, DiscoveryOrder: 1,
 			InstallationState:   providerinventory.InstallationInstalled,
 			UsableForInvocation: "yes",
 			FreshnessState:      providerinventory.FreshnessFresh,
 			Confidence:          providerinventory.ConfidenceExact,
 			ExecutableIdentity: providerinventory.ExecutableIdentity{
-				ResolvedPathHash: rhash, PathHash: "sha256:path-b",
+				Basename: "grok", ResolvedPathHash: rhash, PathHash: "sha256:path-b",
 			},
 		}},
 		QuotaTelemetrySources: []providerinventory.QuotaTelemetrySource{{
@@ -215,27 +217,27 @@ func TestRehydrateTranslatesDurableAliasInstallToSoleLiveTarget(t *testing.T) {
 	}
 }
 
-func TestRehydrateAmbiguousLiveAliasesNoTranslate(t *testing.T) {
+func TestRehydrateMultiLiveAliasesTranslateToPATHPrimary(t *testing.T) {
 	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
 	const rhash = "sha256:ambig"
 	rem := int64(10)
+	// pinst_l2 DiscoveryOrder 0 = LookPath primary.
+	l1 := providerinventory.ProviderInstallation{
+		AdapterID: "grok", ProviderInstallationID: "pinst_l1", ExecutableName: "grok",
+		DiscoverySource: providerinventory.DiscoveryPath, DiscoveryOrder: 1,
+		InstallationState: providerinventory.InstallationInstalled, UsableForInvocation: "yes",
+		FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
+		ExecutableIdentity: providerinventory.ExecutableIdentity{Basename: "grok", ResolvedPathHash: rhash},
+	}
+	l2 := providerinventory.ProviderInstallation{
+		AdapterID: "grok", ProviderInstallationID: "pinst_l2", ExecutableName: "grok",
+		DiscoverySource: providerinventory.DiscoveryPath, DiscoveryOrder: 0,
+		InstallationState: providerinventory.InstallationInstalled, UsableForInvocation: "yes",
+		FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
+		ExecutableIdentity: providerinventory.ExecutableIdentity{Basename: "grok", ResolvedPathHash: rhash},
+	}
 	live := providerinventory.Report{
-		Installations: []providerinventory.ProviderInstallation{
-			{
-				AdapterID: "grok", ProviderInstallationID: "pinst_l1",
-				InstallationState:   providerinventory.InstallationInstalled,
-				UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-				Confidence:         providerinventory.ConfidenceExact,
-				ExecutableIdentity: providerinventory.ExecutableIdentity{ResolvedPathHash: rhash},
-			},
-			{
-				AdapterID: "grok", ProviderInstallationID: "pinst_l2",
-				InstallationState:   providerinventory.InstallationInstalled,
-				UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-				Confidence:         providerinventory.ConfidenceExact,
-				ExecutableIdentity: providerinventory.ExecutableIdentity{ResolvedPathHash: rhash},
-			},
-		},
+		Installations: []providerinventory.ProviderInstallation{l1, l2},
 		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
 			AdapterID: "grok", QuotaSnapshotID: "live-unavail", QuotaSourceID: "src-live",
 			Confidence: providerinventory.ConfidenceUnavailable, FreshnessState: providerinventory.FreshnessNotApplicable,
@@ -244,11 +246,11 @@ func TestRehydrateAmbiguousLiveAliasesNoTranslate(t *testing.T) {
 	}
 	durable := providerinventory.Report{
 		Installations: []providerinventory.ProviderInstallation{{
-			AdapterID: "grok", ProviderInstallationID: "pinst_db",
-			InstallationState:   providerinventory.InstallationInstalled,
-			UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-			Confidence:         providerinventory.ConfidenceExact,
-			ExecutableIdentity: providerinventory.ExecutableIdentity{ResolvedPathHash: rhash},
+			AdapterID: "grok", ProviderInstallationID: "pinst_db", ExecutableName: "grok",
+			DiscoverySource:   providerinventory.DiscoveryPath,
+			InstallationState: providerinventory.InstallationInstalled, UsableForInvocation: "yes",
+			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
+			ExecutableIdentity: providerinventory.ExecutableIdentity{Basename: "grok", ResolvedPathHash: rhash},
 		}},
 		QuotaTelemetrySources: []providerinventory.QuotaTelemetrySource{{
 			AdapterID: "grok", QuotaSourceID: "src-d",
@@ -265,10 +267,52 @@ func TestRehydrateAmbiguousLiveAliasesNoTranslate(t *testing.T) {
 	if len(merged.QuotaSnapshots) != 1 {
 		t.Fatalf("%#v", merged.QuotaSnapshots)
 	}
-	// Ambiguous: keep durable id (fail closed translation).
+	// Durable path pinst_db → LookPath primary pinst_l2 (order 0).
 	if merged.QuotaSnapshots[0].ProviderInstallationID == nil ||
-		*merged.QuotaSnapshots[0].ProviderInstallationID != "pinst_db" {
-		t.Fatalf("ambiguous multi-live must not translate, got %#v", merged.QuotaSnapshots[0].ProviderInstallationID)
+		*merged.QuotaSnapshots[0].ProviderInstallationID != "pinst_l2" {
+		t.Fatalf("want PATH primary pinst_l2, got %#v", merged.QuotaSnapshots[0].ProviderInstallationID)
+	}
+}
+
+func TestRehydrateExplicitDurableNeverTranslatesOntoPATH(t *testing.T) {
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	const rhash = "sha256:same"
+	rem := int64(10)
+	live := providerinventory.Report{
+		Installations: []providerinventory.ProviderInstallation{{
+			AdapterID: "grok", ProviderInstallationID: "pinst_path", ExecutableName: "grok",
+			DiscoverySource: providerinventory.DiscoveryPath, DiscoveryOrder: 0,
+			InstallationState: providerinventory.InstallationInstalled, UsableForInvocation: "yes",
+			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
+			ExecutableIdentity: providerinventory.ExecutableIdentity{Basename: "grok", ResolvedPathHash: rhash},
+		}},
+		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
+			AdapterID: "grok", QuotaSnapshotID: "live-unavail",
+			Confidence: providerinventory.ConfidenceUnavailable, FreshnessState: providerinventory.FreshnessNotApplicable,
+			CapturedAt: now.Format(time.RFC3339),
+		}},
+	}
+	durable := providerinventory.Report{
+		Installations: []providerinventory.ProviderInstallation{{
+			AdapterID: "grok", ProviderInstallationID: "pinst_explicit_dur", ExecutableName: "grok",
+			DiscoverySource:   providerinventory.DiscoveryExplicitConfig,
+			InstallationState: providerinventory.InstallationInstalled, UsableForInvocation: "yes",
+			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
+			ExecutableIdentity: providerinventory.ExecutableIdentity{Basename: "grok", ResolvedPathHash: rhash},
+		}},
+		QuotaTelemetrySources: []providerinventory.QuotaTelemetrySource{{AdapterID: "grok", QuotaSourceID: "src-d"}},
+		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
+			AdapterID: "grok", QuotaSnapshotID: "dq", QuotaSourceID: "src-d",
+			ProviderInstallationID: strPtr("pinst_explicit_dur"),
+			RemainingValue:         &rem, Confidence: providerinventory.ConfidenceExact,
+			FreshnessState: providerinventory.FreshnessFresh,
+			CapturedAt:     now.Format(time.RFC3339), StaleAfter: now.Add(time.Hour).Format(time.RFC3339),
+		}},
+	}
+	merged := providerinventory.RehydrateForAutoRoute(live, durable, now)
+	if merged.QuotaSnapshots[0].ProviderInstallationID == nil ||
+		*merged.QuotaSnapshots[0].ProviderInstallationID != "pinst_explicit_dur" {
+		t.Fatalf("explicit durable must not translate onto PATH, got %#v", merged.QuotaSnapshots[0].ProviderInstallationID)
 	}
 }
 

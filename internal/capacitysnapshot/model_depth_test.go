@@ -31,58 +31,72 @@ func entryAdapterDeclared() []providerinventory.CatalogEntrySource {
 func TestFromInventory_DynamicMachineReadableOnly_ExactToken(t *testing.T) {
 	now := time.Date(2026, 7, 23, 18, 0, 0, 0, time.UTC)
 	rem, lim := int64(50), int64(100)
+	const (
+		agInst = "pinst_agy_dynamic_exact_token"
+		agAcc  = "acct-agy-dynamic-exact-token"
+		snapMR = "mcatsnap_agy_mr_exact"
+		snapAD = "mcatsnap_agy_adapter_declared"
+	)
 	// Real production shape: static adapter-declared is also ConfidenceExact+Fresh,
 	// plus dynamic machine-readable exact. Only dynamic must route.
 	rep := providerinventory.Report{
-		Installations: []providerinventory.ProviderInstallation{{
-			AdapterID: "antigravity", InstallationState: providerinventory.InstallationInstalled,
-			UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-			Confidence: providerinventory.ConfidenceExact,
-		}},
+		Installations: []providerinventory.ProviderInstallation{
+			exactFreshInstall("antigravity", agInst, "sha256:agy-dyn-resolved", "sha256:agy-dyn-path"),
+		},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "antigravity", ReadinessState: providerinventory.ReadinessReady,
-			FreshnessState:      providerinventory.FreshnessFresh,
-			Confidence:          providerinventory.ConfidenceExact,
-			ReadinessConfidence: providerinventory.ConfidenceExact,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			Confidence:             providerinventory.ConfidenceExact,
+			ReadinessConfidence:    providerinventory.ConfidenceExact,
+			AccountProfileID:       ptrStr(agAcc),
+			ProviderInstallationID: ptrStr(agInst),
 		}},
 		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{
 			{
-				AdapterID: "antigravity", CatalogSourceKind: providerinventory.CatalogSourceAdapterDeclared,
+				ModelCatalogSnapshotID: snapAD, AdapterID: "antigravity",
+				CatalogSourceKind:      providerinventory.CatalogSourceAdapterDeclared,
 				CatalogSourceReference: "loopcoder-static-registry:antigravity",
 				Confidence:             providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
+				ProviderInstallationID: ptrStr(agInst), AccountProfileID: ptrStr(agAcc),
 			},
 			{
-				AdapterID: "antigravity", CatalogSourceKind: providerinventory.CatalogSourceProviderMachineReadable,
+				ModelCatalogSnapshotID: snapMR, AdapterID: "antigravity",
+				CatalogSourceKind:      providerinventory.CatalogSourceProviderMachineReadable,
 				CatalogSourceReference: "provider-machine-readable:antigravity:agy-models",
 				Confidence:             providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
+				ProviderInstallationID: ptrStr(agInst), AccountProfileID: ptrStr(agAcc),
 			},
 		},
 		ModelCapabilities: []providerinventory.ModelCapability{
 			{
 				AdapterID: "antigravity", CanonicalModelID: "GPT-OSS 120B",
-				AvailabilityState: providerinventory.AvailabilityAvailable,
-				LifecycleState:    providerinventory.LifecycleAvailable,
-				FreshnessState:    providerinventory.FreshnessFresh,
-				Confidence:        providerinventory.ConfidenceExact,
-				EntrySources:      entryAdapterDeclared(),
-				Source:            providerinventory.SourceDescriptor{Kind: string(providerinventory.CatalogSourceAdapterDeclared)},
+				ModelCatalogSnapshotID: snapAD,
+				AvailabilityState:      providerinventory.AvailabilityAvailable,
+				LifecycleState:         providerinventory.LifecycleAvailable,
+				FreshnessState:         providerinventory.FreshnessFresh,
+				Confidence:             providerinventory.ConfidenceExact,
+				EntrySources:           entryAdapterDeclared(),
+				Source:                 providerinventory.SourceDescriptor{Kind: string(providerinventory.CatalogSourceAdapterDeclared)},
 			},
 			{
 				AdapterID: "antigravity", CanonicalModelID: "gpt-oss-120b-medium",
-				DisplayName:       "GPT-OSS 120B (Medium)",
-				AvailabilityState: providerinventory.AvailabilityAvailable,
-				LifecycleState:    providerinventory.LifecycleAvailable,
-				FreshnessState:    providerinventory.FreshnessFresh,
-				Confidence:        providerinventory.ConfidenceExact,
-				Constraints:       []string{"provider=antigravity", "supported_depth=medium", "cli_model=gpt-oss-120b-medium"},
-				EntrySources:      entryMachineReadable(),
-				Source:            providerinventory.SourceDescriptor{Kind: string(providerinventory.CatalogSourceProviderMachineReadable)},
+				ModelCatalogSnapshotID: snapMR,
+				DisplayName:            "GPT-OSS 120B (Medium)",
+				AvailabilityState:      providerinventory.AvailabilityAvailable,
+				LifecycleState:         providerinventory.LifecycleAvailable,
+				FreshnessState:         providerinventory.FreshnessFresh,
+				Confidence:             providerinventory.ConfidenceExact,
+				Constraints:            []string{"provider=antigravity", "supported_depth=medium", "cli_model=gpt-oss-120b-medium"},
+				EntrySources:           entryMachineReadable(),
+				Source:                 providerinventory.SourceDescriptor{Kind: string(providerinventory.CatalogSourceProviderMachineReadable)},
 			},
 		},
 		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
 			AdapterID: "antigravity", Unit: "percent", WindowKind: providerinventory.WindowFixedHour,
 			RemainingValue: &rem, LimitValue: &lim,
-			Confidence: providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
+			AccountProfileID:       ptrStr(agAcc),
+			ProviderInstallationID: ptrStr(agInst),
+			Confidence:             providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
 			CapturedAt: now.Format(time.RFC3339),
 		}},
 	}
@@ -136,26 +150,40 @@ func TestFromInventory_DynamicMachineReadableOnly_ExactToken(t *testing.T) {
 func TestFromInventory_GrokDoesNotUseAgySlugParse(t *testing.T) {
 	now := time.Date(2026, 7, 23, 18, 0, 0, 0, time.UTC)
 	rem, lim := int64(40), int64(100)
+	const (
+		grokInst = "pinst_grok_no_agy_slug"
+		grokAcc  = "acct-grok-no-agy-slug"
+		snap     = "mcatsnap_grok_models"
+	)
 	rep := providerinventory.Report{
-		Installations: []providerinventory.ProviderInstallation{{
-			AdapterID: "grok", InstallationState: providerinventory.InstallationInstalled,
-			UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-			Confidence: providerinventory.ConfidenceExact,
-		}},
+		Installations: []providerinventory.ProviderInstallation{
+			exactFreshInstall("grok", grokInst, "sha256:grok-slug-resolved", "sha256:grok-slug-path"),
+		},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
-			FreshnessState:      providerinventory.FreshnessFresh,
-			Confidence:          providerinventory.ConfidenceExact,
-			ReadinessConfidence: providerinventory.ConfidenceExact,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			Confidence:             providerinventory.ConfidenceExact,
+			ReadinessConfidence:    providerinventory.ConfidenceExact,
+			AccountProfileID:       ptrStr(grokAcc),
+			ProviderInstallationID: ptrStr(grokInst),
+		}},
+		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{{
+			ModelCatalogSnapshotID: snap, AdapterID: "grok",
+			CatalogSourceKind:      providerinventory.CatalogSourceProviderMachineReadable,
+			Confidence:             providerinventory.ConfidenceExact,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			ProviderInstallationID: ptrStr(grokInst),
+			AccountProfileID:       ptrStr(grokAcc),
 		}},
 		// Fresh `grok models` presence: model id only, no observed depth tokens
 		// (production shape). Must not backfill static registry low/high/xhigh.
 		ModelCapabilities: []providerinventory.ModelCapability{{
 			AdapterID: "grok", CanonicalModelID: "grok-4.5",
-			AvailabilityState: providerinventory.AvailabilityAvailable,
-			LifecycleState:    providerinventory.LifecycleAvailable,
-			FreshnessState:    providerinventory.FreshnessFresh,
-			Confidence:        providerinventory.ConfidenceExact,
+			ModelCatalogSnapshotID: snap,
+			AvailabilityState:      providerinventory.AvailabilityAvailable,
+			LifecycleState:         providerinventory.LifecycleAvailable,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			Confidence:             providerinventory.ConfidenceExact,
 			EntrySources: []providerinventory.CatalogEntrySource{{
 				SourceKind: providerinventory.CatalogSourceProviderMachineReadable,
 				Confidence: providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
@@ -166,7 +194,9 @@ func TestFromInventory_GrokDoesNotUseAgySlugParse(t *testing.T) {
 		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
 			AdapterID: "grok", Unit: "percent", WindowKind: providerinventory.WindowFixedHour,
 			RemainingValue: &rem, LimitValue: &lim,
-			Confidence: providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
+			AccountProfileID:       ptrStr(grokAcc),
+			ProviderInstallationID: ptrStr(grokInst),
+			Confidence:             providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
 			CapturedAt: now.Format(time.RFC3339),
 		}},
 	}
@@ -227,24 +257,38 @@ func TestFromInventory_GrokDoesNotUseAgySlugParse(t *testing.T) {
 func TestFromInventory_LiveMachineReadableNoDepth_NoStaticLadder(t *testing.T) {
 	now := time.Date(2026, 7, 23, 18, 0, 0, 0, time.UTC)
 	rem, lim := int64(40), int64(100)
+	const (
+		codexInst = "pinst_codex_live_mr_no_depth"
+		codexAcc  = "acct-codex-live-mr-no-depth"
+		snap      = "mcatsnap_codex_live_mr"
+	)
 	rep := providerinventory.Report{
-		Installations: []providerinventory.ProviderInstallation{{
-			AdapterID: "codex", InstallationState: providerinventory.InstallationInstalled,
-			UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-			Confidence: providerinventory.ConfidenceExact,
-		}},
+		Installations: []providerinventory.ProviderInstallation{
+			exactFreshInstall("codex", codexInst, "sha256:codex-nodepth-resolved", "sha256:codex-nodepth-path"),
+		},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
-			FreshnessState:      providerinventory.FreshnessFresh,
-			Confidence:          providerinventory.ConfidenceExact,
-			ReadinessConfidence: providerinventory.ConfidenceExact,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			Confidence:             providerinventory.ConfidenceExact,
+			ReadinessConfidence:    providerinventory.ConfidenceExact,
+			AccountProfileID:       ptrStr(codexAcc),
+			ProviderInstallationID: ptrStr(codexInst),
+		}},
+		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{{
+			ModelCatalogSnapshotID: snap, AdapterID: "codex",
+			CatalogSourceKind:      providerinventory.CatalogSourceProviderMachineReadable,
+			Confidence:             providerinventory.ConfidenceExact,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			ProviderInstallationID: ptrStr(codexInst),
+			AccountProfileID:       ptrStr(codexAcc),
 		}},
 		ModelCapabilities: []providerinventory.ModelCapability{{
 			AdapterID: "codex", CanonicalModelID: "gpt-5.5",
-			AvailabilityState: providerinventory.AvailabilityAvailable,
-			LifecycleState:    providerinventory.LifecycleAvailable,
-			FreshnessState:    providerinventory.FreshnessFresh,
-			Confidence:        providerinventory.ConfidenceExact,
+			ModelCatalogSnapshotID: snap,
+			AvailabilityState:      providerinventory.AvailabilityAvailable,
+			LifecycleState:         providerinventory.LifecycleAvailable,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			Confidence:             providerinventory.ConfidenceExact,
 			// No Constraints, no depth tokens — same shape as providers that only
 			// list model ids (Codex supportedReasoningEfforts lands in a later PR).
 			EntrySources: []providerinventory.CatalogEntrySource{{
@@ -258,7 +302,9 @@ func TestFromInventory_LiveMachineReadableNoDepth_NoStaticLadder(t *testing.T) {
 		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
 			AdapterID: "codex", Unit: "percent", WindowKind: providerinventory.WindowFixedHour,
 			RemainingValue: &rem, LimitValue: &lim,
-			Confidence: providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
+			AccountProfileID:       ptrStr(codexAcc),
+			ProviderInstallationID: ptrStr(codexInst),
+			Confidence:             providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
 			CapturedAt: now.Format(time.RFC3339),
 		}},
 	}

@@ -2,6 +2,8 @@ package goalrun_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -173,6 +175,7 @@ func TestResumeEnvelopeTamperMatrix(t *testing.T) {
 					t.Fatal(err)
 				}
 				tc.mut(&cp, nil)
+				refreshCheckpointContentDigest(t, &cp)
 				raw, mErr := json.MarshalIndent(cp, "", "  ")
 				if mErr != nil {
 					t.Fatal(mErr)
@@ -185,6 +188,7 @@ func TestResumeEnvelopeTamperMatrix(t *testing.T) {
 				part := map[string]any{
 					"schema": workflowrun.PartialSchema, "project_id": projectID, "run_id": runID,
 					"plan_digest": planDig, "execution_plan_digest": planDig, "graph_digest": graphDig,
+					"graph_id": graphID, "graph_version": 1,
 					"saved_at": now.Format(time.RFC3339), "interrupted": true,
 					"prior_succeeded": map[string]any{
 						"wi_research": map[string]any{
@@ -261,6 +265,17 @@ func TestResumeEnvelopeTamperMatrix(t *testing.T) {
 	}
 }
 
+func refreshCheckpointContentDigest(t *testing.T, cp *goalrun.Checkpoint) {
+	t.Helper()
+	cp.ContentDigest = ""
+	raw, err := json.Marshal(*cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(raw)
+	cp.ContentDigest = "sha256:" + hex.EncodeToString(sum[:])
+}
+
 func fileExists(p string) bool {
 	_, err := os.Stat(p)
 	return err == nil
@@ -306,6 +321,7 @@ func TestResumeOverlapConflictMatrix(t *testing.T) {
 		part := map[string]any{
 			"schema": workflowrun.PartialSchema, "project_id": projectID, "run_id": runID,
 			"plan_digest": planDig, "execution_plan_digest": planDig, "graph_digest": graphDig,
+			"graph_id": graphID, "graph_version": 1,
 			"prior_succeeded": map[string]any{
 				"wi_research": map[string]any{
 					"work_item_id": p2.WorkItemID, "terminal": p2.Terminal, "attempt_id": p2.AttemptID,
@@ -497,14 +513,14 @@ func TestSuccessfulRestartExactlyOnce(t *testing.T) {
 		return g, nil
 	}
 	// Authoritative restart: real process identity + authority + PID (not Fake).
+	repo := initDisposableGitRepo(t)
 	res1, err1 := goalrun.Execute(context.Background(), goalrun.Request{
 		ProjectID: projectID, RunID: runID,
 		Goal: "implement transparent multi-child routing", Issue: "1397",
 		Actor: "owner", Owner: "worker",
 		Provider: "codex", Model: "gpt-5.5",
-		HomeDir: home, Now: func() time.Time { return now },
-		Decompose:     twoChild,
-		LoadInventory: env.loadInv(), OpenLedger: env.openLed(),
+		HomeDir: home, RepoPath: repo, Now: func() time.Time { return now },
+		Decompose: twoChild, LoadInventory: env.loadInv(), OpenLedger: env.openLed(),
 		Executor: testspawn.Executor{
 			HomeDir: home, Now: func() time.Time { return now },
 			Calls: calls1, FailIDs: map[string]bool{"wi_implement": true},
@@ -528,9 +544,8 @@ func TestSuccessfulRestartExactlyOnce(t *testing.T) {
 		Goal: "implement transparent multi-child routing", Issue: "1397",
 		Actor: "owner", Owner: "worker",
 		Provider: "codex", Model: "gpt-5.5",
-		HomeDir: home, Now: func() time.Time { return now.Add(time.Minute) },
-		Decompose:     twoChild,
-		LoadInventory: env.loadInv(), OpenLedger: env.openLed(),
+		HomeDir: home, RepoPath: repo, Now: func() time.Time { return now.Add(time.Minute) },
+		Decompose: twoChild, LoadInventory: env.loadInv(), OpenLedger: env.openLed(),
 		Executor: testspawn.Executor{
 			HomeDir: home, Now: func() time.Time { return now.Add(time.Minute) },
 			Calls: calls2,

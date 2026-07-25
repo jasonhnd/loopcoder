@@ -1,6 +1,7 @@
 package artifactqual
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -51,13 +52,36 @@ type Input struct {
 	SHA string
 	// WorkDir for extract (required).
 	WorkDir string
-	// Integration dual-green flags measured from Actions (caller-supplied from metadata only).
-	IntegrationVerifyOK bool
-	IntegrationCanaryOK bool
+	// Integration dual-green: REQUIRED path is PreProdActionsReceipt (same Actions
+	// run/attempt). Legacy IntegrationVerifyOK/CanaryOK are non-qualifying
+	// diagnostics only and cannot green dual-green alone.
+	IntegrationReceipt  *PreProdActionsReceipt
+	IntegrationVerifyOK bool // diagnostic only
+	IntegrationCanaryOK bool // diagnostic only
+	// IntegrationVerifier + run/attempt IDs: ModeRelease authority for dual-green.
+	// ModeUnit may still use injected IntegrationReceipt only.
+	IntegrationVerifier   PreProdActionsVerifier
+	IntegrationRunID      int64
+	IntegrationRunAttempt int
+	// Repository owner/repo for integration/RC/PR binding.
+	Repository string
+	// RCActionsBinding is ModeUnit-only injection; ModeRelease ignores it as authority.
+	RCActionsBinding *RCActionsBinding
+	// RCActionsVerifier + run/artifact IDs: ModeRelease authority for RC provenance.
+	RCActionsVerifier RCActionsVerifier
+	RCRunID           int64
+	RCArtifactID      int64
+	// PRLiveVerifier / ExpectedPRHeadOID for live real_pr_human_gate.
+	PRLiveVerifier    PRLiveVerifier
+	ExpectedPRHeadOID string
 	// CanaryEvidencePath is the exact-binary real canary evidence manifest
 	// (loopcoder.canary_evidence.v1). Required for real_runtime scorecard metrics.
 	// Dry-run / --capacity-snapshot structural probes must not substitute.
 	CanaryEvidencePath string
+	// ExpectedCanaryProjectID / ExpectedCanaryRunID bind the operator's one-run
+	// challenge so a prior canary manifest cannot be reused for another run.
+	ExpectedCanaryProjectID string
+	ExpectedCanaryRunID     string
 	// AllowFixture only for unit tests; forbidden when ModeRelease.
 	AllowFixture bool
 	// FixtureEnv only when AllowFixture && ModeUnit.
@@ -99,6 +123,7 @@ func Qualify(in Input) (Evidence, error) {
 		GeneratedAt: now, RejectFixture: in.Mode == ModeRelease,
 	}
 
+	var actionsEvidence releaseActionsEvidence
 	if in.Mode == ModeRelease {
 		if in.AllowFixture || in.FixtureEnv != nil {
 			return Evidence{}, errors.New("artifactqual: fixture constructors forbidden in release mode")
@@ -109,6 +134,12 @@ func Qualify(in Input) (Evidence, error) {
 		if strings.TrimSpace(in.WorkDir) == "" {
 			return Evidence{}, errors.New("artifactqual: workdir required")
 		}
+		// ModeRelease dual-green + RC Actions: fetch by IDs only (ignore caller receipts/bindings).
+		actionsEvidence = resolveReleaseActions(context.Background(), in)
+		ev.Reasons = append(ev.Reasons, actionsEvidence.Reasons...)
+	} else {
+		// ModeUnit may use injected IntegrationReceipt / RCActionsBinding.
+		actionsEvidence = resolveReleaseActions(context.Background(), in)
 	}
 
 	// Unit fixture path (explicit only)
@@ -158,16 +189,16 @@ func Qualify(in Input) (Evidence, error) {
 	_ = os.MkdirAll(home, 0o700)
 	envHome := []string{"LOOPCODER_HOME=" + home, "HOME=" + home, "PATH=" + filepath.Dir(bin) + ":" + os.Getenv("PATH")}
 
+	var binaryIdentity BinaryIdentity
 	versionOK, p := runProbe("version", []string{bin, "--version"}, envHome, func(code int, out string) (bool, []string) {
 		if code != 0 {
 			return false, []string{"non-zero exit"}
 		}
-		if strings.Contains(out, "version=dev") {
-			return false, []string{"version=dev forbidden"}
+		id, err := ValidateBinaryIdentity(out, in.SHA)
+		if err != nil {
+			return false, []string{"binary_identity_invalid"}
 		}
-		if strings.Contains(out, "commit=unknown") {
-			return false, []string{"unknown commit"}
-		}
+		binaryIdentity = id
 		return true, nil
 	})
 	ev.Probes = append(ev.Probes, p)
@@ -310,7 +341,22 @@ func Qualify(in Input) (Evidence, error) {
 			cv := CanaryValidation{Present: true, Valid: false, Reasons: []string{cerr.Error()}, EvidencePath: p}
 			canaryVal = &cv
 		} else {
-			cv := ValidateCanaryEvidence(cev, digest, in.SHA, now)
+			// Optional live PR fetch for real_pr_human_gate.
+			var livePR *PRLiveState
+			if in.PRLiveVerifier != nil && cev.PR != nil && cev.PR.Number > 0 {
+				repo := firstNonEmpty(cev.PR.Repository, in.Repository)
+				if st, perr := in.PRLiveVerifier.FetchPR(context.Background(), repo, cev.PR.Number); perr == nil {
+					livePR = &st
+				} else {
+					ev.Reasons = append(ev.Reasons, "pr_live_fetch:"+perr.Error())
+				}
+			}
+			cv := ValidateCanaryEvidence(cev, digest, in.SHA, now, CanaryValidateOpts{
+				ExpectedProjectID: in.ExpectedCanaryProjectID,
+				ExpectedRunID:     in.ExpectedCanaryRunID,
+				ExpectedPRHeadOID: in.ExpectedPRHeadOID,
+				LivePR:            livePR,
+			})
 			cv.EvidencePath = p
 			canaryVal = &cv
 			if !cv.Valid {
@@ -324,6 +370,35 @@ func Qualify(in Input) (Evidence, error) {
 		ev.Reasons = append(ev.Reasons, "canary_evidence_missing: real_runtime metrics require --canary-evidence from exact binary live canary")
 	}
 	ev.Canary = canaryVal
+
+	// Exact RC provenance: rc-manifest + SHA256SUMS + Release Candidate Draft binding.
+	// Local archive + caller digest alone is not exact RC.
+	if in.Mode == ModeRelease {
+		rcProv, rcErr := LoadRCProvenanceForArchive(in.ArchivePath)
+		if rcErr != nil {
+			ev.Reasons = append(ev.Reasons, "rc_provenance:"+rcErr.Error())
+		} else {
+			okRC, rcReasons := ValidateRCProvenance(rcProv, in.SHA, digest, binaryIdentity.Commit, in.Repository, actionsEvidence.RCBinding)
+			if !okRC {
+				ev.Reasons = append(ev.Reasons, "rc_provenance_invalid")
+				ev.Reasons = append(ev.Reasons, rcReasons...)
+			} else {
+				ev.Probes = append(ev.Probes, Probe{
+					Name: "rc_provenance", Passed: true,
+					OutputDigest: digestBytes([]byte(FormatRCProvenanceRef(rcProv, actionsEvidence.RCBinding))),
+				})
+			}
+		}
+	}
+
+	// Same-run dual-green from resolved pre-prod Actions receipt only (fetched in release mode).
+	intVerify, intCanary, intReasons := PreProdDualGreenFromReceipt(actionsEvidence.IntegrationReceipt, in.SHA, in.Repository)
+	if len(intReasons) > 0 {
+		ev.Reasons = append(ev.Reasons, intReasons...)
+	}
+	// Legacy booleans are diagnostics only — never sole dual-green authority.
+	_ = in.IntegrationVerifyOK
+	_ = in.IntegrationCanaryOK
 
 	// scorecard: structural probes optional; real_runtime from canary only.
 	ok := releaseslo.Bool(true)
@@ -390,11 +465,12 @@ func Qualify(in Input) (Evidence, error) {
 	sc := releaseslo.Compile(releaseslo.Candidate{SHA: in.SHA, ArchiveDigest: digest}, obs, releaseslo.DefaultThresholds(), nil, now)
 	ev.Scorecard = sc
 
-	// GO/NO-GO from measured evidence (operator approval still required for publish)
+	// GO/NO-GO from measured evidence (operator approval still required for publish).
+	// Dual-green uses receipt-derived flags only (not legacy caller booleans).
 	decIn := rcgonogo.Input{
 		SHA: in.SHA, ArchiveDigest: digest,
-		IntegrationVerifyOK: in.IntegrationVerifyOK,
-		IntegrationCanaryOK: in.IntegrationCanaryOK,
+		IntegrationVerifyOK: intVerify,
+		IntegrationCanaryOK: intCanary,
 		Scorecard:           sc,
 		InstallSmoke:        rep,
 		ArtifactLocalDev:    false,
@@ -448,10 +524,12 @@ func nonEmptyRef(s, def string) string {
 
 // realRuntimeObs emits required #1343 metrics only from canary evidence.
 // Without a canary file, metrics are NotRun → scorecard_go=false.
-// With a canary file, each dimension is pass/fail from validation flags
+// Invalid canary (Present but Valid=false) is also NotRun for every required
+// real_runtime metric — never score partial true flags from a failed validate.
+// With a valid canary, each dimension is pass/fail from validation flags
 // (never invent green; dry-run structural probes never populate these).
 func realRuntimeObs(cv *CanaryValidation) []releaseslo.MetricObservation {
-	if cv == nil || !cv.Present {
+	if cv == nil || !cv.Present || !cv.Valid {
 		return []releaseslo.MetricObservation{
 			{ID: releaseslo.MetricMultiDepthRouting, NotRun: true},
 			{ID: releaseslo.MetricUnavailableRouteExclude, NotRun: true},

@@ -9,13 +9,16 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 )
 
-// TestFromProviderInventory_TwoGrokAccountsTwoInstallsSameModel proves no collapse,
-// no cross-wire, deterministic output, and two exact route candidates with distinct
-// windows and quota values.
-func TestFromProviderInventory_TwoGrokAccountsTwoInstallsSameModel(t *testing.T) {
+// TestFromProviderInventory_TwoGrokAccountsOnePATHInstallSameModel proves that two
+// accounts for one provider share the single LookPath-primary CLI installation,
+// keep distinct AccountRefs/auth/quota windows (no cross-account merge), and both
+// remain production-routable against that one install. Distinct physical installs
+// of the same runner command are not simultaneously routable (first-LookPath-wins).
+func TestFromProviderInventory_TwoGrokAccountsOnePATHInstallSameModel(t *testing.T) {
 	now := time.Date(2026, 7, 22, 18, 0, 0, 0, time.UTC)
 	acc1, acc2 := "billing-alice-uuid-aaaaaaaa", "billing-bob-uuid-bbbbbbbb"
-	inst1, inst2 := "install-grok-path-aaa-full-id", "install-grok-path-bbb-full-id"
+	// Single actual PATH-primary install for runner command "grok".
+	const inst = "pinst_grok_path_primary_shared"
 	modelID := "grok-4"
 	capID := "mc-grok-4-shared"
 	snapID := "mcs-grok-dyn"
@@ -26,32 +29,19 @@ func TestFromProviderInventory_TwoGrokAccountsTwoInstallsSameModel(t *testing.T)
 	rep := providerinventory.Report{
 		InventoryFingerprint: "fp-two-grok",
 		Installations: []providerinventory.ProviderInstallation{
-			{
-				ProviderInstallationID: inst1, AdapterID: "grok",
-				InstallationState:   providerinventory.InstallationInstalled,
-				FreshnessState:      providerinventory.FreshnessFresh,
-				Confidence:          providerinventory.ConfidenceExact,
-				UsableForInvocation: "yes",
-			},
-			{
-				ProviderInstallationID: inst2, AdapterID: "grok",
-				InstallationState:   providerinventory.InstallationInstalled,
-				FreshnessState:      providerinventory.FreshnessFresh,
-				Confidence:          providerinventory.ConfidenceExact,
-				UsableForInvocation: "yes",
-			},
+			exactFreshInstall("grok", inst, "sha256:grok-primary-resolved", "sha256:grok-primary-path"),
 		},
 		AuthReadiness: []providerinventory.AuthReadiness{
 			{
 				AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
-				AccountProfileID: ptr(acc1), ProviderInstallationID: ptr(inst1),
+				AccountProfileID: ptr(acc1), ProviderInstallationID: ptr(inst),
 				FreshnessState:      providerinventory.FreshnessFresh,
 				Confidence:          providerinventory.ConfidenceExact,
 				ReadinessConfidence: providerinventory.ConfidenceExact,
 			},
 			{
 				AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
-				AccountProfileID: ptr(acc2), ProviderInstallationID: ptr(inst2),
+				AccountProfileID: ptr(acc2), ProviderInstallationID: ptr(inst),
 				FreshnessState:      providerinventory.FreshnessFresh,
 				Confidence:          providerinventory.ConfidenceExact,
 				ReadinessConfidence: providerinventory.ConfidenceExact,
@@ -60,9 +50,10 @@ func TestFromProviderInventory_TwoGrokAccountsTwoInstallsSameModel(t *testing.T)
 		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{
 			{
 				ModelCatalogSnapshotID: snapID, AdapterID: "grok",
-				CatalogSourceKind: providerinventory.CatalogSourceProviderMachineReadable,
-				Confidence:        providerinventory.ConfidenceExact,
-				FreshnessState:    providerinventory.FreshnessFresh,
+				CatalogSourceKind:      providerinventory.CatalogSourceProviderMachineReadable,
+				Confidence:             providerinventory.ConfidenceExact,
+				FreshnessState:         providerinventory.FreshnessFresh,
+				ProviderInstallationID: ptr(inst),
 			},
 		},
 		ModelCapabilities: []providerinventory.ModelCapability{
@@ -83,7 +74,7 @@ func TestFromProviderInventory_TwoGrokAccountsTwoInstallsSameModel(t *testing.T)
 		QuotaSnapshots: []providerinventory.QuotaSnapshot{
 			{
 				QuotaSnapshotID: "q-alice-5h", AdapterID: "grok",
-				AccountProfileID: ptr(acc1), ProviderInstallationID: ptr(inst1),
+				AccountProfileID: ptr(acc1), ProviderInstallationID: ptr(inst),
 				ScopeKey:   "provider:grok/account:" + acc1 + "/detail:credits_usage",
 				WindowKind: providerinventory.WindowFixedHour,
 				Unit:       "percent", QuantityKind: providerinventory.QuantityProviderDefined,
@@ -93,7 +84,7 @@ func TestFromProviderInventory_TwoGrokAccountsTwoInstallsSameModel(t *testing.T)
 			},
 			{
 				QuotaSnapshotID: "q-bob-week", AdapterID: "grok",
-				AccountProfileID: ptr(acc2), ProviderInstallationID: ptr(inst2),
+				AccountProfileID: ptr(acc2), ProviderInstallationID: ptr(inst),
 				ScopeKey:   "provider:grok/account:" + acc2 + "/detail:credits_usage",
 				WindowKind: providerinventory.WindowFixedWeek,
 				Unit:       "percent", QuantityKind: providerinventory.QuantityProviderDefined,
@@ -116,7 +107,7 @@ func TestFromProviderInventory_TwoGrokAccountsTwoInstallsSameModel(t *testing.T)
 		}
 	}
 
-	// Exactly two Grok accounts with full install identity (no truncation).
+	// Exactly two Grok accounts on the single PATH-primary install (no truncation).
 	type key struct{ acc, inst string }
 	seen := map[key]capacitysnapshot.AccountObservation{}
 	for _, o := range a1 {
@@ -126,9 +117,8 @@ func TestFromProviderInventory_TwoGrokAccountsTwoInstallsSameModel(t *testing.T)
 		if o.AccountRef == "" || o.InstallRef == "" {
 			continue
 		}
-		// No shortRef truncation of install.
-		if o.InstallRef != inst1 && o.InstallRef != inst2 {
-			t.Fatalf("install truncated or invented: %q", o.InstallRef)
+		if o.InstallRef != inst {
+			t.Fatalf("install must be shared PATH primary %q, got %q", inst, o.InstallRef)
 		}
 		// Account must be full opaque (acct-+64hex), not shortRef 12-char.
 		if !strings.HasPrefix(o.AccountRef, "acct-") || len(o.AccountRef) != 5+64 {
@@ -141,13 +131,15 @@ func TestFromProviderInventory_TwoGrokAccountsTwoInstallsSameModel(t *testing.T)
 		for k := range seen {
 			ks = append(ks, k.acc+"|"+k.inst)
 		}
-		t.Fatalf("want 2 exact account×install rows got %d (%+v)", len(seen), ks)
+		t.Fatalf("want 2 exact account×install rows on one install got %d (%+v)", len(seen), ks)
 	}
 
-	// Distinct windows and quota — no cross-wire.
+	// Distinct windows and quota — no cross-wire / no cross-account merge.
 	var winKinds []string
 	var rems []float64
+	accInstalls := map[string]string{}
 	for _, o := range seen {
+		accInstalls[o.AccountRef] = o.InstallRef
 		if len(o.Windows) == 0 {
 			t.Fatalf("account %s missing windows", o.AccountRef)
 		}
@@ -168,6 +160,15 @@ func TestFromProviderInventory_TwoGrokAccountsTwoInstallsSameModel(t *testing.T)
 			t.Fatalf("account %s missing model %s models=%+v", o.AccountRef, modelID, o.Models)
 		}
 	}
+	// Both accounts must share the same production install.
+	var sharedInst string
+	for _, ir := range accInstalls {
+		if sharedInst == "" {
+			sharedInst = ir
+		} else if ir != sharedInst {
+			t.Fatalf("accounts must share one PATH install; got %v", accInstalls)
+		}
+	}
 	// Distinct window kinds (fixed_hour vs fixed_week / weekly).
 	kindSet := map[string]bool{}
 	for _, k := range winKinds {
@@ -181,7 +182,7 @@ func TestFromProviderInventory_TwoGrokAccountsTwoInstallsSameModel(t *testing.T)
 		t.Fatalf("quota collapsed: %v", rems)
 	}
 
-	// Build → ToRouteInventory → two exact route candidates.
+	// Build → ToRouteInventory → two exact route candidates (two accounts, one install).
 	snap, err := capacitysnapshot.Build(a1, now)
 	if err != nil {
 		t.Fatal(err)
@@ -192,6 +193,7 @@ func TestFromProviderInventory_TwoGrokAccountsTwoInstallsSameModel(t *testing.T)
 	}
 	cands := 0
 	accs := map[string]bool{}
+	installs := map[string]bool{}
 	for _, c := range inv.Candidates {
 		if !strings.EqualFold(c.Provider, "grok") || !strings.EqualFold(c.Model, modelID) {
 			continue
@@ -201,8 +203,14 @@ func TestFromProviderInventory_TwoGrokAccountsTwoInstallsSameModel(t *testing.T)
 		}
 		cands++
 		accs[c.AccountRef] = true
+		if c.InstallRef != "" {
+			installs[c.InstallRef] = true
+		}
 	}
 	if cands < 2 || len(accs) < 2 {
 		t.Fatalf("want ≥2 exact route candidates across 2 accounts; cands=%d accs=%d", cands, len(accs))
+	}
+	if len(installs) != 1 || !installs[inst] {
+		t.Fatalf("want single PATH-primary install %q on candidates; installs=%v", inst, installs)
 	}
 }

@@ -40,7 +40,10 @@ func (f *fakeGit) Commit(ctx context.Context, repo, message string) error {
 		return errors.New("commit fail")
 	}
 	f.committed = true
-	f.head = "deadbeef"
+	// Preserve pre-set 40-hex head when tests supply a disposable PR head OID.
+	if f.head == "" {
+		f.head = strings.Repeat("d", 40)
+	}
 	return nil
 }
 func (f *fakeGit) PushUpstream(ctx context.Context, repo, branch string) error {
@@ -52,7 +55,7 @@ func (f *fakeGit) PushUpstream(ctx context.Context, repo, branch string) error {
 }
 func (f *fakeGit) HeadOID(ctx context.Context, repo string) (string, error) {
 	if f.head == "" {
-		f.head = "deadbeef"
+		f.head = strings.Repeat("d", 40)
 	}
 	return f.head, nil
 }
@@ -89,6 +92,20 @@ func (f *fakeHost) Merge(_ context.Context, _ int) error {
 
 func t0() time.Time { return time.Date(2026, 7, 23, 7, 0, 0, 0, time.UTC) }
 
+func fullSHA256(seed string) string {
+	// sha256: + 64 hex (deterministic pad; not a real hash)
+	const hex = "0123456789abcdef"
+	b := "sha256:"
+	for i := 0; i < 64; i++ {
+		if i < len(seed) {
+			b += string(hex[int(seed[i])%16])
+		} else {
+			b += string(hex[i%16])
+		}
+	}
+	return b
+}
+
 func TestOpenCreatesPRHumanGateNoAutoMerge(t *testing.T) {
 	repo := t.TempDir()
 	// seed so WriteFile parent exists + product files so not receipt-only
@@ -98,7 +115,9 @@ func TestOpenCreatesPRHumanGateNoAutoMerge(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(repo, "notes/notes_test.go"), []byte("package notes\n"), 0o600)
 	_ = os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module example.com/n\n\ngo 1.22\n"), 0o600)
 
-	g := &fakeGit{head: "deadbeefcafebabe"}
+	headOID := strings.Repeat("d", 40)
+	verEvid := fullSHA256("verify")
+	g := &fakeGit{head: headOID}
 	h := &fakeHost{
 		checks: []string{"product-tests", "product-build"},
 		green:  true,
@@ -109,12 +128,12 @@ func TestOpenCreatesPRHumanGateNoAutoMerge(t *testing.T) {
 		GraphID: "g1", PlanDigest: "pd", SourceIssue: 1343, Actor: "owner",
 		BaseRef: "main",
 		Children: []workflowrun.ChildOutcome{
-			{WorkItemID: "wi_implement", Terminal: "succeeded", AttemptID: "att-i", OutputEvidence: "sha256:aa",
-				Provider: "antigravity", FilesTouched: []string{"notes/notes.go"}},
-			{WorkItemID: "wi_tests", Terminal: "succeeded", AttemptID: "att-t", OutputEvidence: "sha256:bb",
-				Provider: "antigravity", FilesTouched: []string{"notes/notes_test.go"}},
-			{WorkItemID: "wi_verify", Terminal: "succeeded", AttemptID: "att-v", OutputEvidence: "sha256:verifdead",
-				Provider: "codex", FilesTouched: []string{"review.md"}},
+			{WorkItemID: "wi_implement", TaskClass: "tera", Terminal: "succeeded", AttemptID: "att-i",
+				OutputEvidence: fullSHA256("impl"), Provider: "antigravity", FilesTouched: []string{"notes/notes.go"}},
+			{WorkItemID: "wi_tests", TaskClass: "tera", Terminal: "succeeded", AttemptID: "att-t",
+				OutputEvidence: fullSHA256("tests"), Provider: "antigravity", FilesTouched: []string{"notes/notes_test.go"}},
+			{WorkItemID: "wi_verify", TaskClass: "soul", Terminal: "succeeded", AttemptID: "att-v",
+				OutputEvidence: verEvid, Provider: "codex", FilesTouched: []string{"review.md"}},
 		},
 		InstallMeaningfulCI: &inst,
 		RequiredCheckNames:  goalpr.MeaningfulCheckNames(),
@@ -156,11 +175,12 @@ func TestOpenCreatesPRHumanGateNoAutoMerge(t *testing.T) {
 	if res.VerifierProvider != "codex" || res.VerifierAttemptID != "att-v" {
 		t.Fatalf("verifier bind %+v", res)
 	}
-	if !strings.Contains(res.VerifierEvidenceRef, "sha256:verifdead") || !strings.Contains(res.VerifierEvidenceRef, "@head:") {
-		t.Fatalf("verifier ref %+v", res.VerifierEvidenceRef)
+	wantRef := verEvid + "@head:" + headOID
+	if res.VerifierEvidenceRef != wantRef {
+		t.Fatalf("verifier ref got %q want %q", res.VerifierEvidenceRef, wantRef)
 	}
-	if strings.Contains(res.VerifierEvidenceRef, "pending") {
-		t.Fatal("pending-live forbidden")
+	if res.HeadOID != headOID {
+		t.Fatalf("head=%q", res.HeadOID)
 	}
 	joined := strings.Join(res.Events, "\n")
 	for _, frag := range []string{"git.push", "github.pr_create", "ci.install", "verifier.bind"} {
@@ -170,22 +190,106 @@ func TestOpenCreatesPRHumanGateNoAutoMerge(t *testing.T) {
 	}
 }
 
-func TestOpenRefusesPendingLiveVerifier(t *testing.T) {
+func TestOpenVerifier_PinOnlyWithoutExactWiVerifyFails(t *testing.T) {
 	repo := t.TempDir()
 	_ = os.MkdirAll(filepath.Join(repo, ".git"), 0o700)
 	_ = os.WriteFile(filepath.Join(repo, "x.go"), []byte("package x\n"), 0o600)
 	off := false
+	h := &fakeHost{}
 	_, err := goalpr.Open(context.Background(), goalpr.Request{
 		RepoPath: repo, ProjectID: "p", RunID: "r",
 		Children: []workflowrun.ChildOutcome{
-			{WorkItemID: "a", Terminal: "succeeded", AttemptID: "x", OutputEvidence: "sha256:z", FilesTouched: []string{"x.go"}},
+			{WorkItemID: "wi_implement", TaskClass: "tera", Terminal: "succeeded", AttemptID: "att-i",
+				OutputEvidence: fullSHA256("impl"), Provider: "antigravity", FilesTouched: []string{"x.go"}},
 		},
-		VerifierEvidence:    "sha256:pending-live",
+		IndependentVerifier: "codex",
+		VerifierEvidence:    fullSHA256("pin-only"),
 		InstallMeaningfulCI: &off,
-		Git:                 &fakeGit{}, Host: &fakeHost{},
+		Git:                 &fakeGit{head: strings.Repeat("e", 40)}, Host: h,
 	})
 	if err == nil {
-		t.Fatal("expected refuse pending-live")
+		t.Fatal("expected refuse pin-only without wi_verify")
+	}
+	if !errors.Is(err, goalpr.ErrNotReady) && !strings.Contains(err.Error(), "not ready") {
+		t.Fatalf("%v", err)
+	}
+	if h.created {
+		t.Fatal("must not CreatePR")
+	}
+}
+
+func TestOpenVerifier_SubstringWorkItemFails(t *testing.T) {
+	repo := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(repo, ".git"), 0o700)
+	_ = os.WriteFile(filepath.Join(repo, "x.go"), []byte("package x\n"), 0o600)
+	off := false
+	h := &fakeHost{}
+	_, err := goalpr.Open(context.Background(), goalpr.Request{
+		RepoPath: repo, ProjectID: "p", RunID: "r",
+		Children: []workflowrun.ChildOutcome{
+			{WorkItemID: "wi_implement", TaskClass: "tera", Terminal: "succeeded", AttemptID: "att-i",
+				OutputEvidence: fullSHA256("impl"), Provider: "antigravity", FilesTouched: []string{"x.go"}},
+			{WorkItemID: "wi_verify_notes", TaskClass: "soul", Terminal: "succeeded", AttemptID: "att-v",
+				OutputEvidence: fullSHA256("notes"), Provider: "codex", FilesTouched: []string{"x.go"}},
+		},
+		InstallMeaningfulCI: &off,
+		Git:                 &fakeGit{head: strings.Repeat("e", 40)}, Host: h,
+	})
+	if err == nil {
+		t.Fatal("expected refuse wi_verify_notes")
+	}
+	if h.created {
+		t.Fatal("must not CreatePR")
+	}
+}
+
+func TestOpenVerifier_ShortArbitrarySHA256Fails(t *testing.T) {
+	repo := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(repo, ".git"), 0o700)
+	_ = os.WriteFile(filepath.Join(repo, "x.go"), []byte("package x\n"), 0o600)
+	off := false
+	h := &fakeHost{}
+	_, err := goalpr.Open(context.Background(), goalpr.Request{
+		RepoPath: repo, ProjectID: "p", RunID: "r",
+		Children: []workflowrun.ChildOutcome{
+			{WorkItemID: "wi_implement", TaskClass: "tera", Terminal: "succeeded", AttemptID: "att-i",
+				OutputEvidence: fullSHA256("impl"), Provider: "antigravity", FilesTouched: []string{"x.go"}},
+			{WorkItemID: "wi_verify", TaskClass: "soul", Terminal: "succeeded", AttemptID: "att-v",
+				OutputEvidence: "sha256:short", Provider: "codex", FilesTouched: []string{"x.go"}},
+		},
+		InstallMeaningfulCI: &off,
+		Git:                 &fakeGit{head: strings.Repeat("e", 40)}, Host: h,
+	})
+	if err == nil {
+		t.Fatal("expected refuse short evidence")
+	}
+	if h.created {
+		t.Fatal("must not CreatePR")
+	}
+}
+
+func TestOpenVerifier_SameImplementProviderFails(t *testing.T) {
+	repo := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(repo, ".git"), 0o700)
+	_ = os.WriteFile(filepath.Join(repo, "x.go"), []byte("package x\n"), 0o600)
+	off := false
+	h := &fakeHost{}
+	_, err := goalpr.Open(context.Background(), goalpr.Request{
+		RepoPath: repo, ProjectID: "p", RunID: "r",
+		Children: []workflowrun.ChildOutcome{
+			{WorkItemID: "wi_implement", TaskClass: "tera", Terminal: "succeeded", AttemptID: "att-i",
+				OutputEvidence: fullSHA256("impl"), Provider: "codex", FilesTouched: []string{"x.go"}},
+			{WorkItemID: "wi_verify", TaskClass: "soul", Terminal: "succeeded", AttemptID: "att-v",
+				OutputEvidence: fullSHA256("verify"), Provider: "codex", FilesTouched: []string{"x.go"}},
+		},
+		InstallMeaningfulCI: &off,
+		Git:                 &fakeGit{head: strings.Repeat("e", 40)}, Host: h,
+	})
+	if err == nil {
+		t.Fatal("expected refuse same provider")
+	}
+	if h.created {
+		t.Fatal("must not CreatePR")
 	}
 }
 

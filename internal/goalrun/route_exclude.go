@@ -88,18 +88,17 @@ func BuildUnavailableRetryEvidenceWithProof(excludes []RouteExclude, retryAttemp
 	if len(excludes) == 0 {
 		return nil
 	}
-	retryAttemptID = strings.TrimSpace(retryAttemptID)
-
 	var claimedMU []*RouteExclude
 	for i := range excludes {
 		e := &excludes[i]
 		if !e.Claimed {
 			continue
 		}
-		if !strings.EqualFold(strings.TrimSpace(e.Reason), "model_unavailable") {
+		// Exact durable reason — no EqualFold/TrimSpace normalize.
+		if e.Reason != "model_unavailable" {
 			continue
 		}
-		if strings.TrimSpace(e.Provider) == "" {
+		if e.Provider == "" {
 			continue
 		}
 		claimedMU = append(claimedMU, e)
@@ -115,10 +114,10 @@ func BuildUnavailableRetryEvidenceWithProof(excludes []RouteExclude, retryAttemp
 		}
 		pick := claimedMU[0]
 		// Bind exclude ChildID/Provider exactly to failed ChildOutcome/proof.
-		if wi := strings.TrimSpace(proof.WorkItemID); wi != "" && strings.TrimSpace(pick.ChildID) != wi {
+		if wi := proof.WorkItemID; wi != "" && pick.ChildID != wi {
 			return nil
 		}
-		if fp := strings.TrimSpace(proof.FailedProvider); fp != "" && strings.TrimSpace(pick.Provider) != fp {
+		if fp := proof.FailedProvider; fp != "" && pick.Provider != fp {
 			return nil
 		}
 		noDupClaim := proof.NoDuplicateClaim()
@@ -153,7 +152,7 @@ func BuildUnavailableRetryEvidenceWithProof(excludes []RouteExclude, retryAttemp
 		if e.Claimed {
 			continue
 		}
-		if strings.TrimSpace(e.Provider) == "" || strings.TrimSpace(e.Reason) == "" {
+		if e.Provider == "" || e.Reason == "" {
 			continue
 		}
 		if !isUnavailableRetryReason(e.Reason) {
@@ -180,18 +179,18 @@ func BuildUnavailableRetryEvidenceWithProof(excludes []RouteExclude, retryAttemp
 }
 
 // ValidForClaimedModelUnavailable reports enough concrete measured fields.
-// Attempt identity is case-sensitive after TrimSpace everywhere.
+// Durable attempt identity is byte-exact everywhere.
 func (p *UnavailableRetryProof) ValidForClaimedModelUnavailable() bool {
 	if p == nil {
 		return false
 	}
-	if strings.TrimSpace(p.FailedAttemptID) == "" || strings.TrimSpace(p.RetryAttemptID) == "" {
+	if p.FailedAttemptID == "" || p.RetryAttemptID == "" {
 		return false
 	}
-	if strings.TrimSpace(p.FailedAttemptID) == strings.TrimSpace(p.RetryAttemptID) {
+	if p.FailedAttemptID == p.RetryAttemptID {
 		return false
 	}
-	if strings.TrimSpace(p.WorkItemID) == "" || strings.TrimSpace(p.FailedProvider) == "" {
+	if p.WorkItemID == "" || p.FailedProvider == "" {
 		return false
 	}
 	if p.FailedClaimCount != 1 || p.RetryClaimCount != 1 {
@@ -243,50 +242,48 @@ func (p *UnavailableRetryProof) ValidForClaimedModelUnavailable() bool {
 	}
 	// Capacity: exactly two transitions with strict state/actual/source/identity.
 	if p.PriorTransition.Role != "prior" ||
-		strings.TrimSpace(p.PriorTransition.AttemptID) != strings.TrimSpace(p.FailedAttemptID) {
+		p.PriorTransition.AttemptID != p.FailedAttemptID {
 		return false
 	}
 	if p.AlternateTransition.Role != "alternate" ||
-		strings.TrimSpace(p.AlternateTransition.AttemptID) != strings.TrimSpace(p.RetryAttemptID) {
+		p.AlternateTransition.AttemptID != p.RetryAttemptID {
 		return false
 	}
 	if !validCapacityTransition(p.PriorTransition) || !validCapacityTransition(p.AlternateTransition) {
 		return false
 	}
-	if strings.TrimSpace(p.PriorTransition.ReservationID) == "" ||
-		strings.TrimSpace(p.AlternateTransition.ReservationID) == "" ||
-		strings.TrimSpace(p.PriorTransition.ReservationID) == strings.TrimSpace(p.AlternateTransition.ReservationID) {
+	if p.PriorTransition.ReservationID == "" ||
+		p.AlternateTransition.ReservationID == "" ||
+		p.PriorTransition.ReservationID == p.AlternateTransition.ReservationID {
 		return false
 	}
 	return true
 }
 
 func validCapacityTransition(tr workflowrun.CapacityTransition) bool {
-	st := strings.ToLower(strings.TrimSpace(tr.State))
-	if strings.TrimSpace(tr.Provider) == "" || strings.TrimSpace(tr.Model) == "" ||
-		strings.TrimSpace(tr.Depth) == "" || strings.TrimSpace(tr.AccountRef) == "" ||
-		strings.TrimSpace(tr.WindowKind) == "" || strings.TrimSpace(tr.ReservationID) == "" {
+	st := tr.State
+	if tr.Provider == "" || tr.Model == "" || tr.Depth == "" || tr.AccountRef == "" ||
+		tr.WindowKind == "" || tr.ReservationID == "" {
 		return false
 	}
 	switch st {
 	case "reconciled":
-		return tr.Actual != nil && strings.TrimSpace(tr.Source) != ""
+		return tr.Actual != nil && tr.Source != ""
 	case "released":
-		return tr.Actual == nil && strings.TrimSpace(tr.Source) == ""
+		return tr.Actual == nil && tr.Source == ""
 	default:
 		return false
 	}
 }
 
 func validEventSnap(s EventSnapshot, kind, attempt string) bool {
-	if strings.TrimSpace(s.EventID) == "" {
+	if s.EventID == "" {
 		return false
 	}
-	if !strings.EqualFold(strings.TrimSpace(s.Kind), kind) {
+	if s.Kind != kind {
 		return false
 	}
-	// AttemptID is a case-sensitive identity after TrimSpace.
-	if strings.TrimSpace(s.AttemptID) != strings.TrimSpace(attempt) {
+	if s.AttemptID != attempt {
 		return false
 	}
 	return true
@@ -304,7 +301,7 @@ func (p *UnavailableRetryProof) VerifiedEventIDs() []string {
 		p.ClaimEvent, p.RerouteEvent, p.LaunchEvent, p.RetryTerminalEvent,
 		p.IntegrateEvent,
 	} {
-		if id := strings.TrimSpace(s.EventID); id != "" {
+		if id := s.EventID; id != "" {
 			out = append(out, id)
 		}
 	}
@@ -332,7 +329,7 @@ func (p *UnavailableRetryProof) NoDuplicateClaim() bool {
 		return false
 	}
 	return p.FailedClaimClosed && p.RetryClaimClosed &&
-		strings.TrimSpace(p.FailedAttemptID) != strings.TrimSpace(p.RetryAttemptID)
+		p.FailedAttemptID != p.RetryAttemptID
 }
 
 // NoDuplicateFiles: failed never integrated; product paths do not overlap when both present.
@@ -343,10 +340,10 @@ func (p *UnavailableRetryProof) NoDuplicateFiles() bool {
 	if len(p.FailedProductFiles) > 0 && len(p.RetryProductFiles) > 0 {
 		seen := map[string]bool{}
 		for _, f := range p.FailedProductFiles {
-			seen[strings.TrimSpace(f)] = true
+			seen[f] = true
 		}
 		for _, f := range p.RetryProductFiles {
-			if seen[strings.TrimSpace(f)] {
+			if seen[f] {
 				return false
 			}
 		}
@@ -363,23 +360,23 @@ func (p *UnavailableRetryProof) NoDoubleCapacity() bool {
 		return false
 	}
 	return p.PriorTransition.Role == "prior" && p.AlternateTransition.Role == "alternate" &&
-		strings.TrimSpace(p.PriorTransition.AttemptID) != "" &&
-		strings.TrimSpace(p.AlternateTransition.AttemptID) != "" &&
-		strings.TrimSpace(p.PriorTransition.AttemptID) != strings.TrimSpace(p.AlternateTransition.AttemptID) &&
-		strings.TrimSpace(p.PriorTransition.ReservationID) != strings.TrimSpace(p.AlternateTransition.ReservationID)
+		p.PriorTransition.AttemptID != "" &&
+		p.AlternateTransition.AttemptID != "" &&
+		p.PriorTransition.AttemptID != p.AlternateTransition.AttemptID &&
+		p.PriorTransition.ReservationID != p.AlternateTransition.ReservationID
 }
 
 func firstNonEmptyStr(vals ...string) string {
 	for _, v := range vals {
-		if strings.TrimSpace(v) != "" {
-			return strings.TrimSpace(v)
+		if v != "" {
+			return v
 		}
 	}
 	return ""
 }
 
 func isUnavailableRetryReason(reason string) bool {
-	switch strings.ToLower(strings.TrimSpace(reason)) {
+	switch reason {
 	case "exhausted", "rate_limited", "unavailable",
 		"model_unavailable", "capacity_refused", "permission":
 		return true
@@ -390,7 +387,7 @@ func isUnavailableRetryReason(reason string) bool {
 
 func anyClaimed(excludes []RouteExclude, provider string) bool {
 	for _, e := range excludes {
-		if strings.EqualFold(e.Provider, provider) && e.Claimed {
+		if e.Provider == provider && e.Claimed {
 			return true
 		}
 	}

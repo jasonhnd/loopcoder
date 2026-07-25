@@ -15,25 +15,39 @@ func ptrStr(s string) *string { return &s }
 
 func TestGrokPathAliasFusesInstallAuthModelsWithQuota(t *testing.T) {
 	// Same-report fuse when both aliases are present (associateIdentityEvidence).
+	// Primary MUST be earliest DiscoveryOrder (PATH / LookPath primary), not
+	// lexicographic pinst id. Secondary alias evidence fuses onto primary.
 	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
 	const (
-		acc   = "acct-0c985592aa87678f5c9e10707f0871fcecb480055d14835cee750b19d47df695"
-		instA = "pinst_3an5v55kgyq352a2bbgkfljbmikrndoq"
-		instB = "pinst_wrpmecvyfayff7nnqvaztkqhfs7ua2hd"
-		rhash = "sha256:deadbeefcafebabe0123456789abcdef0123456789abcdef0123456789abcdef"
+		acc = "acct-0c985592aa87678f5c9e10707f0871fcecb480055d14835cee750b19d47df695"
+		// Lexicographically later id is PATH-primary (order 0) — must win over 3an5.
+		instPrimary   = "pinst_wrpmecvyfayff7nnqvaztkqhfs7ua2hd"
+		instSecondary = "pinst_3an5v55kgyq352a2bbgkfljbmikrndoq"
+		rhash         = "sha256:deadbeefcafebabe0123456789abcdef0123456789abcdef0123456789abcdef"
 	)
 	rem, lim := int64(3500), int64(10000)
+	primary := exactFreshInstall("grok", instPrimary, rhash, "sha256:path-primary")
+	primary.DiscoveryOrder = 0
+	secondary := exactFreshInstall("grok", instSecondary, rhash, "sha256:path-secondary")
+	secondary.DiscoveryOrder = 1
 	rep := providerinventory.Report{
 		InventoryFingerprint: "fp-alias",
 		Installations: []providerinventory.ProviderInstallation{
-			exactFreshInstall("grok", instA, rhash, "sha256:path-a"),
-			exactFreshInstall("grok", instB, rhash, "sha256:path-b"),
+			// List secondary first so sort-by-id alone would wrongly prefer it.
+			secondary,
+			primary,
 		},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
 			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
 			ReadinessConfidence: providerinventory.ConfidenceExact,
-			AccountProfileID:    ptrStr(acc), ProviderInstallationID: ptrStr(instA),
+			// Auth on PATH primary (independent readiness); secondary may also bind.
+			AccountProfileID: ptrStr(acc), ProviderInstallationID: ptrStr(instPrimary),
+		}, {
+			AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
+			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
+			ReadinessConfidence: providerinventory.ConfidenceExact,
+			AccountProfileID:    ptrStr(acc), ProviderInstallationID: ptrStr(instSecondary),
 		}},
 		ModelCapabilities: []providerinventory.ModelCapability{{
 			AdapterID: "grok", CanonicalModelID: "grok-4.5",
@@ -51,12 +65,12 @@ func TestGrokPathAliasFusesInstallAuthModelsWithQuota(t *testing.T) {
 			CatalogSourceKind:      providerinventory.CatalogSourceProviderMachineReadable,
 			Confidence:             providerinventory.ConfidenceExact,
 			FreshnessState:         providerinventory.FreshnessFresh,
-			ProviderInstallationID: ptrStr(instA),
+			ProviderInstallationID: ptrStr(instPrimary),
 			EntryCount:             1,
 		}},
 		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
 			QuotaSnapshotID: "q1", AdapterID: "grok",
-			AccountProfileID: ptrStr(acc), ProviderInstallationID: ptrStr(instB),
+			AccountProfileID: ptrStr(acc), ProviderInstallationID: ptrStr(instPrimary),
 			Unit: "percent", WindowKind: providerinventory.WindowFixedWeek,
 			RemainingValue: &rem, LimitValue: &lim, ValueScale: 2,
 			Confidence: providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
@@ -81,8 +95,11 @@ func TestGrokPathAliasFusesInstallAuthModelsWithQuota(t *testing.T) {
 	for _, c := range inv.Candidates {
 		if c.Provider == "grok" && c.Model == "grok-4.5" {
 			found = true
-			if c.InstallRef != instA && c.InstallRef != instB {
-				t.Fatalf("install ref %q not in alias set", c.InstallRef)
+			if c.InstallRef != instPrimary {
+				t.Fatalf("install ref must be PATH primary %s (LookPath), got %q", instPrimary, c.InstallRef)
+			}
+			if c.InstallRef == instSecondary {
+				t.Fatal("secondary path alias must not remain production-eligible")
 			}
 		}
 	}
@@ -537,26 +554,29 @@ func TestEstimatedOrStaleInstallIdentityNeverAliasFuses(t *testing.T) {
 	}
 }
 
-func TestAmbiguousLiveTargetsFailClosedOnRehydrate(t *testing.T) {
-	// Durable B + two live installs sharing resolved hash → no B→live translation.
+func TestMultiLivePathAliasesTranslateDurableToPATHPrimary(t *testing.T) {
+	// Two live path aliases + durable quota on a third pinst of the same resolved
+	// binary → translate durable onto PATH-primary (DiscoveryOrder 0), not fail closed.
 	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
 	const (
 		acc   = "acct-0c985592aa87678f5c9e10707f0871fcecb480055d14835cee750b19d47df695"
-		live1 = "pinst_live_1"
-		live2 = "pinst_live_2"
+		live1 = "pinst_live_path_primary"
+		live2 = "pinst_live_path_secondary"
 		durB  = "pinst_durable_b"
-		rhash = "sha256:ambiguous-multi-live"
+		rhash = "sha256:multi-live-path-primary"
 	)
 	rem := int64(40)
+	p0 := exactFreshInstall("grok", live1, rhash, "sha256:p1")
+	p0.DiscoveryOrder = 0
+	p1 := exactFreshInstall("grok", live2, rhash, "sha256:p2")
+	p1.DiscoveryOrder = 1
 	live := providerinventory.Report{
-		Installations: []providerinventory.ProviderInstallation{
-			exactFreshInstall("grok", live1, rhash, "sha256:p1"),
-			exactFreshInstall("grok", live2, rhash, "sha256:p2"),
-		},
+		Installations: []providerinventory.ProviderInstallation{p0, p1},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
 			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
-			AccountProfileID: ptrStr(acc), ProviderInstallationID: ptrStr(live1),
+			ReadinessConfidence: providerinventory.ConfidenceExact,
+			AccountProfileID:    ptrStr(acc), ProviderInstallationID: ptrStr(live1), // auth on PATH primary
 		}},
 		ModelCapabilities: []providerinventory.ModelCapability{mrModel("grok", "grok-4.5", "mc", nil)},
 		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{{
@@ -581,7 +601,7 @@ func TestAmbiguousLiveTargetsFailClosedOnRehydrate(t *testing.T) {
 			StaleAfter: now.Add(time.Hour).Format(time.RFC3339),
 		}},
 	}
-	_, snap, err := capacitysnapshot.LoadRouteInventory(context.Background(), capacitysnapshot.LoadOptions{
+	inv, snap, err := capacitysnapshot.LoadRouteInventory(context.Background(), capacitysnapshot.LoadOptions{
 		Now: now,
 		Discover: func(context.Context, providerinventory.Options) (providerinventory.Report, error) {
 			return live, nil
@@ -590,9 +610,23 @@ func TestAmbiguousLiveTargetsFailClosedOnRehydrate(t *testing.T) {
 			return durable, nil
 		},
 	})
-	// Ambiguous live targets: durable B not translated; live A has no windows → fail closed.
-	if err == nil && snap.UnattendedOK {
-		t.Fatal("ambiguous multi-live alias must fail closed (not unattended-eligible)")
+	if err != nil {
+		t.Fatalf("multi-live path aliases must rehydrate to PATH primary: %v", err)
+	}
+	if !snap.UnattendedOK {
+		t.Fatalf("want unattended after PATH-primary fuse: reasons=%v", snap.Reasons)
+	}
+	found := false
+	for _, c := range inv.Candidates {
+		if c.Provider == "grok" && c.Model == "grok-4.5" {
+			found = true
+			if c.InstallRef != live1 {
+				t.Fatalf("want PATH primary install %s, got %s", live1, c.InstallRef)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("want grok-4.5 on PATH primary; candidates=%#v", inv.Candidates)
 	}
 }
 
@@ -919,7 +953,8 @@ func int64Ptr(v int64) *int64 { return &v }
 
 func exactFreshInstall(adapter, id, resolved, pathHash string) providerinventory.ProviderInstallation {
 	return providerinventory.ProviderInstallation{
-		AdapterID: adapter, ProviderInstallationID: id,
+		AdapterID: adapter, ProviderInstallationID: id, ExecutableName: adapter,
+		DiscoverySource:     providerinventory.DiscoveryPath,
 		InstallationState:   providerinventory.InstallationInstalled,
 		UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
 		Confidence: providerinventory.ConfidenceExact,

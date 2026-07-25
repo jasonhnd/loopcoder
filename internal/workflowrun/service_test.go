@@ -132,16 +132,19 @@ func TestThreeNodeChainClaimOnce(t *testing.T) {
 	if res.ClaimCount != 3 || res.LaunchCount != 3 {
 		t.Fatalf("%+v", res)
 	}
-	if len(res.Integrated) != 3 {
-		t.Fatalf("integrated %v", res.Integrated)
-	}
-	// deterministic order a,b,c
-	if strings.Join(res.Integrated, ",") != "a,b,c" {
-		t.Fatalf("order %v", res.Integrated)
+	// No git RepoPath → product integrate skipped: terminal success only, no Integrated fiction.
+	if len(res.Integrated) != 0 {
+		t.Fatalf("SkipIntegrate/no-repo must not fabricate Integrated: %v", res.Integrated)
 	}
 	for _, c := range res.Children {
 		if c.OutputEvidence == "" || c.WorktreePath == "" {
 			t.Fatalf("child missing evidence/worktree: %+v", c)
+		}
+		if c.Terminal != "succeeded" {
+			t.Fatalf("want terminal succeeded without integrate: %+v", c)
+		}
+		if c.IntegrateCommitSHA != "" {
+			t.Fatalf("no-repo must not invent integrate commit: %+v", c)
 		}
 	}
 }

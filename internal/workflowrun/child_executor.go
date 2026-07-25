@@ -474,7 +474,13 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 			}, werr
 		}
 		// Still hash product files when present; stub-only is allowed only in AllowFixture.
-		if productDig, productFiles, perr := productOutputDigest(wt); perr == nil && productDig != "" {
+		// Never ignore digest errors (symlink/non-regular product must fail closed).
+		if productDig, productFiles, perr := productOutputDigest(wt); perr != nil {
+			return ChildExecResult{
+				Terminal: workgraph.TermFailed, FailureClass: FailureClassProductDigest, Message: perr.Error(),
+				WorktreePath: wt, Provider: prov, Model: model, Depth: depth, ActualSource: "unknown",
+			}, perr
+		} else if productDig != "" {
 			digest = productDig
 			files = mergeUniquePaths(files, productFiles)
 		}
@@ -617,7 +623,12 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 		out.IdentityAmbiguityNote = spawnStart.IdentityAmbiguityNote
 	}
 	// Product evidence digest from actual worktree changes (not stub evidence file).
-	digest, files, _ := productOutputDigest(wt)
+	// On already-failed process paths, preserve real FailureClass/route/spawn/usage:
+	// digest errors only clear product evidence (do not overwrite process FC).
+	digest, files, digErr := productOutputDigest(wt)
+	if digErr != nil {
+		digest, files = "", nil
+	}
 	files = mergeUniquePaths(files, auditFiles)
 	if rerr != nil {
 		term := workgraph.TermFailed
@@ -691,7 +702,27 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	//
 	// If materialize is attempted and fails, surface the real typed failure —
 	// never swallow into generic missing_evidence (RC39 Stage D diagnostics).
-	digest, files, _ = productOutputDigest(wt)
+	// Digest errors on the success path are fail-closed (never discard).
+	failProductDigest := func(perr error) (ChildExecResult, error) {
+		out := ChildExecResult{
+			Terminal: workgraph.TermFailed, WorktreePath: wt,
+			FailureClass: FailureClassProductDigest, Message: perr.Error(),
+			Provider: actualProv, Model: actualModel, Depth: actualDepth,
+			ActualSource: "unknown",
+			InvokedRoute: ChildRoute{
+				Provider: actualProv, Model: actualModel, Depth: actualDepth,
+				Permission: actualPerm, AccountRef: actualAcct, InstallRef: actualInstall,
+			},
+		}
+		bindSources(&out)
+		bindSpawn(&out)
+		out = attachUsage(out, res)
+		return out, perr
+	}
+	digest, files, digErr = productOutputDigest(wt)
+	if digErr != nil {
+		return failProductDigest(digErr)
+	}
 	if strings.TrimSpace(digest) == "" {
 		role := ClassifyTaskRole(in.WorkItemID, in.Intent, "")
 		var merr error
@@ -703,6 +734,9 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 		case RoleVerify:
 			fc = FailureClassVerifierVerdictMaterialization
 			merr = materializeVerifierVerdict(wt, res.Summary, in)
+		case RoleDocs:
+			fc = FailureClassDocsMaterialization
+			merr = materializeDocsNotes(wt, res.Summary, in)
 		}
 		if fc != "" {
 			if merr != nil {
@@ -721,7 +755,10 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 				out = attachUsage(out, res)
 				return out, merr
 			}
-			digest, files, _ = productOutputDigest(wt)
+			digest, files, digErr = productOutputDigest(wt)
+			if digErr != nil {
+				return failProductDigest(digErr)
+			}
 		}
 	}
 	if strings.TrimSpace(digest) == "" {
@@ -977,11 +1014,26 @@ func mergePayloadStringMap(dst, src map[string]string) map[string]string {
 // productOutputDigest hashes actual changed product paths/content under the
 // worktree (excluding .loopcoder audit stubs, ownership markers, and provider
 // runtime logs/summaries). Empty when no useful product change exists — cannot
-// become successful evidence. Directory entries from discovery are hard failures
-// (must not silently skip). Align exclusions with filterProductFiles so success
-// digests cannot be built from files acceptance will discard (RC39 research).
+// become successful evidence.
+//
+// Security: never os.Stat/os.ReadFile (those follow symlinks). Every leaf is
+// hashed via the secure regular product chain (non-symlink root + parents,
+// pre-Lstat / Open / SameFile / stream / post-Lstat). Any invalid product
+// returns a non-nil error — callers must not discard it on success paths.
+// Align exclusions with filterProductFiles so success digests cannot be built
+// from files acceptance will discard (RC39 research).
 func productOutputDigest(wt string) (digest string, files []string, err error) {
-	discovered, derr := discoverProductFiles(wt)
+	if strings.TrimSpace(wt) == "" {
+		return "", nil, nil
+	}
+	wtAbs, aerr := filepath.Abs(wt)
+	if aerr != nil {
+		return "", nil, fmt.Errorf("workflowrun: product digest worktree: %w", aerr)
+	}
+	if rerr := requireNonSymlinkDir(wtAbs); rerr != nil {
+		return "", nil, fmt.Errorf("workflowrun: product digest worktree root: %w", rerr)
+	}
+	discovered, derr := discoverProductFiles(wtAbs)
 	if derr != nil {
 		return "", nil, derr
 	}
@@ -1003,29 +1055,31 @@ func productOutputDigest(wt string) (digest string, files []string, err error) {
 			strings.HasPrefix(base, ".loopcoder-child") || base == "loopcoder-child-provider.log" {
 			continue
 		}
-		product = append(product, rel)
+		// Reject unclean paths early with typed error (no silent skip).
+		cleaned, cerr := cleanWorktreeRelPath(rel)
+		if cerr != nil {
+			return "", nil, fmt.Errorf("workflowrun: product path %s: %w", rel, cerr)
+		}
+		product = append(product, filepath.ToSlash(cleaned))
 	}
 	if len(product) == 0 {
 		return "", nil, nil
 	}
 	h := sha256.New()
 	for _, rel := range product {
-		full := filepath.Join(wt, filepath.FromSlash(rel))
-		st, serr := os.Stat(full)
-		if serr != nil {
-			return "", nil, fmt.Errorf("workflowrun: product path %s: %w", rel, serr)
+		// Canonical digest input: slash-rel + NUL + secure stream + NUL.
+		if _, werr := h.Write([]byte(rel)); werr != nil {
+			return "", nil, werr
 		}
-		if st.IsDir() {
-			return "", nil, fmt.Errorf("workflowrun: product path %s is a directory (file-level discovery required)", rel)
+		if _, werr := h.Write([]byte{0}); werr != nil {
+			return "", nil, werr
 		}
-		raw, rerr := os.ReadFile(full)
-		if rerr != nil {
-			return "", nil, fmt.Errorf("workflowrun: product path %s: %w", rel, rerr)
+		if _, herr := streamSecureRegularProduct(wtAbs, rel, h, maxProductHashBytes); herr != nil {
+			return "", nil, fmt.Errorf("workflowrun: product path %s: %w", rel, herr)
 		}
-		h.Write([]byte(rel))
-		h.Write([]byte{0})
-		h.Write(raw)
-		h.Write([]byte{0})
+		if _, werr := h.Write([]byte{0}); werr != nil {
+			return "", nil, werr
+		}
 		files = append(files, rel)
 	}
 	if len(files) == 0 {
@@ -1041,16 +1095,16 @@ func materializeResearchFindings(wt, summary string, in ChildExecInput) error {
 	if wt == "" || len(summary) < 80 {
 		return fmt.Errorf("research summary too short to materialize findings")
 	}
-	low := strings.ToLower(summary)
-	for _, p := range []string{"please clarify", "need clarification", "need more information", "what should i"} {
-		if strings.Contains(low, p) && len(summary) < 400 {
-			return fmt.Errorf("research summary looks like clarification-only")
-		}
+	if isExplicitClarificationOnly(summary) {
+		return fmt.Errorf("research summary looks like clarification-only")
 	}
 	body := "# Research findings\n\n" +
 		"Work item: " + strings.TrimSpace(in.WorkItemID) + "\n\n" +
 		"Intent: " + strings.TrimSpace(in.Intent) + "\n\n" +
 		"## Provider survey\n\n" + summary + "\n"
+	if isExplicitClarificationOnly(body) {
+		return fmt.Errorf("research summary looks like clarification-only")
+	}
 	return writeProductFileSecurely(wt, "findings.md", body, "research findings")
 }
 
@@ -1061,23 +1115,38 @@ func materializeVerifierVerdict(wt, summary string, in ChildExecInput) error {
 	if wt == "" || len(summary) < 80 {
 		return fmt.Errorf("verifier summary too short to materialize verdict")
 	}
-	low := strings.ToLower(summary)
-	for _, p := range []string{"please clarify", "need clarification", "need more information", "what should i"} {
-		if strings.Contains(low, p) && len(summary) < 400 {
-			return fmt.Errorf("verifier summary looks like clarification-only")
-		}
-	}
-	// Explicit reject empty-review shells that would fail hasVerifierVerdict.
-	if strings.Contains(low, "nothing to review") || strings.Contains(low, "no implementation") {
-		if len(summary) < 400 {
-			return fmt.Errorf("verifier summary is empty-review shell")
-		}
+	if isExplicitClarificationOnly(summary) {
+		return fmt.Errorf("verifier summary looks like clarification-only")
 	}
 	body := "# Verification verdict\n\n" +
 		"Work item: " + strings.TrimSpace(in.WorkItemID) + "\n\n" +
 		"Intent: " + strings.TrimSpace(in.Intent) + "\n\n" +
 		"## Adversarial review\n\n" + summary + "\n"
+	// Refuse if headers + body would still be clarification-only.
+	if isExplicitClarificationOnly(body) {
+		return fmt.Errorf("verifier summary looks like clarification-only")
+	}
 	return writeProductFileSecurely(wt, "verdict.md", body, "verifier verdict")
+}
+
+// materializeDocsNotes writes docs-notes.md from the provider Summary when docs
+// child left no product files (summary-only path).
+func materializeDocsNotes(wt, summary string, in ChildExecInput) error {
+	summary = strings.TrimSpace(summary)
+	if wt == "" || len(summary) < 80 {
+		return fmt.Errorf("docs summary too short to materialize notes")
+	}
+	if isExplicitClarificationOnly(summary) {
+		return fmt.Errorf("docs summary looks like clarification-only")
+	}
+	body := "# Documentation notes\n\n" +
+		"Work item: " + strings.TrimSpace(in.WorkItemID) + "\n\n" +
+		"Intent: " + strings.TrimSpace(in.Intent) + "\n\n" +
+		"## Documentation\n\n" + summary + "\n"
+	if isExplicitClarificationOnly(body) {
+		return fmt.Errorf("docs summary looks like clarification-only")
+	}
+	return writeProductFileSecurely(wt, "docs-notes.md", body, "docs notes")
 }
 
 // writeProductFileSecurely writes leafName under worktree via 0600 temp + Rename
@@ -1346,33 +1415,19 @@ func cleanupIsolationViolation(escaped, parentMut, projectMut []string, parentSn
 }
 
 func attachUsage(out ChildExecResult, res agent.Result) ChildExecResult {
+	// Preserve raw token usage only. Token counts are NOT the same unit as
+	// provider quota remaining fraction (Grok credits, weekly %, etc.).
+	// Never reconcile/subtract tokens as capacityledger Actual.
 	if res.Usage.InputTokens != nil {
 		out.InputTokens = *res.Usage.InputTokens
 	}
 	if res.Usage.OutputTokens != nil {
 		out.OutputTokens = *res.Usage.OutputTokens
 	}
-	total := out.InputTokens + out.OutputTokens
-	if res.Usage.TotalTokens != nil && *res.Usage.TotalTokens > 0 {
-		total = *res.Usage.TotalTokens
-	}
-	if total <= 0 {
-		out.ActualSource = "unknown"
-		out.ActualCapacity = nil
-		return out
-	}
-	// Honest estimated fraction from token count vs a large soft window.
-	// Never claim exact when the provider only reported tokens.
-	const softWindow = 200_000.0
-	frac := float64(total) / softWindow
-	if frac > 1 {
-		frac = 1
-	}
-	if frac < 0 {
-		frac = 0
-	}
-	out.ActualCapacity = &frac
-	out.ActualSource = "estimated"
+	// Explicit unknown for quota-window Actual — goalrun derives same-window
+	// Before−After delta after ObserveAfter when identity matches.
+	out.ActualSource = "unknown"
+	out.ActualCapacity = nil
 	return out
 }
 
@@ -1560,17 +1615,30 @@ func writeFakeProductFiles(wt string, in ChildExecInput, override map[string][]s
 			paths = list
 		}
 	}
+	role := ClassifyTaskRole(in.WorkItemID, in.Intent, "")
 	if len(paths) == 0 {
-		// Default product path per child — enough for integrate tests.
-		switch {
-		case strings.Contains(strings.ToLower(in.WorkItemID), "test") || strings.Contains(strings.ToLower(in.Intent), "test"):
+		// Default product path per child — enough for integrate + acceptance tests.
+		switch role {
+		case RoleTests:
 			paths = []string{"notes/notes_test.go", "notes/notes.go"}
-		case strings.Contains(strings.ToLower(in.WorkItemID), "implement") || strings.Contains(strings.ToLower(in.Intent), "implement"):
+		case RoleImplement:
 			paths = []string{"notes/notes.go"}
-		case strings.Contains(strings.ToLower(in.WorkItemID), "doc"):
-			paths = []string{"docs/notes.md"}
+		case RoleDocs:
+			paths = []string{"docs-notes.md"}
+		case RoleVerify:
+			paths = []string{"verdict.md"}
+		case RoleResearch:
+			paths = []string{"findings.md"}
 		default:
-			paths = []string{"notes/" + in.WorkItemID + ".md"}
+			if strings.Contains(strings.ToLower(in.WorkItemID), "test") || strings.Contains(strings.ToLower(in.Intent), "test") {
+				paths = []string{"notes/notes_test.go", "notes/notes.go"}
+			} else if strings.Contains(strings.ToLower(in.WorkItemID), "implement") || strings.Contains(strings.ToLower(in.Intent), "implement") {
+				paths = []string{"notes/notes.go"}
+			} else if strings.Contains(strings.ToLower(in.WorkItemID), "doc") {
+				paths = []string{"docs-notes.md"}
+			} else {
+				paths = []string{"notes/" + in.WorkItemID + ".md"}
+			}
 		}
 	}
 	written := make([]string, 0, len(paths))
@@ -1585,8 +1653,30 @@ func writeFakeProductFiles(wt string, in ChildExecInput, override map[string][]s
 		if strings.HasSuffix(rel, "_test.go") {
 			body = fmt.Sprintf("package notes\n\nimport \"testing\"\n\nfunc TestNotes_%s(t *testing.T) {\n\t// generated for attempt %s\n}\n",
 				strings.ReplaceAll(in.WorkItemID, "-", "_"), in.AttemptID)
+		} else if filepath.Base(rel) == "findings.md" || (role == RoleResearch && strings.HasSuffix(rel, ".md")) {
+			// Substantial survey body so AcceptSucceededChild RoleResearch passes.
+			body = fmt.Sprintf("# Research findings\n\nWork item: %s\n\n## Provider survey\n\n"+
+				"Survey scope and constraints for attempt %s.\n"+
+				"Intent: %s\n"+
+				"Fake fixture survey covers multi-provider notes package layout, capacity routing, and test plan.\n"+
+				"Residual risks: fixture-only path; production uses provider Summary materialization.\n",
+				in.WorkItemID, in.AttemptID, in.Intent)
+		} else if filepath.Base(rel) == "verdict.md" || (role == RoleVerify && strings.HasSuffix(rel, ".md")) {
+			body = fmt.Sprintf("# Verification verdict\n\nWork item: %s\n\n## Adversarial review\n\n"+
+				"Independent review of attempt %s for intent: %s\n"+
+				"Findings: fixture product is consistent with goal graph contracts; residual risk low for tests.\n"+
+				"Recommendation: proceed with integration under human gate.\n",
+				in.WorkItemID, in.AttemptID, in.Intent)
+		} else if filepath.Base(rel) == "docs-notes.md" || (role == RoleDocs && strings.HasSuffix(rel, ".md")) {
+			body = fmt.Sprintf("# Documentation notes\n\nWork item: %s\n\n## Documentation\n\n"+
+				"User-facing notes for attempt %s.\nIntent: %s\n"+
+				"Describe package API, configuration, and multi-provider selection for operators.\n",
+				in.WorkItemID, in.AttemptID, in.Intent)
 		} else if strings.HasSuffix(rel, ".md") {
-			body = fmt.Sprintf("# %s\n\nAttempt: %s\nIntent: %s\n", in.WorkItemID, in.AttemptID, in.Intent)
+			body = fmt.Sprintf("# %s\n\nAttempt: %s\nIntent: %s\n\n"+
+				"Substantial markdown product for fixture acceptance and integrate tests.\n"+
+				"Scope notes, constraints, and residual documentation risks are captured here.\n",
+				in.WorkItemID, in.AttemptID, in.Intent)
 		} else if strings.HasSuffix(rel, ".go") && !strings.HasSuffix(rel, "_test.go") {
 			body = fmt.Sprintf("package notes\n\n// WorkItem %s attempt %s\nfunc Notes() string { return %q }\n",
 				in.WorkItemID, in.AttemptID, in.Intent)

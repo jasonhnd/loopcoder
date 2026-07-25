@@ -72,10 +72,13 @@ func requireKinds(t *testing.T, events []workflowrun.Event, kinds ...string) {
 	}
 }
 
-func validateAllChildEvents(t *testing.T, events []workflowrun.Event, plan, runID string, itemOK map[string]bool) {
+func validateAllChildEvents(t *testing.T, events []workflowrun.Event, id workflowrun.EventWriteIdentity, itemOK map[string]bool) {
 	t.Helper()
 	for _, ev := range events {
-		if err := workflowrun.ValidateChildEventIdentityForPlan(ev, plan, runID, itemOK); err != nil {
+		if id.ProjectID == "" {
+			id.ProjectID = ev.ProjectID
+		}
+		if err := workflowrun.ValidateChildEventIdentityForPlan(ev, id, itemOK); err != nil {
 			t.Fatalf("kind=%s: %v", ev.Kind, err)
 		}
 		if workflowrun.ChildLifecycleKinds[ev.Kind] && !workflowrun.IsParentInterrupt(ev) {
@@ -148,7 +151,11 @@ func TestPersistedPrimarySuccessEvents_RequireAllKinds(t *testing.T) {
 		t.Fatalf("status=%s msg=%s", res.Status, res.Message)
 	}
 	events := loadEvents(t, home, project, runID)
-	validateAllChildEvents(t, events, res.PlanDigest, runID, map[string]bool{"only": true})
+	validateAllChildEvents(t, events, workflowrun.EventWriteIdentity{
+		ProjectID: events[0].ProjectID, RunID: runID,
+		PlanDigest: res.PlanDigest, GraphDigest: res.GraphDigest,
+		GraphID: res.GraphID, GraphVersion: res.GraphVersion,
+	}, map[string]bool{"only": true})
 	requireKinds(t, events, "claim", "launch", "pid", "terminal", "integrate")
 	// Exact attempt/generation on child facts.
 	var att string
@@ -217,7 +224,11 @@ func TestPersistedAlternateRetryEvents_RequireAllKinds(t *testing.T) {
 		t.Fatalf("%v status=%s msg=%s", err, res.Status, res.Message)
 	}
 	events := loadEvents(t, home, project, runID)
-	validateAllChildEvents(t, events, res.PlanDigest, runID, map[string]bool{"only": true})
+	validateAllChildEvents(t, events, workflowrun.EventWriteIdentity{
+		ProjectID: events[0].ProjectID, RunID: runID,
+		PlanDigest: res.PlanDigest, GraphDigest: res.GraphDigest,
+		GraphID: res.GraphID, GraphVersion: res.GraphVersion,
+	}, map[string]bool{"only": true})
 	requireKinds(t, events, "model_unavailable", "reroute", "claim", "launch", "pid", "terminal", "integrate")
 	// Count launches/claims >= 2 for alternate.
 	nLaunch, nClaim, nPID, nTerm := 0, 0, 0, 0
@@ -279,7 +290,11 @@ func TestPersistedClosedClaimTerminalReuse_ZeroSecondLaunch(t *testing.T) {
 		t.Fatalf("ReuseCount=%d", r2.ReuseCount)
 	}
 	events := loadEvents(t, home, project, runID)
-	validateAllChildEvents(t, events, r2.PlanDigest, runID, map[string]bool{"only": true})
+	validateAllChildEvents(t, events, workflowrun.EventWriteIdentity{
+		ProjectID: events[0].ProjectID, RunID: runID,
+		PlanDigest: r2.PlanDigest, GraphDigest: r2.GraphDigest,
+		GraphID: r2.GraphID, GraphVersion: r2.GraphVersion,
+	}, map[string]bool{"only": true})
 	requireKinds(t, events, "reuse")
 	// Message should indicate durable claim+terminal restart reuse.
 	sawTermReuse := false
@@ -341,7 +356,11 @@ func TestPersistedChildInterrupt_RequireInterruptAndPid(t *testing.T) {
 		t.Fatalf("empty plan: err=%v", err)
 	}
 	events := loadEvents(t, home, project, runID)
-	validateAllChildEvents(t, events, res.PlanDigest, runID, map[string]bool{"only": true})
+	validateAllChildEvents(t, events, workflowrun.EventWriteIdentity{
+		ProjectID: events[0].ProjectID, RunID: runID,
+		PlanDigest: res.PlanDigest, GraphDigest: res.GraphDigest,
+		GraphID: res.GraphID, GraphVersion: res.GraphVersion,
+	}, map[string]bool{"only": true})
 	requireKinds(t, events, "claim", "launch", "pid", "interrupt")
 	// Exact attempt shared across claim/launch/pid/interrupt.
 	var att string
@@ -438,7 +457,11 @@ func TestPersistedAlternateChildInterrupt_RequireInterruptAndPid(t *testing.T) {
 		t.Fatalf("interrupted alternate must not report human_gate: %+v", res)
 	}
 	events := loadEvents(t, home, project, runID)
-	validateAllChildEvents(t, events, res.PlanDigest, runID, map[string]bool{"only": true})
+	validateAllChildEvents(t, events, workflowrun.EventWriteIdentity{
+		ProjectID: events[0].ProjectID, RunID: runID,
+		PlanDigest: res.PlanDigest, GraphDigest: res.GraphDigest,
+		GraphID: res.GraphID, GraphVersion: res.GraphVersion,
+	}, map[string]bool{"only": true})
 	requireKinds(t, events, "model_unavailable", "reroute", "claim", "launch", "pid", "interrupt")
 
 	// Interrupt is the alternate-attempt proof anchor.
@@ -604,6 +627,9 @@ func TestRecoverOpenLaunch_G0InterruptDoesNotSuppressG1(t *testing.T) {
 	}
 	must := func(e workflowrun.Event) {
 		e.ProjectID, e.RunID = "proj-r", "run-r"
+		e.ExecutionPlanDigest, e.GraphDigest = "sha256:plan-r", "sha256:graph-r"
+		e.GraphID, e.GraphVersion = "g-r", 1
+		e.TaskClass, e.ChildContractDigest = "tera", "sha256:ccd-r"
 		if _, err := elog.Append(e); err != nil {
 			t.Fatal(err)
 		}

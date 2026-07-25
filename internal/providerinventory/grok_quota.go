@@ -61,16 +61,14 @@ func inspectGrokACPBilling(ctx context.Context, discovery *discoveryContext, ada
 	// Primary: official CLI-owned credits billing HTTP endpoint. Current Grok
 	// Build CLI does not advertise ACP billing/read; the CLI-owned
 	// /v1/billing?format=credits path is the truthful observation source.
-	if source, snaps, probe, err := collectGrokCreditsBilling(ctx, discovery, adapter, installation, now, deps); err == nil && len(snaps) > 0 {
-		return source, snaps, probe
-	} else if err != nil {
-		// Remember credits failure for final gap when ACP also unavailable.
-		// Network grant denials short-circuit without ACP attempt.
-		if probe.NetworkPermission != NetworkGranted || containsString(probe.GapReasons, "quota-collection-not-granted") {
-			return source, snaps, probe
-		}
-		// Fall through to ACP only when credits failed for non-grant reasons.
-		_ = err
+	creditsSource, creditsSnaps, creditsProbe, creditsErr :=
+		collectGrokCreditsBilling(ctx, discovery, adapter, installation, now, deps)
+	if creditsErr == nil && len(creditsSnaps) > 0 {
+		return creditsSource, creditsSnaps, creditsProbe
+	}
+	// Network grant denials short-circuit without ACP attempt.
+	if creditsProbe.NetworkPermission != NetworkGranted || containsString(creditsProbe.GapReasons, "quota-collection-not-granted") {
+		return creditsSource, creditsSnaps, creditsProbe
 	}
 
 	source := grokACPBillingSource(now)
@@ -109,19 +107,12 @@ func inspectGrokACPBilling(ctx context.Context, discovery *discoveryContext, ada
 		return unavailable("quota-collection-not-granted", "ErrQuotaCollectionGrantRequired")
 	}
 	if !grokACPBillingCapabilityAdvertised(ctx, discovery, candidate, env, deps) {
-		// ACP unavailable (current CLI). Prefer credits-auth-missing when that
-		// was the primary path failure; otherwise surface both gaps.
+		// ACP unavailable must not replace the typed primary official-API
+		// failure with the less useful method/capability gap.
+		if creditsErr != nil {
+			return creditsSource, creditsSnaps, creditsProbe
+		}
 		probe.SideEffectClass = "local-read"
-		// Re-attempt credits only for reason reporting is unnecessary; surface
-		// billing-capability-not-advertised and note credits path when auth missing.
-		home, _ := deps.UserHomeDir()
-		if h := strings.TrimSpace(deps.Getenv("HOME")); h != "" {
-			home = h
-		}
-		if _, _, aerr := loadGrokCLIAuthToken(home, deps.Getenv); aerr != nil {
-			return unavailable("credits-auth-missing", "ErrGrokCreditsAuthMissing")
-		}
-		// Auth present but credits collect failed earlier and ACP not advertised.
 		return unavailable("billing-capability-not-advertised", "ErrQuotaSourceUnsupported")
 	}
 
@@ -142,6 +133,9 @@ func inspectGrokACPBilling(ctx context.Context, discovery *discoveryContext, ada
 	probe.Killed = result.Killed
 	probe.ExitCode = &result.ExitCode
 	if err != nil && grokACPBillingProtocolError(err) {
+		if errors.Is(err, ErrGrokACPBillingUnsupported) && creditsErr != nil {
+			return creditsSource, creditsSnaps, creditsProbe
+		}
 		return unavailable(grokACPBillingReason(err), grokACPBillingTerminal(err))
 	}
 	if err != nil || result.TimedOut || result.Killed {
@@ -159,6 +153,9 @@ func inspectGrokACPBilling(ctx context.Context, discovery *discoveryContext, ada
 
 	billing, frames, err := decodeGrokACPBilling(result.Stdout)
 	if err != nil {
+		if errors.Is(err, ErrGrokACPBillingUnsupported) && creditsErr != nil {
+			return creditsSource, creditsSnaps, creditsProbe
+		}
 		return unavailable(grokACPBillingReason(err), grokACPBillingTerminal(err))
 	}
 	snapshots, err := snapshotsFromGrokACPBilling(source, &installationID, installation.Version, billing, frames, now)

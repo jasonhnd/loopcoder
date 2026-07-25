@@ -299,9 +299,14 @@ func TestCrossStoreCanonicalIdentity(t *testing.T) {
 	if cp.GraphDigest != wantGraph {
 		t.Fatalf("checkpoint GraphDigest: %q want %q", cp.GraphDigest, wantGraph)
 	}
+	// Dual ChildReports (MU failed + winner) are valid; pin winner by AttemptID.
 	foundCP := false
 	for _, c := range cp.Children {
 		if c.ChildID != report.ChildID {
+			continue
+		}
+		if c.AttemptID != wantAtt {
+			// Non-winner row (e.g. model_unavailable failed) may coexist.
 			continue
 		}
 		foundCP = true
@@ -311,12 +316,9 @@ func TestCrossStoreCanonicalIdentity(t *testing.T) {
 		if c.ExecutionPlanDigest != wantPlan {
 			t.Fatalf("checkpoint child plan: %q want %q", c.ExecutionPlanDigest, wantPlan)
 		}
-		if c.AttemptID != wantAtt {
-			t.Fatalf("checkpoint child attempt: %q want %q", c.AttemptID, wantAtt)
-		}
 	}
 	if !foundCP {
-		t.Fatalf("checkpoint missing child %s", report.ChildID)
+		t.Fatalf("checkpoint missing winner child %s attempt %s", report.ChildID, wantAtt)
 	}
 	foundWK := false
 	for _, c := range cp.WorkflowKids {
