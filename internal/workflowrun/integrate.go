@@ -555,11 +555,18 @@ func releaseIntegrateWorktree(repoPath, tmpWT string) error {
 	return fmt.Errorf("releaseIntegrateWorktree %s: %s", tmpWT, strings.Join(errs, "; "))
 }
 
-func filterProductFiles(files []string) []string {
+// ProductFilesOnly returns provider-produced paths that are eligible for
+// product evidence/integration. Runtime-only roots are exact, top-level
+// namespaces created by bounded provider invocations; they can never satisfy a
+// product output contract or enter a goal branch.
+func ProductFilesOnly(files []string) []string {
 	out := make([]string, 0, len(files))
 	for _, f := range files {
 		f = filepath.ToSlash(filepath.Clean(f))
 		if f == "." || f == "" || strings.HasPrefix(f, "../") {
+			continue
+		}
+		if runtimeOnlyProductPath(f) {
 			continue
 		}
 		base := filepath.Base(f)
@@ -579,6 +586,24 @@ func filterProductFiles(files []string) []string {
 		out = append(out, f)
 	}
 	return out
+}
+
+func filterProductFiles(files []string) []string {
+	return ProductFilesOnly(files)
+}
+
+func runtimeOnlyProductPath(rel string) bool {
+	rel = filepath.ToSlash(rel)
+	first := rel
+	if i := strings.IndexByte(rel, '/'); i >= 0 {
+		first = rel[:i]
+	}
+	switch first {
+	case ".cache", ".tmp":
+		return true
+	default:
+		return false
+	}
 }
 
 func copyPath(src, dst string) error {

@@ -1051,6 +1051,9 @@ func productOutputDigest(wt string) (digest string, files []string, err error) {
 		if rel == "" || rel == ".loopcoder-owned-worktree" {
 			continue
 		}
+		if runtimeOnlyProductPath(rel) {
+			continue
+		}
 		if strings.HasPrefix(rel, ".loopcoder/") {
 			continue
 		}
