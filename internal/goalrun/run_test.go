@@ -335,6 +335,103 @@ func TestExecuteAutoRoutesChildrenWithCapacityAccounting(t *testing.T) {
 	}
 }
 
+func TestExecuteCanaryUnavailableProbeUsesGenerationSafeVerifiedAlternate(t *testing.T) {
+	now := time.Date(2026, 7, 26, 8, 0, 0, 0, time.UTC)
+	env := newProductEnv(t, now, "codex")
+	for i := range env.Inv.Candidates {
+		env.Inv.Candidates[i].AccountRef = capacityledger.CanonicalAccountRef(env.Inv.Candidates[i].AccountRef)
+	}
+	for i := range env.Inv.Soft {
+		env.Inv.Soft[i].AccountRef = capacityledger.CanonicalAccountRef(env.Inv.Soft[i].AccountRef)
+	}
+	repo := initDisposableGitRepo(t)
+	calls := map[string]int{}
+	req := env.pinRequest("exercise exact unavailable route and continue useful work", "1429")
+	req.ProjectID = "proj-canary-unavailable-probe"
+	req.RunID = "run_canary_unavailable_probe_1"
+	req.Provider = ""
+	req.Model = ""
+	req.RepoPath = repo
+	// This is structural test wiring only; formal acceptance still uses the
+	// production LoadLiveInventory path and independent report digest.
+	req.InventoryProvenance = goalrun.InventoryProvenanceLiveDiscover
+	req.Executor = workflowrun.FakeChildExecutor{
+		HomeDir: env.Home, Now: func() time.Time { return now },
+		FailModel: "gpt-5.3-codex", Calls: calls,
+	}
+	req.CanaryUnavailableProbeProvider = "codex"
+	req.CanaryUnavailableProbeModel = "gpt-5.3-codex"
+	req.CanaryEmit = &goalrun.CanaryEmitOptions{
+		OutPath:             filepath.Join(t.TempDir(), "canary.json"),
+		ArchiveDigest:       strings.Repeat("ab", 32),
+		PreProdSHA:          strings.Repeat("cd", 20),
+		BinaryVersion:       "0.9.0-test",
+		BinaryCommit:        strings.Repeat("cd", 20),
+		HomeDir:             env.Home,
+		RepoPath:            repo,
+		InventoryProvenance: goalrun.InventoryProvenanceLiveDiscover,
+	}
+
+	res, err := goalrun.Execute(context.Background(), req)
+	if err != nil {
+		t.Fatalf("execute: %v status=%s msg=%s", err, res.Status, res.Message)
+	}
+	if calls["wi_research"] != 2 {
+		t.Fatalf("research calls=%d want exact g0+g1", calls["wi_research"])
+	}
+	var failed, succeeded *workflowrun.ChildOutcome
+	for i := range res.Workflow.Children {
+		child := &res.Workflow.Children[i]
+		if child.WorkItemID != "wi_research" {
+			continue
+		}
+		switch {
+		case child.FailureClass == "model_unavailable":
+			failed = child
+		case child.Terminal == "succeeded":
+			succeeded = child
+		}
+	}
+	if failed == nil || succeeded == nil {
+		t.Fatalf("missing exact g0/g1 outcomes: %+v", res.Workflow.Children)
+	}
+	if failed.Model != "gpt-5.3-codex" || failed.Generation != 1 {
+		t.Fatalf("failed attempt mismatch: %+v", failed)
+	}
+	if succeeded.Model != "gpt-5.5" || succeeded.Generation != 2 ||
+		succeeded.SupersedesAttemptID != failed.AttemptID {
+		t.Fatalf("verified alternate mismatch: failed=%+v succeeded=%+v", failed, succeeded)
+	}
+	if succeeded.Provider != failed.Provider ||
+		succeeded.AccountRef != failed.AccountRef ||
+		succeeded.InstallRef != failed.InstallRef ||
+		succeeded.Depth != failed.Depth ||
+		succeeded.Permission != failed.Permission {
+		t.Fatalf("same-account/depth reroute drifted: failed=%+v succeeded=%+v", failed, succeeded)
+	}
+	if res.CanaryEvidencePath == "" {
+		t.Fatal("canary evidence was not emitted")
+	}
+	if len(res.RouteExcludes) == 0 {
+		t.Fatal("missing measured route exclusion")
+	}
+	ledger := ledgerFileEntries(t, env.LedgerPath)
+	var failedEntry, succeededEntry *capacityledger.Entry
+	for i := range ledger {
+		entry := &ledger[i]
+		switch entry.AttemptID {
+		case failed.AttemptID:
+			failedEntry = entry
+		case succeeded.AttemptID:
+			succeededEntry = entry
+		}
+	}
+	if failedEntry == nil || failedEntry.State != "released" ||
+		succeededEntry == nil || (succeededEntry.State != "released" && succeededEntry.State != "reconciled") {
+		t.Fatalf("probe capacity not reconciled: failed=%+v succeeded=%+v", failedEntry, succeededEntry)
+	}
+}
+
 func TestUniqueProjectIDNeverLocalProject(t *testing.T) {
 	now := time.Date(2026, 7, 22, 20, 0, 0, 0, time.UTC)
 	a := goalrun.UniqueProjectID("/tmp/disp-a", func() time.Time { return now })

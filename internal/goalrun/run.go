@@ -110,6 +110,12 @@ type Request struct {
 	WaitPRChecks bool
 	// PRCheckWait max wait for checks (default 15m when WaitPRChecks).
 	PRCheckWait time.Duration
+	// CanaryUnavailableProbe* selects one adapter-declared but non-routable
+	// model for a fixed read-only paid capability probe on wi_research. It is
+	// valid only with CanaryEmit and auto-route. Success blocks; only a real
+	// typed model_unavailable may reroute.
+	CanaryUnavailableProbeProvider string
+	CanaryUnavailableProbeModel    string
 }
 
 // ChildReport is one transparent child line for UI/JSONL.
@@ -280,6 +286,9 @@ func rejectForbiddenProductRoute(provider, model string) error {
 func Execute(ctx context.Context, req Request) (Result, error) {
 	// Earliest request validation: forbidden product routes create zero durable state.
 	if err := rejectForbiddenProductRoute(req.Provider, req.Model); err != nil {
+		return Result{}, err
+	}
+	if err := validateCanaryUnavailableProbeRequest(req); err != nil {
 		return Result{}, err
 	}
 
@@ -930,6 +939,24 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 			InstallRef: strings.TrimSpace(res.InstallRef),
 			WindowKind: strings.TrimSpace(res.WindowKind),
 		}
+		probeOnly := false
+		var probeAlternate selectedRoute
+		if it.ID == "wi_research" &&
+			req.CanaryUnavailableProbeProvider != "" &&
+			req.CanaryUnavailableProbeModel != "" {
+			if sel.Provider != req.CanaryUnavailableProbeProvider {
+				return Result{}, fmt.Errorf("goalrun: canary unavailable probe provider %q does not match live selected provider %q", req.CanaryUnavailableProbeProvider, sel.Provider)
+			}
+			if decisionHasHardEligibleRoute(res.Decision, sel.Provider, req.CanaryUnavailableProbeModel, reqDepth, normalizePerm(perm)) {
+				return Result{}, fmt.Errorf("goalrun: canary unavailable probe model %q is already hard-eligible; refusing to demote a live route into a probe", req.CanaryUnavailableProbeModel)
+			}
+			if !declaredModelSupports(req.CanaryUnavailableProbeProvider, req.CanaryUnavailableProbeModel, reqDepth) {
+				return Result{}, fmt.Errorf("goalrun: canary unavailable probe is not an adapter-declared model/depth")
+			}
+			probeAlternate = sel
+			sel.Model = req.CanaryUnavailableProbeModel
+			probeOnly = true
+		}
 		// Prefer alternate provider if already used and decision lists others.
 		// Diversification must update provider/model/depth/permission/account/window
 		// atomically — never leave original account/window on a new provider.
@@ -1017,6 +1044,12 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 			// Resolve message omitted provider or pointed at a different pin — restate truth.
 			winnerLine = fmt.Sprintf("Winner: %s/%s depth=%s", prov, model, effort)
 		}
+		if probeOnly {
+			winnerLine = fmt.Sprintf(
+				"Canary paid capability probe: %s/%s depth=%s; verified alternate=%s/%s",
+				prov, model, effort, probeAlternate.Provider, probeAlternate.Model,
+			)
+		}
 		cr.RouteReason = fmt.Sprintf(
 			"%s; permission=%s; depth requirement=%s selection=%s invocation=%s",
 			winnerLine, perm, reqDepth, selDepth, effort,
@@ -1060,6 +1093,15 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 					AccountRef: accRef, InstallRef: strings.TrimSpace(cv.InstallRef),
 					WindowKind:   winKind,
 					HardEligible: true, SoftExcluded: false,
+				})
+			}
+			if probeOnly {
+				alts = prependAlternateUnique(alts, workflowrun.AlternateCandidate{
+					Provider: probeAlternate.Provider, Model: probeAlternate.Model,
+					Effort: probeAlternate.Depth, Permission: probeAlternate.Permission,
+					AccountRef: probeAlternate.AccountRef, InstallRef: probeAlternate.InstallRef,
+					WindowKind:   probeAlternate.WindowKind,
+					HardEligible: true,
 				})
 			}
 			if len(alts) > 0 {
@@ -1158,13 +1200,14 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 		cr.Permission = sel.Permission
 		childRoutes[it.ID] = workflowrun.ChildRoute{
 			Provider: prov, Model: model, Depth: effort,
-			Permission:    sel.Permission,
-			TaskClass:     cr.TaskClass,
-			AccountRef:    cr.AccountRef,
-			InstallRef:    firstNonEmpty(cr.InstallRef, sel.InstallRef),
-			WindowKind:    firstNonEmpty(cr.WindowKind, sel.WindowKind),
-			ReservationID: cr.ReservationID,
-			RouteReason:   cr.RouteReason,
+			Permission:          sel.Permission,
+			TaskClass:           cr.TaskClass,
+			AccountRef:          cr.AccountRef,
+			InstallRef:          firstNonEmpty(cr.InstallRef, sel.InstallRef),
+			WindowKind:          firstNonEmpty(cr.WindowKind, sel.WindowKind),
+			ReservationID:       cr.ReservationID,
+			RouteReason:         cr.RouteReason,
+			CapabilityProbeOnly: probeOnly,
 		}
 		children = append(children, cr)
 		emitChild(req.ReportOut, cr)

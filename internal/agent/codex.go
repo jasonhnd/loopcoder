@@ -233,6 +233,10 @@ func (ExecCodexRunner) Run(ctx context.Context, inv Invocation) (Result, error) 
 		result.ActualSourceInstall = ActualSourceInstallBinding
 	}
 	argv := append([]string{"codex"}, BuildCodexArgs(inv)...)
+	result.ArgvDigest = RedactedArgvDigest(argv)
+	if inv.CapabilityProbeOnly && result.ExitCode != 0 && codexLogReportsModelUnavailable(logBytes) {
+		result.FailureClass = "model_unavailable"
+	}
 	// Failures first — never accepted_invocation on partial/failed runs.
 	if runErr != nil {
 		ClearAcceptedActual(&result)
@@ -265,6 +269,28 @@ func (ExecCodexRunner) Run(ctx context.Context, inv Invocation) (Result, error) 
 		return result, fmt.Errorf("codex: depth %q requested but not reported (actual effort unknown)", want)
 	}
 	return result, nil
+}
+
+// codexLogReportsModelUnavailable recognizes only provider/CLI terminal model
+// refusal phrases. It must not classify generic process errors or quota/auth
+// failures as model_unavailable.
+func codexLogReportsModelUnavailable(logBytes []byte) bool {
+	s := strings.ToLower(string(logBytes))
+	switch {
+	case strings.Contains(s, "model is not supported") &&
+		strings.Contains(s, "chatgpt account"):
+		return true
+	case strings.Contains(s, "model is not available") &&
+		strings.Contains(s, "chatgpt account"):
+		return true
+	case strings.Contains(s, "model") &&
+		strings.Contains(s, "does not exist or you do not have access"):
+		return true
+	case strings.Contains(s, "not recognized as a known model"):
+		return true
+	default:
+		return false
+	}
 }
 
 func codexPromptPath(logPath string) string {

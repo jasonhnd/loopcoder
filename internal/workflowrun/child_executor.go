@@ -36,6 +36,10 @@ type ChildRoute struct {
 	WindowKind    string `json:"window_kind,omitempty"`
 	ReservationID string `json:"reservation_id,omitempty"`
 	RouteReason   string `json:"route_reason,omitempty"`
+	// CapabilityProbeOnly runs a fixed read-only no-tools prompt. Success is
+	// fail-closed and never integrated; only typed model_unavailable may use the
+	// normal generation-safe alternate path.
+	CapabilityProbeOnly bool `json:"capability_probe_only,omitempty"`
 }
 
 // ProcessStart is workflow-owned spawn identity published while the provider
@@ -214,6 +218,12 @@ func writeInvocationBinding(wt string, r ChildRoute) error {
 		"permission": r.Permission, "account_ref": r.AccountRef,
 		"install_ref": r.InstallRef, "window_kind": r.WindowKind,
 		"reservation_id": r.ReservationID,
+		"capability_probe_only": func() string {
+			if r.CapabilityProbeOnly {
+				return "true"
+			}
+			return ""
+		}(),
 	})
 	if err != nil {
 		return err
@@ -521,6 +531,17 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	if prompt == "" {
 		prompt = "bounded LoopCoder child work item " + in.WorkItemID
 	}
+	if in.Route.CapabilityProbeOnly {
+		if !in.ReadOnly || strings.TrimSpace(in.Route.Permission) != "read-only" {
+			return ChildExecResult{
+				Terminal: workgraph.TermFailed, FailureClass: "capability_probe_permission",
+				Message:      "capability probe requires exact read-only route",
+				WorktreePath: wt, Provider: prov, Model: model, Depth: depth,
+				ActualSource: "unknown",
+			}, fmt.Errorf("workflowrun: capability probe requires read-only")
+		}
+		prompt = "Reply with exactly OK. Do not use tools."
+	}
 	// Explicit anti-delegation: LoopCoder owns children; never provider-native subagents.
 	hardCap := p.HardCap
 	if hardCap <= 0 {
@@ -537,24 +558,25 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	}
 
 	inv := agent.Invocation{
-		WorktreePath:      wt,
-		Prompt:            prompt,
-		Model:             model,
-		Effort:            depth,
-		Permission:        strings.TrimSpace(in.Route.Permission),
-		AccountRef:        strings.TrimSpace(in.Route.AccountRef),
-		InstallRef:        strings.TrimSpace(in.Route.InstallRef),
-		WindowKind:        strings.TrimSpace(in.Route.WindowKind),
-		ReservationID:     strings.TrimSpace(in.Route.ReservationID),
-		ReadOnly:          in.ReadOnly,
-		BoundedWrite:      !in.ReadOnly,
-		DisableDelegation: true,
-		Role:              "nested-bounded-write",
-		LogPath:           logPath,
-		RunID:             in.AttemptID,
-		ProviderKey:       in.AttemptID,
-		HardCap:           hardCap,
-		Guardian:          in.Guardian,
+		WorktreePath:        wt,
+		Prompt:              prompt,
+		Model:               model,
+		Effort:              depth,
+		Permission:          strings.TrimSpace(in.Route.Permission),
+		AccountRef:          strings.TrimSpace(in.Route.AccountRef),
+		InstallRef:          strings.TrimSpace(in.Route.InstallRef),
+		WindowKind:          strings.TrimSpace(in.Route.WindowKind),
+		ReservationID:       strings.TrimSpace(in.Route.ReservationID),
+		ReadOnly:            in.ReadOnly,
+		BoundedWrite:        !in.ReadOnly,
+		DisableDelegation:   true,
+		CapabilityProbeOnly: in.Route.CapabilityProbeOnly,
+		Role:                "nested-bounded-write",
+		LogPath:             logPath,
+		RunID:               in.AttemptID,
+		ProviderKey:         in.AttemptID,
+		HardCap:             hardCap,
+		Guardian:            in.Guardian,
 	}
 	if in.ReadOnly {
 		inv.Role = "nested-read-only"
@@ -590,12 +612,22 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	// success and duplicate capacity/files semantics). Scheduler/goalrun must
 	// pick another HardEligible same-depth candidate with a generation-safe
 	// retry attempt when that path is wired; until then surface the class.
-	if isModelUnavailableResult(res, rerr) && res.FailureClass == "" {
+	if in.Route.CapabilityProbeOnly {
+		// Canary authority accepts only the adapter's exact typed refusal from
+		// the fixed prompt. Never derive it from Summary/error prose.
+		if res.FailureClass != "model_unavailable" {
+			res.FailureClass = firstNonEmpty(res.FailureClass, "capability_probe_unclassified_failure")
+		}
+	} else if isModelUnavailableResult(res, rerr) && res.FailureClass == "" {
 		res.FailureClass = "model_unavailable"
 	}
 	// Audit stub (not acceptance evidence). Product OutputEvidence comes from
 	// actual changed product paths after execution.
-	_, _, auditFiles, _ := writeChildEvidence(wt, in, "provider_run", now().UTC())
+	evidenceIn := in
+	if in.Route.CapabilityProbeOnly {
+		evidenceIn.Intent = "fixed read-only capability probe"
+	}
+	_, _, auditFiles, _ := writeChildEvidence(wt, evidenceIn, "provider_run", now().UTC())
 	// Actual route ONLY from independently verified runner Actual* fields.
 	// Never res.Model/res.Effort (request-echo) or inv request fallbacks.
 	actualProv := strings.TrimSpace(res.ActualProvider)
@@ -604,6 +636,17 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	actualPerm := strings.TrimSpace(res.ActualPermission)
 	actualAcct := strings.TrimSpace(res.ActualAccountRef)
 	actualInstall := strings.TrimSpace(res.ActualInstallRef)
+	if res.FailureClass == "model_unavailable" && in.Route.CapabilityProbeOnly {
+		// The provider refused the exact attempted argv. Preserve attempted route
+		// identity without promoting it to accepted_invocation success evidence.
+		actualProv = strings.TrimSpace(in.Route.Provider)
+		actualModel = strings.TrimSpace(in.Route.Model)
+		actualDepth = strings.TrimSpace(in.Route.Depth)
+		actualPerm = strings.TrimSpace(in.Route.Permission)
+		res.ActualSourceModel = agent.ActualSourceAttemptedInvocation
+		res.ActualSourceEffort = agent.ActualSourceAttemptedInvocation
+		res.ActualSourcePermission = agent.ActualSourceAttemptedInvocation
+	}
 	// Carry honest per-dimension sources + argv digest through child evidence.
 	bindSources := func(out *ChildExecResult) {
 		if out == nil {
@@ -659,6 +702,7 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 		out.InvokedRoute = ChildRoute{
 			Provider: actualProv, Model: actualModel, Depth: actualDepth,
 			Permission: actualPerm, AccountRef: actualAcct, InstallRef: actualInstall,
+			CapabilityProbeOnly: in.Route.CapabilityProbeOnly,
 		}
 		out = attachUsage(out, res)
 		return out, rerr
@@ -676,9 +720,28 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 		out.InvokedRoute = ChildRoute{
 			Provider: actualProv, Model: actualModel, Depth: actualDepth,
 			Permission: actualPerm, AccountRef: actualAcct, InstallRef: actualInstall,
+			CapabilityProbeOnly: in.Route.CapabilityProbeOnly,
 		}
 		out = attachUsage(out, res)
 		return out, nil
+	}
+	if in.Route.CapabilityProbeOnly {
+		out := ChildExecResult{
+			Terminal: workgraph.TermFailed, WorktreePath: wt,
+			ExitCode: 1, FailureClass: "capability_probe_unexpected_success",
+			Message:  "declared-only capability probe succeeded but is not an authoritative production route",
+			Provider: actualProv, Model: actualModel, Depth: actualDepth,
+			FilesTouched: files, ActualSource: "unknown",
+			InvokedRoute: ChildRoute{
+				Provider: actualProv, Model: actualModel, Depth: actualDepth,
+				Permission: actualPerm, AccountRef: actualAcct, InstallRef: actualInstall,
+				CapabilityProbeOnly: true,
+			},
+		}
+		bindSources(&out)
+		bindSpawn(&out)
+		out = attachUsage(out, res)
+		return out, fmt.Errorf("workflowrun: capability probe unexpectedly succeeded; refusing product integration")
 	}
 	// Isolation first (before evidence/actual requirements) so escapes fail closed
 	// even when no in-worktree product files or Actual* affirmation exist.
@@ -1003,6 +1066,12 @@ func childRoutePayloadFields(r ChildRoute) map[string]string {
 		"window_kind":    strings.TrimSpace(r.WindowKind),
 		"reservation_id": strings.TrimSpace(r.ReservationID),
 		"route_reason":   strings.TrimSpace(r.RouteReason),
+		"capability_probe_only": func() string {
+			if r.CapabilityProbeOnly {
+				return "true"
+			}
+			return ""
+		}(),
 	}
 }
 
