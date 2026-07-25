@@ -2049,10 +2049,7 @@ func parseClaudeAuthStatus(output string, exitCode int) []parsedAuthStatus {
 		reference := firstNonEmpty(profile.ID, profile.Email, profile.OrgID, profile.OrgName, fmt.Sprintf("claude-profile-%d", index))
 		// Email may contribute to the in-memory reference hash, but it is
 		// never retained as a profile display or diagnostic.
-		display := safeSummary(firstNonEmpty(profile.Display, profile.OrgName, fmt.Sprintf("profile-%d", index+1)))
-		if strings.TrimSpace(display) == "" || secretLike(display) {
-			display = "profile-" + hashBase32("claude", reference)[:8]
-		}
+		display := claudeMachineProfileDisplay(profile.Display, profile.OrgName, reference, index)
 		summaryParts := []string{}
 		if profile.APIProvider != "" {
 			summaryParts = append(summaryParts, "api_provider="+boundedToken(safeSummary(profile.APIProvider), 48))
@@ -2081,6 +2078,21 @@ func parseClaudeAuthStatus(output string, exitCode int) []parsedAuthStatus {
 		})
 	}
 	return parsed
+}
+
+func claudeMachineProfileDisplay(display, orgName, reference string, index int) string {
+	candidate := strings.TrimSpace(firstNonEmpty(display, orgName))
+	// Claude may mirror the principal email into either display or orgName.
+	// Fail closed before and after generic redaction: even a partially redacted
+	// address remains account material and must not enter durable records.
+	if candidate == "" || strings.Contains(candidate, "@") || secretLike(candidate) {
+		return "profile-" + hashBase32("claude", reference, fmt.Sprintf("%d", index))[:8]
+	}
+	candidate = safeSummary(candidate)
+	if candidate == "" || strings.Contains(candidate, "@") || secretLike(candidate) {
+		return "profile-" + hashBase32("claude", reference, fmt.Sprintf("%d", index))[:8]
+	}
+	return candidate
 }
 
 func boolAuthStatus(loggedIn bool, exitCode int) string {
@@ -2170,7 +2182,7 @@ func authRecordsFromParsed(adapter AdapterDeclaration, installationID string, pa
 		auth.GapReasons = append([]string(nil), item.Gaps...)
 		auth.Confidence = auth.ReadinessConfidence
 		display := safeSummary(item.Display)
-		if strings.TrimSpace(display) == "" {
+		if strings.TrimSpace(display) == "" || (adapter.AdapterID == "claude" && strings.Contains(display, "@")) {
 			display = "profile-" + hashBase32(accountID)[:8]
 		}
 		collisionSet := []string{}
