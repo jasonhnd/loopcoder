@@ -1422,51 +1422,58 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 			// Only THIS branch may use failure_class=forced_interrupt / service_forced_interrupt.
 			serviceInterruptID := ""
 			if ctx.Err() != nil && term != workgraph.TermSucceeded {
-				term = workgraph.TermCancelled
-				outcome.FailureClass = "forced_interrupt"
-				out.Interrupted = true
-				if out.AbortedAttempts == nil {
-					out.AbortedAttempts = map[string]string{}
-				}
-				out.AbortedAttempts[id] = attemptID
-				// Required child interrupt evidence — not best-effort.
-				// Prefer durable spawn-time PID when spawn was logged (exact identity).
-				intPID, intPIDErr := interruptPIDFromSpawn(spawnPIDLogged, spawnStart, childOut)
-				if intPIDErr != nil {
-					outcome.FailureClass = "interrupt_pid_mismatch"
-					outcome.Message = intPIDErr.Error()
-					outcome.Terminal = string(workgraph.TermFailed)
+				if bindErr := bindServiceInterruptedOutcomeRoute(&outcome, route, childOut.InvokedRoute); bindErr != nil {
 					term = workgraph.TermFailed
-					emit(fmt.Sprintf("interrupt_pid_mismatch:%s: %v", id, intPIDErr))
+					outcome.FailureClass = "interrupt_route_mismatch"
+					outcome.Message = bindErr.Error()
+					emit(fmt.Sprintf("interrupt_route_mismatch:%s: %v", id, bindErr))
 				} else {
-					serviceInterruptID = newInterruptID(attemptID, eventGen)
-					intPayload := map[string]string{
-						"failure_class":   "forced_interrupt",
-						"interrupt_class": InterruptClassServiceForced,
-						"interrupt_id":    serviceInterruptID,
-						"terminal":        string(workgraph.TermCancelled),
-						"work_item_id":    id,
-						"attempt_id":      attemptID,
-						"generation":      fmt.Sprintf("%d", eventGen),
+					term = workgraph.TermCancelled
+					outcome.FailureClass = "forced_interrupt"
+					out.Interrupted = true
+					if out.AbortedAttempts == nil {
+						out.AbortedAttempts = map[string]string{}
 					}
-					intPayload = mergePayloadStringMap(intPayload, childRoutePayloadFields(route))
-					if intPID > 0 {
-						intPayload["pid"] = fmt.Sprintf("%d", intPID)
-					}
-					if _, ierr := logEv(Event{
-						Kind: "interrupt", WorkItemID: id, AttemptID: attemptID, Generation: eventGen,
-						PID: intPID, Message: "forced interrupt; attempt aborted",
-						Terminal: string(workgraph.TermCancelled), FailureClass: "forced_interrupt",
-						Payload: eventJSONPayload(intPayload),
-					}); ierr != nil {
-						outcome.FailureClass = "interrupt_event_failed"
-						outcome.Message = ierr.Error()
+					out.AbortedAttempts[id] = attemptID
+					// Required child interrupt evidence — not best-effort.
+					// Prefer durable spawn-time PID when spawn was logged (exact identity).
+					intPID, intPIDErr := interruptPIDFromSpawn(spawnPIDLogged, spawnStart, childOut)
+					if intPIDErr != nil {
+						outcome.FailureClass = "interrupt_pid_mismatch"
+						outcome.Message = intPIDErr.Error()
 						outcome.Terminal = string(workgraph.TermFailed)
 						term = workgraph.TermFailed
-						serviceInterruptID = ""
-						emit(fmt.Sprintf("interrupt_event_failed:%s: %v", id, ierr))
+						emit(fmt.Sprintf("interrupt_pid_mismatch:%s: %v", id, intPIDErr))
 					} else {
-						emit(fmt.Sprintf("interrupt:%s attempt=%s pid=%d class=%s", id, attemptID, intPID, InterruptClassServiceForced))
+						serviceInterruptID = newInterruptID(attemptID, eventGen)
+						intPayload := map[string]string{
+							"failure_class":   "forced_interrupt",
+							"interrupt_class": InterruptClassServiceForced,
+							"interrupt_id":    serviceInterruptID,
+							"terminal":        string(workgraph.TermCancelled),
+							"work_item_id":    id,
+							"attempt_id":      attemptID,
+							"generation":      fmt.Sprintf("%d", eventGen),
+						}
+						intPayload = mergePayloadStringMap(intPayload, childRoutePayloadFields(route))
+						if intPID > 0 {
+							intPayload["pid"] = fmt.Sprintf("%d", intPID)
+						}
+						if _, ierr := logEv(Event{
+							Kind: "interrupt", WorkItemID: id, AttemptID: attemptID, Generation: eventGen,
+							PID: intPID, Message: "forced interrupt; attempt aborted",
+							Terminal: string(workgraph.TermCancelled), FailureClass: "forced_interrupt",
+							Payload: eventJSONPayload(intPayload),
+						}); ierr != nil {
+							outcome.FailureClass = "interrupt_event_failed"
+							outcome.Message = ierr.Error()
+							outcome.Terminal = string(workgraph.TermFailed)
+							term = workgraph.TermFailed
+							serviceInterruptID = ""
+							emit(fmt.Sprintf("interrupt_event_failed:%s: %v", id, ierr))
+						} else {
+							emit(fmt.Sprintf("interrupt:%s attempt=%s pid=%d class=%s", id, attemptID, intPID, InterruptClassServiceForced))
+						}
 					}
 				}
 			} else if term == workgraph.TermCancelled ||
@@ -2119,47 +2126,54 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 							}
 						}
 						if ctx.Err() != nil && term2 != workgraph.TermSucceeded {
-							term2 = workgraph.TermCancelled
-							outcome.FailureClass = "forced_interrupt"
-							out.Interrupted = true
-							if out.AbortedAttempts == nil {
-								out.AbortedAttempts = map[string]string{}
-							}
-							out.AbortedAttempts[id] = newAttemptID
-							// Typed service_forced_interrupt (not hard_kill_recovery).
-							intPID, intPIDErr := interruptPIDFromSpawn(altSpawnLogged, altSpawnStart, childOut2)
-							if intPIDErr != nil {
-								outcome.FailureClass = "interrupt_pid_mismatch"
-								outcome.Message = intPIDErr.Error()
-								outcome.Terminal = string(workgraph.TermFailed)
+							if bindErr := bindServiceInterruptedOutcomeRoute(&outcome, altRoute, childOut2.InvokedRoute); bindErr != nil {
 								term2 = workgraph.TermFailed
-								serviceInterruptID = ""
-								emit(fmt.Sprintf("interrupt_pid_mismatch:alt:%s: %v", id, intPIDErr))
+								outcome.FailureClass = "interrupt_route_mismatch"
+								outcome.Message = bindErr.Error()
+								emit(fmt.Sprintf("interrupt_route_mismatch:alt:%s: %v", id, bindErr))
 							} else {
-								serviceInterruptID = newInterruptID(newAttemptID, altEventGen)
-								altIntPL := map[string]string{
-									"failure_class": "forced_interrupt", "interrupt_class": InterruptClassServiceForced,
-									"interrupt_id": serviceInterruptID,
-									"terminal":     string(workgraph.TermCancelled),
+								term2 = workgraph.TermCancelled
+								outcome.FailureClass = "forced_interrupt"
+								out.Interrupted = true
+								if out.AbortedAttempts == nil {
+									out.AbortedAttempts = map[string]string{}
 								}
-								altIntPL = mergePayloadStringMap(altIntPL, childRoutePayloadFields(altRoute))
-								if intPID > 0 {
-									altIntPL["pid"] = fmt.Sprintf("%d", intPID)
-								}
-								if _, ierr := logEv(Event{
-									Kind: "interrupt", WorkItemID: id, AttemptID: newAttemptID, Generation: altEventGen,
-									PID: intPID, Message: "forced interrupt; alternate attempt aborted",
-									Terminal: string(workgraph.TermCancelled), FailureClass: "forced_interrupt",
-									Payload: eventJSONPayload(altIntPL),
-								}); ierr != nil {
-									outcome.FailureClass = "interrupt_event_failed"
-									outcome.Message = ierr.Error()
+								out.AbortedAttempts[id] = newAttemptID
+								// Typed service_forced_interrupt (not hard_kill_recovery).
+								intPID, intPIDErr := interruptPIDFromSpawn(altSpawnLogged, altSpawnStart, childOut2)
+								if intPIDErr != nil {
+									outcome.FailureClass = "interrupt_pid_mismatch"
+									outcome.Message = intPIDErr.Error()
 									outcome.Terminal = string(workgraph.TermFailed)
 									term2 = workgraph.TermFailed
 									serviceInterruptID = ""
-									emit(fmt.Sprintf("interrupt_event_failed:alt:%s: %v", id, ierr))
+									emit(fmt.Sprintf("interrupt_pid_mismatch:alt:%s: %v", id, intPIDErr))
 								} else {
-									emit(fmt.Sprintf("interrupt:alt:%s attempt=%s pid=%d", id, newAttemptID, intPID))
+									serviceInterruptID = newInterruptID(newAttemptID, altEventGen)
+									altIntPL := map[string]string{
+										"failure_class": "forced_interrupt", "interrupt_class": InterruptClassServiceForced,
+										"interrupt_id": serviceInterruptID,
+										"terminal":     string(workgraph.TermCancelled),
+									}
+									altIntPL = mergePayloadStringMap(altIntPL, childRoutePayloadFields(altRoute))
+									if intPID > 0 {
+										altIntPL["pid"] = fmt.Sprintf("%d", intPID)
+									}
+									if _, ierr := logEv(Event{
+										Kind: "interrupt", WorkItemID: id, AttemptID: newAttemptID, Generation: altEventGen,
+										PID: intPID, Message: "forced interrupt; alternate attempt aborted",
+										Terminal: string(workgraph.TermCancelled), FailureClass: "forced_interrupt",
+										Payload: eventJSONPayload(altIntPL),
+									}); ierr != nil {
+										outcome.FailureClass = "interrupt_event_failed"
+										outcome.Message = ierr.Error()
+										outcome.Terminal = string(workgraph.TermFailed)
+										term2 = workgraph.TermFailed
+										serviceInterruptID = ""
+										emit(fmt.Sprintf("interrupt_event_failed:alt:%s: %v", id, ierr))
+									} else {
+										emit(fmt.Sprintf("interrupt:alt:%s attempt=%s pid=%d", id, newAttemptID, intPID))
+									}
 								}
 							}
 						} else if term2 == workgraph.TermCancelled ||
@@ -2742,6 +2756,72 @@ func exactRouteMatch(want, got ChildRoute) error {
 			return fmt.Errorf("invoked %s %q != route %q", f.n, f.b, f.a)
 		}
 	}
+	return nil
+}
+
+// bindServiceInterruptedOutcomeRoute binds a Service-owned context cancellation
+// to the exact route selected before claim/launch. Executors may return only the
+// invocation fields they observed before cancellation; missing fields are
+// recovered solely from that immutable selected route. Any nonempty executor
+// field must be byte-for-byte identical, otherwise the interruption is not
+// resumable as service_forced_interrupt.
+func bindServiceInterruptedOutcomeRoute(out *ChildOutcome, selected, invoked ChildRoute) error {
+	if out == nil {
+		return fmt.Errorf("service interrupted outcome required")
+	}
+	required := []struct {
+		name     string
+		selected string
+		invoked  string
+	}{
+		{"provider", selected.Provider, invoked.Provider},
+		{"model", selected.Model, invoked.Model},
+		{"depth", selected.Depth, invoked.Depth},
+		{"permission", selected.Permission, invoked.Permission},
+	}
+	for _, field := range required {
+		if field.selected == "" {
+			return fmt.Errorf("selected route %s required nonempty", field.name)
+		}
+		if field.invoked != "" && field.invoked != field.selected {
+			return fmt.Errorf("interrupted invoked %s %q != selected route %q", field.name, field.invoked, field.selected)
+		}
+	}
+	capacityBound := selected.AccountRef != "" ||
+		selected.InstallRef != "" ||
+		selected.WindowKind != "" ||
+		selected.ReservationID != ""
+	capacity := []struct {
+		name     string
+		selected string
+		invoked  string
+	}{
+		{"account_ref", selected.AccountRef, invoked.AccountRef},
+		{"install_ref", selected.InstallRef, invoked.InstallRef},
+		{"window_kind", selected.WindowKind, invoked.WindowKind},
+		{"reservation_id", selected.ReservationID, invoked.ReservationID},
+	}
+	for _, field := range capacity {
+		if capacityBound && field.selected == "" {
+			return fmt.Errorf("selected route %s required nonempty for capacity route", field.name)
+		}
+		if field.invoked != "" && field.invoked != field.selected {
+			return fmt.Errorf("interrupted invoked %s %q != selected route %q", field.name, field.invoked, field.selected)
+		}
+	}
+	if invoked.TaskClass != "" && invoked.TaskClass != selected.TaskClass {
+		return fmt.Errorf("interrupted invoked task_class %q != selected route %q", invoked.TaskClass, selected.TaskClass)
+	}
+
+	out.Provider = selected.Provider
+	out.Model = selected.Model
+	out.Depth = selected.Depth
+	out.Permission = selected.Permission
+	out.AccountRef = selected.AccountRef
+	out.InstallRef = selected.InstallRef
+	out.WindowKind = selected.WindowKind
+	out.ReservationID = selected.ReservationID
+	out.RouteReason = selected.RouteReason
 	return nil
 }
 

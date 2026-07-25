@@ -42,8 +42,12 @@ type Executor struct {
 	FailModelUnavailableOnceIDs map[string]bool
 	FailModelUnavailableCounts  map[string]int
 	CancelAfterIDs              map[string]bool // after durable PID, return forced_interrupt without hang
-	Calls                       map[string]int
-	InvocationCountPath         string
+	// MutateInterruptedRoute alters only the route echoed after a Service-owned
+	// context cancellation. It reproduces production executors that can report
+	// a partial invocation identity when interrupted before final stamping.
+	MutateInterruptedRoute func(workflowrun.ChildRoute) workflowrun.ChildRoute
+	Calls                  map[string]int
+	InvocationCountPath    string
 }
 
 // Execute implements workflowrun.ChildExecutor.
@@ -178,12 +182,16 @@ func (e Executor) Execute(ctx context.Context, in workflowrun.ChildExecInput) (w
 		<-ctx.Done()
 		_ = process.KillGroup(pid)
 		_, _ = cmd.Process.Wait()
-		return stamp(workflowrun.ChildExecResult{
+		out := stamp(workflowrun.ChildExecResult{
 			Terminal: workgraph.TermCancelled, OutputEvidence: base.OutputEvidence, WorktreePath: wt,
 			ProcessPID: pid, ExitCode: 130, FailureClass: "forced_interrupt",
 			Message:      "forced interrupt while running " + in.WorkItemID,
 			FilesTouched: base.FilesTouched, SpawnObserved: true, ActualSource: "unknown",
-		}, in.Route), ctx.Err()
+		}, in.Route)
+		if e.MutateInterruptedRoute != nil {
+			out.InvokedRoute = e.MutateInterruptedRoute(out.InvokedRoute)
+		}
+		return out, ctx.Err()
 	}
 
 	_ = cmd.Wait()

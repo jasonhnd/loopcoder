@@ -102,6 +102,12 @@ func TestForcedInterruptProductionProof_KillMidChildResumeEmitCanary(t *testing.
 		Executor: testspawn.Executor{
 			HomeDir: home, Now: func() time.Time { return now },
 			Calls: calls1, HangIDs: map[string]bool{hangWI: true},
+			// Reproduce the production cancellation shape: the runner observed
+			// the invocation but returned before stamping permission.
+			MutateInterruptedRoute: func(route workflowrun.ChildRoute) workflowrun.ChildRoute {
+				route.Permission = ""
+				return route
+			},
 			OnHangEntry: func(workItemID string, pid int) {
 				if workItemID == hangWI && pid > 0 {
 					hangPID = pid
@@ -231,6 +237,9 @@ func TestForcedInterruptProductionProof_KillMidChildResumeEmitCanary(t *testing.
 			if c.Generation < 1 || c.TaskClass == "" || c.ChildContractDigest == "" {
 				t.Fatalf("pass1 aborted row incomplete identity: %+v", c)
 			}
+			if c.Permission != "bounded_write" {
+				t.Fatalf("pass1 aborted row permission=%q want exact selected bounded_write: %+v", c.Permission, c)
+			}
 		}
 	}
 	if !foundAbortedRow {
@@ -246,6 +255,9 @@ func TestForcedInterruptProductionProof_KillMidChildResumeEmitCanary(t *testing.
 			foundPart = true
 			if k.Terminal != "cancelled" || k.FailureClass != "forced_interrupt" {
 				t.Fatalf("partial aborted row incomplete: %+v", k)
+			}
+			if k.Permission != "bounded_write" {
+				t.Fatalf("partial aborted row permission=%q want exact selected bounded_write: %+v", k.Permission, k)
 			}
 		}
 	}
