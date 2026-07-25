@@ -96,7 +96,8 @@ func BuildUnavailableRetryEvidenceWithProof(excludes []RouteExclude, retryAttemp
 		if !e.Claimed {
 			continue
 		}
-		if !strings.EqualFold(strings.TrimSpace(e.Reason), "model_unavailable") {
+		// Exact durable reason — no EqualFold/TrimSpace normalize.
+		if e.Reason != "model_unavailable" {
 			continue
 		}
 		if strings.TrimSpace(e.Provider) == "" {

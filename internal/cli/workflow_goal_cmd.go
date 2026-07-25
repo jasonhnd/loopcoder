@@ -15,6 +15,13 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/goalrun"
 )
 
+func formatTimeOrNA(t time.Time) string {
+	if t.IsZero() {
+		return "n/a"
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
 // runWorkflowGoal: loopcoder workflow goal --goal TEXT [--issue N]
 func runWorkflowGoal(args []string, stdout, stderr io.Writer, deps Deps) int {
 	fs := flag.NewFlagSet("workflow goal", flag.ContinueOnError)
@@ -69,17 +76,25 @@ func runWorkflowGoal(args []string, stdout, stderr io.Writer, deps Deps) int {
 		ReportOut: stderr, Now: deps.Now,
 	}
 	if p := strings.TrimSpace(*canaryOut); p != "" {
+		// Fail closed: release canary cannot use injected/test capacity snapshot.
+		if strings.TrimSpace(*capSnap) != "" {
+			fmt.Fprintln(stderr, "workflow goal: --canary-evidence-out rejects --capacity-snapshot (injected inventory cannot produce release canary)")
+			return 2
+		}
 		req.CanaryEmit = &goalrun.CanaryEmitOptions{
 			OutPath: p, ArchiveDigest: strings.TrimSpace(*archDig),
 			PreProdSHA:    strings.TrimSpace(*preSHA),
 			BinaryVersion: deps.BuildInfo.Version, BinaryCommit: deps.BuildInfo.Commit,
+			RepoPath: resolvedRepo,
 		}
+		req.InventoryProvenance = goalrun.InventoryProvenanceLiveDiscover
 	}
 	if *resume && strings.TrimSpace(*runID) == "" {
 		fmt.Fprintln(stderr, "workflow goal: --resume requires --run-id")
 		return 2
 	}
 	if p := strings.TrimSpace(*capSnap); p != "" {
+		req.InventoryProvenance = goalrun.InventoryProvenanceCapacitySnapshot
 		req.LoadInventory = func(ctx context.Context, repo string, at time.Time) (autoroute.Inventory, capacitysnapshot.Snapshot, error) {
 			raw, rerr := os.ReadFile(p)
 			if rerr != nil {
@@ -117,10 +132,17 @@ func runWorkflowGoal(args []string, stdout, stderr io.Writer, deps Deps) int {
 			if c.CapacityAfter != nil {
 				after = fmt.Sprintf("%.3f", *c.CapacityAfter)
 			}
-			fmt.Fprintf(stdout, "- %s stage=%s provider=%s account=%s model=%s depth=%s route=%s\n",
-				c.ChildID, c.Stage, c.Provider, c.AccountRef, c.Model, c.Depth, c.RouteReason)
-			fmt.Fprintf(stdout, "    capacity before=%s reserved=%s actual=%s after=%s state=%s source=%s\n",
-				before, reserved, actual, after, c.CapacityState, c.ActualSource)
+			fmt.Fprintf(stdout, "- %s stage=%s provider=%s account=%s install=%s window=%s class=%s perm=%s model=%s depth=%s\n",
+				c.ChildID, c.Stage, c.Provider, c.AccountRef, c.InstallRef, c.WindowKind, c.TaskClass, c.Permission, c.Model, c.Depth)
+			fmt.Fprintf(stdout, "    route=%s model_src=%s depth_src=%s perm_src=%s\n",
+				c.RouteReason, c.ActualSources.Model, c.ActualSources.Effort, c.ActualSources.Permission)
+			fmt.Fprintf(stdout, "    capacity before=%s(src=%s conf=%s at=%s) reserved=%s actual=%s(src=%s conf=%s) after=%s(src=%s conf=%s at=%s state=%s)\n",
+				before, c.CapacityBeforeSource, c.CapacityBeforeConfidence, formatTimeOrNA(c.CapacityBeforeCapturedAt),
+				reserved,
+				actual, c.ActualSource, c.CapacityActualConfidence,
+				after, c.CapacityAfterSource, c.CapacityAfterConfidence, formatTimeOrNA(c.CapacityAfterObservedAt), c.CapacityAfterState)
+			fmt.Fprintf(stdout, "    group=%s observe=%s tokens=%d state=%s\n",
+				c.CapacityGroupID, c.CapacityGroupObserveID, c.TokenTotal, c.CapacityState)
 			fmt.Fprintf(stdout, "    attempt=%s terminal=%s evidence=%s worktree=%s next=%s\n",
 				c.AttemptID, c.Terminal, c.OutputEvidence, c.WorktreePath, c.NextAction)
 		}

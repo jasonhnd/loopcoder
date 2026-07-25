@@ -115,15 +115,23 @@ func RehydrateForAutoRoute(live, durable Report, now time.Time) Report {
 	out.QuotaTelemetrySources = mergedSources
 
 	// Auth: recover sole recent exact+fresh durable Ready only when live lacks an
-	// exact+fresh observation on that install and durable latest truth allows it.
+	// authoritative collected exact+fresh observation on that install and durable
+	// latest truth allows it.
 	out.AuthReadiness = rehydrateAuth(out.AuthReadiness, durableAuth, now)
 	// Models: fill missing live catalog entries from durable when still fresh.
 	out.ModelCapabilities = rehydrateModels(out.ModelCapabilities, durableModels)
 	// Catalog snapshots: fill when live has no exact MR catalog for adapter.
 	out.ModelCatalogSnapshots = rehydrateCatalogSnapshots(out.ModelCatalogSnapshots, durableCatalogs)
 
-	// Live Installations remain sole host truth for Installed/Usable. Do not
+	// Live Installations remain sole host truth for Installed presence. Do not
 	// append durable installs as live-installed (RC36 review).
+	//
+	// Discover runs promoteUsableInstallations before rehydrate, so grantless
+	// live installs often stay UsableForInvocation=unknown even when durable
+	// exact+fresh Ready is later recovered. Re-promote ONLY the current live
+	// installation set against the merged auth list (translated PATH-primary
+	// install IDs). Never invent installs from durable-only rows (A7-2B).
+	promoteUsableInstallations(out.Installations, out.AuthReadiness)
 
 	// Drop grant-required gaps when we successfully rehydrated durable quota.
 	out.GapReasons = filterRehydratedGaps(out.GapReasons, out.QuotaSnapshots)
@@ -156,64 +164,93 @@ func exactFreshInstallIdentity(inst ProviderInstallation) bool {
 	return true
 }
 
-// durableToLiveInstallAliasMap maps durable ProviderInstallationIDs onto the
-// live PATH-primary installation when adapter + exact ResolvedPathHash matches
-// at least one live target. Primary = lowest DiscoveryOrder among live aliases
-// (LookPath / first PATH hit); secondary live aliases are not independent
-// translation targets. Distinct ResolvedPathHash values never map together.
-// Does not promote durable installs as live-installed.
+// durableToLiveInstallAliasMap maps durable PATH-provenance install IDs onto
+// the live LookPath primary. Mirrors capacitysnapshot:
+//  1. Per adapter|executableName, earliest DiscoveryPath DiscoveryOrder is actual LookPath.
+//  2. That hit must be exact+fresh+installed+usable or no translation.
+//  3. Only durable DiscoverySource==path rows with same resolved hash translate.
+//
+// Explicit-config durable evidence never translates onto PATH.
 func durableToLiveInstallAliasMap(live, durable []ProviderInstallation) map[string]string {
-	// resolvedKey → live installs eligible for alias (id + discovery order)
-	type liveMeta struct {
-		id    string
-		order int
+	type hit struct {
+		id       string
+		order    int
+		resolved string
+		exe      string
+		usable   bool
+		exact    bool
+		inst     ProviderInstallation
 	}
-	liveByKey := map[string][]liveMeta{}
-	liveSeen := map[string]map[string]bool{}
+	// commandKey = adapter|exe → all live PATH hits
+	pathByCmd := map[string][]hit{}
 	for _, inst := range live {
-		if !exactFreshInstallIdentity(inst) {
+		if inst.DiscoverySource != DiscoveryPath {
+			continue
+		}
+		id := strings.TrimSpace(inst.ProviderInstallationID)
+		if id == "" {
 			continue
 		}
 		adapter := strings.ToLower(strings.TrimSpace(inst.AdapterID))
-		resolved := strings.TrimSpace(inst.ExecutableIdentity.ResolvedPathHash)
-		key := adapter + "|" + resolved
-		id := strings.TrimSpace(inst.ProviderInstallationID)
-		if liveSeen[key] == nil {
-			liveSeen[key] = map[string]bool{}
+		exe := strings.ToLower(strings.TrimSpace(inst.ExecutableName))
+		if exe == "" {
+			exe = strings.ToLower(strings.TrimSpace(inst.ExecutableIdentity.Basename))
 		}
-		if liveSeen[key][id] {
-			continue
-		}
-		liveSeen[key][id] = true
-		liveByKey[key] = append(liveByKey[key], liveMeta{id: id, order: inst.DiscoveryOrder})
-	}
-	// PATH primary per key: earliest DiscoveryOrder, then stable id.
-	primaryByKey := map[string]string{}
-	for k, members := range liveByKey {
-		sort.SliceStable(members, func(i, j int) bool {
-			if members[i].order != members[j].order {
-				return members[i].order < members[j].order
-			}
-			return members[i].id < members[j].id
+		ck := adapter + "|" + exe
+		u := strings.ToLower(strings.TrimSpace(inst.UsableForInvocation))
+		pathByCmd[ck] = append(pathByCmd[ck], hit{
+			id: id, order: inst.DiscoveryOrder,
+			resolved: strings.TrimSpace(inst.ExecutableIdentity.ResolvedPathHash),
+			exe:      exe,
+			usable:   (u == "yes" || u == "true") && inst.InstallationState == InstallationInstalled,
+			exact:    exactFreshInstallIdentity(inst),
+			inst:     inst,
 		})
-		primaryByKey[k] = members[0].id
+	}
+	// LookPath primary id per command if eligible.
+	primaryByCmd := map[string]string{}
+	primaryResolved := map[string]string{} // cmd → resolved hash of primary
+	for ck, hits := range pathByCmd {
+		sort.SliceStable(hits, func(i, j int) bool {
+			if hits[i].order != hits[j].order {
+				return hits[i].order < hits[j].order
+			}
+			return hits[i].id < hits[j].id
+		})
+		first := hits[0]
+		// Actual LookPath-first must independently meet full eligibility.
+		if !first.exact || !first.usable || first.resolved == "" {
+			continue // fail closed for this command
+		}
+		primaryByCmd[ck] = first.id
+		primaryResolved[ck] = first.resolved
 	}
 
 	out := map[string]string{}
 	for _, inst := range durable {
+		// Path provenance required on durable side.
+		if inst.DiscoverySource != DiscoveryPath {
+			continue
+		}
 		if !exactFreshInstallIdentity(inst) {
 			continue
 		}
 		adapter := strings.ToLower(strings.TrimSpace(inst.AdapterID))
-		resolved := strings.TrimSpace(inst.ExecutableIdentity.ResolvedPathHash)
-		key := adapter + "|" + resolved
-		durID := strings.TrimSpace(inst.ProviderInstallationID)
-		primary, ok := primaryByKey[key]
+		exe := strings.ToLower(strings.TrimSpace(inst.ExecutableName))
+		if exe == "" {
+			exe = strings.ToLower(strings.TrimSpace(inst.ExecutableIdentity.Basename))
+		}
+		ck := adapter + "|" + exe
+		primary, ok := primaryByCmd[ck]
 		if !ok || primary == "" {
-			// 0 live targets: no translation.
 			continue
 		}
-		if durID == primary {
+		resolved := strings.TrimSpace(inst.ExecutableIdentity.ResolvedPathHash)
+		if resolved == "" || resolved != primaryResolved[ck] {
+			continue // distinct binary
+		}
+		durID := strings.TrimSpace(inst.ProviderInstallationID)
+		if durID == "" || durID == primary {
 			continue
 		}
 		out[durID] = primary
@@ -386,12 +423,44 @@ func authAdapterInstallKey(a AuthReadiness) string {
 }
 
 // exactFreshAuthObservation is live dominance: exact Confidence, exact
-// ReadinessConfidence, and FreshnessFresh — for any ReadinessState (Ready,
-// NotAuthenticated, Expired, unknown, …).
+// ReadinessConfidence, and FreshnessFresh — for collected readiness states.
 func exactFreshAuthObservation(a AuthReadiness) bool {
 	return a.Confidence == ConfidenceExact &&
 		a.ReadinessConfidence == ConfidenceExact &&
 		a.FreshnessState == FreshnessFresh
+}
+
+// liveAuthDominatesDurableRecovery is true only for a genuinely collected live
+// exact+fresh observation of Ready / NotAuthenticated / Expired.
+//
+// Grant-denied, not-run, not-collected, unavailable, or unknown live auth rows
+// must NOT suppress a recent durable exact+fresh Ready observation (A7-2).
+// A collected live exact+fresh NotAuthenticated or Expired MUST still dominate.
+func liveAuthDominatesDurableRecovery(a AuthReadiness) bool {
+	if !exactFreshAuthObservation(a) {
+		return false
+	}
+	// Not-run / grant-denied shapes never dominate even if confidences were exact.
+	if a.EvidenceKind == EvidenceNotRun {
+		return false
+	}
+	for _, g := range a.GapReasons {
+		switch strings.TrimSpace(g) {
+		case "network-permission-denied", "quota-collection-not-granted", "not-collected",
+			"auth-collection-not-granted", "network-not-granted":
+			return false
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(a.SideEffectClass), "not-run") {
+		return false
+	}
+	switch a.ReadinessState {
+	case ReadinessReady, ReadinessNotAuthenticated, ReadinessExpired:
+		return true
+	default:
+		// Unknown / unsupported live observations do not suppress durable Ready.
+		return false
+	}
 }
 
 func parseAuthCapturedAt(value string) (time.Time, bool) {
@@ -430,11 +499,12 @@ func authTruthSignature(a AuthReadiness) string {
 }
 
 // rehydrateAuth recovers a sole recent durable exact+fresh Ready auth when live
-// has no exact+fresh observation on that adapter+install.
+// has no authoritative collected exact+fresh observation on that adapter+install.
 //
 // Algorithm (fail closed):
-//  1. Live exact+fresh (both confidences) any state on adapter+install blocks
-//     all durable recovery for that install.
+//  1. Live exact+fresh Ready/NotAuthenticated/Expired that was actually collected
+//     (not grant-denied / not-run / not-collected) blocks durable recovery for
+//     that install. Unknown / not-run live rows never suppress durable Ready.
 //  2. Group ALL durable rows by adapter+account+translated-install (do not
 //     filter to Ready first).
 //  3. Per identity: any empty/unparseable CapturedAt ⇒ non-recoverable (do not
@@ -454,11 +524,12 @@ func rehydrateAuth(live, durable []AuthReadiness, now time.Time) []AuthReadiness
 		return out
 	}
 
-	// Live dominate: exact+fresh observation of any readiness state blocks
-	// durable recovery on that adapter+install.
+	// Live dominate: only collected exact+fresh Ready/NotAuthenticated/Expired
+	// blocks durable recovery on that adapter+install. Grant-denied / not-run /
+	// unknown live rows never suppress durable Ready (A7-2).
 	liveBlockedAI := map[string]bool{}
 	for _, a := range live {
-		if exactFreshAuthObservation(a) {
+		if liveAuthDominatesDurableRecovery(a) {
 			liveBlockedAI[authAdapterInstallKey(a)] = true
 		}
 	}

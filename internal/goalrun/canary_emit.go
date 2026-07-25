@@ -23,6 +23,14 @@ type CanaryEmitOptions struct {
 	BinaryCommit  string
 	// HomeDir for event log discovery when Workflow.EventLogPath is empty.
 	HomeDir string
+	// RepoPath is the project repo root for repo-local .loopcoder measurement.
+	// When empty at emit time, EmitCanaryFromResult fills from the Execute Request
+	// only via the caller wiring opts.RepoPath = req.RepoPath (never invents clean).
+	RepoPath string
+	// InventoryProvenance must be live_discover for release canary (structural).
+	InventoryProvenance InventoryProvenance
+	// RequireLiveInventory when true fails closed on non-live inventory provenance.
+	RequireLiveInventory bool
 }
 
 // EmitCanaryFromResult builds and writes canary_evidence.v1 from a completed goal Result.
@@ -36,6 +44,11 @@ type CanaryEmitOptions struct {
 func EmitCanaryFromResult(res Result, opts CanaryEmitOptions) (artifactqual.CanaryEvidence, error) {
 	if strings.TrimSpace(opts.OutPath) == "" {
 		return artifactqual.CanaryEvidence{}, fmt.Errorf("goalrun: canary out path required")
+	}
+	// Structural inventory provenance: release canary never from snapshot/injected.
+	if opts.RequireLiveInventory && opts.InventoryProvenance != InventoryProvenanceLiveDiscover &&
+		opts.InventoryProvenance != InventoryProvenanceUnspecified {
+		return artifactqual.CanaryEvidence{}, fmt.Errorf("goalrun: canary emit rejects inventory provenance %q (require live_discover)", opts.InventoryProvenance)
 	}
 
 	events, evPath, loadErr := loadWorkflowEvents(res, opts.HomeDir)
@@ -59,19 +72,26 @@ func EmitCanaryFromResult(res Result, opts CanaryEmitOptions) (artifactqual.Cana
 	children := canaryChildrenFromReports(res)
 	obs := canaryProviderObsFromReports(res)
 
-	var prURL, prBranch, prVer, prVerRef string
+	var prURL, prBranch, prBase, prHead, prRepo, prVer, prVerRef, prVerProv, prVerAtt string
 	var prNum int
 	var prChecks []string
-	var prGreen, prOwned bool
+	var prGreen, prOwned, prHuman bool
 	if res.PR != nil {
 		prURL = res.PR.URL
 		prBranch = res.PR.Branch
 		prNum = res.PR.Number
+		prBase = res.PR.BaseRef
+		prHead = res.PR.HeadOID
 		prChecks = res.PR.RequiredChecks
 		prGreen = res.PR.RequiredChecksGreen
+		prVerProv = res.PR.VerifierProvider
 		prVer = firstNonEmpty(res.PR.VerifierProvider, res.PR.IndependentVerifier)
 		prVerRef = res.PR.VerifierEvidenceRef
+		prVerAtt = res.PR.VerifierAttemptID
 		prOwned = res.PR.CreatedByLoopCoder
+		prHuman = res.PR.HumanMergeGate
+		// Repository inferred from URL when possible (owner/repo).
+		prRepo = repoFromPRURL(res.PR.URL)
 	}
 
 	in := artifactqual.EmitInput{
@@ -80,13 +100,19 @@ func EmitCanaryFromResult(res Result, opts CanaryEmitOptions) (artifactqual.Cana
 		ProjectID: res.ProjectID, RunID: res.RunID,
 		Children: children, ProviderObs: obs, Events: events, EventLogPath: evPath,
 		ReuseCount: res.ReuseCount, WorktreePeak: res.WorktreePeak, ProcessPeak: res.ProcessPeak,
-		Resumed: res.Resumed || res.Workflow.Interrupted,
-		PRURL:   prURL, PRBranch: prBranch, PRNumber: prNum,
+		// Occupancy measured from workflowrun.Result at return (never invent zeros).
+		WorktreeActive: res.Workflow.WorktreeActive, ProcessActive: res.Workflow.ProcessActive,
+		ActiveOccupancyMeasured: true,
+		Resumed:                 res.Resumed || res.Workflow.Interrupted,
+		RepoPath:                opts.RepoPath,
+		PRURL:                   prURL, PRRepository: prRepo, PRBranch: prBranch, PRNumber: prNum,
+		PRBaseRef: prBase, PRHeadOID: prHead,
 		PRRequiredChecks: prChecks, PRRequiredChecksGreen: prGreen,
 		PRIndependentVerifier: prVer, PRVerifierEvidenceRef: prVerRef,
-		PRCreatedByLoopCoder: prOwned,
-		Unavailable:          unavail,
-		ProducedAt:           time.Now().UTC(),
+		PRVerifierProvider: prVerProv, PRVerifierAttemptID: prVerAtt,
+		PRCreatedByLoopCoder: prOwned, PRAutoMerge: false, PRHumanMergeGate: prHuman || prOwned,
+		Unavailable: unavail,
+		ProducedAt:  time.Now().UTC(),
 	}
 	ev, err := artifactqual.EmitCanaryEvidence(in)
 	if err != nil {
@@ -96,6 +122,23 @@ func EmitCanaryFromResult(res Result, opts CanaryEmitOptions) (artifactqual.Cana
 		return ev, err
 	}
 	return ev, nil
+}
+
+// repoFromPRURL extracts owner/repo from a GitHub PR URL when possible.
+func repoFromPRURL(url string) string {
+	url = strings.TrimSpace(url)
+	// https://github.com/owner/repo/pull/N
+	const marker = "github.com/"
+	i := strings.Index(url, marker)
+	if i < 0 {
+		return ""
+	}
+	rest := url[i+len(marker):]
+	parts := strings.Split(rest, "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[0] + "/" + parts[1]
 }
 
 // LoadWorkflowEventsForTest exposes loadWorkflowEvents for package tests.
@@ -169,16 +212,30 @@ func canaryChildrenFromReports(res Result) []artifactqual.CanaryChild {
 			}
 		}
 		cc := artifactqual.CanaryChild{
-			ChildID: c.ChildID, AttemptID: c.AttemptID, Provider: c.Provider, Model: c.Model,
+			ChildID: c.ChildID, WorkItemID: c.ChildID, TaskClass: c.TaskClass,
+			OutputEvidence: c.OutputEvidence,
+			AttemptID:      c.AttemptID, Provider: c.Provider, Model: c.Model,
 			DepthRequired: req, DepthSelected: sel, DepthInvocation: inv,
 			Permission: c.Permission, AccountRef: c.AccountRef, InstallRef: c.InstallRef,
-			Terminal: c.Terminal, WorktreePath: c.WorktreePath,
+			WindowKind: c.WindowKind,
+			Terminal:   c.Terminal, WorktreePath: c.WorktreePath,
 			CapacityBefore: c.CapacityBefore, CapacityReserved: c.CapacityReserved,
 			CapacityActual: c.CapacityActual, CapacityAfter: c.CapacityAfter,
-			ActualSource: c.ActualSource, // capacity fraction source only
-			ArgvDigest:   c.ArgvDigest,
-			RealProviderExecuted: c.AttemptID != "" && c.OutputEvidence != "" &&
-				c.Provider != "fixture" && c.Terminal != "",
+			ActualSource: c.ActualSource, ActualConfidence: c.CapacityActualConfidence,
+			// Group evidence propagated via CapacityNote / structured ActualSource.
+			ArgvDigest: c.ArgvDigest,
+			// Structured capacity evidence only — never CapacityNote prose defaults.
+			AfterSource: c.CapacityAfterSource, AfterFreshness: c.CapacityAfterFreshness,
+			AfterConfidence: c.CapacityAfterConfidence, AfterState: c.CapacityAfterState,
+			AfterObservedAt: c.CapacityAfterObservedAt,
+			BeforeSource:    c.CapacityBeforeSource, BeforeFreshness: c.CapacityBeforeFreshness,
+			BeforeConfidence: c.CapacityBeforeConfidence, BeforeCapturedAt: c.CapacityBeforeCapturedAt,
+			// Exact window reset identity (UTC) — never prose.
+			ResetAt: copyTimeUTC(c.CapacityResetAt),
+			// Same fail-closed gate as collectUsage: terminal succeeded + ArgvDigest
+			// + truthful accepted-invocation/provider_stream sources. Failed/fake/
+			// planned/auth_binding-only never set RealProviderExecuted.
+			RealProviderExecuted: childActuallyExecutedProvider(c),
 		}
 		// Propagate per-dimension route sources (never collapse into ActualSource).
 		if c.ActualSources.Model != "" || c.ActualSources.Effort != "" ||
@@ -190,18 +247,6 @@ func canaryChildrenFromReports(res Result) []artifactqual.CanaryChild {
 				Install: c.ActualSources.Install,
 			}
 		}
-		if c.CapacityAfter != nil {
-			if strings.Contains(c.CapacityNote, "after_source=") {
-				cc.AfterSource = extractAfter(c.CapacityNote, "after_source=")
-			} else {
-				cc.AfterSource = "capacity_snapshot"
-			}
-			if strings.Contains(c.CapacityNote, "after_freshness=") {
-				cc.AfterFreshness = extractAfter(c.CapacityNote, "after_freshness=")
-			} else {
-				cc.AfterFreshness = "fresh"
-			}
-		}
 		out = append(out, cc)
 	}
 	return out
@@ -210,7 +255,6 @@ func canaryChildrenFromReports(res Result) []artifactqual.CanaryChild {
 func canaryProviderObsFromReports(res Result) []artifactqual.CanaryProviderObs {
 	seen := map[string]bool{}
 	var out []artifactqual.CanaryProviderObs
-	now := time.Now().UTC()
 	for _, c := range res.Children {
 		p := strings.ToLower(strings.TrimSpace(c.Provider))
 		if p == "" || p == "fixture" || seen[p] {
@@ -219,21 +263,53 @@ func canaryProviderObsFromReports(res Result) []artifactqual.CanaryProviderObs {
 		if c.CapacityBefore == nil && c.CapacityAfter == nil {
 			continue
 		}
-		seen[p] = true
-		rem := c.CapacityAfter
-		if rem == nil {
+		// Prefer real observed-after evidence; else real before-window evidence.
+		// Never invent Source/Freshness/CapturedAt via time.Now or "capacity_snapshot".
+		var (
+			rem   *float64
+			src   string
+			fresh string
+			conf  string
+			capAt time.Time
+		)
+		if c.CapacityAfter != nil && strings.EqualFold(c.CapacityAfterState, "observed") {
+			rem = c.CapacityAfter
+			src = strings.TrimSpace(c.CapacityAfterSource)
+			fresh = strings.TrimSpace(c.CapacityAfterFreshness)
+			conf = strings.TrimSpace(c.CapacityAfterConfidence)
+			capAt = c.CapacityAfterObservedAt
+		} else if c.CapacityBefore != nil {
 			rem = c.CapacityBefore
+			src = strings.TrimSpace(c.CapacityBeforeSource)
+			fresh = strings.TrimSpace(c.CapacityBeforeFreshness)
+			conf = strings.TrimSpace(c.CapacityBeforeConfidence)
+			capAt = c.CapacityBeforeCapturedAt
+		} else {
+			continue
 		}
-		src := "capacity_snapshot"
-		if strings.Contains(c.CapacityNote, "after_source=") {
-			src = extractAfter(c.CapacityNote, "after_source=")
+		// Incomplete structured evidence: skip rather than fabricate.
+		if rem == nil || src == "" || fresh == "" || capAt.IsZero() {
+			continue
 		}
+		seen[p] = true
 		out = append(out, artifactqual.CanaryProviderObs{
-			Provider: c.Provider, AccountRef: c.AccountRef, Source: src,
-			Freshness: "fresh", Remaining: rem, CapturedAt: now,
+			Provider: c.Provider, AccountRef: c.AccountRef,
+			InstallRef: c.InstallRef, WindowKind: c.WindowKind,
+			Source: src, Freshness: fresh, Confidence: conf,
+			Remaining: rem, CapturedAt: capAt.UTC(),
+			ResetAt: copyTimeUTC(c.CapacityResetAt),
 		})
 	}
 	return out
+}
+
+// copyTimeUTC returns a UTC copy of t, or nil when t is nil.
+func copyTimeUTC(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	u := t.UTC()
+	return &u
 }
 
 func firstRetryAttempt(res Result) string {
@@ -260,10 +336,8 @@ func hasClaimedModelUnavailableExclude(excludes []RouteExclude) bool {
 	return false
 }
 
-// idExact is case-sensitive identity after TrimSpace (project/run/attempt/work_item).
-func idExact(a, b string) bool {
-	return strings.TrimSpace(a) == strings.TrimSpace(b)
-}
+// idExact is defined in durable_identity.go as pure byte-exact equality
+// (no TrimSpace normalize of durable identity).
 
 // proofFromResult derives concrete UnavailableRetryProof from pre-loaded EventLog
 // events, IntegrateCommits, and CapacityTransitions — never CapacityNote prose
@@ -684,20 +758,6 @@ func extractKV(s, key string) string {
 	rest := s[idx+len(key)+1:]
 	for i, r := range rest {
 		if r == ' ' || r == ';' || r == ',' {
-			return rest[:i]
-		}
-	}
-	return rest
-}
-
-func extractAfter(note, prefix string) string {
-	idx := strings.Index(note, prefix)
-	if idx < 0 {
-		return ""
-	}
-	rest := note[idx+len(prefix):]
-	for i, r := range rest {
-		if r == ' ' || r == ';' {
 			return rest[:i]
 		}
 	}

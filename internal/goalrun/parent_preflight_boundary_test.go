@@ -264,10 +264,12 @@ func TestParentPreflightGhostAttemptGeneration_ZeroSideEffects(t *testing.T) {
 				ExecutionPlanDigest: planDig, ChildContractDigest: ccd, Generation: 1,
 			},
 		},
-		AbortedAttempts:   map[string]string{"wi_not_in_graph": ghostAbort},
+		// Ghost AttemptGeneration only — unbound AbortedAttempts without
+		// PriorOutcome would fail earlier; this fixture targets gen ghost keys.
 		AttemptGeneration: map[string]int{"wi_not_in_graph": 0},
 		SavedAt:           now,
 	}
+	_ = ghostAbort
 	if _, err := goalrun.SaveCheckpoint(home, cp); err != nil {
 		t.Fatal(err)
 	}

@@ -10,11 +10,14 @@ import (
 // associateIdentityEvidence repairs production identity splits without inventing
 // capacity or cross-account joins:
 //
-//  1. Path aliases: installations that share adapter + exact+fresh ResolvedPathHash
-//     are rewritten to one canonical ProviderInstallationID so install/auth/models
-//     and exact/fresh quota that landed on different path aliases can recombine.
-//     Never fuses solely by adapter, map iteration order, or across distinct
-//     resolved binaries. Estimated/stale/empty ResolvedPathHash ⇒ no alias fuse.
+//  1. Path aliases: only DiscoverySource==path installs that share adapter +
+//     exact+fresh ResolvedPathHash may fuse. The canonical install is the actual
+//     LookPath hit for the runner command (earliest PATH DiscoveryOrder for that
+//     adapter+executable name), and only if that hit is exact/fresh/installed/
+//     usable. If the LookPath-first hit fails eligibility, the whole group fails
+//     closed — never skip to a later usable PATH alias. Explicit-config rows
+//     never fuse, never donate auth/health/models/quota, and stay self-mapped.
+//     Distinct ResolvedPathHash values never fuse.
 //
 //  2. Empty-account reassociation: capacity windows (or other evidence) on
 //     provider|""|install are merged into the sole Authenticated account for that
@@ -25,14 +28,14 @@ import (
 // Sentinel scope tokens such as account:unknown must already be rejected before
 // this step (see accountSegmentFromScope); they must not create a fake AccountRef.
 //
-// Note: RC36 live Discover may only list alias A while durable quota references
-// alias B. RehydrateForAutoRoute translates durable B→A when exact+fresh resolved
-// identities on both sides yield one unambiguous live target before this step runs.
+// Note: RC36 live Discover may only list path-alias A while durable quota
+// references path-alias B of the same resolved binary. Rehydrate translates
+// durable B→LookPath-primary live only with path provenance.
 func associateIdentityEvidence(accounts []AccountObservation, installs []providerinventory.ProviderInstallation) []AccountObservation {
 	if len(accounts) == 0 {
 		return accounts
 	}
-	alias := canonicalInstallByAlias(installs)
+	alias := computePathInstallPlan(installs).Alias
 	// Rewrite install refs through alias map, then re-bucket and merge collisions.
 	type bucket struct {
 		obs AccountObservation
@@ -135,73 +138,144 @@ func associateIdentityEvidence(accounts []AccountObservation, installs []provide
 	return out
 }
 
-// canonicalInstallByAlias maps each ProviderInstallationID to a canonical id
-// among installs that share (adapter, exact ResolvedPathHash) with exact
-// confidence and fresh (non-stale) identity. Installs that fail the exact+fresh
-// gate map to themselves only (no alias fuse).
-//
-// Primary selection is PATH / discovery order first so the production-eligible
-// install_ref matches what LookPath would launch (first PATH hit). Secondary
-// path aliases of the same resolved binary are rewritten to that primary and
-// must not remain independently routable. Lexicographic pinst id is only a
-// final tie-break — never preferred over DiscoveryOrder.
-// Distinct ResolvedPathHash values never fuse.
-func canonicalInstallByAlias(installs []providerinventory.ProviderInstallation) map[string]string {
-	type meta struct {
-		id    string
-		order int // DiscoveryOrder: lower = earlier PATH = LookPath primary
-		rank  int // secondary rank; lower is better
+// installCommandKey binds inventory rows to the runner command LookPath uses
+// (adapter + executable basename), not merely resolved-hash groups.
+func installCommandKey(inst providerinventory.ProviderInstallation) string {
+	adapter := strings.ToLower(strings.TrimSpace(inst.AdapterID))
+	exe := strings.ToLower(strings.TrimSpace(inst.ExecutableName))
+	if exe == "" {
+		exe = strings.ToLower(strings.TrimSpace(inst.ExecutableIdentity.Basename))
 	}
-	// Group by adapter|resolvedHash — only exact+fresh members participate.
-	groups := map[string][]meta{}
-	out := map[string]string{}
+	return adapter + "|" + exe
+}
+
+func installUsableYes(inst providerinventory.ProviderInstallation) bool {
+	u := strings.ToLower(strings.TrimSpace(inst.UsableForInvocation))
+	return u == "yes" || u == "true"
+}
+
+// lookPathPrimaryEligible is true when the actual LookPath-first PATH hit is
+// production-invocable: exact+fresh identity, installed, usable.
+func lookPathPrimaryEligible(inst providerinventory.ProviderInstallation) bool {
+	if !exactFreshInstallForAlias(inst) {
+		return false
+	}
+	if inst.DiscoverySource != providerinventory.DiscoveryPath {
+		return false
+	}
+	if inst.InstallationState != providerinventory.InstallationInstalled {
+		return false
+	}
+	return installUsableYes(inst)
+}
+
+// pathInstallPlan is the authoritative PATH LookPath canonicalization result.
+// Alias rewrites only PATH→PATH same (command, resolved). ProductionEligible
+// contains only the true LookPath-primary install IDs that may contribute
+// Installed/Healthy/Authenticated for unattended routing. Explicit-config and
+// later PATH rows when the first hit fails are never production-eligible.
+type pathInstallPlan struct {
+	Alias               map[string]string // installID → canonical (self if no fuse)
+	ProductionEligible  map[string]bool   // LookPath-primary IDs only when eligible
+	LookPathPrimaryByCmd map[string]string // commandKey → primary install id (even if ineligible)
+}
+
+// computePathInstallPlan builds alias fuse + production eligibility for PATH installs.
+func computePathInstallPlan(installs []providerinventory.ProviderInstallation) pathInstallPlan {
+	type pathHit struct {
+		id       string
+		order    int
+		resolved string
+		cmd      string
+		inst     providerinventory.ProviderInstallation
+	}
+	plan := pathInstallPlan{
+		Alias:                map[string]string{},
+		ProductionEligible:   map[string]bool{},
+		LookPathPrimaryByCmd: map[string]string{},
+	}
+	pathByCmd := map[string][]pathHit{}
+	// exact+fresh PATH only, keyed by command|resolved (never adapter|resolved alone).
+	pathExactByCmdResolved := map[string][]string{}
+	idToCmd := map[string]string{}
+
 	for _, inst := range installs {
 		id := strings.TrimSpace(inst.ProviderInstallationID)
 		if id == "" {
 			continue
 		}
-		// Default: no alias fuse.
-		out[id] = id
-		if !exactFreshInstallForAlias(inst) {
+		plan.Alias[id] = id
+		if inst.DiscoverySource != providerinventory.DiscoveryPath {
 			continue
 		}
-		adapter := strings.ToLower(strings.TrimSpace(inst.AdapterID))
+		ck := installCommandKey(inst)
+		idToCmd[id] = ck
 		resolved := strings.TrimSpace(inst.ExecutableIdentity.ResolvedPathHash)
-		// Secondary preferences after PATH order.
-		rank := 100
-		if inst.InstallationState == providerinventory.InstallationInstalled {
-			rank -= 40
-		}
-		if inst.UsableForInvocation == "yes" || inst.UsableForInvocation == "true" {
-			rank -= 20
-		}
-		gkey := adapter + "|" + resolved
-		groups[gkey] = append(groups[gkey], meta{
-			id: id, order: inst.DiscoveryOrder, rank: rank,
+		pathByCmd[ck] = append(pathByCmd[ck], pathHit{
+			id: id, order: inst.DiscoveryOrder, resolved: resolved, cmd: ck, inst: inst,
 		})
+		if exactFreshInstallForAlias(inst) && resolved != "" {
+			gkey := ck + "|" + resolved
+			pathExactByCmdResolved[gkey] = append(pathExactByCmdResolved[gkey], id)
+		}
 	}
-	for _, members := range groups {
-		if len(members) < 2 {
-			// Single exact+fresh member: already self-mapped.
+
+	for ck, hits := range pathByCmd {
+		sort.SliceStable(hits, func(i, j int) bool {
+			if hits[i].order != hits[j].order {
+				return hits[i].order < hits[j].order
+			}
+			return hits[i].id < hits[j].id
+		})
+		first := hits[0]
+		plan.LookPathPrimaryByCmd[ck] = first.id
+		// Eligibility checked AFTER selecting actual LookPath-first hit.
+		if !lookPathPrimaryEligible(first.inst) {
+			// Fail closed for this command: no fuse, no production eligibility
+			// for first or later PATH rows.
 			continue
 		}
-		// Primary = earliest discovery order (PATH primary / LookPath), then
-		// installed+usable rank, then stable install id.
-		sort.SliceStable(members, func(i, j int) bool {
-			if members[i].order != members[j].order {
-				return members[i].order < members[j].order
+		if first.resolved == "" {
+			continue
+		}
+		plan.ProductionEligible[first.id] = true
+		gkey := ck + "|" + first.resolved
+		for _, id := range pathExactByCmdResolved[gkey] {
+			// Only same command key (enforced by gkey prefix).
+			if idToCmd[id] != ck {
+				continue
 			}
-			if members[i].rank != members[j].rank {
-				return members[i].rank < members[j].rank
-			}
-			return members[i].id < members[j].id
-		})
-		canon := members[0].id
-		for _, m := range members {
-			out[m.id] = canon
+			plan.Alias[id] = first.id
 		}
 	}
-	return out
+	return plan
+}
+
+// canonicalInstallByAlias is the PATH-only identity fuse map from computePathInstallPlan.
+func canonicalInstallByAlias(installs []providerinventory.ProviderInstallation) map[string]string {
+	return computePathInstallPlan(installs).Alias
+}
+
+// productionInstallEligible reports whether installID may complete unattended
+// production routing (LookPath primary only).
+func productionInstallEligible(plan pathInstallPlan, installID string) bool {
+	id := strings.TrimSpace(installID)
+	if id == "" {
+		return false
+	}
+	if plan.ProductionEligible[id] {
+		return true
+	}
+	// Path aliases that rewrite to an eligible primary are not independently
+	// production-eligible as their own install ID; after associate they share
+	// the primary InstallRef. During FromProviderInventoryReport, auth/usable
+	// on a path alias of an eligible primary may apply only after rewrite —
+	// allow contribution when alias target is production-eligible AND the
+	// source will fuse (path alias), not when self-mapped non-primary.
+	if canon := plan.Alias[id]; canon != "" && canon != id && plan.ProductionEligible[canon] {
+		return true // path alias of eligible primary — identity repair only
+	}
+	return false
 }
 
 // exactFreshInstallForAlias mirrors providerinventory.exactFreshInstallIdentity:

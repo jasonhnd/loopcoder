@@ -52,15 +52,41 @@ var ChildLifecycleKinds = map[string]bool{
 	"reroute": true, "interrupt": true,
 }
 
+// ParentOnlyEventKinds never bind to an AttemptID for lifecycle evidence.
+// Attempt binding must ignore these; they must not be confused with child rows.
+var ParentOnlyEventKinds = map[string]bool{
+	"run.start": true,
+}
+
+// EventWriteIdentity is the authoritative runtime workgraph identity stamped on
+// attempt-scoped events at write time (never git/archive SHA).
+type EventWriteIdentity struct {
+	ProjectID    string
+	RunID        string
+	PlanDigest   string // ExecutionPlanDigest (workflowdef.Normalize)
+	GraphDigest  string // workgraph.DigestGraph
+	GraphID      string
+	GraphVersion int
+}
+
 // IsParentInterrupt reports a true parent-level cancel line: interrupt with
 // empty WorkItemID, empty AttemptID, and Generation exactly 0 (not negative).
 func IsParentInterrupt(ev Event) bool {
-	if strings.TrimSpace(ev.Kind) != "interrupt" {
+	// Exact kind + empty child identity (byte-exact empty, not trimmed-empty of " ").
+	if ev.Kind != "interrupt" {
 		return false
 	}
-	return strings.TrimSpace(ev.WorkItemID) == "" &&
-		strings.TrimSpace(ev.AttemptID) == "" &&
+	return ev.WorkItemID == "" &&
+		ev.AttemptID == "" &&
 		ev.Generation == 0
+}
+
+// IsParentOnlyEvent reports parent-scoped log lines that must not enter attempt binding.
+func IsParentOnlyEvent(ev Event) bool {
+	if ParentOnlyEventKinds[ev.Kind] {
+		return true
+	}
+	return IsParentInterrupt(ev)
 }
 
 // ClaimGenerationFromAttemptID maps 0-indexed attempt suffix -gN to the
@@ -79,12 +105,22 @@ func ClaimGenerationFromAttemptID(attemptID string) (int, error) {
 // only with Generation exactly 0. Non-interrupt child events with both IDs
 // empty fail closed. Negative generation on interrupt with empty IDs is rejected.
 func ValidateChildEventIdentity(ev Event) error {
-	kind := strings.TrimSpace(ev.Kind)
+	// Exact durable kind/work_item/attempt — reject padding, never normalize.
+	kind := ev.Kind
+	if kind != "" && kind != strings.TrimSpace(kind) {
+		return fmt.Errorf("workflowrun: child event kind has whitespace padding %q", kind)
+	}
 	if !ChildLifecycleKinds[kind] {
 		return nil
 	}
-	id := strings.TrimSpace(ev.WorkItemID)
-	att := strings.TrimSpace(ev.AttemptID)
+	id := ev.WorkItemID
+	att := ev.AttemptID
+	if id != "" && id != strings.TrimSpace(id) {
+		return fmt.Errorf("workflowrun: child event work_item_id has whitespace padding %q", id)
+	}
+	if att != "" && att != strings.TrimSpace(att) {
+		return fmt.Errorf("workflowrun: child event attempt_id has whitespace padding %q", att)
+	}
 	if kind == "interrupt" && id == "" && att == "" {
 		if ev.Generation < 0 {
 			return fmt.Errorf("workflowrun: parent interrupt rejects negative generation %d", ev.Generation)
@@ -152,9 +188,19 @@ func ValidateEventStreamInvariants(events []Event) error {
 	openByItem := map[string]map[string]bool{}
 
 	for i, ev := range events {
-		kind := strings.TrimSpace(ev.Kind)
-		id := strings.TrimSpace(ev.WorkItemID)
-		att := strings.TrimSpace(ev.AttemptID)
+		// Exact durable kind/work_item/attempt — padded identity never aliases.
+		kind := ev.Kind
+		id := ev.WorkItemID
+		att := ev.AttemptID
+		if kind != "" && kind != strings.TrimSpace(kind) {
+			return fmt.Errorf("workflowrun: event stream line %d kind has whitespace padding %q (fail closed)", i+1, kind)
+		}
+		if id != "" && id != strings.TrimSpace(id) {
+			return fmt.Errorf("workflowrun: event stream line %d work_item_id has whitespace padding %q (fail closed)", i+1, id)
+		}
+		if att != "" && att != strings.TrimSpace(att) {
+			return fmt.Errorf("workflowrun: event stream line %d attempt_id has whitespace padding %q (fail closed)", i+1, att)
+		}
 		switch kind {
 		case "launch":
 			if id == "" || att == "" {
@@ -310,7 +356,8 @@ func childInterruptClass(ev Event) string {
 // with complete structured payload (failure_class + interrupt_class + interrupt_id).
 // Distinct from hard recovery; never selects hard-recovery gN+1.
 func isServiceForcedInterruptEvent(ev Event) bool {
-	kind := strings.TrimSpace(ev.Kind)
+	// Exact durable kind/terminal — no TrimSpace/EqualFold normalize of authority.
+	kind := ev.Kind
 	if kind != "interrupt" && kind != "terminal" {
 		return false
 	}
@@ -327,12 +374,12 @@ func isServiceForcedInterruptEvent(ev Event) bool {
 	if eventPayloadString(ev, "interrupt_class") != InterruptClassServiceForced {
 		return false
 	}
-	if strings.TrimSpace(eventPayloadString(ev, "interrupt_id")) == "" {
+	if eventPayloadString(ev, "interrupt_id") == "" {
 		return false
 	}
 	if kind == "terminal" {
-		term := strings.TrimSpace(firstNonEmpty(ev.Terminal, eventPayloadString(ev, "terminal")))
-		if !strings.EqualFold(term, string(workgraph.TermCancelled)) {
+		term := firstNonEmpty(ev.Terminal, eventPayloadString(ev, "terminal"))
+		if term != string(workgraph.TermCancelled) {
 			return false
 		}
 	}
@@ -354,7 +401,7 @@ func validateTypedTerminalAfterInterrupt(term, priorInterrupt Event, intClass st
 		if !isServiceForcedInterruptEvent(term) {
 			return fmt.Errorf("terminal after service_forced_interrupt must be matching cancelled forced_interrupt terminal")
 		}
-		if !strings.EqualFold(strings.TrimSpace(term.Terminal), string(workgraph.TermCancelled)) {
+		if term.Terminal != string(workgraph.TermCancelled) {
 			return fmt.Errorf("service forced_interrupt terminal must be cancelled")
 		}
 		return nil
@@ -385,9 +432,10 @@ func eventPayloadString(ev Event, key string) string {
 
 // ValidateExistingEventLogForPlan reads raw events and enforces child identity
 // + stream invariants against the current graph/plan/run. Does not mutate.
-func ValidateExistingEventLogForPlan(events []Event, planDigest, runID string, itemOK map[string]bool) error {
+// id must carry the same plan/graph identity that production logEv stamps.
+func ValidateExistingEventLogForPlan(events []Event, id EventWriteIdentity, itemOK map[string]bool) error {
 	for i, ev := range events {
-		if err := ValidateChildEventIdentityForPlan(ev, planDigest, runID, itemOK); err != nil {
+		if err := ValidateChildEventIdentityForPlan(ev, id, itemOK); err != nil {
 			return fmt.Errorf("event log line %d: %w", i, err)
 		}
 	}
@@ -398,34 +446,77 @@ func ValidateExistingEventLogForPlan(events []Event, planDigest, runID string, i
 }
 
 // ValidateChildEventIdentityForPlan extends ValidateChildEventIdentity with
-// current-graph membership and canonical AttemptID(workItem, plan, run, g).
-func ValidateChildEventIdentityForPlan(ev Event, planDigest, runID string, itemOK map[string]bool) error {
+// current-graph membership, canonical AttemptID(workItem, plan, run, g), and
+// required runtime stamps (plan/graph digests, graph id/version, project/run).
+// Parent-only events (run.start, parent interrupt) skip attempt stamps.
+func ValidateChildEventIdentityForPlan(ev Event, id EventWriteIdentity, itemOK map[string]bool) error {
+	if IsParentOnlyEvent(ev) {
+		// Parent lines may omit attempt stamps; project/run when present must match byte-exact.
+		if ev.ProjectID != "" && id.ProjectID != "" && ev.ProjectID != id.ProjectID {
+			return fmt.Errorf("workflowrun: parent event project_id mismatch")
+		}
+		if ev.RunID != "" && id.RunID != "" && ev.RunID != id.RunID {
+			return fmt.Errorf("workflowrun: parent event run_id mismatch")
+		}
+		return nil
+	}
 	if err := ValidateChildEventIdentity(ev); err != nil {
 		return err
 	}
-	if IsParentInterrupt(ev) {
-		return nil
-	}
-	kind := strings.TrimSpace(ev.Kind)
+	kind := ev.Kind
 	if !ChildLifecycleKinds[kind] {
 		return nil
 	}
-	id := strings.TrimSpace(ev.WorkItemID)
-	att := strings.TrimSpace(ev.AttemptID)
-	if itemOK != nil && !itemOK[id] {
-		return fmt.Errorf("workflowrun: child event ghost work_item_id %q kind=%s not in current graph", id, kind)
+	// EventWriteIdentity is runtime-derived; reject padding rather than normalize.
+	if id.ProjectID == "" || id.ProjectID != strings.TrimSpace(id.ProjectID) ||
+		id.RunID == "" || id.RunID != strings.TrimSpace(id.RunID) ||
+		id.PlanDigest == "" || id.PlanDigest != strings.TrimSpace(id.PlanDigest) ||
+		id.GraphDigest == "" || id.GraphDigest != strings.TrimSpace(id.GraphDigest) ||
+		id.GraphID == "" || id.GraphID != strings.TrimSpace(id.GraphID) ||
+		id.GraphVersion <= 0 {
+		return fmt.Errorf("workflowrun: ValidateChildEventIdentityForPlan requires complete exact EventWriteIdentity")
+	}
+	if ev.ProjectID != id.ProjectID {
+		return fmt.Errorf("workflowrun: child event project_id %q != %q", ev.ProjectID, id.ProjectID)
+	}
+	if ev.RunID != id.RunID {
+		return fmt.Errorf("workflowrun: child event run_id %q != %q", ev.RunID, id.RunID)
+	}
+	if ev.ExecutionPlanDigest == "" || ev.ExecutionPlanDigest != id.PlanDigest {
+		return fmt.Errorf("workflowrun: child event execution_plan_digest %q != %q", ev.ExecutionPlanDigest, id.PlanDigest)
+	}
+	if ev.GraphDigest == "" || ev.GraphDigest != id.GraphDigest {
+		return fmt.Errorf("workflowrun: child event graph_digest %q != %q", ev.GraphDigest, id.GraphDigest)
+	}
+	if ev.GraphID == "" || ev.GraphID != id.GraphID {
+		return fmt.Errorf("workflowrun: child event graph_id %q != %q", ev.GraphID, id.GraphID)
+	}
+	if ev.GraphVersion != id.GraphVersion {
+		return fmt.Errorf("workflowrun: child event graph_version %d != %d", ev.GraphVersion, id.GraphVersion)
+	}
+	if ev.TaskClass == "" || ev.TaskClass != strings.TrimSpace(ev.TaskClass) {
+		return fmt.Errorf("workflowrun: child event kind=%s missing or padded task_class", kind)
+	}
+	if ev.ChildContractDigest == "" || ev.ChildContractDigest != strings.TrimSpace(ev.ChildContractDigest) {
+		return fmt.Errorf("workflowrun: child event kind=%s missing or padded child_contract_digest", kind)
+	}
+	wid := ev.WorkItemID
+	att := ev.AttemptID
+	if itemOK != nil && !itemOK[wid] {
+		return fmt.Errorf("workflowrun: child event ghost work_item_id %q kind=%s not in current graph", wid, kind)
 	}
 	g := ParseAttemptGeneration(att)
-	want := AttemptID(id, planDigest, runID, g)
+	want := AttemptID(wid, id.PlanDigest, id.RunID, g)
 	if att != want {
-		return fmt.Errorf("workflowrun: child event %s attempt_id %q != canonical %q", id, att, want)
+		return fmt.Errorf("workflowrun: child event %s attempt_id %q != canonical %q", wid, att, want)
 	}
 	return nil
 }
 
 // attemptKey is the exact work-item+attempt durable identity for recovery.
 func attemptKey(workItemID, attemptID string) string {
-	return strings.TrimSpace(workItemID) + "\x00" + strings.TrimSpace(attemptID)
+	// Byte-exact durable keys — never TrimSpace-normalize identity into authority.
+	return workItemID + "\x00" + attemptID
 }
 
 func splitAttemptKey(k string) (workItemID, attemptID string) {

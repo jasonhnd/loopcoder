@@ -24,17 +24,9 @@ func TestLoadRouteInventory_LiveStaticModels_DurableMREmptyQuota_CodexMultiDepth
 	rem, lim := int64(71), int64(100)
 
 	live := providerinventory.Report{
-		Installations: []providerinventory.ProviderInstallation{{
-			AdapterID: "codex", ProviderInstallationID: inst,
-			InstallationState:   providerinventory.InstallationInstalled,
-			UsableForInvocation: "yes",
-			FreshnessState:      providerinventory.FreshnessFresh,
-			Confidence:          providerinventory.ConfidenceExact,
-			ExecutableIdentity: providerinventory.ExecutableIdentity{
-				ResolvedPathHash: "sha256:codex-resolved-rc37",
-				PathHash:         "sha256:codex-path-rc37",
-			},
-		}},
+		Installations: []providerinventory.ProviderInstallation{
+			exactFreshInstall("codex", inst, "sha256:codex-resolved-rc37", "sha256:codex-path-rc37"),
+		},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
 			AccountProfileID: ptr(acc), ProviderInstallationID: ptr(inst),
@@ -168,13 +160,9 @@ func TestLoadRouteInventory_LiveStaticModels_DurableMREmptyQuota_AntigravityMult
 	rem := int64(90)
 
 	live := providerinventory.Report{
-		Installations: []providerinventory.ProviderInstallation{{
-			AdapterID: "antigravity", ProviderInstallationID: inst,
-			InstallationState:   providerinventory.InstallationInstalled,
-			UsableForInvocation: "yes",
-			FreshnessState:      providerinventory.FreshnessFresh,
-			Confidence:          providerinventory.ConfidenceExact,
-		}},
+		Installations: []providerinventory.ProviderInstallation{
+			exactFreshInstall("antigravity", inst, "sha256:agy-resolved-rc37", "sha256:agy-path-rc37"),
+		},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "antigravity", ReadinessState: providerinventory.ReadinessReady,
 			AccountProfileID: ptr(acc), ProviderInstallationID: ptr(inst),

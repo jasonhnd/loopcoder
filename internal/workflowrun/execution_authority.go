@@ -316,8 +316,12 @@ func ValidateAuthorityMatchesSpawn(auth storage.ProviderExecutionAuthority, ps P
 	if auth.ClaimGeneration != claimGen {
 		return fmt.Errorf("authority claim_generation %d != %d", auth.ClaimGeneration, claimGen)
 	}
-	if strings.TrimSpace(auth.AttemptID) != strings.TrimSpace(attemptID) {
+	// Byte-exact durable AttemptID — no TrimSpace normalize into authority.
+	if auth.AttemptID != attemptID {
 		return fmt.Errorf("authority attempt_id mismatch")
+	}
+	if attemptID != "" && attemptID != strings.TrimSpace(attemptID) {
+		return fmt.Errorf("authority attempt_id has whitespace padding")
 	}
 	if strings.TrimSpace(ownerID) == "" || strings.TrimSpace(auth.OwnerID) != strings.TrimSpace(ownerID) {
 		return fmt.Errorf("authority owner_id mismatch want %q got %q", ownerID, auth.OwnerID)
@@ -377,8 +381,12 @@ func NextAttemptGenerationFromEvents(events []Event) map[string]int {
 		case "reuse", "integrate":
 			s.terminal = string(workgraph.TermSucceeded)
 		case "terminal":
-			term := strings.TrimSpace(ev.Terminal)
-			s.terminal = term
+			// Exact durable terminal (no TrimSpace/EqualFold into selection authority).
+			if ev.Terminal != "" && ev.Terminal != strings.TrimSpace(ev.Terminal) {
+				// Padded terminal cannot select hard-recovery generation.
+				continue
+			}
+			s.terminal = ev.Terminal
 			if isAuthoritativeHardRecoveryEvent(ev) {
 				s.hardRecov = true
 			}
@@ -400,13 +408,13 @@ func NextAttemptGenerationFromEvents(events []Event) map[string]int {
 			continue
 		}
 		st := gens[maxG]
-		if strings.EqualFold(st.terminal, string(workgraph.TermSucceeded)) {
+		if st.terminal == string(workgraph.TermSucceeded) {
 			// Reuse exact succeeded attempt gN.
 			out[id] = maxG
 			continue
 		}
-		if st.hardRecov && (strings.EqualFold(st.terminal, string(workgraph.TermCancelled)) ||
-			strings.EqualFold(st.terminal, string(workgraph.TermFailed))) {
+		if st.hardRecov && (st.terminal == string(workgraph.TermCancelled) ||
+			st.terminal == string(workgraph.TermFailed)) {
 			// Authoritative recovery finished gN → claim gN+1.
 			out[id] = maxG + 1
 			continue
@@ -422,7 +430,8 @@ func NextAttemptGenerationFromEvents(events []Event) map[string]int {
 // interrupt_class=hard_kill_recovery. Kind must be interrupt or terminal;
 // terminal requires cancelled|failed.
 func isAuthoritativeHardRecoveryEvent(ev Event) bool {
-	kind := strings.TrimSpace(ev.Kind)
+	// Exact durable kind — no TrimSpace normalize of event identity.
+	kind := ev.Kind
 	if kind != "interrupt" && kind != "terminal" {
 		return false
 	}
@@ -439,13 +448,14 @@ func isAuthoritativeHardRecoveryEvent(ev Event) bool {
 	if m["failure_class"] != "hard_kill_recovery" {
 		return false
 	}
-	if strings.TrimSpace(m["interrupt_class"]) != InterruptClassHardKillRecovery {
+	// Exact interrupt_class identity (no TrimSpace).
+	if m["interrupt_class"] != InterruptClassHardKillRecovery {
 		return false
 	}
 	if kind == "terminal" {
-		term := strings.TrimSpace(firstNonEmpty(ev.Terminal, m["terminal"]))
-		if !strings.EqualFold(term, string(workgraph.TermCancelled)) &&
-			!strings.EqualFold(term, string(workgraph.TermFailed)) {
+		term := firstNonEmpty(ev.Terminal, m["terminal"])
+		// Exact cancelled|failed only — no EqualFold.
+		if term != string(workgraph.TermCancelled) && term != string(workgraph.TermFailed) {
 			return false
 		}
 	}
@@ -704,7 +714,11 @@ func RecoverOpenLaunchInterruptsAuthoritative(elog *EventLog, opts RecoverOption
 				return err
 			}
 			itemOK := map[string]bool{c.workItemID: true}
-			if err := ValidateChildEventIdentityForPlan(ev, planDig, runID, itemOK); err != nil {
+			if err := ValidateChildEventIdentityForPlan(ev, EventWriteIdentity{
+				ProjectID: projectID, RunID: runID,
+				PlanDigest: planDig, GraphDigest: graphDig,
+				GraphID: c.graphID, GraphVersion: c.graphVer,
+			}, itemOK); err != nil {
 				return err
 			}
 			return nil

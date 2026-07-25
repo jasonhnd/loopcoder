@@ -41,8 +41,13 @@ func TestGrokPathAliasFusesInstallAuthModelsWithQuota(t *testing.T) {
 			AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
 			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
 			ReadinessConfidence: providerinventory.ConfidenceExact,
-			// Auth observed on secondary alias — must rebind to PATH primary.
-			AccountProfileID: ptrStr(acc), ProviderInstallationID: ptrStr(instSecondary),
+			// Auth on PATH primary (independent readiness); secondary may also bind.
+			AccountProfileID: ptrStr(acc), ProviderInstallationID: ptrStr(instPrimary),
+		}, {
+			AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
+			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
+			ReadinessConfidence: providerinventory.ConfidenceExact,
+			AccountProfileID:    ptrStr(acc), ProviderInstallationID: ptrStr(instSecondary),
 		}},
 		ModelCapabilities: []providerinventory.ModelCapability{{
 			AdapterID: "grok", CanonicalModelID: "grok-4.5",
@@ -60,7 +65,7 @@ func TestGrokPathAliasFusesInstallAuthModelsWithQuota(t *testing.T) {
 			CatalogSourceKind:      providerinventory.CatalogSourceProviderMachineReadable,
 			Confidence:             providerinventory.ConfidenceExact,
 			FreshnessState:         providerinventory.FreshnessFresh,
-			ProviderInstallationID: ptrStr(instSecondary),
+			ProviderInstallationID: ptrStr(instPrimary),
 			EntryCount:             1,
 		}},
 		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
@@ -571,14 +576,14 @@ func TestMultiLivePathAliasesTranslateDurableToPATHPrimary(t *testing.T) {
 			AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
 			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
 			ReadinessConfidence: providerinventory.ConfidenceExact,
-			AccountProfileID:    ptrStr(acc), ProviderInstallationID: ptrStr(live2), // auth on secondary
+			AccountProfileID:    ptrStr(acc), ProviderInstallationID: ptrStr(live1), // auth on PATH primary
 		}},
 		ModelCapabilities: []providerinventory.ModelCapability{mrModel("grok", "grok-4.5", "mc", nil)},
 		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{{
 			ModelCatalogSnapshotID: "mc", AdapterID: "grok",
 			CatalogSourceKind: providerinventory.CatalogSourceProviderMachineReadable,
 			Confidence:        providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
-			ProviderInstallationID: ptrStr(live2), EntryCount: 1,
+			ProviderInstallationID: ptrStr(live1), EntryCount: 1,
 		}},
 	}
 	durable := providerinventory.Report{
@@ -948,7 +953,8 @@ func int64Ptr(v int64) *int64 { return &v }
 
 func exactFreshInstall(adapter, id, resolved, pathHash string) providerinventory.ProviderInstallation {
 	return providerinventory.ProviderInstallation{
-		AdapterID: adapter, ProviderInstallationID: id,
+		AdapterID: adapter, ProviderInstallationID: id, ExecutableName: adapter,
+		DiscoverySource:     providerinventory.DiscoveryPath,
 		InstallationState:   providerinventory.InstallationInstalled,
 		UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
 		Confidence: providerinventory.ConfidenceExact,

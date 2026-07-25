@@ -46,17 +46,25 @@ func TestProductPath_InventoryToLaunchBinding(t *testing.T) {
 		Installations: []providerinventory.ProviderInstallation{
 			{
 				ProviderInstallationID: wantInstall, AdapterID: "grok",
+				ExecutableName: "grok", DiscoverySource: providerinventory.DiscoveryPath,
 				InstallationState:   providerinventory.InstallationInstalled,
 				FreshnessState:      providerinventory.FreshnessFresh,
 				Confidence:          providerinventory.ConfidenceExact,
 				UsableForInvocation: "yes",
+				ExecutableIdentity: providerinventory.ExecutableIdentity{
+					Basename: "grok", ResolvedPathHash: "sha256:grok-product-resolved", PathHash: "sha256:grok-product-path",
+				},
 			},
 			{
 				ProviderInstallationID: "install-codex-other", AdapterID: "codex",
+				ExecutableName: "codex", DiscoverySource: providerinventory.DiscoveryPath,
 				InstallationState:   providerinventory.InstallationInstalled,
 				FreshnessState:      providerinventory.FreshnessFresh,
 				Confidence:          providerinventory.ConfidenceExact,
 				UsableForInvocation: "yes",
+				ExecutableIdentity: providerinventory.ExecutableIdentity{
+					Basename: "codex", ResolvedPathHash: "sha256:codex-product-resolved", PathHash: "sha256:codex-product-path",
+				},
 			},
 		},
 		AuthReadiness: []providerinventory.AuthReadiness{

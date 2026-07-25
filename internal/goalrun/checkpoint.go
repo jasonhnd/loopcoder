@@ -10,6 +10,7 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/workflowrun"
+	"github.com/jasonhnd/loopcoder/internal/workgraph"
 )
 
 // CheckpointSchema is the durable forced-restart document for a goal run.
@@ -171,23 +172,29 @@ func PriorSucceededFrom(wf []workflowrun.ChildOutcome, reports []ChildReport) ma
 // AuditPriorSucceededFrom is the explicit audit-only derivation of prior
 // succeeded outcomes from workflow kids + child reports. Never used as a
 // product resume seed path (LoadCheckpoint does not call it).
+// Only exact succeeded + nonempty exact attempt/evidence qualify — padded or
+// case-mutated terminal/attempt/evidence never become canonical succeeded.
 func AuditPriorSucceededFrom(wf []workflowrun.ChildOutcome, reports []ChildReport) map[string]workflowrun.ChildOutcome {
 	out := map[string]workflowrun.ChildOutcome{}
 	for _, c := range wf {
-		if !isResumeEligible(c.Terminal, c.AttemptID, c.OutputEvidence) {
+		if !isResumeEligibleExact(c.Terminal, c.AttemptID, c.OutputEvidence) {
 			continue
 		}
-		// Copy without mutating the caller's slice element identity fields
-		// beyond terminal normalization for the audit map value.
+		if c.WorkItemID == "" || c.WorkItemID != strings.TrimSpace(c.WorkItemID) {
+			continue
+		}
+		// Preserve exact durable terminal (already exact succeeded); never rewrite.
 		cc := c
-		cc.Terminal = "succeeded"
 		out[c.WorkItemID] = cc
 	}
 	for _, r := range reports {
 		if _, ok := out[r.ChildID]; ok {
 			continue
 		}
-		if !isResumeEligible(r.Terminal, r.AttemptID, r.OutputEvidence) {
+		if !isResumeEligibleExact(r.Terminal, r.AttemptID, r.OutputEvidence) {
+			continue
+		}
+		if r.ChildID == "" || r.ChildID != strings.TrimSpace(r.ChildID) {
 			continue
 		}
 		out[r.ChildID] = workflowrun.ChildOutcome{
@@ -196,7 +203,7 @@ func AuditPriorSucceededFrom(wf []workflowrun.ChildOutcome, reports []ChildRepor
 			Permission: r.Permission, RouteReason: r.RouteReason,
 			TaskClass: r.TaskClass, ExecutionPlanDigest: r.ExecutionPlanDigest,
 			ChildContractDigest: r.ChildContractDigest, Generation: r.Generation,
-			Terminal: "succeeded", OutputEvidence: r.OutputEvidence,
+			Terminal: string(workgraph.TermSucceeded), OutputEvidence: r.OutputEvidence,
 			WorktreePath: r.WorktreePath, AttemptID: r.AttemptID,
 			ActualCapacity: r.CapacityActual, ActualSource: r.ActualSource,
 		}
@@ -205,12 +212,6 @@ func AuditPriorSucceededFrom(wf []workflowrun.ChildOutcome, reports []ChildRepor
 		return nil
 	}
 	return out
-}
-
-func isResumeEligible(terminal, attemptID, evidence string) bool {
-	return strings.EqualFold(strings.TrimSpace(terminal), "succeeded") &&
-		strings.TrimSpace(attemptID) != "" &&
-		strings.TrimSpace(evidence) != ""
 }
 
 func sanitizeRunKey(runID string) string {

@@ -159,6 +159,16 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 	}
 	// Explicit install-id → sorted list of group keys for deterministic rebind.
 	installKeys := map[string][]string{} // installRef -> group keys
+	// installInstalled carries InstallationInstalled presence by full install id
+	// so every account bound to that install inherits Installed (multi-account
+	// same PATH-primary CLI). Does not invent installs or relax path-plan gates.
+	installInstalled := map[string]bool{}
+
+	// Authoritative PATH LookPath plan: only true primary (and its PATH aliases
+	// for identity repair) may complete unattended production eligibility.
+	// Explicit-config and failed LookPath-first later PATH rows stay observable
+	// but non-production-routable.
+	pathPlan := computePathInstallPlan(rep.Installations)
 
 	// Sort installations for deterministic processing.
 	installs := append([]providerinventory.ProviderInstallation(nil), rep.Installations...)
@@ -168,8 +178,14 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 	for _, inst := range installs {
 		iref := installRefOf(inst)
 		b := ensure(inst.AdapterID, "", iref)
+		prod := productionInstallEligible(pathPlan, iref)
 		if inst.InstallationState == providerinventory.InstallationInstalled {
+			// Observable install presence for all sources; production routing
+			// still requires Authenticated+Healthy which are path-plan gated.
 			b.in.Installed = true
+			if iref != "" {
+				installInstalled[iref] = true
+			}
 		}
 		if inst.FreshnessState == providerinventory.FreshnessFresh {
 			b.in.HealthFreshness = FreshnessFresh
@@ -179,13 +195,20 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 		if conf := mapPIConfidence(inst.Confidence); conf != ConfidenceUnknown {
 			b.in.HealthConfidence = conf
 		}
-		if inst.UsableForInvocation == "yes" || inst.UsableForInvocation == "true" {
+		if prod && (inst.UsableForInvocation == "yes" || inst.UsableForInvocation == "true") {
 			b.in.Healthy = true
+		} else if inst.UsableForInvocation == "yes" || inst.UsableForInvocation == "true" {
+			b.in.Provenance = strings.TrimSpace(b.in.Provenance +
+				"; install_usable_non_production_routable source=" + string(inst.DiscoverySource))
 		}
 		if iref != "" {
 			b.in.InstallRef = iref
 			k := groupKey(b.in.Provider, b.in.AccountRef, iref)
 			installKeys[iref] = append(installKeys[iref], k)
+		}
+		if !prod && inst.DiscoverySource == providerinventory.DiscoveryExplicitConfig {
+			b.in.Provenance = strings.TrimSpace(b.in.Provenance +
+				"; discovery_source=explicit-config non_production_routable")
 		}
 	}
 
@@ -230,11 +253,23 @@ func FromProviderInventoryReport(rep providerinventory.Report, now time.Time) []
 			}
 			accountToInstalls[acc] = appendUniqueSorted(accountToInstalls[acc], iref)
 		}
+		// Every account bound to an installed install inherits Installed presence
+		// (same PATH-primary CLI, distinct AccountRefs). No empty-install invent.
+		if iref != "" && installInstalled[iref] {
+			b.in.Installed = true
+		}
 		if productionRoutableAuth(auth) {
-			b.in.Authenticated = true
-			b.in.Healthy = true
-			b.in.HealthFreshness = FreshnessFresh
-			b.in.HealthConfidence = ConfidenceExact
+			// Auth may complete production eligibility only for LookPath-primary
+			// (or PATH aliases that fuse onto it). Explicit-config never donates.
+			if productionInstallEligible(pathPlan, iref) {
+				b.in.Authenticated = true
+				b.in.Healthy = true
+				b.in.HealthFreshness = FreshnessFresh
+				b.in.HealthConfidence = ConfidenceExact
+			} else {
+				b.in.Provenance = strings.TrimSpace(b.in.Provenance +
+					"; auth_exact_ready_non_production_install install=" + iref)
+			}
 		} else if auth.ReadinessState == providerinventory.ReadinessReady {
 			// Non-production Ready (stale/estimated/unknown): keep evidence but
 			// never mark Authenticated for unattended routing.

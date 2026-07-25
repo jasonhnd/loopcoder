@@ -36,14 +36,20 @@ func nextAttemptGenerationFromAttemptID(workItemID, att, planDigest, runID strin
 func validateEventsAgainstGraph(
 	events []workflowrun.Event,
 	graphItems []workgraph.WorkItem,
-	planDigest, runID string,
+	projectID, planDigest, graphDigest, graphID, runID string,
+	graphVersion int,
 ) error {
 	itemOK := map[string]bool{}
 	for _, it := range graphItems {
 		itemOK[it.ID] = true
 	}
+	id := workflowrun.EventWriteIdentity{
+		ProjectID: projectID, RunID: runID,
+		PlanDigest: planDigest, GraphDigest: graphDigest,
+		GraphID: graphID, GraphVersion: graphVersion,
+	}
 	for i, ev := range events {
-		if err := workflowrun.ValidateChildEventIdentityForPlan(ev, planDigest, runID, itemOK); err != nil {
+		if err := workflowrun.ValidateChildEventIdentityForPlan(ev, id, itemOK); err != nil {
 			return fmt.Errorf("goalrun: event log line %d: %w (fail closed; log unchanged)", i, err)
 		}
 	}
@@ -70,7 +76,8 @@ func mergeMonotonicAttemptGen(attemptGen map[string]int, id string, next int) {
 //
 // Invalid logs are left byte-for-byte unchanged (no recovery interrupt appended).
 func applyEventLogResumeSource(
-	homeDir, projectID, runID, planDigest string,
+	homeDir, projectID, runID, planDigest, graphDigest, graphID string,
+	graphVersion int,
 	graphItems []workgraph.WorkItem,
 	attemptGen map[string]int,
 	priorSucceeded map[string]workflowrun.ChildOutcome,
@@ -94,7 +101,7 @@ func applyEventLogResumeSource(
 	if err != nil {
 		return nil, false, fmt.Errorf("goalrun: event log parse: %w", err)
 	}
-	if err := validateEventsAgainstGraph(events, graphItems, planDigest, runID); err != nil {
+	if err := validateEventsAgainstGraph(events, graphItems, projectID, planDigest, graphDigest, graphID, runID, graphVersion); err != nil {
 		return nil, false, err
 	}
 	if err := workflowrun.ValidateEventStreamInvariants(events); err != nil {
@@ -113,7 +120,7 @@ func applyEventLogResumeSource(
 	if err != nil {
 		return nil, false, fmt.Errorf("goalrun: event log reread: %w", err)
 	}
-	if err := validateEventsAgainstGraph(events, graphItems, planDigest, runID); err != nil {
+	if err := validateEventsAgainstGraph(events, graphItems, projectID, planDigest, graphDigest, graphID, runID, graphVersion); err != nil {
 		return nil, false, err
 	}
 	if err := workflowrun.ValidateEventStreamInvariants(events); err != nil {

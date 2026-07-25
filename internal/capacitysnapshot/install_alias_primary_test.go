@@ -6,96 +6,136 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 )
 
-// Two PATH aliases of one physical binary: primary is earliest DiscoveryOrder
-// (LookPath first hit), never lexicographic pinst alone. Secondary maps to primary.
-func TestCanonicalInstallByAlias_PATHPrimaryNotLexicographic(t *testing.T) {
+func pathInstall(adapter, exe, id, resolved, pathHash string, order int) providerinventory.ProviderInstallation {
+	return providerinventory.ProviderInstallation{
+		AdapterID: adapter, ProviderInstallationID: id, ExecutableName: exe,
+		DiscoverySource: providerinventory.DiscoveryPath, DiscoveryOrder: order,
+		InstallationState: providerinventory.InstallationInstalled, UsableForInvocation: "yes",
+		FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
+		ExecutableIdentity: providerinventory.ExecutableIdentity{
+			Basename: exe, ResolvedPathHash: resolved, PathHash: pathHash,
+		},
+	}
+}
+
+func TestCanonicalInstallByAlias_LookPathPrimaryNotLaterEligible(t *testing.T) {
 	const (
-		// Secondary is lexicographically first (3an5 < wrpm) — old bug preferred it.
+		// Lexico-first secondary id must not win over PATH order 0.
 		secondary = "pinst_3an5v55kgyq352a2bbgkfljbmikrndoq"
 		primary   = "pinst_wrpmecvyfayff7nnqvaztkqhfs7ua2hd"
 		rhash     = "sha256:same-resolved-binary"
 	)
 	installs := []providerinventory.ProviderInstallation{
-		{
-			AdapterID: "grok", ProviderInstallationID: secondary,
-			DiscoveryOrder: 1, InstallationState: providerinventory.InstallationInstalled,
-			UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-			Confidence: providerinventory.ConfidenceExact,
-			ExecutableIdentity: providerinventory.ExecutableIdentity{
-				ResolvedPathHash: rhash, PathHash: "sha256:path-secondary",
-			},
-		},
-		{
-			AdapterID: "grok", ProviderInstallationID: primary,
-			DiscoveryOrder: 0, InstallationState: providerinventory.InstallationInstalled,
-			UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-			Confidence: providerinventory.ConfidenceExact,
-			ExecutableIdentity: providerinventory.ExecutableIdentity{
-				ResolvedPathHash: rhash, PathHash: "sha256:path-primary",
-			},
-		},
+		pathInstall("grok", "grok", secondary, rhash, "sha256:path-secondary", 1),
+		pathInstall("grok", "grok", primary, rhash, "sha256:path-primary", 0),
 	}
 	alias := canonicalInstallByAlias(installs)
 	if alias[primary] != primary {
 		t.Fatalf("primary must map to self, got %q", alias[primary])
 	}
 	if alias[secondary] != primary {
-		t.Fatalf("secondary alias must map to PATH primary %s, got %q", primary, alias[secondary])
+		t.Fatalf("secondary PATH alias must map to LookPath primary %s, got %q", primary, alias[secondary])
 	}
 }
 
-// Flipping DiscoveryOrder flips primary so install_ref always tracks LookPath order.
+// PATH hit 0 unusable + hit 1 usable → no routable fallback (fail closed).
+func TestCanonicalInstallByAlias_UnusableLookPathFirstNoFallback(t *testing.T) {
+	const (
+		first  = "pinst_path_hit0_unusable"
+		second = "pinst_path_hit1_usable"
+		rhash  = "sha256:same"
+	)
+	p0 := pathInstall("grok", "grok", first, rhash, "sha256:p0", 0)
+	p0.UsableForInvocation = "unknown"
+	p1 := pathInstall("grok", "grok", second, rhash, "sha256:p1", 1)
+	alias := canonicalInstallByAlias([]providerinventory.ProviderInstallation{p0, p1})
+	if alias[first] != first || alias[second] != second {
+		t.Fatalf("unusable LookPath-first must fail closed (no later fallback): %v", alias)
+	}
+}
+
+func TestCanonicalInstallByAlias_ExplicitNeverFusesOrBecomesPrimary(t *testing.T) {
+	const (
+		pathID     = "pinst_path_lookpath"
+		explicitID = "pinst_explicit_first_order"
+		rhash      = "sha256:same"
+	)
+	explicit := pathInstall("codex", "codex", explicitID, rhash, "sha256:e", 0)
+	explicit.DiscoverySource = providerinventory.DiscoveryExplicitConfig
+	path := pathInstall("codex", "codex", pathID, rhash, "sha256:p", 5)
+	alias := canonicalInstallByAlias([]providerinventory.ProviderInstallation{explicit, path})
+	if alias[pathID] != pathID {
+		t.Fatalf("PATH install must stay primary self, got %q", alias[pathID])
+	}
+	// Explicit must remain self — never fuse into PATH AccountObservation.
+	if alias[explicitID] != explicitID {
+		t.Fatalf("explicit must not fuse into PATH primary, got %q", alias[explicitID])
+	}
+}
+
+func TestCanonicalInstallByAlias_SoleExplicitNoFuse(t *testing.T) {
+	const (
+		a     = "pinst_explicit_a"
+		b     = "pinst_explicit_b"
+		rhash = "sha256:same"
+	)
+	ea := pathInstall("grok", "grok", a, rhash, "sha256:a", 0)
+	ea.DiscoverySource = providerinventory.DiscoveryExplicitConfig
+	eb := pathInstall("grok", "grok", b, rhash, "sha256:b", 1)
+	eb.DiscoverySource = providerinventory.DiscoveryExplicitConfig
+	alias := canonicalInstallByAlias([]providerinventory.ProviderInstallation{ea, eb})
+	if alias[a] != a || alias[b] != b {
+		t.Fatalf("explicit-only must not fuse: %v", alias)
+	}
+}
+
 func TestCanonicalInstallByAlias_PATHOrderFlipConsistent(t *testing.T) {
 	const (
 		a     = "pinst_a_first_on_path"
 		b     = "pinst_b_second_on_path"
 		rhash = "sha256:same"
 	)
-	mk := func(id string, order int) providerinventory.ProviderInstallation {
-		return providerinventory.ProviderInstallation{
-			AdapterID: "codex", ProviderInstallationID: id,
-			DiscoveryOrder: order, InstallationState: providerinventory.InstallationInstalled,
-			UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-			Confidence: providerinventory.ConfidenceExact,
-			ExecutableIdentity: providerinventory.ExecutableIdentity{
-				ResolvedPathHash: rhash, PathHash: "sha256:" + id,
-			},
-		}
-	}
-	// PATH order a then b
-	m1 := canonicalInstallByAlias([]providerinventory.ProviderInstallation{mk(a, 0), mk(b, 1)})
+	m1 := canonicalInstallByAlias([]providerinventory.ProviderInstallation{
+		pathInstall("codex", "codex", a, rhash, "sha256:a", 0),
+		pathInstall("codex", "codex", b, rhash, "sha256:b", 1),
+	})
 	if m1[a] != a || m1[b] != a {
 		t.Fatalf("PATH a,b: want primary a; map=%v", m1)
 	}
-	// PATH order b then a
-	m2 := canonicalInstallByAlias([]providerinventory.ProviderInstallation{mk(b, 0), mk(a, 1)})
+	m2 := canonicalInstallByAlias([]providerinventory.ProviderInstallation{
+		pathInstall("codex", "codex", b, rhash, "sha256:b", 0),
+		pathInstall("codex", "codex", a, rhash, "sha256:a", 1),
+	})
 	if m2[b] != b || m2[a] != b {
 		t.Fatalf("PATH b,a: want primary b; map=%v", m2)
 	}
 }
 
-// Distinct physical binaries (different ResolvedPathHash) never fuse.
 func TestCanonicalInstallByAlias_DistinctBinariesRemainDistinct(t *testing.T) {
 	const (
 		a = "pinst_bin_a"
 		b = "pinst_bin_b"
 	)
-	installs := []providerinventory.ProviderInstallation{
-		{
-			AdapterID: "grok", ProviderInstallationID: a, DiscoveryOrder: 0,
-			InstallationState: providerinventory.InstallationInstalled, UsableForInvocation: "yes",
-			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
-			ExecutableIdentity: providerinventory.ExecutableIdentity{ResolvedPathHash: "sha256:binary-a"},
-		},
-		{
-			AdapterID: "grok", ProviderInstallationID: b, DiscoveryOrder: 1,
-			InstallationState: providerinventory.InstallationInstalled, UsableForInvocation: "yes",
-			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
-			ExecutableIdentity: providerinventory.ExecutableIdentity{ResolvedPathHash: "sha256:binary-b"},
-		},
+	alias := canonicalInstallByAlias([]providerinventory.ProviderInstallation{
+		pathInstall("grok", "grok", a, "sha256:binary-a", "sha256:pa", 0),
+		pathInstall("grok", "grok", b, "sha256:binary-b", "sha256:pb", 1),
+	})
+	// LookPath-first is a; b has different resolved hash so stays self (not fused to a).
+	if alias[a] != a {
+		t.Fatalf("LookPath primary a must map to self: %v", alias)
 	}
-	alias := canonicalInstallByAlias(installs)
-	if alias[a] != a || alias[b] != b {
-		t.Fatalf("distinct binaries must not fuse: %v", alias)
+	if alias[b] != b {
+		t.Fatalf("distinct binary b must not fuse onto a: %v", alias)
+	}
+}
+
+// Same resolved hash but different runner command must never fuse.
+func TestCanonicalInstallByAlias_DifferentCommandSameResolvedNoFuse(t *testing.T) {
+	const rhash = "sha256:same-file"
+	a := pathInstall("tool", "cmd-a", "pinst_cmd_a", rhash, "sha256:pa", 0)
+	b := pathInstall("tool", "cmd-b", "pinst_cmd_b", rhash, "sha256:pb", 0)
+	alias := canonicalInstallByAlias([]providerinventory.ProviderInstallation{a, b})
+	if alias["pinst_cmd_a"] != "pinst_cmd_a" || alias["pinst_cmd_b"] != "pinst_cmd_b" {
+		t.Fatalf("different commands must not fuse: %v", alias)
 	}
 }

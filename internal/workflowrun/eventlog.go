@@ -3,6 +3,7 @@ package workflowrun
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/jasonhnd/loopcoder/internal/workgraph"
 	"os"
 	"path/filepath"
 	"sort"
@@ -183,8 +184,11 @@ func (e *EventLog) ReadAllForRun(projectID, runID string) ([]Event, error) {
 // When expectProject/expectRun empty, the first nonempty project/run becomes the
 // expected value for subsequent lines (internal consistency).
 func ParseEventJSONLStrict(raw, expectProject, expectRun string) ([]Event, error) {
-	expectProject = strings.TrimSpace(expectProject)
-	expectRun = strings.TrimSpace(expectRun)
+	// Callers may pass trimmed expect values; stored durable fields must be
+	// byte-exact (no surrounding whitespace, no case fold of identity).
+	if expectProject != strings.TrimSpace(expectProject) || expectRun != strings.TrimSpace(expectRun) {
+		return nil, fmt.Errorf("workflowrun: ParseEventJSONLStrict expect project/run must not carry surrounding whitespace")
+	}
 	var out []Event
 	seenID := map[string]bool{}
 	for i, line := range strings.Split(raw, "\n") {
@@ -196,37 +200,34 @@ func ParseEventJSONLStrict(raw, expectProject, expectRun string) ([]Event, error
 		if err := json.Unmarshal([]byte(line), &ev); err != nil {
 			return nil, fmt.Errorf("workflowrun: event log line %d: malformed JSON: %w", i+1, err)
 		}
-		if strings.TrimSpace(ev.Schema) != "" && strings.TrimSpace(ev.Schema) != EventSchema {
-			return nil, fmt.Errorf("workflowrun: event log line %d: schema want %q got %q", i+1, EventSchema, ev.Schema)
+		// Byte-exact durable identity — reject padded/noncanonical schema/kind/ids.
+		if ev.Schema != EventSchema {
+			return nil, fmt.Errorf("workflowrun: event log line %d: schema want exact %q got %q", i+1, EventSchema, ev.Schema)
 		}
-		if strings.TrimSpace(ev.Schema) == "" {
-			return nil, fmt.Errorf("workflowrun: event log line %d: missing schema", i+1)
+		if ev.Kind == "" || ev.Kind != strings.TrimSpace(ev.Kind) {
+			return nil, fmt.Errorf("workflowrun: event log line %d: missing or whitespace-padded kind %q", i+1, ev.Kind)
 		}
-		if strings.TrimSpace(ev.Kind) == "" {
-			return nil, fmt.Errorf("workflowrun: event log line %d: missing kind", i+1)
+		if ev.EventID == "" || ev.EventID != strings.TrimSpace(ev.EventID) {
+			return nil, fmt.Errorf("workflowrun: event log line %d: missing or whitespace-padded event_id %q", i+1, ev.EventID)
 		}
-		eid := strings.TrimSpace(ev.EventID)
-		if eid == "" {
-			return nil, fmt.Errorf("workflowrun: event log line %d: missing event_id", i+1)
+		if seenID[ev.EventID] {
+			return nil, fmt.Errorf("workflowrun: event log line %d: duplicate event_id %q", i+1, ev.EventID)
 		}
-		if seenID[eid] {
-			return nil, fmt.Errorf("workflowrun: event log line %d: duplicate event_id %q", i+1, eid)
-		}
-		seenID[eid] = true
-		// Every event must have nonempty exact project_id/run_id (including first).
-		if strings.TrimSpace(ev.ProjectID) == "" || strings.TrimSpace(ev.RunID) == "" {
-			return nil, fmt.Errorf("workflowrun: event log line %d: project_id and run_id required nonempty", i+1)
+		seenID[ev.EventID] = true
+		if ev.ProjectID == "" || ev.ProjectID != strings.TrimSpace(ev.ProjectID) ||
+			ev.RunID == "" || ev.RunID != strings.TrimSpace(ev.RunID) {
+			return nil, fmt.Errorf("workflowrun: event log line %d: project_id/run_id required nonempty without whitespace padding", i+1)
 		}
 		if expectProject == "" {
-			expectProject = strings.TrimSpace(ev.ProjectID)
+			expectProject = ev.ProjectID
 		}
 		if expectRun == "" {
-			expectRun = strings.TrimSpace(ev.RunID)
+			expectRun = ev.RunID
 		}
-		if strings.TrimSpace(ev.ProjectID) != expectProject {
+		if ev.ProjectID != expectProject {
 			return nil, fmt.Errorf("workflowrun: event log line %d: project_id mismatch", i+1)
 		}
-		if strings.TrimSpace(ev.RunID) != expectRun {
+		if ev.RunID != expectRun {
 			return nil, fmt.Errorf("workflowrun: event log line %d: run_id mismatch", i+1)
 		}
 		out = append(out, ev)
@@ -253,8 +254,11 @@ func InterruptedFromEvents(events []Event) (interrupted bool, aborted map[string
 	lastLaunch := map[string]launchRec{}
 
 	for _, ev := range events {
-		id := strings.TrimSpace(ev.WorkItemID)
-		att := strings.TrimSpace(ev.AttemptID)
+		id := ev.WorkItemID
+		att := ev.AttemptID
+		if (id != "" && id != strings.TrimSpace(id)) || (att != "" && att != strings.TrimSpace(att)) {
+			continue // never normalize padded durable identity into authority maps
+		}
 		switch ev.Kind {
 		case "launch", "pid":
 			if id == "" || att == "" {
@@ -340,8 +344,11 @@ func OpenLaunchesWithoutTerminal(events []Event) map[string]string {
 	interruptedAt := map[string]bool{}
 
 	for _, ev := range events {
-		id := strings.TrimSpace(ev.WorkItemID)
-		att := strings.TrimSpace(ev.AttemptID)
+		id := ev.WorkItemID
+		att := ev.AttemptID
+		if (id != "" && id != strings.TrimSpace(id)) || (att != "" && att != strings.TrimSpace(att)) {
+			continue // never normalize padded durable identity into authority maps
+		}
 		switch ev.Kind {
 		case "launch", "pid":
 			if id == "" || att == "" {
@@ -402,18 +409,18 @@ func FailedRetryGenerations(events []Event) map[string]int {
 	// last non-empty terminal per work item (event order).
 	lastTerm := map[string]string{}
 	for _, ev := range events {
-		id := strings.TrimSpace(ev.WorkItemID)
-		if id == "" {
+		id := ev.WorkItemID
+		if id == "" || id != strings.TrimSpace(id) {
 			continue
 		}
-		if g := parseAttemptGeneration(ev.AttemptID); g >= 0 {
+		if g := ParseAttemptGeneration(ev.AttemptID); g >= 0 {
 			if g > maxGen[id] {
 				maxGen[id] = g
 			}
 		}
 		switch ev.Kind {
 		case "terminal":
-			if t := strings.TrimSpace(ev.Terminal); t != "" {
+			if t := ev.Terminal; t != "" && t == strings.TrimSpace(t) {
 				lastTerm[id] = t
 			}
 		case "reuse", "integrate":
@@ -423,7 +430,7 @@ func FailedRetryGenerations(events []Event) map[string]int {
 	}
 	out := map[string]int{}
 	for id, term := range lastTerm {
-		if strings.EqualFold(term, "succeeded") {
+		if term == string(workgraph.TermSucceeded) {
 			continue
 		}
 		out[id] = maxGen[id] + 1
@@ -432,15 +439,14 @@ func FailedRetryGenerations(events []Event) map[string]int {
 }
 
 // parseAttemptGeneration extracts N from att-…-gN. Returns -1 when absent.
-func parseAttemptGeneration(attemptID string) int {
-	return ParseAttemptGeneration(attemptID)
-}
-
 // ParseAttemptGeneration extracts the 0-indexed attempt suffix N from
 // att-…-gN. Returns -1 when absent or malformed. Exported for goalrun resume
 // aborted-ID validation (never invent next generation without a proven g).
 func ParseAttemptGeneration(attemptID string) int {
-	attemptID = strings.TrimSpace(attemptID)
+	// Durable identity is byte-exact: padded AttemptID must not parse as canonical.
+	if attemptID == "" || attemptID != strings.TrimSpace(attemptID) {
+		return -1
+	}
 	idx := strings.LastIndex(attemptID, "-g")
 	if idx < 0 || idx+2 >= len(attemptID) {
 		return -1
@@ -492,11 +498,35 @@ func RecoverOpenLaunchInterrupts(elog *EventLog, projectID, runID string) (int, 
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
+	// Index launch stamps by attempt so recovery interrupts inherit production identity.
+	launchStamp := map[string]Event{}
+	for _, ev := range events {
+		if ev.Kind != "launch" {
+			continue
+		}
+		att := ev.AttemptID
+		if att != "" && att != strings.TrimSpace(att) {
+			continue
+		}
+		if att == "" {
+			continue
+		}
+		launchStamp[att] = ev
+	}
 	for _, id := range ids {
 		att := open[id]
 		gen, gerr := ClaimGenerationFromAttemptID(att)
 		if gerr != nil {
 			return n, fmt.Errorf("workflowrun: recover interrupt %s: %w", id, gerr)
+		}
+		ln, ok := launchStamp[att]
+		if !ok {
+			return n, fmt.Errorf("workflowrun: recover interrupt %s: missing launch stamp for attempt %s", id, att)
+		}
+		if ln.ExecutionPlanDigest == "" || ln.GraphDigest == "" ||
+			ln.GraphID == "" || ln.GraphVersion <= 0 ||
+			ln.TaskClass == "" || ln.ChildContractDigest == "" {
+			return n, fmt.Errorf("workflowrun: recover interrupt %s: incomplete launch identity stamps for attempt %s", id, att)
 		}
 		// Soft ledger recovery: complete service_forced_interrupt structured pair
 		// (distinct from authoritative hard recovery; does not select gN+1).
@@ -508,13 +538,18 @@ func RecoverOpenLaunchInterrupts(elog *EventLog, projectID, runID string) (int, 
 			"terminal":        "cancelled",
 			"work_item_id":    id,
 			"attempt_id":      att,
+			"generation":      fmt.Sprintf("%d", gen),
 		})
+		// Stamp from the open launch — never append attempt-scoped events without identity.
 		if _, err := elog.Append(Event{
 			ProjectID: projectID, RunID: runID,
 			Kind: "interrupt", WorkItemID: id, AttemptID: att, Generation: gen,
-			Terminal: "cancelled",
-			Message:  "forced process kill recovery; open launch without terminal in ledger",
-			Payload:  payload,
+			ExecutionPlanDigest: ln.ExecutionPlanDigest, GraphDigest: ln.GraphDigest,
+			GraphID: ln.GraphID, GraphVersion: ln.GraphVersion,
+			TaskClass: ln.TaskClass, ChildContractDigest: ln.ChildContractDigest,
+			Terminal: "cancelled", FailureClass: "forced_interrupt",
+			Message: "forced process kill recovery; open launch without terminal in ledger",
+			Payload: payload,
 		}); err != nil {
 			return n, err
 		}

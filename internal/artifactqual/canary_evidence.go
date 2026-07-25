@@ -43,20 +43,30 @@ type CanaryEvidence struct {
 	ContentDigest string `json:"content_digest,omitempty"`
 }
 
-// CanaryProviderObs is one fresh capacity observation.
+// CanaryProviderObs is one fresh capacity observation from real structured
+// before/after evidence — never time.Now / invented "fresh" labels.
 type CanaryProviderObs struct {
 	Provider   string    `json:"provider"`
 	AccountRef string    `json:"account_ref,omitempty"`
+	InstallRef string    `json:"install_ref,omitempty"`
+	WindowKind string    `json:"window_kind,omitempty"`
 	Source     string    `json:"source"`
 	Freshness  string    `json:"freshness"`
 	Confidence string    `json:"confidence,omitempty"`
 	Remaining  *float64  `json:"remaining,omitempty"`
 	CapturedAt time.Time `json:"captured_at"`
+	// ResetAt is exact window reset identity for finite/fixed windows (UTC).
+	ResetAt *time.Time `json:"reset_at,omitempty"`
 }
 
 // CanaryChild is one real provider-executed child.
 type CanaryChild struct {
-	ChildID          string   `json:"child_id"`
+	// ChildID remains for report compatibility; WorkItemID is the structured work kind.
+	ChildID    string `json:"child_id"`
+	WorkItemID string `json:"work_item_id,omitempty"`
+	TaskClass  string `json:"task_class,omitempty"`
+	// OutputEvidence is the durable product/output digest from the child outcome.
+	OutputEvidence   string   `json:"output_evidence,omitempty"`
 	AttemptID        string   `json:"attempt_id"`
 	Provider         string   `json:"provider"`
 	Model            string   `json:"model"`
@@ -66,16 +76,30 @@ type CanaryChild struct {
 	Permission       string   `json:"permission,omitempty"`
 	AccountRef       string   `json:"account_ref,omitempty"`
 	InstallRef       string   `json:"install_ref,omitempty"`
+	WindowKind       string   `json:"window_kind,omitempty"`
 	Terminal         string   `json:"terminal"`
 	WorktreePath     string   `json:"worktree_path,omitempty"`
 	CapacityBefore   *float64 `json:"capacity_before,omitempty"`
 	CapacityReserved *float64 `json:"capacity_reserved,omitempty"`
-	CapacityActual   *float64 `json:"capacity_actual,omitempty"` // may be nil/unknown
+	CapacityActual   *float64 `json:"capacity_actual,omitempty"` // quota-window fraction only
 	CapacityAfter    *float64 `json:"capacity_after,omitempty"`  // required when observed
-	// ActualSource is capacity fraction source only (distinct from route sources).
-	ActualSource   string `json:"actual_source,omitempty"`
-	AfterSource    string `json:"after_source,omitempty"`
-	AfterFreshness string `json:"after_freshness,omitempty"`
+	// ActualSource / ActualConfidence for quota-window Actual (same_window_delta).
+	ActualSource     string `json:"actual_source,omitempty"`
+	ActualConfidence string `json:"actual_confidence,omitempty"`
+	// Structured after evidence (never defaulted from CapacityNote prose).
+	AfterSource     string    `json:"after_source,omitempty"`
+	AfterFreshness  string    `json:"after_freshness,omitempty"`
+	AfterConfidence string    `json:"after_confidence,omitempty"`
+	AfterState      string    `json:"after_state,omitempty"` // observed|derived
+	AfterObservedAt time.Time `json:"after_observed_at,omitempty"`
+	// Structured before evidence at reserve.
+	BeforeSource     string    `json:"before_source,omitempty"`
+	BeforeFreshness  string    `json:"before_freshness,omitempty"`
+	BeforeConfidence string    `json:"before_confidence,omitempty"`
+	BeforeCapturedAt time.Time `json:"before_captured_at,omitempty"`
+	// ResetAt is exact window reset identity for finite/fixed windows (UTC).
+	// Required for capacity_after_runtime when window is not unbounded/non-reset.
+	ResetAt *time.Time `json:"reset_at,omitempty"`
 	// ActualSources is per-dimension route proof; required for real provider rows.
 	// Erasure or forgery of any required dimension must fail qualification.
 	ActualSources *CanaryRouteSources `json:"actual_sources,omitempty"`
@@ -107,7 +131,13 @@ type CanaryUnavailableRetry struct {
 	EvidenceRef      string `json:"evidence_ref,omitempty"`
 }
 
+// ProductionSequentialCeiling is the production process/worktree peak limit for
+// sequential wave execution (workflowrun runs wave members sequentially).
+const ProductionSequentialCeiling = 1
+
 // CanaryRestart proves forced interrupt + recover + ceilings.
+// Precomputed *OK flags must match recomputation from measured fields; validators
+// never trust flags alone.
 type CanaryRestart struct {
 	Interrupted        bool   `json:"interrupted"`
 	ResumedFromDurable bool   `json:"resumed_from_durable"`
@@ -118,18 +148,47 @@ type CanaryRestart struct {
 	NoLeakedProcesses  bool   `json:"no_leaked_processes"`
 	NoRepoLocalRuntime bool   `json:"no_repo_local_runtime"`
 	EvidenceRef        string `json:"evidence_ref,omitempty"`
+	// Measured transparency (validator recomputes OK flags from these).
+	ProcessPeak               int  `json:"process_peak"`
+	WorktreePeak              int  `json:"worktree_peak"`
+	ProcessActive             int  `json:"process_active"`
+	WorktreeActive            int  `json:"worktree_active"`
+	ProcessLimit              int  `json:"process_limit"`
+	WorktreeLimit             int  `json:"worktree_limit"`
+	ReuseCountMeasured        int  `json:"reuse_count_measured"`
+	AbortedAttemptCount       int  `json:"aborted_attempt_count"`
+	ActiveOccupancyMeasured   bool `json:"active_occupancy_measured"`
+	RepoLocalRuntimeChecked   bool `json:"repo_local_runtime_checked"`
+	RepoLocalRuntimePresent   bool `json:"repo_local_runtime_present"`
+	DuplicateLaunch           bool `json:"duplicate_launch"`
+	DuplicateSuccessIntegrate bool `json:"duplicate_success_integrate"`
+	AbortedAttemptSucceeded   bool `json:"aborted_attempt_succeeded"`
+	// LaterGenerationResume is true when a higher-generation launch exists after
+	// a typed forced-interrupt cancelled abort (production resume sequence).
+	LaterGenerationResume bool `json:"later_generation_resume"`
 }
 
 // CanaryPR is a real GitHub PR human merge gate.
+// Live qualification verifies URL/number/head_oid/checks; manifest booleans alone
+// cannot green real_pr_human_gate.
 type CanaryPR struct {
 	URL                 string   `json:"url"`
+	Repository          string   `json:"repository,omitempty"` // owner/repo
 	Branch              string   `json:"branch,omitempty"`
 	Number              int      `json:"number,omitempty"`
+	BaseRef             string   `json:"base_ref,omitempty"`
+	HeadOID             string   `json:"head_oid,omitempty"`
 	RequiredChecks      []string `json:"required_checks,omitempty"`
 	RequiredChecksGreen bool     `json:"required_checks_green"`
 	IndependentVerifier string   `json:"independent_verifier,omitempty"`
 	VerifierEvidenceRef string   `json:"verifier_evidence_ref,omitempty"`
+	VerifierProvider    string   `json:"verifier_provider,omitempty"`
+	VerifierAttemptID   string   `json:"verifier_attempt_id,omitempty"`
 	CreatedByLoopCoder  bool     `json:"created_by_loopcoder"`
+	// AutoMerge must be false (human gate).
+	AutoMerge bool `json:"auto_merge"`
+	// HumanMergeGate must be true.
+	HumanMergeGate bool `json:"human_merge_gate"`
 }
 
 // CanaryValidation is the scored result of loading a canary evidence manifest.
@@ -167,11 +226,28 @@ func LoadCanaryEvidence(path string) (CanaryEvidence, error) {
 	return ev, nil
 }
 
+// CanaryValidateOpts binds operator-expected one-run identity so a prior
+// canary manifest cannot be reused for another project/run.
+// LivePR (when set) is required to green real_pr_human_gate — manifest booleans alone cannot.
+type CanaryValidateOpts struct {
+	ExpectedProjectID string
+	ExpectedRunID     string
+	// ExpectedPRHeadOID is the delivered canary commit that PR head must equal.
+	ExpectedPRHeadOID string
+	// LivePR is authoritative PR observation; nil → real_pr cannot GO.
+	LivePR *PRLiveState
+}
+
 // ValidateCanaryEvidence binds a live canary manifest to this qualify archive+SHA.
 // Dry-run structural prechecks must never call this with synthetic green data.
-func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string, now time.Time) CanaryValidation {
+// Optional opts: ExpectedProjectID/ExpectedRunID for anti-reuse challenge.
+func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string, now time.Time, opts ...CanaryValidateOpts) CanaryValidation {
 	v := CanaryValidation{Present: true}
 	add := func(r string) { v.Reasons = append(v.Reasons, r) }
+	var expect CanaryValidateOpts
+	if len(opts) > 0 {
+		expect = opts[0]
+	}
 
 	if strings.TrimSpace(ev.Schema) != SchemaCanaryEvidence {
 		add("schema_mismatch")
@@ -184,9 +260,18 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 	gotSHA := strings.TrimSpace(ev.PreProdSHA)
 	if gotSHA == "" {
 		add("pre_prod_sha_missing")
-	} else if wantSHA != "" && gotSHA != wantSHA &&
-		!strings.HasPrefix(wantSHA, gotSHA) && !strings.HasPrefix(gotSHA, wantSHA) {
+	} else if wantSHA != "" && gotSHA != wantSHA {
+		// Exact match only — no prefix fuzzy reuse.
 		add("pre_prod_sha_mismatch")
+	}
+	// BinaryCommit must exactly match PreProdSHA (exact binary identity).
+	binCommit := strings.TrimSpace(ev.BinaryCommit)
+	if binCommit == "" {
+		add("binary_commit_missing")
+	} else if wantSHA != "" && binCommit != wantSHA {
+		add("binary_commit_pre_prod_sha_mismatch")
+	} else if gotSHA != "" && binCommit != gotSHA {
+		add("binary_commit_pre_prod_sha_mismatch")
 	}
 	if strings.TrimSpace(ev.ProjectID) == "" || ev.ProjectID == "local-project" {
 		add("project_id_not_unique_disposable")
@@ -194,38 +279,36 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 	if strings.TrimSpace(ev.RunID) == "" {
 		add("run_id_missing")
 	}
+	if exp := strings.TrimSpace(expect.ExpectedProjectID); exp != "" && exp != strings.TrimSpace(ev.ProjectID) {
+		add("expected_project_id_mismatch")
+	}
+	if exp := strings.TrimSpace(expect.ExpectedRunID); exp != "" && exp != strings.TrimSpace(ev.RunID) {
+		add("expected_run_id_mismatch")
+	}
 	if ev.ProducedAt.IsZero() {
 		add("produced_at_missing")
-	} else if now.Sub(ev.ProducedAt) > 7*24*time.Hour || ev.ProducedAt.After(now.Add(time.Hour)) {
-		// Reject ancient/stale or future-skewed manifests (cross-run reuse guard).
+	} else if now.Sub(ev.ProducedAt) > 2*time.Hour || ev.ProducedAt.After(now.Add(15*time.Minute)) {
+		// Tighten anti-reuse: canary must be from the current qualify window.
 		add("produced_at_stale_or_skewed")
 	}
 	if strings.TrimSpace(ev.BinaryVersion) == "" && strings.TrimSpace(ev.BinaryCommit) == "" {
 		add("binary_identity_missing")
 	}
-
-	// Fresh provider observations (≥2 companies).
-	provSeen := map[string]bool{}
-	freshObs := 0
-	for _, o := range ev.ProviderObservations {
-		p := strings.ToLower(strings.TrimSpace(o.Provider))
-		if p == "" {
-			continue
-		}
-		provSeen[p] = true
-		fr := strings.ToLower(strings.TrimSpace(o.Freshness))
-		if fr == "fresh" && strings.TrimSpace(o.Source) != "" {
-			freshObs++
+	// ContentDigest is required and must match recomputation of the body.
+	if strings.TrimSpace(ev.ContentDigest) == "" {
+		add("content_digest_missing")
+	} else {
+		want := DigestCanaryBody(ev)
+		if !strings.EqualFold(normHex(ev.ContentDigest), normHex(want)) {
+			add("content_digest_mismatch")
 		}
 	}
-	if len(provSeen) < 2 {
-		add("providers_lt_2")
-	}
-	if freshObs < 2 {
-		add("fresh_provider_observations_lt_2")
-	}
 
-	// Real children
+	// Build counted real-child identity keys for provider-obs correspondence.
+	type childIDKey struct{ p, acc, inst, win string }
+	realChildIDs := map[childIDKey]bool{}
+
+	// Real children first (so provider obs can require correspondence).
 	depths := map[string]bool{}
 	childProv := map[string]bool{}
 	useful := 0
@@ -242,40 +325,97 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 		}
 		attemptIDs[c.AttemptID] = true
 		if !c.RealProviderExecuted {
-			add("child_not_real_provider:" + c.ChildID)
 			continue
 		}
-		if c.Terminal != "succeeded" {
-			// still count for diversity if executed
-		} else {
-			useful++
+		if !strings.EqualFold(strings.TrimSpace(c.Terminal), "succeeded") {
+			add("real_provider_not_succeeded:" + c.ChildID)
+			continue
 		}
-		if p := strings.ToLower(strings.TrimSpace(c.Provider)); p != "" {
-			childProv[p] = true
+		// Identity required for production canary children.
+		if strings.TrimSpace(c.AccountRef) == "" || strings.TrimSpace(c.InstallRef) == "" || strings.TrimSpace(c.WindowKind) == "" {
+			add("child_identity_incomplete:" + c.ChildID)
+			continue
 		}
-		req := strings.ToLower(strings.TrimSpace(c.DepthRequired))
-		sel := strings.ToLower(strings.TrimSpace(c.DepthSelected))
-		inv := strings.ToLower(strings.TrimSpace(c.DepthInvocation))
-		if req != "" {
-			depths[req] = true
-		}
-		if req != "" && req == sel && req == inv {
-			depthBindOK++
-		}
+		// Structured before evidence required.
 		if c.CapacityBefore == nil || c.CapacityReserved == nil {
 			add("capacity_before_or_reserved_missing:" + c.ChildID)
+		} else {
+			if strings.TrimSpace(c.BeforeSource) == "" || isForbiddenCanarySource(c.BeforeSource) {
+				add("before_source_invalid:" + c.ChildID)
+			}
+			if !strings.EqualFold(strings.TrimSpace(c.BeforeFreshness), "fresh") {
+				add("before_freshness_not_fresh:" + c.ChildID)
+			}
+			if c.BeforeCapturedAt.IsZero() {
+				add("before_captured_at_missing:" + c.ChildID)
+			} else if !inCanaryRunWindow(c.BeforeCapturedAt, ev.ProducedAt, now) {
+				add("before_captured_at_outside_canary_run:" + c.ChildID)
+			}
+			if strings.TrimSpace(c.BeforeConfidence) == "" {
+				add("before_confidence_missing:" + c.ChildID)
+			}
 		}
-		// actual may be unknown/nil; after must be present from fresh observation
+		// Observed after with chronological order vs before.
 		if c.CapacityAfter == nil {
 			add("capacity_after_missing:" + c.ChildID)
 		} else {
-			afterOK++
-			if strings.TrimSpace(c.AfterSource) == "" {
+			state := strings.ToLower(strings.TrimSpace(c.AfterState))
+			src := strings.TrimSpace(c.AfterSource)
+			fr := strings.ToLower(strings.TrimSpace(c.AfterFreshness))
+			if state != "observed" {
+				add("capacity_after_not_observed:" + c.ChildID + ":" + state)
+			} else if src == "" {
 				add("after_source_missing:" + c.ChildID)
+			} else if isForbiddenCanarySource(src) {
+				add("after_forbidden_source:" + c.ChildID + ":" + src)
+			} else if fr != "fresh" {
+				add("after_freshness_not_fresh:" + c.ChildID + ":" + fr)
+			} else if c.AfterObservedAt.IsZero() {
+				add("after_observed_at_missing:" + c.ChildID)
+			} else if !inCanaryRunWindow(c.AfterObservedAt, ev.ProducedAt, now) {
+				add("after_observed_at_outside_canary_run:" + c.ChildID)
+			} else if !c.BeforeCapturedAt.IsZero() && c.AfterObservedAt.Before(c.BeforeCapturedAt) {
+				add("after_before_before_timestamp:" + c.ChildID)
+			} else if strings.TrimSpace(c.AfterConfidence) == "" {
+				add("after_confidence_missing:" + c.ChildID)
+			} else if !capacityResetOK(c.WindowKind, c.ResetAt, c.BeforeCapturedAt, c.AfterObservedAt, add, "child:"+c.ChildID) {
+				// stable reason already added
+			} else {
+				afterOK++
 			}
-			if strings.TrimSpace(c.AfterFreshness) == "" {
-				add("after_freshness_missing:" + c.ChildID)
-			}
+		}
+		// Structured Actual in quota-window fraction unit required for useful kids.
+		if c.CapacityActual == nil || strings.TrimSpace(c.ActualSource) == "" {
+			add("capacity_actual_missing:" + c.ChildID)
+		} else if isTokenProxyActualSourceCanary(c.ActualSource) {
+			add("capacity_actual_token_proxy:" + c.ChildID)
+		} else if !isGroupDeltaActualSource(c.ActualSource) {
+			add("capacity_actual_source_not_group_delta:" + c.ChildID)
+		} else if strings.TrimSpace(c.ActualConfidence) == "" {
+			add("capacity_actual_confidence_missing:" + c.ChildID)
+		} else if !strings.EqualFold(strings.TrimSpace(c.ActualConfidence), "estimated") {
+			// Window aggregate group deltas are always estimated.
+			add("capacity_actual_confidence_not_estimated:" + c.ChildID)
+		}
+
+		useful++
+		p := strings.ToLower(strings.TrimSpace(c.Provider))
+		if p != "" {
+			childProv[p] = true
+		}
+		realChildIDs[childIDKey{
+			p: p, acc: strings.TrimSpace(c.AccountRef),
+			inst: strings.TrimSpace(c.InstallRef), win: strings.TrimSpace(c.WindowKind),
+		}] = true
+		req := strings.ToLower(strings.TrimSpace(c.DepthRequired))
+		sel := strings.ToLower(strings.TrimSpace(c.DepthSelected))
+		inv := strings.ToLower(strings.TrimSpace(c.DepthInvocation))
+		effortOK := c.ActualSources != nil && canaryTruthfulActualSource(c.ActualSources.Effort)
+		if effortOK && req != "" {
+			depths[req] = true
+		}
+		if effortOK && req != "" && req == sel && req == inv {
+			depthBindOK++
 		}
 		// Reject dry-run markers
 		if strings.Contains(strings.ToLower(c.AttemptID), "dry") ||
@@ -284,34 +424,95 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 		}
 		// Route ActualSources + ArgvDigest required for real provider rows.
 		// Erasure or forgery of any required dimension must fail closed.
-		if c.RealProviderExecuted && c.Terminal == "succeeded" {
-			if c.ActualSources == nil {
-				add("route_actual_sources_missing:" + c.ChildID)
-			} else {
-				allowed := map[string]bool{
-					"provider_stream": true, "accepted_invocation": true,
-					"auth_binding": true, "install_binding": true,
-				}
-				checkSrc := func(dim, val string) {
-					if strings.TrimSpace(val) == "" || !allowed[val] {
-						add("route_source_invalid:" + c.ChildID + ":" + dim + ":" + val)
-					}
-				}
-				checkSrc("model", c.ActualSources.Model)
-				checkSrc("effort", c.ActualSources.Effort)
-				checkSrc("permission", c.ActualSources.Permission)
-				if strings.TrimSpace(c.AccountRef) != "" {
-					checkSrc("account", c.ActualSources.Account)
-				}
-				if strings.TrimSpace(c.InstallRef) != "" {
-					checkSrc("install", c.ActualSources.Install)
+		if c.ActualSources == nil {
+			add("route_actual_sources_missing:" + c.ChildID)
+		} else {
+			// Provider/model/permission must be truthful accepted proof.
+			// auth_binding/install_binding alone never qualify execution.
+			truthful := map[string]bool{
+				"provider_stream": true, "accepted_invocation": true,
+			}
+			allowedBinding := map[string]bool{
+				"provider_stream": true, "accepted_invocation": true,
+				"auth_binding": true, "install_binding": true,
+			}
+			checkTruthful := func(dim, val string) {
+				if strings.TrimSpace(val) == "" || !truthful[val] {
+					add("route_source_invalid:" + c.ChildID + ":" + dim + ":" + val)
 				}
 			}
-			if strings.TrimSpace(c.ArgvDigest) == "" {
-				add("argv_digest_missing:" + c.ChildID)
+			checkBinding := func(dim, val string) {
+				if strings.TrimSpace(val) == "" || !allowedBinding[val] {
+					add("route_source_invalid:" + c.ChildID + ":" + dim + ":" + val)
+				}
+			}
+			checkTruthful("model", c.ActualSources.Model)
+			checkTruthful("effort", c.ActualSources.Effort)
+			checkTruthful("permission", c.ActualSources.Permission)
+			if strings.TrimSpace(c.AccountRef) != "" {
+				checkBinding("account", c.ActualSources.Account)
+			}
+			if strings.TrimSpace(c.InstallRef) != "" {
+				checkBinding("install", c.ActualSources.Install)
 			}
 		}
+		if strings.TrimSpace(c.ArgvDigest) == "" {
+			add("argv_digest_missing:" + c.ChildID)
+		}
 	}
+
+	// Provider observations must correspond to counted real child identities.
+	// Unrelated observation rows cannot satisfy multi-provider freshness.
+	provSeen := map[string]bool{}
+	freshObs := 0
+	for _, o := range ev.ProviderObservations {
+		p := strings.ToLower(strings.TrimSpace(o.Provider))
+		if p == "" {
+			continue
+		}
+		src := strings.ToLower(strings.TrimSpace(o.Source))
+		fr := strings.ToLower(strings.TrimSpace(o.Freshness))
+		if src == "" {
+			add("provider_obs_source_missing:" + p)
+			continue
+		}
+		if isForbiddenCanarySource(src) {
+			add("provider_obs_forbidden_source:" + p + ":" + src)
+			continue
+		}
+		if strings.TrimSpace(o.AccountRef) == "" || strings.TrimSpace(o.InstallRef) == "" || strings.TrimSpace(o.WindowKind) == "" {
+			add("provider_obs_identity_incomplete:" + p)
+			continue
+		}
+		if o.CapturedAt.IsZero() {
+			add("provider_obs_captured_at_missing:" + p)
+			continue
+		}
+		if !inCanaryRunWindow(o.CapturedAt, ev.ProducedAt, now) {
+			add("provider_obs_captured_at_outside_canary_run:" + p)
+			continue
+		}
+		k := childIDKey{p: p, acc: strings.TrimSpace(o.AccountRef), inst: strings.TrimSpace(o.InstallRef), win: strings.TrimSpace(o.WindowKind)}
+		if !realChildIDs[k] {
+			add("provider_obs_unrelated_to_real_child:" + p)
+			continue
+		}
+		// Finite/fixed windows used for capacity_after_runtime require reset identity.
+		if !capacityResetOK(o.WindowKind, o.ResetAt, o.CapturedAt, o.CapturedAt, add, "provider_obs:"+p) {
+			continue
+		}
+		if fr == "fresh" {
+			freshObs++
+			provSeen[p] = true
+		}
+	}
+	if len(provSeen) < 2 {
+		add("providers_lt_2")
+	}
+	if freshObs < 2 {
+		add("fresh_provider_observations_lt_2")
+	}
+
 	v.UsefulChildren = useful
 	for p := range childProv {
 		v.Providers = append(v.Providers, p)
@@ -360,17 +561,44 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 		}
 	}
 
-	// Restart / ceilings — evidence_ref must point at raw event ledger digest/path.
+	// Restart / ceilings — recompute from measured fields; never trust *OK alone.
 	if ev.Restart == nil {
 		add("restart_evidence_missing")
 	} else {
 		r := ev.Restart
-		if !r.Interrupted || !r.ResumedFromDurable || !r.ExactlyOnce {
+		// Recompute ceilings/leaks/repo-local from transparent measured fields.
+		reProcessOK := r.ProcessPeak > 0 && r.ProcessLimit > 0 && r.ProcessPeak <= r.ProcessLimit
+		reWorktreeOK := r.WorktreePeak > 0 && r.WorktreeLimit > 0 && r.WorktreePeak <= r.WorktreeLimit
+		reNoLeaked := r.ActiveOccupancyMeasured && r.ProcessActive == 0 && r.WorktreeActive == 0
+		reNoRepoLocal := r.RepoLocalRuntimeChecked && !r.RepoLocalRuntimePresent
+		reExactlyOnce := r.Interrupted && r.ResumedFromDurable && r.LaterGenerationResume &&
+			r.AbortedAttemptCount > 0 && r.ReuseCountMeasured > 0 &&
+			!r.DuplicateLaunch && !r.DuplicateSuccessIntegrate && !r.AbortedAttemptSucceeded
+
+		if r.ProcessCeilingOK != reProcessOK {
+			add("restart_process_ceiling_flag_mismatch")
+		}
+		if r.WorktreeCeilingOK != reWorktreeOK {
+			add("restart_worktree_ceiling_flag_mismatch")
+		}
+		if r.NoLeakedProcesses != reNoLeaked {
+			add("restart_no_leaked_flag_mismatch")
+		}
+		if r.NoRepoLocalRuntime != reNoRepoLocal {
+			add("restart_no_repo_local_flag_mismatch")
+		}
+		if r.ExactlyOnce != reExactlyOnce {
+			add("restart_exactly_once_flag_mismatch")
+		}
+
+		if !r.Interrupted || !r.ResumedFromDurable || !reExactlyOnce {
 			add("restart_flags_incomplete")
 		} else if r.ChildCountUseful < 4 {
 			add("restart_useful_children_lt_4")
-		} else if !r.ProcessCeilingOK || !r.WorktreeCeilingOK || !r.NoLeakedProcesses || !r.NoRepoLocalRuntime {
+		} else if !reProcessOK || !reWorktreeOK || !reNoLeaked || !reNoRepoLocal {
 			add("restart_ceilings_or_leaks_unmet")
+		} else if r.ProcessLimit != ProductionSequentialCeiling || r.WorktreeLimit != ProductionSequentialCeiling {
+			add("restart_limit_not_production_sequential_ceiling")
 		} else if strings.TrimSpace(r.EvidenceRef) == "" {
 			add("restart_evidence_ref_missing")
 		} else if !strings.Contains(r.EvidenceRef, "workflow-events") && !strings.Contains(r.EvidenceRef, "event") {
@@ -380,27 +608,21 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 		}
 	}
 
-	// Real PR — refuse pending-live and empty verifier digests.
+	// Real PR — require live verification + wi_verify-derived independent verifier.
+	// Manifest RequiredChecksGreen alone cannot green real_pr_human_gate.
 	if ev.PR == nil {
 		add("real_pr_missing")
 	} else {
-		p := ev.PR
-		if strings.TrimSpace(p.URL) == "" || !strings.Contains(p.URL, "/pull/") {
-			add("real_pr_url_invalid")
-		} else if !p.CreatedByLoopCoder {
-			add("real_pr_not_loopcoder_owned")
-		} else if !p.RequiredChecksGreen || len(p.RequiredChecks) == 0 {
-			add("real_pr_checks_unmet")
-		} else if strings.TrimSpace(p.IndependentVerifier) == "" && strings.TrimSpace(p.VerifierEvidenceRef) == "" {
-			add("real_pr_verifier_missing")
-		} else if strings.Contains(strings.ToLower(p.VerifierEvidenceRef), "pending") {
-			add("real_pr_verifier_pending_live")
-		} else if strings.TrimSpace(p.VerifierEvidenceRef) != "" &&
-			!strings.HasPrefix(p.VerifierEvidenceRef, "sha256:") &&
-			!strings.Contains(p.VerifierEvidenceRef, "receipt:") &&
-			!strings.Contains(p.VerifierEvidenceRef, "event") {
-			add("real_pr_verifier_ref_unbound")
-		} else {
+		p := *ev.PR
+		liveOK, liveReasons := ValidatePRLive(p, expect.LivePR, expect.ExpectedPRHeadOID)
+		for _, r := range liveReasons {
+			add(r)
+		}
+		verOK, verReasons := ValidateIndependentVerifierFromChildren(p, ev.Children)
+		for _, r := range verReasons {
+			add(r)
+		}
+		if liveOK && verOK {
 			v.RealPROK = true
 		}
 	}
@@ -427,6 +649,126 @@ func hasReasonPrefix(reasons []string, prefix string) bool {
 		}
 	}
 	return false
+}
+
+// windowRequiresCapacityReset is true for finite/fixed quota windows.
+// Unbounded / non-reset capacity does not require ResetAt.
+func windowRequiresCapacityReset(windowKind string) bool {
+	k := strings.ToLower(strings.TrimSpace(windowKind))
+	if k == "" {
+		return false // incomplete identity already fails separately
+	}
+	if strings.Contains(k, "unbounded") || strings.Contains(k, "non-reset") ||
+		strings.Contains(k, "non_reset") || k == "nonreset" {
+		return false
+	}
+	return true
+}
+
+// capacityResetOK validates structured ResetAt for capacity_after_runtime evidence.
+// Reasons are stable IDs only (no credentials). Returns false when fail-closed.
+func capacityResetOK(windowKind string, reset *time.Time, obsA, obsB time.Time, add func(string), id string) bool {
+	if !windowRequiresCapacityReset(windowKind) {
+		return true
+	}
+	if reset == nil || reset.IsZero() {
+		add("capacity_reset_at_missing:" + id)
+		return false
+	}
+	r := reset.UTC()
+	// Reset must be strictly after every observation timestamp (not stale/expired).
+	for _, o := range []time.Time{obsA, obsB} {
+		if o.IsZero() {
+			continue
+		}
+		if !r.After(o.UTC()) {
+			add("capacity_reset_at_stale_vs_observation:" + id)
+			return false
+		}
+	}
+	return true
+}
+
+// canaryTruthfulActualSource matches goalrun collectUsage: only provider_stream
+// or accepted_invocation prove model/depth/permission actual diversity.
+// auth_binding / install_binding alone never count.
+func canaryTruthfulActualSource(s string) bool {
+	switch strings.TrimSpace(s) {
+	case "provider_stream", "accepted_invocation":
+		return true
+	default:
+		return false
+	}
+}
+
+// isForbiddenCanarySource rejects fixture/test/fake/defaulted sources in release evidence.
+// Exact tokens and known prefixes only — never substring "test" matching "attest".
+func isForbiddenCanarySource(src string) bool {
+	s := strings.ToLower(strings.TrimSpace(src))
+	if s == "" {
+		return true
+	}
+	switch s {
+	case "fixture", "test", "fake", "capacity_snapshot", "before_minus_actual",
+		"unknown", "n/a", "na", "estimated":
+		return true
+	}
+	for _, p := range []string{"fixture:", "fixture_", "test:", "test_", "fake:", "fake_",
+		"before_minus_actual", "capacity_snapshot", "token"} {
+		if strings.HasPrefix(s, p) || s == p {
+			return true
+		}
+	}
+	return false
+}
+
+// inCanaryRunWindow requires t within the current canary ProducedAt window
+// (not a generic 24h/7d reuse window).
+func inCanaryRunWindow(t, producedAt, now time.Time) bool {
+	if t.IsZero() || producedAt.IsZero() {
+		return false
+	}
+	// Observation must not be after ProducedAt + skew or before ProducedAt - 2h.
+	if t.After(producedAt.Add(15 * time.Minute)) {
+		return false
+	}
+	if t.Before(producedAt.Add(-2 * time.Hour)) {
+		return false
+	}
+	// Qualify time must still be near the canary production.
+	if now.Sub(producedAt) > 2*time.Hour || producedAt.After(now.Add(15*time.Minute)) {
+		return false
+	}
+	return true
+}
+
+// isTokenProxyActualSourceCanary rejects soft-window token estimates as Actual.
+func isTokenProxyActualSourceCanary(src string) bool {
+	s := strings.ToLower(strings.TrimSpace(src))
+	if s == "" || s == "unknown" {
+		return true
+	}
+	// Bare "estimated" without group_delta prefix is a soft-window proxy.
+	if s == "estimated" {
+		return true
+	}
+	if strings.Contains(s, "soft_window") || strings.Contains(s, "softwindow") {
+		return true
+	}
+	// token_count/soft proxy — but allow estimated_group_delta_token_weighted
+	if strings.HasPrefix(s, "estimated_group_delta_") {
+		return false
+	}
+	return strings.Contains(s, "token")
+}
+
+// isGroupDeltaActualSource accepts only auditable group allocation sources.
+func isGroupDeltaActualSource(src string) bool {
+	s := strings.ToLower(strings.TrimSpace(src))
+	return strings.HasPrefix(s, "estimated_group_delta_token_weighted:") ||
+		strings.HasPrefix(s, "estimated_group_delta_reservation_weighted:") ||
+		strings.HasPrefix(s, "estimated_group_delta_zero:") ||
+		strings.HasPrefix(s, "estimated_group_delta_empty:")
 }
 
 // isCanaryUnavailableReason is the closed set of unavailability classes that may

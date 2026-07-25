@@ -370,18 +370,41 @@ func TestGoalrunModelUnavailable_FullCrossStoreIdentity(t *testing.T) {
 	if cp.PlanDigest != wantPlan || cp.GraphDigest != wantGraph {
 		t.Fatal("checkpoint digests")
 	}
-	foundR, foundW := false, false
+	// Universal report retains BOTH MU-failed and winning alternate ChildReports.
+	// Winner must match wfOK; failed MU row must keep plan/class/CCD with model_unavailable.
+	foundR, foundW, foundMUFail := false, false, false
 	for _, c := range cp.Children {
 		if c.ChildID != "wi_impl" {
 			continue
 		}
-		foundR = true
 		if c.ExecutionPlanDigest != wantPlan || c.TaskClass != wantClass || c.ChildContractDigest != wantCCD {
 			t.Fatalf("checkpoint child plan/class/ccd: %+v", c)
 		}
-		if c.AttemptID != wfOK.AttemptID || c.Generation != wfOK.Generation {
-			t.Fatalf("checkpoint child attempt/gen: %+v", c)
+		if strings.EqualFold(strings.TrimSpace(c.FailureClass), "model_unavailable") {
+			foundMUFail = true
+			if c.AttemptID == "" || c.AttemptID == wfOK.AttemptID {
+				t.Fatalf("MU failed report must be distinct attempt from winner: %+v", c)
+			}
+			if c.ReservationID == "" || c.WindowKind == "" || c.InstallRef == "" {
+				t.Fatalf("MU failed report incomplete capacity identity: %+v", c)
+			}
+			if c.ReservationID == wfOK.ReservationID {
+				t.Fatalf("MU failed share winner reservation (hold misattribute): fail=%s win=%s", c.ReservationID, wfOK.ReservationID)
+			}
+			continue
 		}
+		if c.Terminal == "succeeded" || c.AttemptID == wfOK.AttemptID {
+			foundR = true
+			if c.AttemptID != wfOK.AttemptID || c.Generation != wfOK.Generation {
+				t.Fatalf("checkpoint winner child attempt/gen: %+v want att=%s gen=%d", c, wfOK.AttemptID, wfOK.Generation)
+			}
+			if c.WindowKind == "" || c.InstallRef == "" || c.ReservationID == "" {
+				t.Fatalf("winner report incomplete capacity identity: %+v", c)
+			}
+		}
+	}
+	if !foundMUFail {
+		t.Fatal("checkpoint Children missing model_unavailable failed route alongside winner")
 	}
 	for _, c := range cp.WorkflowKids {
 		if c.WorkItemID != "wi_impl" || c.AttemptID != wfOK.AttemptID {
@@ -408,15 +431,15 @@ func TestGoalrunModelUnavailable_FullCrossStoreIdentity(t *testing.T) {
 	if successN != 1 {
 		t.Fatalf("want exactly one success, got %d", successN)
 	}
-	// Exactly one integration of the work item (not merely ≤1).
-	intN := 0
-	for _, id := range res.Workflow.Integrated {
-		if id == "wi_impl" {
-			intN++
-		}
+	// Structural Fake path without git RepoPath: terminal success only — never
+	// fabricate product Integrated membership.
+	if len(res.Workflow.Integrated) != 0 {
+		t.Fatalf("no-repo Fake MU must not fabricate Integrated: %v", res.Workflow.Integrated)
 	}
-	if intN != 1 {
-		t.Fatalf("integration count of wi_impl=%d want exactly 1; Integrated=%v", intN, res.Workflow.Integrated)
+	for _, c := range res.Children {
+		if c.ChildID == "wi_impl" && c.Terminal == "succeeded" && c.Stage == "integrated" {
+			t.Fatalf("terminal success without product integrate must not Stage=integrated: %+v", c)
+		}
 	}
 }
 

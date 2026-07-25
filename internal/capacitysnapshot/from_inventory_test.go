@@ -22,35 +22,51 @@ func TestFromProviderInventoryReportMapsQuotaAndModels(t *testing.T) {
 	now := time.Date(2026, 7, 22, 16, 0, 0, 0, time.UTC)
 	rem := int64(60)
 	lim := int64(100)
+	const (
+		inst = "pinst_codex_map_quota_models"
+		acc  = "acct-map-quota-codex-fixture-profile"
+		snap = "mcatsnap_codex_map_quota"
+	)
 	rep := providerinventory.Report{
 		InventoryFingerprint: "fp-test",
-		Installations: []providerinventory.ProviderInstallation{{
-			AdapterID: "codex", InstallationState: providerinventory.InstallationInstalled,
-			UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-			Confidence: providerinventory.ConfidenceExact,
-		}},
+		Installations: []providerinventory.ProviderInstallation{
+			exactFreshInstall("codex", inst, "sha256:codex-map-resolved", "sha256:codex-map-path"),
+		},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
 			FreshnessState:      providerinventory.FreshnessFresh,
 			Confidence:          providerinventory.ConfidenceExact,
 			ReadinessConfidence: providerinventory.ConfidenceExact,
+			AccountProfileID:       ptrStr(acc),
+			ProviderInstallationID: ptrStr(inst),
+		}},
+		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{{
+			ModelCatalogSnapshotID: snap, AdapterID: "codex",
+			CatalogSourceKind:      providerinventory.CatalogSourceProviderMachineReadable,
+			Confidence:             providerinventory.ConfidenceExact,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			ProviderInstallationID: ptrStr(inst),
+			AccountProfileID:       ptrStr(acc),
 		}},
 		ModelCapabilities: []providerinventory.ModelCapability{{
 			AdapterID: "codex", CanonicalModelID: "gpt-5.5",
-			AvailabilityState: providerinventory.AvailabilityAvailable,
-			LifecycleState:    providerinventory.LifecycleAvailable,
-			FreshnessState:    providerinventory.FreshnessFresh,
-			Confidence:        providerinventory.ConfidenceExact,
-			EntrySources:      testMachineReadableSources("codex"),
-			Source:            providerinventory.SourceDescriptor{Kind: string(providerinventory.CatalogSourceProviderMachineReadable)},
+			ModelCatalogSnapshotID: snap,
+			AvailabilityState:      providerinventory.AvailabilityAvailable,
+			LifecycleState:         providerinventory.LifecycleAvailable,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			Confidence:             providerinventory.ConfidenceExact,
+			EntrySources:           testMachineReadableSources("codex"),
+			Source:                 providerinventory.SourceDescriptor{Kind: string(providerinventory.CatalogSourceProviderMachineReadable)},
 		}},
 		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
 			AdapterID: "codex", Unit: "percent", WindowKind: providerinventory.WindowFixedHour,
 			RemainingValue: &rem, LimitValue: &lim,
-			Confidence:     providerinventory.ConfidenceEstimated,
-			FreshnessState: providerinventory.FreshnessFresh,
-			CapturedAt:     now.Format(time.RFC3339),
-			SourceKind:     providerinventory.QuotaSourceFixture,
+			AccountProfileID:       ptrStr(acc),
+			ProviderInstallationID: ptrStr(inst),
+			Confidence:             providerinventory.ConfidenceEstimated,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			CapturedAt:             now.Format(time.RFC3339),
+			SourceKind:             providerinventory.QuotaSourceFixture,
 		}},
 	}
 	accounts := capacitysnapshot.FromProviderInventoryReport(rep, now)
@@ -240,18 +256,23 @@ func TestCodexGpt53ExcludedAsCapabilityNotInventedCapacity(t *testing.T) {
 func TestStaticSeedAndSourcelessCapabilityNotProductionRoutable(t *testing.T) {
 	now := t0()
 	rem := int64(90)
-	// Auth + real quota but only static seed / source-less capability → no auto-route.
+	const (
+		agInst = "pinst_agy_static_seed_shell"
+		agAcc  = "acct-agy-static-seed-fixture"
+	)
+	// Auth + real quota on a real PATH install but only static seed / source-less
+	// capability → unattended shell ok, no production auto-route models.
 	rep := providerinventory.Report{
-		Installations: []providerinventory.ProviderInstallation{{
-			AdapterID: "antigravity", InstallationState: providerinventory.InstallationInstalled,
-			UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-			Confidence: providerinventory.ConfidenceExact,
-		}},
+		Installations: []providerinventory.ProviderInstallation{
+			exactFreshInstall("antigravity", agInst, "sha256:agy-static-resolved", "sha256:agy-static-path"),
+		},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "antigravity", ReadinessState: providerinventory.ReadinessReady,
 			FreshnessState:      providerinventory.FreshnessFresh,
 			Confidence:          providerinventory.ConfidenceExact,
 			ReadinessConfidence: providerinventory.ConfidenceExact,
+			AccountProfileID:       ptrStr(agAcc),
+			ProviderInstallationID: ptrStr(agInst),
 		}},
 		// Bare capability without EntrySources / Source.Kind — CatalogHintOnly.
 		ModelCapabilities: []providerinventory.ModelCapability{{
@@ -264,8 +285,10 @@ func TestStaticSeedAndSourcelessCapabilityNotProductionRoutable(t *testing.T) {
 		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
 			AdapterID: "antigravity", Unit: "percent", WindowKind: providerinventory.WindowFixedHour,
 			RemainingValue: &rem, Confidence: providerinventory.ConfidenceExact,
-			FreshnessState: providerinventory.FreshnessFresh,
-			CapturedAt:     now.Format(time.RFC3339),
+			AccountProfileID:       ptrStr(agAcc),
+			ProviderInstallationID: ptrStr(agInst),
+			FreshnessState:         providerinventory.FreshnessFresh,
+			CapturedAt:             now.Format(time.RFC3339),
 		}},
 	}
 	accounts := capacitysnapshot.FromProviderInventoryReport(rep, now)
@@ -305,20 +328,30 @@ func TestStaticSeedAndSourcelessCapabilityNotProductionRoutable(t *testing.T) {
 		t.Fatal("source-less/static catalog must not produce production route inventory")
 	}
 
-	// Pure static seed path: no capabilities, real quota.
+	// Pure static seed path: no capabilities, real quota on PATH install.
+	const (
+		codexInst = "pinst_codex_static_seed_only"
+		codexAcc  = "acct-codex-static-seed-fixture"
+	)
 	rep2 := providerinventory.Report{
-		Installations: []providerinventory.ProviderInstallation{{
-			AdapterID: "codex", InstallationState: providerinventory.InstallationInstalled,
-			UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-		}},
+		Installations: []providerinventory.ProviderInstallation{
+			exactFreshInstall("codex", codexInst, "sha256:codex-seed-resolved", "sha256:codex-seed-path"),
+		},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
+			FreshnessState:      providerinventory.FreshnessFresh,
+			Confidence:          providerinventory.ConfidenceExact,
+			ReadinessConfidence: providerinventory.ConfidenceExact,
+			AccountProfileID:       ptrStr(codexAcc),
+			ProviderInstallationID: ptrStr(codexInst),
 		}},
 		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
 			AdapterID: "codex", Unit: "percent", WindowKind: providerinventory.WindowFixedHour,
 			RemainingValue: &rem, Confidence: providerinventory.ConfidenceExact,
-			FreshnessState: providerinventory.FreshnessFresh,
-			CapturedAt:     now.Format(time.RFC3339),
+			AccountProfileID:       ptrStr(codexAcc),
+			ProviderInstallationID: ptrStr(codexInst),
+			FreshnessState:         providerinventory.FreshnessFresh,
+			CapturedAt:             now.Format(time.RFC3339),
 		}},
 	}
 	accounts2 := capacitysnapshot.FromProviderInventoryReport(rep2, now)

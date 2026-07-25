@@ -1415,33 +1415,19 @@ func cleanupIsolationViolation(escaped, parentMut, projectMut []string, parentSn
 }
 
 func attachUsage(out ChildExecResult, res agent.Result) ChildExecResult {
+	// Preserve raw token usage only. Token counts are NOT the same unit as
+	// provider quota remaining fraction (Grok credits, weekly %, etc.).
+	// Never reconcile/subtract tokens as capacityledger Actual.
 	if res.Usage.InputTokens != nil {
 		out.InputTokens = *res.Usage.InputTokens
 	}
 	if res.Usage.OutputTokens != nil {
 		out.OutputTokens = *res.Usage.OutputTokens
 	}
-	total := out.InputTokens + out.OutputTokens
-	if res.Usage.TotalTokens != nil && *res.Usage.TotalTokens > 0 {
-		total = *res.Usage.TotalTokens
-	}
-	if total <= 0 {
-		out.ActualSource = "unknown"
-		out.ActualCapacity = nil
-		return out
-	}
-	// Honest estimated fraction from token count vs a large soft window.
-	// Never claim exact when the provider only reported tokens.
-	const softWindow = 200_000.0
-	frac := float64(total) / softWindow
-	if frac > 1 {
-		frac = 1
-	}
-	if frac < 0 {
-		frac = 0
-	}
-	out.ActualCapacity = &frac
-	out.ActualSource = "estimated"
+	// Explicit unknown for quota-window Actual — goalrun derives same-window
+	// Before−After delta after ObserveAfter when identity matches.
+	out.ActualSource = "unknown"
+	out.ActualCapacity = nil
 	return out
 }
 

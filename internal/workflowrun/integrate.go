@@ -3,6 +3,8 @@ package workflowrun
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -59,10 +61,73 @@ var (
 
 // GitBranchIntegrator is the production integrator using system git.
 type GitBranchIntegrator struct {
-	// LedgerDir stores exactly-once attempt→commit records under the repo.
-	// Empty → <repo>/.loopcoder/integrate-ledger/
+	// LedgerDir stores exactly-once attempt→commit records.
+	// When set (including by Service default), the ledger file is
+	// <LedgerDir>/integrate-ledger.json and never under the customer repo.
+	// Empty (explicit inject only) → legacy <repo>/.loopcoder/integrate-ledger/.
+	// Production Service never leaves this empty: see DefaultIntegrateLedgerDir.
 	LedgerDir string
 	Now       func() time.Time
+}
+
+// DefaultIntegrateLedgerDir is the production Service integrate-ledger location:
+//
+//	<durableHome>/projects/<exactIDComponent(project_id)>/runs/<exactIDComponent(run_id)>/integrate-ledger
+//
+// exactIDComponent = readable sanitized prefix + SHA-256 of the exact raw ID, so
+// distinct raw project_id/run_id never collide even when sanitize alone would
+// (a/b vs a-b, long prefixes, dot-like segments). Same exact pair always yields
+// a byte-identical path. Containment-checked under durable home.
+func DefaultIntegrateLedgerDir(homeDir, projectID, runID string) (string, error) {
+	root, err := ResolveDurableHome(homeDir)
+	if err != nil {
+		return "", err
+	}
+	projRaw := strings.TrimSpace(projectID)
+	runRaw := strings.TrimSpace(runID)
+	if projRaw == "" || runRaw == "" {
+		return "", fmt.Errorf("workflowrun: project_id and run_id required for integrate ledger")
+	}
+	projComp, err := exactDurableIDComponent(projRaw)
+	if err != nil {
+		return "", fmt.Errorf("workflowrun: project_id component: %w", err)
+	}
+	runComp, err := exactDurableIDComponent(runRaw)
+	if err != nil {
+		return "", fmt.Errorf("workflowrun: run_id component: %w", err)
+	}
+	dir := filepath.Join(root, "projects", projComp, "runs", runComp, "integrate-ledger")
+	rel, rerr := filepath.Rel(root, dir)
+	if rerr != nil || !filepath.IsLocal(rel) {
+		return "", fmt.Errorf("workflowrun: integrate ledger path escapes durable home")
+	}
+	return dir, nil
+}
+
+// exactDurableIDComponent builds a collision-resistant path segment from the
+// exact raw ID: readable sanitized prefix (≤32) + "-" + full SHA-256 hex of the
+// raw UTF-8 bytes. Distinct raw strings never share a component.
+func exactDurableIDComponent(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("empty id")
+	}
+	prefix := sanitizeBranch(raw)
+	if len(prefix) > 32 {
+		prefix = prefix[:32]
+	}
+	// Drop trailing dots/dashes from truncated prefix for cleanliness.
+	prefix = strings.Trim(prefix, ".-_")
+	if prefix == "" {
+		prefix = "id"
+	}
+	sum := sha256.Sum256([]byte(raw))
+	comp := prefix + "-" + hex.EncodeToString(sum[:])
+	// Component itself must not be a parent-dir segment.
+	if comp == ".." || strings.Contains(comp, string(filepath.Separator)) {
+		return "", fmt.Errorf("invalid id component")
+	}
+	return comp, nil
 }
 
 // EnsureGoalBranch implements BranchIntegrator.

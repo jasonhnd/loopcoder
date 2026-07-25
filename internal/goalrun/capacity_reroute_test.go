@@ -57,7 +57,7 @@ func TestCapacityRerouteReconcileOrReleaseThenReserve(t *testing.T) {
 	if err != nil || prior.State == "refused" {
 		t.Fatalf("prior reserve: %+v %v", prior, err)
 	}
-	holds["wi_x"] = capacityHold{projectID: "p", runID: "r", attemptID: priorAtt}
+	holds[priorAtt] = capacityHold{projectID: "p", runID: "r", attemptID: priorAtt}
 	hook := &goalCapacityReroute{ledger: led, snap: &snap, projectID: "p", runID: "r", holds: holds}
 
 	res, err := hook.OnModelUnavailableAlternate(workflowrun.CapacityRerouteInput{
@@ -97,7 +97,10 @@ func TestCapacityRerouteReconcileOrReleaseThenReserve(t *testing.T) {
 	if !ok || alt.State != "reserved" {
 		t.Fatalf("alt: %+v", alt)
 	}
-	if holds["wi_x"].attemptID != altAtt {
+	if _, stillPrior := holds[priorAtt]; stillPrior {
+		t.Fatalf("prior hold must be cleared: %+v", holds)
+	}
+	if holds[altAtt].attemptID != altAtt {
 		t.Fatalf("hold: %+v", holds)
 	}
 
@@ -114,7 +117,7 @@ func TestCapacityRerouteReconcileOrReleaseThenReserve(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	holds2["wi_y"] = capacityHold{projectID: "p", runID: "r2", attemptID: prior2Att}
+	holds2[prior2Att] = capacityHold{projectID: "p", runID: "r2", attemptID: prior2Att}
 	hook2 := &goalCapacityReroute{ledger: led2, snap: &snap, projectID: "p", runID: "r2", holds: holds2}
 	act := 0.05
 	res2, err := hook2.OnModelUnavailableAlternate(workflowrun.CapacityRerouteInput{
@@ -187,7 +190,7 @@ func TestCapacityRerouteRejectsWorkItemIDFallback(t *testing.T) {
 		AccountRef: "a", WindowKind: "five_hour", Snapshot: &snap,
 		InstallRef: "i-test",
 	})
-	hook.holds["wi_x"] = capacityHold{projectID: "p", runID: "r", attemptID: "att-hold"}
+	hook.holds["att-hold"] = capacityHold{projectID: "p", runID: "r", attemptID: "att-hold"}
 	if _, err := hook.OnModelUnavailableAlternate(workflowrun.CapacityRerouteInput{
 		WorkItemID: "wi_x", FailedAttemptID: "att-other", PriorHoldAttempt: "att-hold",
 		NewAttemptID: "att-g1", AltProvider: "codex", AltModel: "gpt-5.5", Depth: "medium",

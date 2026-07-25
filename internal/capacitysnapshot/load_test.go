@@ -13,26 +13,40 @@ func TestLoadRouteInventoryRehydratesDurableQuotaWithoutSnapshotFlag(t *testing.
 	now := time.Date(2026, 7, 22, 16, 30, 0, 0, time.UTC)
 	rem := int64(97)
 
-	// Live discover path: auth ready, models present, but quota not granted.
+	// Live discover path: PATH install + auth ready + models, but quota not granted.
+	const (
+		inst   = "pinst_codex_load_rehydrate"
+		acc    = "acct-codex-load-rehydrate"
+		catSnap = "mcatsnap_codex_load"
+	)
 	live := providerinventory.Report{
 		InventoryFingerprint: "live-fp",
-		Installations: []providerinventory.ProviderInstallation{{
-			AdapterID: "codex", InstallationState: providerinventory.InstallationInstalled,
-			UsableForInvocation: "yes", FreshnessState: providerinventory.FreshnessFresh,
-			Confidence: providerinventory.ConfidenceExact,
-		}},
+		Installations: []providerinventory.ProviderInstallation{
+			exactFreshInstall("codex", inst, "sha256:codex-load-resolved", "sha256:codex-load-path"),
+		},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
 			FreshnessState:      providerinventory.FreshnessFresh,
 			Confidence:          providerinventory.ConfidenceExact,
 			ReadinessConfidence: providerinventory.ConfidenceExact,
+			AccountProfileID:       ptrStr(acc),
+			ProviderInstallationID: ptrStr(inst),
+		}},
+		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{{
+			ModelCatalogSnapshotID: catSnap, AdapterID: "codex",
+			CatalogSourceKind:      providerinventory.CatalogSourceProviderMachineReadable,
+			Confidence:             providerinventory.ConfidenceExact,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			ProviderInstallationID: ptrStr(inst),
+			AccountProfileID:       ptrStr(acc),
 		}},
 		ModelCapabilities: []providerinventory.ModelCapability{{
 			AdapterID: "codex", CanonicalModelID: "gpt-5.5",
-			AvailabilityState: providerinventory.AvailabilityAvailable,
-			LifecycleState:    providerinventory.LifecycleAvailable,
-			FreshnessState:    providerinventory.FreshnessFresh,
-			Confidence:        providerinventory.ConfidenceExact,
+			ModelCatalogSnapshotID: catSnap,
+			AvailabilityState:      providerinventory.AvailabilityAvailable,
+			LifecycleState:         providerinventory.LifecycleAvailable,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			Confidence:             providerinventory.ConfidenceExact,
 			EntrySources: []providerinventory.CatalogEntrySource{{
 				SourceKind: providerinventory.CatalogSourceProviderMachineReadable,
 				Confidence: providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
@@ -42,10 +56,12 @@ func TestLoadRouteInventoryRehydratesDurableQuotaWithoutSnapshotFlag(t *testing.
 		}},
 		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
 			AdapterID: "codex", QuotaSnapshotID: "live-denied",
-			Confidence:     providerinventory.ConfidenceUnavailable,
-			FreshnessState: providerinventory.FreshnessNotApplicable,
-			GapReasons:     []string{"quota-collection-not-granted"},
-			CapturedAt:     now.Format(time.RFC3339),
+			AccountProfileID:       ptrStr(acc),
+			ProviderInstallationID: ptrStr(inst),
+			Confidence:             providerinventory.ConfidenceUnavailable,
+			FreshnessState:         providerinventory.FreshnessNotApplicable,
+			GapReasons:             []string{"quota-collection-not-granted"},
+			CapturedAt:             now.Format(time.RFC3339),
 		}},
 	}
 	durable := providerinventory.Report{
@@ -56,12 +72,14 @@ func TestLoadRouteInventoryRehydratesDurableQuotaWithoutSnapshotFlag(t *testing.
 		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
 			AdapterID: "codex", QuotaSnapshotID: "dur-ok", QuotaSourceID: "src-d",
 			Unit: "percent", WindowKind: providerinventory.WindowFixedWeek,
-			RemainingValue: &rem, Confidence: providerinventory.ConfidenceExact,
-			FreshnessState:       providerinventory.FreshnessFresh,
-			CapturedAt:           now.Format(time.RFC3339),
-			StaleAfter:           now.Add(24 * time.Hour).Format(time.RFC3339),
-			ResetAt:              now.Add(48 * time.Hour).Format(time.RFC3339),
-			ProviderQuantityName: "primary_used_percent",
+			AccountProfileID:       ptrStr(acc),
+			ProviderInstallationID: ptrStr(inst),
+			RemainingValue:         &rem, Confidence: providerinventory.ConfidenceExact,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			CapturedAt:             now.Format(time.RFC3339),
+			StaleAfter:             now.Add(24 * time.Hour).Format(time.RFC3339),
+			ResetAt:                now.Add(48 * time.Hour).Format(time.RFC3339),
+			ProviderQuantityName:   "primary_used_percent",
 		}},
 	}
 

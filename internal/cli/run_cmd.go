@@ -890,13 +890,14 @@ func observeAfterIfPossible(
 	if lg == nil {
 		return &e
 	}
-	after, src, fresh, ok := freshWindowRemaining(routeRes.Provider, routeRes.AccountRef, routeRes.InstallRef, routeRes.WindowKind, now)
+	after, src, fresh, conf, capAt, ok := freshWindowRemaining(routeRes.Provider, routeRes.AccountRef, routeRes.InstallRef, routeRes.WindowKind, now)
 	if !ok {
 		// Keep actual unknown; do not claim after unchanged.
 		return &e
 	}
 	re, err := lg.ObserveAfterBound(projectID, runID, attemptID, after, src, fresh, capacityledger.ObserveAfterOpts{
 		AccountRef: routeRes.AccountRef, WindowKind: routeRes.WindowKind, InstallRef: routeRes.InstallRef,
+		ObservedAt: capAt, Confidence: conf,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "run: observe-after skipped: %v\n", err)
@@ -920,12 +921,12 @@ func finalizeCapacityAfterRun(
 		return &e
 	}
 	_ = execRes // usage tokens not unit-compatible with window fraction without provider scale
-	after, src, fresh, ok := freshWindowRemaining(routeRes.Provider, routeRes.AccountRef, routeRes.InstallRef, routeRes.WindowKind, now)
+	after, src, fresh, conf, capAt, ok := freshWindowRemaining(routeRes.Provider, routeRes.AccountRef, routeRes.InstallRef, routeRes.WindowKind, now)
 	if ok {
-		// Observe after first (same account/window/install).
+		// Observe after first (same account/window/install) with real window CapturedAt.
 		reObs, oerr := lg.ObserveAfterBound(projectID, runID, attemptID, after, src, fresh, capacityledger.ObserveAfterOpts{
 			AccountRef: routeRes.AccountRef, WindowKind: routeRes.WindowKind,
-			InstallRef: routeRes.InstallRef, ObservedAt: now().UTC(),
+			InstallRef: routeRes.InstallRef, ObservedAt: capAt, Confidence: conf,
 		})
 		if oerr != nil {
 			fmt.Fprintf(stderr, "run: observe-after skipped: %v\n", oerr)
@@ -955,20 +956,23 @@ func finalizeCapacityAfterRun(
 
 // freshWindowRemaining reloads capacity inventory and returns remaining fraction
 // for the exact provider/account/install/window when available (never first-match).
-func freshWindowRemaining(provider, accountRef, installRef, windowKind string, now func() time.Time) (frac float64, source, freshness string, ok bool) {
+// Returns real window Source/CapturedAt/Confidence — never invents capacity_snapshot or now.
+func freshWindowRemaining(provider, accountRef, installRef, windowKind string, now func() time.Time) (
+	frac float64, source, freshness string, conf quotapolicy.EvidenceClass, capturedAt time.Time, ok bool,
+) {
 	provider = strings.TrimSpace(provider)
 	accountRef = strings.TrimSpace(accountRef)
 	installRef = strings.TrimSpace(installRef)
 	windowKind = strings.TrimSpace(windowKind)
 	// Production: exact nonempty account/install/window required — no install wildcard.
 	if provider == "" || accountRef == "" || installRef == "" || windowKind == "" {
-		return 0, "", "", false
+		return 0, "", "", "", time.Time{}, false
 	}
 	_, snap, err := capacitysnapshot.LoadRouteInventory(context.Background(), capacitysnapshot.LoadOptions{
 		Now: now().UTC(),
 	})
 	if err != nil {
-		return 0, "", "", false
+		return 0, "", "", "", time.Time{}, false
 	}
 	for _, a := range snap.Accounts {
 		if !strings.EqualFold(a.Provider, provider) {
@@ -991,10 +995,27 @@ func freshWindowRemaining(provider, accountRef, installRef, windowKind string, n
 			if rf == nil {
 				continue
 			}
-			return *rf, "fresh_inventory:" + string(w.Source), string(w.Freshness), true
+			src := strings.TrimSpace(w.Source)
+			if src == "" {
+				// Incomplete window source — refuse rather than invent.
+				continue
+			}
+			if w.CapturedAt.IsZero() {
+				continue
+			}
+			c := quotapolicy.EvidenceEstimated
+			switch w.Confidence {
+			case capacitysnapshot.ConfidenceExact:
+				c = quotapolicy.EvidenceExact
+			case capacitysnapshot.ConfidenceEstimated:
+				c = quotapolicy.EvidenceEstimated
+			default:
+				c = quotapolicy.EvidenceUnknown
+			}
+			return *rf, src, string(w.Freshness), c, w.CapturedAt.UTC(), true
 		}
 	}
-	return 0, "", "", false
+	return 0, "", "", "", time.Time{}, false
 }
 
 // resolveCanonicalProjectID picks ONE project identity for the whole run path.

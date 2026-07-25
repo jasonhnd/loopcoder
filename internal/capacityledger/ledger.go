@@ -70,10 +70,24 @@ type Entry struct {
 	// delta is never exact under concurrent use — label estimated.
 	ActualConfidence quotapolicy.EvidenceClass `json:"actual_confidence,omitempty"`
 	// InstallRef binds the exact install observation used at reserve/after.
-	InstallRef    string   `json:"install_ref,omitempty"`
-	After         *float64 `json:"capacity_after,omitempty"` // remaining after observation
-	ReservationID string   `json:"reservation_id,omitempty"`
-	RouteReason   string   `json:"route_reason,omitempty"`
+	InstallRef string `json:"install_ref,omitempty"`
+	// BeforeSource / BeforeCapturedAt are the selected window's evidence at Reserve
+	// (never invented; empty when unknown).
+	BeforeSource     string     `json:"before_source,omitempty"`
+	BeforeCapturedAt *time.Time `json:"before_captured_at,omitempty"`
+	// After is remaining after observation or derived estimate.
+	After *float64 `json:"capacity_after,omitempty"`
+	// AfterState is "observed" (fresh same-window ObserveAfter) or "derived"
+	// (Before−Actual only). Derived never qualifies as fresh capacity-after.
+	AfterState string `json:"after_state,omitempty"`
+	// AfterSource / AfterObservedAt / AfterFreshness / AfterConfidence are set for
+	// observed after; derived after uses explicit non-fresh labels and zero ObservedAt.
+	AfterSource     string                    `json:"after_source,omitempty"`
+	AfterObservedAt *time.Time                `json:"after_observed_at,omitempty"`
+	AfterFreshness  string                    `json:"after_freshness,omitempty"`
+	AfterConfidence quotapolicy.EvidenceClass `json:"after_confidence,omitempty"`
+	ReservationID   string                    `json:"reservation_id,omitempty"`
+	RouteReason     string                    `json:"route_reason,omitempty"`
 	// ReleaseReason is set when State is released (fail/cancel/unknown usage).
 	// Does not invent Actual — release remains honest-unknown when no reconcile.
 	ReleaseReason  string `json:"release_reason,omitempty"`
@@ -84,6 +98,12 @@ type Entry struct {
 	CreatedAt     time.Time  `json:"created_at"`
 	UpdatedAt     time.Time  `json:"updated_at"`
 }
+
+// AfterStateObserved / AfterStateDerived classify capacity-after evidence.
+const (
+	AfterStateObserved = "observed"
+	AfterStateDerived  = "derived"
+)
 
 // Ledger is a durable, process-local capacity account bound to LOOPCODER_HOME.
 type Ledger struct {
@@ -367,7 +387,7 @@ func (l *Ledger) Reserve(in ReserveInput) (Entry, error) {
 	now := l.now().UTC()
 	cfg := ModeConfig(in.Policy)
 	// Atomic account+install+window selection; never cross-wire install/account.
-	win, before, conf, fresh, resetAt, accRef, err := pickWindow(in)
+	win, before, conf, fresh, resetAt, accRef, beforeSrc, beforeCap, err := pickWindow(in)
 	planDig := strings.TrimSpace(in.PlanDigest)
 	graphDig := strings.TrimSpace(in.GraphDigest)
 	taskClass := strings.TrimSpace(in.TaskClass)
@@ -383,7 +403,9 @@ func (l *Ledger) Reserve(in ReserveInput) (Entry, error) {
 			RouteReason: in.RouteReason,
 		}
 		l.byKey[key] = &e
-		_ = l.saveLocked()
+		if serr := l.saveLocked(); serr != nil {
+			return e, fmt.Errorf("%w; capacity ledger persist refused entry: %v", err, serr)
+		}
 		return e, err
 	}
 	accCanon := CanonicalAccountRef(accRef)
@@ -409,18 +431,26 @@ func (l *Ledger) Reserve(in ReserveInput) (Entry, error) {
 		DemandEstimate: demand, DemandEvidence: demEv,
 		Config: cfg,
 	})
+	var beforeCapPtr *time.Time
+	if !beforeCap.IsZero() {
+		t := beforeCap.UTC()
+		beforeCapPtr = &t
+	}
 	if rerr != nil {
 		e := Entry{
 			Schema: SchemaEntry, ProjectID: in.ProjectID, RunID: in.RunID, AttemptID: in.AttemptID,
 			PlanDigest: planDig, GraphDigest: graphDig, TaskClass: taskClass, ChildContractDigest: ccd,
 			Policy: ParsePolicy(string(in.Policy)), Provider: in.Provider, Model: in.Model, Depth: in.Depth,
 			AccountRef: accCanon, InstallRef: installCanon, WindowKind: string(win), Confidence: conf, Freshness: fresh,
-			ResetAt: resetAt, Before: before, Reserved: 0, State: "refused",
+			ResetAt: resetAt, Before: before, BeforeSource: beforeSrc, BeforeCapturedAt: beforeCapPtr,
+			Reserved: 0, State: "refused",
 			ReservationID: res.ID, IdempotencyKey: key, CreatedAt: now, UpdatedAt: now,
 			RouteReason: in.RouteReason + "; reserve_refused=" + rerr.Error(),
 		}
 		l.byKey[key] = &e
-		_ = l.saveLocked()
+		if serr := l.saveLocked(); serr != nil {
+			return e, fmt.Errorf("%w; capacity ledger persist refused entry: %v", rerr, serr)
+		}
 		return e, rerr
 	}
 	exp := res.ExpiresAt
@@ -429,7 +459,8 @@ func (l *Ledger) Reserve(in ReserveInput) (Entry, error) {
 		PlanDigest: planDig, GraphDigest: graphDig, TaskClass: taskClass, ChildContractDigest: ccd,
 		Policy: ParsePolicy(string(in.Policy)), Provider: in.Provider, Model: in.Model, Depth: in.Depth,
 		AccountRef: accCanon, InstallRef: installCanon, WindowKind: string(win), Confidence: conf, Freshness: fresh,
-		ResetAt: resetAt, Before: before, Reserved: res.Fraction, State: "reserved",
+		ResetAt: resetAt, Before: before, BeforeSource: beforeSrc, BeforeCapturedAt: beforeCapPtr,
+		Reserved: res.Fraction, State: "reserved",
 		ReservationID: res.ID, IdempotencyKey: key, CreatedAt: now, UpdatedAt: now,
 		SoftExpiresAt: &exp, RouteReason: in.RouteReason,
 	}
@@ -561,14 +592,19 @@ func (l *Ledger) ReconcileWithConfidence(projectID, runID, attemptID string, act
 	e.Actual = &a
 	e.ActualSource = src
 	e.ActualConfidence = conf
-	// Do not invent After from actual when After may come from ObserveAfter.
-	// Only set After when not already observed.
-	if e.After == nil {
+	// Derived After = Before−Actual only when no observed after yet.
+	// Never classify derived as fresh observed; ObserveAfter overrides later.
+	if e.After == nil || e.AfterState != AfterStateObserved {
 		after := e.Before - a
 		if after < 0 {
 			after = 0
 		}
 		e.After = &after
+		e.AfterState = AfterStateDerived
+		e.AfterSource = "before_minus_actual"
+		e.AfterFreshness = "estimated"
+		e.AfterConfidence = quotapolicy.EvidenceEstimated
+		e.AfterObservedAt = nil // derived has no observation timestamp
 	}
 	e.State = "reconciled"
 	e.ReleaseReason = ""
@@ -632,8 +668,10 @@ type ObserveAfterOpts struct {
 	InstallRef string
 	// ObservationID optional source observation id for audit.
 	ObservationID string
-	// ObservedAt optional observation time.
+	// ObservedAt is required nonzero for an observed-after claim (window CapturedAt).
 	ObservedAt time.Time
+	// Confidence of the after observation (exact|estimated|unknown).
+	Confidence quotapolicy.EvidenceClass
 	// ResetObserved true when the observation includes a quota reset since reserve
 	// (allows after > before). Without this, after rising is fail-closed.
 	ResetObserved bool
@@ -646,7 +684,7 @@ type ObserveAfterOpts struct {
 // After must never be left n/a when a real same-window observation is available.
 // After rising above Before without reset evidence is rejected (fail closed).
 // Uses the reservation's exact account/install/window identity (no wildcard).
-func (l *Ledger) ObserveAfter(projectID, runID, attemptID string, afterFraction float64, source, freshness string) (Entry, error) {
+func (l *Ledger) ObserveAfter(projectID, runID, attemptID string, afterFraction float64, source, freshness string, observedAt time.Time) (Entry, error) {
 	key := idemKey(projectID, runID, attemptID)
 	l.mu.Lock()
 	e, ok := l.byKey[key]
@@ -659,6 +697,7 @@ func (l *Ledger) ObserveAfter(projectID, runID, attemptID string, afterFraction 
 	}
 	return l.ObserveAfterBound(projectID, runID, attemptID, afterFraction, source, freshness, ObserveAfterOpts{
 		AccountRef: e.AccountRef, InstallRef: e.InstallRef, WindowKind: e.WindowKind,
+		ObservedAt: observedAt,
 	})
 }
 
@@ -690,12 +729,22 @@ func (l *Ledger) ObserveAfterBound(projectID, runID, attemptID string, afterFrac
 		return Entry{}, fmt.Errorf("%w: after install %q != reserved %q", ErrInvalid, iref, e.InstallRef)
 	}
 	e.InstallRef = iref
+	src := strings.TrimSpace(source)
+	fr := strings.TrimSpace(freshness)
+	if src == "" {
+		return Entry{}, fmt.Errorf("%w: ObserveAfter requires nonempty source (refuse invent capacity_snapshot)", ErrInvalid)
+	}
+	if fr == "" {
+		return Entry{}, fmt.Errorf("%w: ObserveAfter requires nonempty freshness", ErrInvalid)
+	}
+	// ObservedAt must be nonzero for an observed-after claim.
+	if opts.ObservedAt.IsZero() {
+		return Entry{}, fmt.Errorf("%w: ObserveAfter requires nonzero ObservedAt (window CapturedAt)", ErrInvalid)
+	}
 	if oid := strings.TrimSpace(opts.ObservationID); oid != "" {
 		e.RouteReason = appendNote(e.RouteReason, "after_obs="+oid)
 	}
-	if !opts.ObservedAt.IsZero() {
-		e.RouteReason = appendNote(e.RouteReason, "after_at="+opts.ObservedAt.UTC().Format(time.RFC3339))
-	}
+	e.RouteReason = appendNote(e.RouteReason, "after_at="+opts.ObservedAt.UTC().Format(time.RFC3339))
 	a := clamp01(afterFraction)
 	// Fail closed: after cannot rise without reset evidence (cross-window drift).
 	if a > e.Before+0.001 {
@@ -705,14 +754,23 @@ func (l *Ledger) ObserveAfterBound(projectID, runID, attemptID string, afterFrac
 		}
 		e.RouteReason = appendNote(e.RouteReason, "after_reset="+opts.ResetEvidence)
 	}
+	// Observed after overrides any derived Before−Actual estimate.
 	e.After = &a
-	if src := strings.TrimSpace(source); src != "" {
-		e.RouteReason = appendNote(e.RouteReason, "after_source="+src)
+	e.AfterState = AfterStateObserved
+	e.AfterSource = src
+	e.AfterFreshness = fr
+	obsAt := opts.ObservedAt.UTC()
+	e.AfterObservedAt = &obsAt
+	if opts.Confidence != "" {
+		e.AfterConfidence = opts.Confidence
+	} else {
+		e.AfterConfidence = quotapolicy.EvidenceEstimated
 	}
-	if fr := strings.TrimSpace(freshness); fr != "" {
-		e.Freshness = fr
-		e.RouteReason = appendNote(e.RouteReason, "after_freshness="+fr)
-	}
+	// Keep entry.Freshness aligned with latest after observation for summary.
+	e.Freshness = fr
+	e.RouteReason = appendNote(e.RouteReason, "after_source="+src)
+	e.RouteReason = appendNote(e.RouteReason, "after_freshness="+fr)
+	e.RouteReason = appendNote(e.RouteReason, "after_state="+AfterStateObserved)
 	e.RouteReason = appendNote(e.RouteReason, "after_window="+e.WindowKind)
 	e.UpdatedAt = l.now().UTC()
 	if err := l.saveLocked(); err != nil {
@@ -767,9 +825,10 @@ func (e Entry) HumanReport() string {
 // pickWindow selects account+install+window atomically. When AccountRef/
 // InstallRef/WindowKind are requested, only exact-matching rows are considered.
 // Never returns account B with a window from account A, or install X for account Y.
-func pickWindow(in ReserveInput) (quotapolicy.WindowKind, float64, quotapolicy.EvidenceClass, string, *time.Time, string, error) {
+// Also returns the selected window's Source and CapturedAt (may be zero/empty).
+func pickWindow(in ReserveInput) (quotapolicy.WindowKind, float64, quotapolicy.EvidenceClass, string, *time.Time, string, string, time.Time, error) {
 	if in.Snapshot == nil {
-		return "", 0, quotapolicy.EvidenceUnknown, "unknown", nil, "", fmt.Errorf("%w: missing snapshot", ErrNoWindow)
+		return "", 0, quotapolicy.EvidenceUnknown, "unknown", nil, "", "", time.Time{}, fmt.Errorf("%w: missing snapshot", ErrNoWindow)
 	}
 	wantAcc := ""
 	if strings.TrimSpace(in.AccountRef) != "" {
@@ -828,7 +887,7 @@ func pickWindow(in ReserveInput) (quotapolicy.WindowKind, float64, quotapolicy.E
 		}
 	}
 	if best == nil {
-		return "", 0, quotapolicy.EvidenceUnknown, "unknown", nil, wantAcc, fmt.Errorf("%w: provider=%s account=%q install=%q window=%q", ErrNoWindow, in.Provider, wantAcc, wantInstall, wantWin)
+		return "", 0, quotapolicy.EvidenceUnknown, "unknown", nil, wantAcc, "", time.Time{}, fmt.Errorf("%w: provider=%s account=%q install=%q window=%q", ErrNoWindow, in.Provider, wantAcc, wantInstall, wantWin)
 	}
 	f := capacitysnapshot.RemainingFraction(*best)
 	before := 0.0
@@ -845,7 +904,10 @@ func pickWindow(in ReserveInput) (quotapolicy.WindowKind, float64, quotapolicy.E
 		conf = quotapolicy.EvidenceUnknown
 	}
 	wk := mapWindowKind(string(best.Kind))
-	return wk, before, conf, string(best.Freshness), best.ResetAt, bestAcc, nil
+	// Real window source/captured_at only — never invent capacity_snapshot/now.
+	src := strings.TrimSpace(best.Source)
+	capAt := best.CapturedAt
+	return wk, before, conf, string(best.Freshness), best.ResetAt, bestAcc, src, capAt, nil
 }
 
 // mapWindowKind normalizes known aliases but preserves distinct exact kinds.

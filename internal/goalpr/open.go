@@ -260,13 +260,10 @@ func Open(ctx context.Context, req Request) (Result, error) {
 		req.RequiredCheckNames = MeaningfulCheckNames()
 	}
 
-	// Bind independent verifier to a real verify child digest + attempt (no pending-live).
+	// Bind independent verifier from structured children only (no pin/prose fallback).
 	verProv, verAtt, verEv := bindVerifierFromChildren(req.Children, req.IndependentVerifier, req.VerifierEvidence)
-	if strings.Contains(strings.ToLower(verEv), "pending") {
-		return out, fmt.Errorf("%w: refuse pending-live verifier evidence", ErrNotReady)
-	}
-	if verEv == "" {
-		return out, fmt.Errorf("%w: verifier evidence digest required from succeeded verify child", ErrNotReady)
+	if verProv == "" || verAtt == "" || verEv == "" {
+		return out, fmt.Errorf("%w: verifier evidence required from structured wi_verify child", ErrNotReady)
 	}
 
 	// Durable receipt in-repo (product file, not hand-filled canary manifest).
@@ -274,7 +271,7 @@ func Open(ctx context.Context, req Request) (Result, error) {
 		Schema: ReceiptSchema, ProjectID: req.ProjectID, RunID: req.RunID,
 		GraphID: req.GraphID, PlanDigest: req.PlanDigest, Actor: req.Actor,
 		SourceIssue: req.SourceIssue, Children: req.Children,
-		IndependentVerifier: firstNonEmpty(verProv, req.IndependentVerifier, "independent"),
+		IndependentVerifier: verProv,
 		VerifierEvidence:    verEv,
 		HumanGate:           true, AutoMerge: false, CreatedAt: now,
 	}
@@ -336,13 +333,10 @@ func Open(ctx context.Context, req Request) (Result, error) {
 	emit("github.pr_url:" + out.URL)
 
 	// Independent verifier bound to same head SHA + real child attempt/output.
-	out.IndependentVerifier = firstNonEmpty(verProv, req.IndependentVerifier)
+	out.IndependentVerifier = verProv
 	out.VerifierProvider = verProv
 	out.VerifierAttemptID = verAtt
 	out.VerifierEvidenceRef = verEv + "@head:" + out.HeadOID
-	if out.IndependentVerifier == "" {
-		return out, fmt.Errorf("%w: independent verifier required", ErrNotReady)
-	}
 	emit(fmt.Sprintf("verifier.bind provider=%s attempt=%s head=%s", out.VerifierProvider, out.VerifierAttemptID, out.HeadOID))
 
 	// Observe checks once (honest: usually pending right after open).
@@ -406,28 +400,71 @@ func Open(ctx context.Context, req Request) (Result, error) {
 	return out, nil
 }
 
+// bindVerifierFromChildren derives independent verifier identity from structured
+// children only. pinProv/pinEv are ignored (no prose/pin fallback).
+// Requires exactly one succeeded wi_verify (soul) and one succeeded wi_implement
+// (tera) with distinct providers; OutputEvidence must be sha256:+64 hex.
+// Returns empty values on any failure so Open can refuse with ErrNotReady.
 func bindVerifierFromChildren(children []workflowrun.ChildOutcome, pinProv, pinEv string) (provider, attemptID, evidence string) {
-	if strings.Contains(strings.ToLower(pinEv), "pending") {
-		pinEv = ""
-	}
+	_ = pinProv
+	_ = pinEv
+	var verifyKids, implementKids []workflowrun.ChildOutcome
 	for _, c := range children {
-		if !strings.EqualFold(c.Terminal, "succeeded") {
+		if !strings.EqualFold(strings.TrimSpace(c.Terminal), "succeeded") {
 			continue
 		}
-		id := strings.ToLower(c.WorkItemID + " " + c.RouteReason)
-		if !strings.Contains(id, "verify") && !strings.Contains(strings.ToLower(c.WorkItemID), "verify") {
-			continue
+		wid := strings.TrimSpace(c.WorkItemID)
+		switch wid {
+		case "wi_verify":
+			if strings.TrimSpace(c.TaskClass) != "soul" {
+				continue
+			}
+			verifyKids = append(verifyKids, c)
+		case "wi_implement":
+			if strings.TrimSpace(c.TaskClass) != "tera" {
+				continue
+			}
+			implementKids = append(implementKids, c)
 		}
-		if strings.TrimSpace(c.OutputEvidence) == "" || !strings.HasPrefix(c.OutputEvidence, "sha256:") {
-			continue
-		}
-		return firstNonEmpty(c.Provider, pinProv), c.AttemptID, c.OutputEvidence
 	}
-	// Fallback: pin only if real sha256 (not pending).
-	if strings.HasPrefix(strings.TrimSpace(pinEv), "sha256:") {
-		return pinProv, "", pinEv
+	if len(verifyKids) != 1 || len(implementKids) != 1 {
+		return "", "", ""
 	}
-	return pinProv, "", ""
+	v := verifyKids[0]
+	imp := implementKids[0]
+	if strings.TrimSpace(v.Provider) == "" || strings.TrimSpace(v.AttemptID) == "" {
+		return "", "", ""
+	}
+	if strings.TrimSpace(imp.Provider) == "" {
+		return "", "", ""
+	}
+	if !isExactSHA256Digest(v.OutputEvidence) {
+		return "", "", ""
+	}
+	if strings.EqualFold(strings.TrimSpace(v.Provider), strings.TrimSpace(imp.Provider)) {
+		return "", "", ""
+	}
+	return strings.TrimSpace(v.Provider), strings.TrimSpace(v.AttemptID), strings.TrimSpace(v.OutputEvidence)
+}
+
+// isExactSHA256Digest is true for "sha256:" + exactly 64 hex digits.
+func isExactSHA256Digest(s string) bool {
+	s = strings.TrimSpace(s)
+	const p = "sha256:"
+	if len(s) < len(p)+64 || !strings.HasPrefix(strings.ToLower(s), p) {
+		return false
+	}
+	hexPart := s[len(p):]
+	if len(hexPart) != 64 {
+		return false
+	}
+	for i := 0; i < len(hexPart); i++ {
+		c := hexPart[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 func containsAll(have, need []string) bool {

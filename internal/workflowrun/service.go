@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -78,6 +79,14 @@ type Request struct {
 	// interrupted run. Same attempt_id is reused; executor is NOT re-invoked
 	// (exactly-once provider call / file / capacity).
 	PriorSucceeded map[string]ChildOutcome
+	// PriorOutcomes is the complete validated durable attempt set from resume
+	// preflight (checkpoint/partial WorkflowKids cross-bound to the event log
+	// BEFORE inventory/ledger/claim/launch). Every row is re-validated in pure
+	// preflight; out.Children is seeded with this set so writePartialPrior
+	// persists the full history without reading on-disk partial. Only
+	// terminal=succeeded rows with evidence may also appear in PriorSucceeded
+	// for scheduling reuse. Non-success historical rows never re-exec.
+	PriorOutcomes []ChildOutcome
 	// AttemptGeneration bumps attempt IDs for aborted/in-flight children on resume
 	// (completed children stay generation 0 / prior attempt). Key = work item id.
 	AttemptGeneration map[string]int
@@ -147,18 +156,38 @@ type CapacityRerouteInput struct {
 // Canary proof must use these records — never prose CapacityNote inference.
 // Provider/Model/Depth/AccountRef/WindowKind bind exact selected route capacity identity.
 type CapacityTransition struct {
-	AttemptID     string   `json:"attempt_id"`
-	Role          string   `json:"role"`  // prior|alternate
-	State         string   `json:"state"` // released|reconciled|reserved
-	Provider      string   `json:"provider,omitempty"`
-	Model         string   `json:"model,omitempty"`
-	Depth         string   `json:"depth,omitempty"`
-	Permission    string   `json:"permission,omitempty"`
-	AccountRef    string   `json:"account_ref,omitempty"`
-	WindowKind    string   `json:"window_kind,omitempty"`
-	ReservationID string   `json:"reservation_id,omitempty"`
-	Actual        *float64 `json:"actual,omitempty"` // nil = honest unknown
-	Source        string   `json:"source,omitempty"`
+	AttemptID  string `json:"attempt_id"`
+	Role       string `json:"role"`  // prior|alternate
+	State      string `json:"state"` // released|reconciled|reserved
+	Provider   string `json:"provider,omitempty"`
+	Model      string `json:"model,omitempty"`
+	Depth      string `json:"depth,omitempty"`
+	Permission string `json:"permission,omitempty"`
+	AccountRef string `json:"account_ref,omitempty"`
+	// InstallRef binds exact install observation (required on finalized MU transitions).
+	InstallRef    string `json:"install_ref,omitempty"`
+	WindowKind    string `json:"window_kind,omitempty"`
+	ReservationID string `json:"reservation_id,omitempty"`
+	// Before / Reserved / After are ledger remaining fractions for this attempt.
+	Before   float64  `json:"capacity_before,omitempty"`
+	Reserved float64  `json:"capacity_reserved,omitempty"`
+	Actual   *float64 `json:"actual,omitempty"` // nil = honest unknown
+	After    *float64 `json:"capacity_after,omitempty"`
+	// Source is ActualSource (never prose). Empty when Actual is nil.
+	Source string `json:"source,omitempty"`
+	// Structured before-window evidence (exact|estimated|unknown + freshness + reset).
+	BeforeSource     string     `json:"before_source,omitempty"`
+	BeforeCapturedAt *time.Time `json:"before_captured_at,omitempty"`
+	BeforeFreshness  string     `json:"before_freshness,omitempty"`
+	BeforeConfidence string     `json:"before_confidence,omitempty"`
+	ResetAt          *time.Time `json:"reset_at,omitempty"`
+	// Structured after evidence (observed|derived); derived never greens runtime freshness.
+	AfterSource      string     `json:"after_source,omitempty"`
+	AfterObservedAt  *time.Time `json:"after_observed_at,omitempty"`
+	AfterFreshness   string     `json:"after_freshness,omitempty"`
+	AfterConfidence  string     `json:"after_confidence,omitempty"`
+	AfterState       string     `json:"after_state,omitempty"`
+	ActualConfidence string     `json:"actual_confidence,omitempty"`
 }
 
 // CapacityRerouteResult binds the alternate reservation (account must not cross companies)
@@ -211,9 +240,13 @@ type ChildOutcome struct {
 	FailureClass   string   `json:"failure_class,omitempty"`
 	Message        string   `json:"message,omitempty"`
 	ActualCapacity *float64 `json:"actual_capacity,omitempty"`
-	// ActualSource is capacity fraction source (provider_usage|estimated|unknown).
-	// Distinct from ActualSources for route dimension proof.
+	// ActualSource is capacity fraction source (same_window_delta only when known).
+	// Distinct from ActualSources for route dimension proof. Token estimates never
+	// set ActualCapacity (preserve InputTokens/OutputTokens separately).
 	ActualSource string `json:"actual_source,omitempty"`
+	// Raw token usage (not quota-window fraction unit).
+	InputTokens  int64 `json:"input_tokens,omitempty"`
+	OutputTokens int64 `json:"output_tokens,omitempty"`
 	// ActualSources is per-dimension route proof class:
 	// provider_stream|accepted_invocation|auth_binding|install_binding|unknown.
 	// accepted_invocation is never collapsed into provider_stream.
@@ -487,13 +520,26 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 		itemByID[it.ID] = it
 	}
 
-	// Entire PriorSucceeded + AttemptGeneration maps validated in pure preflight
-	// (not lazily when a wave reaches an item). Present-invalid → fail closed.
+	// Entire PriorSucceeded + PriorOutcomes + AttemptGeneration validated in pure
+	// preflight (not lazily when a wave reaches an item). Present-invalid → fail closed.
 	if err := validateEntirePriorSucceededMap(req.PriorSucceeded, itemByID, contracts, out.PlanDigest, runID); err != nil {
+		return fail(out, StatusBlocked, err.Error())
+	}
+	if err := validateEntirePriorOutcomes(req.PriorOutcomes, itemByID, contracts, out.PlanDigest, runID); err != nil {
+		return fail(out, StatusBlocked, err.Error())
+	}
+	// PriorSucceeded must be a subset of PriorOutcomes when both present (no
+	// succeeded reuse identity outside the full attempt set).
+	if err := requirePriorSucceededSubsetOfOutcomes(req.PriorSucceeded, req.PriorOutcomes); err != nil {
 		return fail(out, StatusBlocked, err.Error())
 	}
 	if err := validateEntireAttemptGenerationMap(req.AttemptGeneration, itemByID); err != nil {
 		return fail(out, StatusBlocked, err.Error())
+	}
+	// Seed out.Children with the full validated historical attempt set BEFORE
+	// any side effect so every writePartialPrior sees complete history.
+	if len(req.PriorOutcomes) > 0 {
+		out.Children = append([]ChildOutcome(nil), req.PriorOutcomes...)
 	}
 
 	// Item set for plan-bound child event identity at write and recovery boundaries.
@@ -516,7 +562,11 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 		if perr != nil {
 			return fail(out, StatusBlocked, "event log pre-recovery parse: "+perr.Error())
 		}
-		if verr := ValidateExistingEventLogForPlan(preEvents, out.PlanDigest, runID, itemOK); verr != nil {
+		if verr := ValidateExistingEventLogForPlan(preEvents, EventWriteIdentity{
+			ProjectID: projectID, RunID: runID,
+			PlanDigest: out.PlanDigest, GraphDigest: out.GraphDigest,
+			GraphID: out.GraphID, GraphVersion: out.GraphVersion,
+		}, itemOK); verr != nil {
 			return fail(out, StatusBlocked, "event log pre-recovery validate: "+verr.Error())
 		}
 	}
@@ -531,7 +581,13 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 	if doIntegrate {
 		integrator = req.Integrator
 		if integrator == nil {
-			integrator = GitBranchIntegrator{Now: now}
+			// Production default: durable namespaced integrate ledger under HomeDir.
+			// Never <repo>/.loopcoder — customer repo stays free of LoopCoder runtime.
+			ledgerDir, lerr := DefaultIntegrateLedgerDir(s.HomeDir, projectID, runID)
+			if lerr != nil {
+				return fail(out, StatusBlocked, "integrate ledger dir: "+lerr.Error())
+			}
+			integrator = GitBranchIntegrator{Now: now, LedgerDir: ledgerDir}
 		}
 		if _, err := integrator.EnsureGoalBranch(ctx, req.RepoPath, baseRef, goalBranch); err != nil {
 			return fail(out, StatusBlocked, "ensure goal branch: "+err.Error())
@@ -573,7 +629,11 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 		return fail(out, StatusBlocked, "event log post-recovery read: "+perr2.Error())
 	}
 	if len(postEvents) > 0 {
-		if verr := ValidateExistingEventLogForPlan(postEvents, out.PlanDigest, runID, itemOK); verr != nil {
+		if verr := ValidateExistingEventLogForPlan(postEvents, EventWriteIdentity{
+			ProjectID: projectID, RunID: runID,
+			PlanDigest: out.PlanDigest, GraphDigest: out.GraphDigest,
+			GraphID: out.GraphID, GraphVersion: out.GraphVersion,
+		}, itemOK); verr != nil {
 			return fail(out, StatusBlocked, "event log post-recovery validate: "+verr.Error())
 		}
 	}
@@ -585,82 +645,97 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 	for id, att := range aborted {
 		out.AbortedAttempts[id] = att
 	}
-	if _, err := elog.Append(Event{ProjectID: projectID, RunID: runID, Kind: "run.start", Message: "workflow execute"}); err != nil {
-		return fail(out, StatusBlocked, "event log start: "+err.Error())
-	}
 	// logEv persists and returns the durable event. Failures return error —
 	// model_unavailable/reroute/claim linkage must not invent event IDs.
-	// Child lifecycle facts are validated at the write boundary before Append.
+	// Every attempt-scoped lifecycle event is stamped at write time with the
+	// authoritative runtime identity (plan/graph digests, graph id/version,
+	// project/run, work item, attempt, task class, CCD, generation).
+	writeID := EventWriteIdentity{
+		ProjectID: projectID, RunID: runID,
+		PlanDigest: out.PlanDigest, GraphDigest: out.GraphDigest,
+		GraphID: out.GraphID, GraphVersion: out.GraphVersion,
+	}
 	logEv := func(ev Event) (Event, error) {
 		if elog == nil {
 			return Event{}, fmt.Errorf("workflowrun: event log unavailable")
 		}
-		ev.ProjectID, ev.RunID = projectID, runID
-		// Stamp canonical execution identity on durable events (never invent empty).
-		if strings.TrimSpace(ev.ExecutionPlanDigest) == "" && strings.TrimSpace(out.PlanDigest) != "" {
-			ev.ExecutionPlanDigest = out.PlanDigest
+		ev.ProjectID = projectID
+		ev.RunID = runID
+		if IsParentOnlyEvent(ev) {
+			// Parent-only: project/run only; never invent attempt lifecycle stamps.
+			outEv, err := elog.Append(ev)
+			if err != nil {
+				return Event{}, err
+			}
+			if strings.TrimSpace(outEv.EventID) == "" {
+				return Event{}, fmt.Errorf("workflowrun: empty persisted event_id kind=%s", ev.Kind)
+			}
+			return outEv, nil
 		}
-		if strings.TrimSpace(ev.GraphDigest) == "" && strings.TrimSpace(out.GraphDigest) != "" {
-			ev.GraphDigest = out.GraphDigest
+		// Authoritative stamp — always overwrite from current Execute identity.
+		if strings.TrimSpace(writeID.PlanDigest) == "" || strings.TrimSpace(writeID.GraphDigest) == "" ||
+			strings.TrimSpace(writeID.GraphID) == "" || writeID.GraphVersion <= 0 {
+			return Event{}, fmt.Errorf("workflowrun: refuse persist: incomplete result identity for kind=%s", ev.Kind)
 		}
-		if strings.TrimSpace(ev.GraphID) == "" && strings.TrimSpace(out.GraphID) != "" {
-			ev.GraphID = out.GraphID
+		ev.ExecutionPlanDigest = writeID.PlanDigest
+		ev.GraphDigest = writeID.GraphDigest
+		ev.GraphID = writeID.GraphID
+		ev.GraphVersion = writeID.GraphVersion
+		// Assignment-time child contract + complete structured identity.
+		// Never post-exec invent from InvokedRoute.
+		wid := strings.TrimSpace(ev.WorkItemID)
+		if wid == "" {
+			return Event{}, fmt.Errorf("workflowrun: refuse persist: attempt-scoped kind=%s missing work_item_id", ev.Kind)
 		}
-		if ev.GraphVersion <= 0 && out.GraphVersion > 0 {
-			ev.GraphVersion = out.GraphVersion
+		if contracts == nil {
+			return Event{}, fmt.Errorf("workflowrun: refuse persist: child contracts unavailable for %s", wid)
 		}
-		// Assignment-time child contract + complete structured identity on every
-		// child lifecycle event. Never post-exec invent from InvokedRoute.
-		if id := strings.TrimSpace(ev.WorkItemID); id != "" && contracts != nil {
-			if c, ok := contracts[id]; ok {
-				if strings.TrimSpace(ev.TaskClass) == "" {
-					ev.TaskClass = c.TaskClass
-				}
-				if strings.TrimSpace(ev.ChildContractDigest) == "" {
-					ev.ChildContractDigest = c.Digest
-				}
-				var m map[string]string
-				if len(ev.Payload) > 0 {
-					_ = json.Unmarshal(ev.Payload, &m)
-				}
-				if m == nil {
-					m = map[string]string{}
-				}
-				m = stampChildIdentityPayload(m, projectID, runID, ev.GraphID, ev.GraphVersion,
-					id, strings.TrimSpace(ev.AttemptID), ev.Generation,
-					strings.TrimSpace(ev.ExecutionPlanDigest), strings.TrimSpace(ev.GraphDigest),
-					c.TaskClass, c.Digest)
-				// Preserve caller-supplied route fields; fill missing from ChildRoute when empty.
-				r := resolveChildRoute(req.ChildRoutes, id, defaultProvider, defaultModel)
-				r.TaskClass = c.TaskClass
-				r.Depth = firstNonEmpty(r.Depth, c.Depth)
-				r.Permission = firstNonEmpty(r.Permission, c.Permission)
-				rf := childRoutePayloadFields(r)
-				for _, k := range requiredRouteKeys {
-					if strings.TrimSpace(m[k]) == "" && strings.TrimSpace(rf[k]) != "" {
-						m[k] = rf[k]
-					}
-				}
-				// Canonical FailureClass: top-level ↔ payload failure_class (never Message).
-				if strings.TrimSpace(ev.FailureClass) == "" {
-					ev.FailureClass = strings.TrimSpace(m["failure_class"])
-				}
-				if strings.TrimSpace(ev.FailureClass) != "" {
-					m["failure_class"] = strings.TrimSpace(ev.FailureClass)
-				}
-				if strings.EqualFold(strings.TrimSpace(ev.Terminal), string(workgraph.TermSucceeded)) {
-					ev.FailureClass = ""
-					delete(m, "failure_class")
-				}
-				ev.Payload = eventJSONPayload(m)
+		c, ok := contracts[wid]
+		if !ok {
+			return Event{}, fmt.Errorf("workflowrun: refuse persist: no contract for work_item_id %q", wid)
+		}
+		ev.TaskClass = c.TaskClass
+		ev.ChildContractDigest = c.Digest
+		var m map[string]string
+		if len(ev.Payload) > 0 {
+			if err := json.Unmarshal(ev.Payload, &m); err != nil {
+				return Event{}, fmt.Errorf("workflowrun: refuse persist: malformed event payload kind=%s: %w", ev.Kind, err)
+			}
+			if m == nil {
+				return Event{}, fmt.Errorf("workflowrun: refuse persist: event payload must be a JSON object kind=%s", ev.Kind)
+			}
+		} else {
+			m = map[string]string{}
+		}
+		m = stampChildIdentityPayload(m, projectID, runID, ev.GraphID, ev.GraphVersion,
+			wid, ev.AttemptID, ev.Generation,
+			ev.ExecutionPlanDigest, ev.GraphDigest, c.TaskClass, c.Digest)
+		// Preserve caller-supplied route fields; fill missing from ChildRoute when empty.
+		r := resolveChildRoute(req.ChildRoutes, wid, defaultProvider, defaultModel)
+		r.TaskClass = c.TaskClass
+		r.Depth = firstNonEmpty(r.Depth, c.Depth)
+		r.Permission = firstNonEmpty(r.Permission, c.Permission)
+		rf := childRoutePayloadFields(r)
+		for _, k := range requiredRouteKeys {
+			if strings.TrimSpace(m[k]) == "" && strings.TrimSpace(rf[k]) != "" {
+				m[k] = rf[k]
 			}
 		}
-		// Write-boundary identity: parent run.start / exact parent interrupt skip;
-		// all child lifecycle facts must pass the one canonical validator.
-		if strings.TrimSpace(ev.Kind) != "run.start" {
-			if err := ValidateChildEventIdentityForPlan(ev, out.PlanDigest, runID, itemOK); err != nil {
-				return Event{}, fmt.Errorf("workflowrun: refuse persist: %w", err)
-			}
+		// Canonical FailureClass: top-level ↔ payload failure_class (never Message).
+		if strings.TrimSpace(ev.FailureClass) == "" {
+			ev.FailureClass = strings.TrimSpace(m["failure_class"])
+		}
+		if strings.TrimSpace(ev.FailureClass) != "" {
+			m["failure_class"] = strings.TrimSpace(ev.FailureClass)
+		}
+		// Exact durable terminal on persisted event stamp — no EqualFold/TrimSpace.
+		if ev.Terminal == string(workgraph.TermSucceeded) {
+			ev.FailureClass = ""
+			delete(m, "failure_class")
+		}
+		ev.Payload = eventJSONPayload(m)
+		if err := ValidateChildEventIdentityForPlan(ev, writeID, itemOK); err != nil {
+			return Event{}, fmt.Errorf("workflowrun: refuse persist: %w", err)
 		}
 		outEv, err := elog.Append(ev)
 		if err != nil {
@@ -670,6 +745,9 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 			return Event{}, fmt.Errorf("workflowrun: empty persisted event_id kind=%s", ev.Kind)
 		}
 		return outEv, nil
+	}
+	if _, err := logEv(Event{Kind: "run.start", Message: "workflow execute"}); err != nil {
+		return fail(out, StatusBlocked, "event log start: "+err.Error())
 	}
 	// --- schedule + claim + real child execute each ready item once ---
 	// Durable claim store co-located with the event log (stable home, not PID).
@@ -709,12 +787,10 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 			out.Interrupted = true
 			// Parent interrupt is recovery evidence — not silent best-effort.
 			if _, ierr := logEv(Event{Kind: "interrupt", Message: "cancelled mid-wave (forced process interrupt)", Generation: 0}); ierr != nil {
-				_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-				return fail(out, StatusBlocked, "parent interrupt event: "+ierr.Error()+"; cancelled mid-wave")
+				return failBlockedJoin(out, s.HomeDir, projectID, runID, "parent interrupt event: "+ierr.Error()+"; cancelled mid-wave", nil)
 			}
 			emit("interrupt:mid_wave")
-			_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-			return fail(out, StatusBlocked, "cancelled mid-wave")
+			return failBlockedJoin(out, s.HomeDir, projectID, runID, "cancelled mid-wave", nil)
 		}
 		ready := workgraph.EvaluateReady(g, ev)
 		if !ready.Valid {
@@ -761,11 +837,25 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 				// Mark claimed so claim-once map stays consistent without a second claim.
 				claimed[id] = 1
 				out.ReuseCount++
-				// Append prior as-is — never assign/mutate WorkItemID or digests.
 				ev[id] = workgraph.TermSucceeded
-				out.Children = append(out.Children, prior)
-				// Prior succeeded already integrated; do not re-exec or re-commit.
-				integrated = append(integrated, id)
+				// PriorOutcomes may already have seeded this attempt into out.Children;
+				// append only when missing (exact AttemptID). Never duplicate.
+				already := false
+				for _, c := range out.Children {
+					// Byte-exact AttemptID compare for durable prior seed.
+					if c.AttemptID == prior.AttemptID {
+						already = true
+						break
+					}
+				}
+				if !already {
+					out.Children = append(out.Children, prior)
+				}
+				// Re-list Integrated only when prior carries product integrate SHA.
+				// Terminal-only prior (SkipIntegrate / no-repo) must not invent Integrated.
+				if strings.TrimSpace(prior.IntegrateCommitSHA) != "" {
+					integrated = append(integrated, id)
+				}
 				emit(fmt.Sprintf("child.reuse:%s attempt=%s evidence=%s", id, prior.AttemptID, short(prior.OutputEvidence)))
 				// Reuse events must carry exact plan/class/full CCD/attempt/positive generation.
 				if _, lerr := logEv(Event{
@@ -824,7 +914,9 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 				out.ReuseCount++
 				ev[id] = workgraph.TerminalState(reused.Terminal)
 				out.Children = append(out.Children, reused)
-				if strings.EqualFold(reused.Terminal, string(workgraph.TermSucceeded)) {
+				// Product Integrated only with durable integrate commit identity.
+				if reused.Terminal == string(workgraph.TermSucceeded) &&
+					reused.IntegrateCommitSHA != "" {
 					integrated = append(integrated, id)
 				}
 				emit(fmt.Sprintf("child.terminal_reuse:%s attempt=%s terminal=%s", id, reused.AttemptID, reused.Terminal))
@@ -1204,11 +1296,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 						Provider: route.Provider, Model: route.Model, Depth: route.Depth,
 					})
 					ev[id] = workgraph.TermFailed
-					_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-					if cerr := releaseWorktreePeak(); cerr != nil {
-						return fail(out, StatusBlocked, "worktree cleanup: "+cerr.Error())
-					}
-					return fail(out, StatusBlocked, "pid event: "+spawnPIDErr.Error()+"; terminal: "+terr.Error())
+					return failBlockedJoin(out, s.HomeDir, projectID, runID, "pid event: "+spawnPIDErr.Error()+"; terminal: "+terr.Error(), releaseWorktreePeak)
 				}
 				if _, cerr := cs.Close(workclaim.CloseRequest{
 					ClaimID: res.Claim.ClaimID, Generation: res.Claim.Generation,
@@ -1230,11 +1318,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 					Provider: route.Provider, Model: route.Model, Depth: route.Depth,
 				})
 				ev[id] = workgraph.TermFailed
-				_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-				if cerr := releaseWorktreePeak(); cerr != nil {
-					return fail(out, StatusBlocked, "worktree cleanup: "+cerr.Error())
-				}
-				return fail(out, StatusBlocked, "pid event: "+spawnPIDErr.Error()+closeMsg)
+				return failBlockedJoin(out, s.HomeDir, projectID, runID, "pid event: "+spawnPIDErr.Error()+closeMsg, releaseWorktreePeak)
 			}
 			if spawnPIDLogged {
 				if err := crossCheckSpawnPID(spawnStart, childOut); err != nil {
@@ -1256,8 +1340,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 							Provider: route.Provider, Model: route.Model, Depth: route.Depth,
 						})
 						ev[id] = workgraph.TermFailed
-						_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-						return fail(out, StatusBlocked, "pid identity mismatch: "+err.Error()+"; terminal: "+terr.Error())
+						return failBlockedJoin(out, s.HomeDir, projectID, runID, "pid identity mismatch: "+err.Error()+"; terminal: "+terr.Error(), nil)
 					}
 					if _, cerr := cs.Close(workclaim.CloseRequest{
 						ClaimID: res.Claim.ClaimID, Generation: res.Claim.Generation,
@@ -1277,11 +1360,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 						Provider: route.Provider, Model: route.Model, Depth: route.Depth,
 					})
 					ev[id] = workgraph.TermFailed
-					_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-					if cerr := releaseWorktreePeak(); cerr != nil {
-						return fail(out, StatusBlocked, "worktree cleanup: "+cerr.Error())
-					}
-					return fail(out, StatusBlocked, "pid identity mismatch: "+err.Error()+closeMsg)
+					return failBlockedJoin(out, s.HomeDir, projectID, runID, "pid identity mismatch: "+err.Error()+closeMsg, releaseWorktreePeak)
 				}
 			}
 			// Fake / no SpawnObserved: never emit a durable production pid event without
@@ -1300,6 +1379,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 				OutputEvidence: childOut.OutputEvidence, ExitCode: childOut.ExitCode,
 				FailureClass: childOut.FailureClass, Message: childOut.Message,
 				ActualCapacity: childOut.ActualCapacity, ActualSource: childOut.ActualSource,
+				InputTokens: childOut.InputTokens, OutputTokens: childOut.OutputTokens,
 				ActualSources: ActualRouteSources{
 					Model: childOut.ActualSources.Model, Effort: childOut.ActualSources.Effort,
 					Permission: childOut.ActualSources.Permission, Account: childOut.ActualSources.Account,
@@ -1363,6 +1443,9 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 						"interrupt_class": InterruptClassServiceForced,
 						"interrupt_id":    serviceInterruptID,
 						"terminal":        string(workgraph.TermCancelled),
+						"work_item_id":    id,
+						"attempt_id":      attemptID,
+						"generation":      fmt.Sprintf("%d", eventGen),
 					}
 					intPayload = mergePayloadStringMap(intPayload, childRoutePayloadFields(route))
 					if intPID > 0 {
@@ -1442,6 +1525,9 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 				payload := map[string]string{
 					"terminal": string(term), "failure_class": outc.FailureClass,
 					"output_evidence": evid,
+					"work_item_id":    id,
+					"attempt_id":      att,
+					"generation":      fmt.Sprintf("%d", genn),
 				}
 				payload = mergePayloadStringMap(payload, childRoutePayloadFields(route))
 				// Matching typed pair for Service forced cancel (not hard_kill_recovery).
@@ -1572,11 +1658,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 				// Preserve exact terminal (cancelled stays cancelled).
 				if ferr := finalizeTerminal(activeClaim, attemptID, eventGen, &outcome, closeTerm, closeEvidence, ""); ferr != nil {
 					out.Children = append(out.Children, outcome)
-					_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-					if cerr := releaseWorktreePeak(); cerr != nil {
-						return fail(out, StatusBlocked, "worktree cleanup: "+cerr.Error())
-					}
-					return fail(out, StatusBlocked, "finalize terminal "+id+": "+ferr.Error())
+					return failBlockedJoin(out, s.HomeDir, projectID, runID, "finalize terminal "+id+": "+ferr.Error(), releaseWorktreePeak)
 				}
 				// Generation-safe same-depth alternate after typed model_unavailable.
 				// Release primary worktree occupancy before alternate launch (sequential peak).
@@ -1620,8 +1702,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 						if lerr != nil {
 							out.Children = append(out.Children, failedOutcome)
 							ev[id] = workgraph.TermFailed
-							_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-							return fail(out, StatusBlocked, "model_unavailable event: "+lerr.Error())
+							return failBlockedJoin(out, s.HomeDir, projectID, runID, "model_unavailable event: "+lerr.Error(), nil)
 						}
 						out.Children = append(out.Children, failedOutcome)
 
@@ -1637,8 +1718,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 						})
 						if cerr2 != nil || res2.Code != workclaim.ResultClaimed {
 							ev[id] = workgraph.TermFailed
-							_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-							return fail(out, StatusBlocked, fmt.Sprintf("alternate claim %s: %v code=%v", id, cerr2, res2.Code))
+							return failBlockedJoin(out, s.HomeDir, projectID, runID, fmt.Sprintf("alternate claim %s: %v code=%v", id, cerr2, res2.Code), nil)
 						}
 						claimed[id]++
 						out.ClaimCount++
@@ -1667,8 +1747,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 							_ = finalizeTerminal(res2.Claim, newAttemptID, altEventGen, &altFail, workgraph.TermFailed,
 								"failed:event_log:"+id, failedAttemptID)
 							out.Children = append(out.Children, altFail)
-							_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-							return fail(out, StatusBlocked, altFail.Message)
+							return failBlockedJoin(out, s.HomeDir, projectID, runID, altFail.Message, nil)
 						}
 
 						altPerm := firstNonEmpty(alt.Permission, reqPerm)
@@ -1733,8 +1812,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 							}
 							out.Children = append(out.Children, altFail)
 							ev[id] = workgraph.TermFailed
-							_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-							return fail(out, StatusBlocked, "capacity reroute "+id+": "+altFail.Message)
+							return failBlockedJoin(out, s.HomeDir, projectID, runID, "capacity reroute "+id+": "+altFail.Message, nil)
 						}
 						if verr := validateCapacityRerouteResult(cr, capIn); verr != nil {
 							compMsg := ""
@@ -1754,8 +1832,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 							}
 							out.Children = append(out.Children, altFail)
 							ev[id] = workgraph.TermFailed
-							_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-							return fail(out, StatusBlocked, "capacity contract "+id+": "+altFail.Message)
+							return failBlockedJoin(out, s.HomeDir, projectID, runID, "capacity contract "+id+": "+altFail.Message, nil)
 						}
 						capacityTransferred = true
 						altRoute.AccountRef = strings.TrimSpace(cr.AccountRef)
@@ -1801,8 +1878,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 							_ = finalizeTerminal(res2.Claim, newAttemptID, altEventGen, &altFail, workgraph.TermFailed,
 								"failed:reroute_event:"+id, failedAttemptID)
 							out.Children = append(out.Children, altFail)
-							_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-							return fail(out, StatusBlocked, altFail.Message)
+							return failBlockedJoin(out, s.HomeDir, projectID, runID, altFail.Message, nil)
 						}
 						emit(fmt.Sprintf("child.reroute:%s from=%s/%s to=%s/%s gen=%d", id, failedProv, failedModel, alt.Provider, alt.Model, newGen))
 						evLaunch, lerr := logEv(Event{
@@ -1834,8 +1910,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 							_ = finalizeTerminal(res2.Claim, newAttemptID, altEventGen, &altFail, workgraph.TermFailed,
 								"failed:launch_event:"+id, failedAttemptID)
 							out.Children = append(out.Children, altFail)
-							_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-							return fail(out, StatusBlocked, altFail.Message)
+							return failBlockedJoin(out, s.HomeDir, projectID, runID, altFail.Message, nil)
 						}
 						launches++
 						out.LaunchCount = launches
@@ -1986,11 +2061,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 							_ = finalizeTerminal(res2.Claim, newAttemptID, altEventGen, &altFail, workgraph.TermFailed,
 								"failed:pid_event:"+id, failedAttemptID)
 							out.Children = append(out.Children, altFail)
-							_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-							if cerr := releaseWorktreePeak(); cerr != nil {
-								return fail(out, StatusBlocked, "worktree cleanup: "+cerr.Error())
-							}
-							return fail(out, StatusBlocked, "alternate pid event: "+altSpawnErr.Error())
+							return failBlockedJoin(out, s.HomeDir, projectID, runID, "alternate pid event: "+altSpawnErr.Error(), releaseWorktreePeak)
 						}
 						if altSpawnLogged {
 							if err := crossCheckSpawnPID(altSpawnStart, childOut2); err != nil {
@@ -2004,11 +2075,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 								_ = finalizeTerminal(res2.Claim, newAttemptID, altEventGen, &altFail, workgraph.TermFailed,
 									"failed:pid_mismatch:"+id, failedAttemptID)
 								out.Children = append(out.Children, altFail)
-								_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-								if cerr := releaseWorktreePeak(); cerr != nil {
-									return fail(out, StatusBlocked, "worktree cleanup: "+cerr.Error())
-								}
-								return fail(out, StatusBlocked, "alternate pid identity mismatch: "+err.Error())
+								return failBlockedJoin(out, s.HomeDir, projectID, runID, "alternate pid identity mismatch: "+err.Error(), releaseWorktreePeak)
 							}
 						}
 						// Fake alternate: never emit durable production pid without authority.
@@ -2032,6 +2099,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 							OutputEvidence: childOut2.OutputEvidence, ExitCode: childOut2.ExitCode,
 							FailureClass: childOut2.FailureClass, Message: childOut2.Message,
 							ActualCapacity: childOut2.ActualCapacity, ActualSource: childOut2.ActualSource,
+							InputTokens: childOut2.InputTokens, OutputTokens: childOut2.OutputTokens,
 							ActualSources: ActualRouteSources{
 								Model: childOut2.ActualSources.Model, Effort: childOut2.ActualSources.Effort,
 								Permission: childOut2.ActualSources.Permission, Account: childOut2.ActualSources.Account,
@@ -2129,11 +2197,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 						if closeTerm != workgraph.TermSucceeded {
 							if ferr := finalizeFailed(activeClaim, attemptID, eventGen, &outcome, closeEvidence, failedAttemptID); ferr != nil {
 								out.Children = append(out.Children, outcome)
-								_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-								if cerr := releaseWorktreePeak(); cerr != nil {
-									return fail(out, StatusBlocked, "worktree cleanup: "+cerr.Error())
-								}
-								return fail(out, StatusBlocked, "alternate finalize failed: "+ferr.Error())
+								return failBlockedJoin(out, s.HomeDir, projectID, runID, "alternate finalize failed: "+ferr.Error(), releaseWorktreePeak)
 							}
 							if cerr := releaseWorktreePeak(); cerr != nil {
 								return fail(out, StatusBlocked, "worktree cleanup: "+cerr.Error())
@@ -2160,21 +2224,17 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 					}
 					if ferr := finalizeFailed(activeClaim, attemptID, eventGen, &outcome, closeEvidence, supersedes); ferr != nil {
 						out.Children = append(out.Children, outcome)
-						_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-						if cerr := releaseWorktreePeak(); cerr != nil {
-							return fail(out, StatusBlocked, "worktree cleanup: "+cerr.Error())
-						}
-						return fail(out, StatusBlocked, "accept finalize: "+ferr.Error())
+						return failBlockedJoin(out, s.HomeDir, projectID, runID, "accept finalize: "+ferr.Error(), releaseWorktreePeak)
 					}
 					ev[id] = workgraph.TermFailed
 					out.Children = append(out.Children, outcome)
 					emit(fmt.Sprintf("accept.fail:%s err=%s", id, aerr.Error()))
-					_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-					if cerr := releaseWorktreePeak(); cerr != nil {
-						return fail(out, StatusBlocked, "worktree cleanup: "+cerr.Error())
-					}
 					if it.Status == workgraph.ItemRequired {
-						return fail(out, StatusBlocked, "accept "+id+": "+aerr.Error())
+						return failBlockedJoin(out, s.HomeDir, projectID, runID, "accept "+id+": "+aerr.Error(), releaseWorktreePeak)
+					}
+					// Non-required: still persist partial + cleanup occupancy.
+					if _, jerr := failBlockedJoin(out, s.HomeDir, projectID, runID, "", releaseWorktreePeak); jerr != nil {
+						return out, jerr
 					}
 					continue
 				}
@@ -2198,21 +2258,16 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 						}
 						if ferr := finalizeFailed(activeClaim, attemptID, eventGen, &outcome, closeEvidence, supersedes); ferr != nil {
 							out.Children = append(out.Children, outcome)
-							_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-							if cerr := releaseWorktreePeak(); cerr != nil {
-								return fail(out, StatusBlocked, "worktree cleanup: "+cerr.Error())
-							}
-							return fail(out, StatusBlocked, "integrate finalize: "+ferr.Error())
+							return failBlockedJoin(out, s.HomeDir, projectID, runID, "integrate finalize: "+ferr.Error(), releaseWorktreePeak)
 						}
 						ev[id] = workgraph.TermFailed
 						out.Children = append(out.Children, outcome)
 						emit(fmt.Sprintf("integrate.fail:%s err=%s", id, ierr.Error()))
-						_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-						if cerr := releaseWorktreePeak(); cerr != nil {
-							return fail(out, StatusBlocked, "worktree cleanup: "+cerr.Error())
-						}
 						if it.Status == workgraph.ItemRequired {
-							return fail(out, StatusBlocked, "integrate "+id+": "+ierr.Error())
+							return failBlockedJoin(out, s.HomeDir, projectID, runID, "integrate "+id+": "+ierr.Error(), releaseWorktreePeak)
+						}
+						if _, jerr := failBlockedJoin(out, s.HomeDir, projectID, runID, "", releaseWorktreePeak); jerr != nil {
+							return out, jerr
 						}
 						continue
 					}
@@ -2249,11 +2304,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 						// Commit landed; preserve IntegrateCommits identity without succeeded terminal.
 						out.Children = append(out.Children, outcome)
 						ev[id] = workgraph.TermFailed
-						_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-						if cerr := releaseWorktreePeak(); cerr != nil {
-							return fail(out, StatusBlocked, "worktree cleanup: "+cerr.Error())
-						}
-						return fail(out, StatusBlocked, "integrate event: "+outcome.Message)
+						return failBlockedJoin(out, s.HomeDir, projectID, runID, "integrate event: "+outcome.Message, releaseWorktreePeak)
 					}
 					if ferr := finalizeSucceeded(activeClaim, attemptID, eventGen, &outcome, closeEvidence, supersedes); ferr != nil {
 						// Never report succeeded without durable terminal + closed claim.
@@ -2261,11 +2312,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 						outcome.FailureClass = firstNonEmpty(outcome.FailureClass, "terminal_event_failed")
 						outcome.Message = ferr.Error()
 						out.Children = append(out.Children, outcome)
-						_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-						if cerr := releaseWorktreePeak(); cerr != nil {
-							return fail(out, StatusBlocked, "worktree cleanup: "+cerr.Error())
-						}
-						return fail(out, StatusBlocked, "success finalize: "+ferr.Error())
+						return failBlockedJoin(out, s.HomeDir, projectID, runID, "success finalize: "+ferr.Error(), releaseWorktreePeak)
 					}
 					if ic.Skipped {
 						emit(fmt.Sprintf("integrate.skip:%s attempt=%s commit=%s", id, attemptID, short(ic.CommitSHA)))
@@ -2283,11 +2330,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 						outcome.FailureClass = firstNonEmpty(outcome.FailureClass, "terminal_event_failed")
 						outcome.Message = ferr.Error()
 						out.Children = append(out.Children, outcome)
-						_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-						if cerr := releaseWorktreePeak(); cerr != nil {
-							return fail(out, StatusBlocked, "worktree cleanup: "+cerr.Error())
-						}
-						return fail(out, StatusBlocked, "success finalize: "+ferr.Error())
+						return failBlockedJoin(out, s.HomeDir, projectID, runID, "success finalize: "+ferr.Error(), releaseWorktreePeak)
 					}
 				}
 			}
@@ -2299,48 +2342,41 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 			}
 			out.Children = append(out.Children, outcome)
 			emit(fmt.Sprintf("child.terminal:%s term=%s evidence=%s", id, outcome.Terminal, short(closeEvidence)))
-			// Durable partial snapshot for forced process kill recovery.
-			_ = writePartialPrior(s.HomeDir, projectID, runID, out)
-			// Attempt complete: exact worktree leave (integration/terminal done).
-			if cerr := releaseWorktreePeak(); cerr != nil {
-				return fail(out, StatusBlocked, "worktree cleanup: "+cerr.Error())
-			}
-			out.WorktreeActive = peaks.activeWorktree
-			out.ProcessActive = peaks.activeProcess
-
+			// Durable partial + worktree leave: both required; join failures with terminal cause.
 			// Required child failure blocks the parent (do not pretend human_gate success).
 			if it.Status == workgraph.ItemRequired && closeTerm != workgraph.TermSucceeded {
 				msg := fmt.Sprintf("required child %s terminal=%s", id, closeTerm)
 				if outcome.Message != "" {
 					msg += ": " + outcome.Message
 				}
-				return fail(out, StatusBlocked, msg)
+				return failBlockedJoin(out, s.HomeDir, projectID, runID, msg, releaseWorktreePeak)
 			}
+			// Success/continue path: still persist partial and release occupancy.
+			if perr := writePartialPrior(s.HomeDir, projectID, runID, out); perr != nil {
+				if cerr := releaseWorktreePeak(); cerr != nil {
+					return fail(out, StatusBlocked, errors.Join(
+						fmt.Errorf("partial_checkpoint: %w", perr),
+						fmt.Errorf("cleanup: %w", cerr),
+					).Error())
+				}
+				return fail(out, StatusBlocked, "partial_checkpoint: "+perr.Error())
+			}
+			if cerr := releaseWorktreePeak(); cerr != nil {
+				return fail(out, StatusBlocked, "worktree cleanup: "+cerr.Error())
+			}
+			out.WorktreeActive = peaks.activeWorktree
+			out.ProcessActive = peaks.activeProcess
+			// Required child failure already returned above.
 			if cerr != nil && it.Status == workgraph.ItemRequired {
 				return fail(out, StatusBlocked, "required child "+id+": "+cerr.Error())
 			}
 		}
 	}
 
-	// When integrate is skipped (no repo), keep legacy in-order integrated list.
-	// Skip ids already recorded on PriorSucceeded reuse / terminal-reuse paths
-	// so each work item appears exactly once (exactly-once integration).
-	if !doIntegrate {
-		already := map[string]bool{}
-		for _, id := range integrated {
-			already[id] = true
-		}
-		order := workgraph.IntegrationOrder(g)
-		for _, id := range order {
-			if already[id] {
-				continue
-			}
-			if term, ok := ev[id]; ok && term == workgraph.TermSucceeded {
-				integrated = append(integrated, id)
-				emit("integrate:" + id)
-			}
-		}
-	}
+	// Integrated is product-branch integrate identity only (IntegrateChild + integrate
+	// event + commit SHA). When doIntegrate is false (SkipIntegrate or no git repo),
+	// succeeded children remain terminal/completed and MUST NOT enter Integrated or
+	// emit integrate-equivalent events. Never fabricate a legacy integrated list.
 	out.Integrated = integrated
 
 	// Claim budget per logical child: exactly one normal claim, or two when a
@@ -3217,6 +3253,27 @@ func allTerminal(g workgraph.Graph, ev workgraph.TerminalEvidence) bool {
 	return true
 }
 
+// failBlockedJoin writes partial checkpoint, runs cleanup, and returns blocked
+// with ALL of primary + partial + cleanup errors joined (never replace original cause).
+func failBlockedJoin(out Result, homeDir, projectID, runID, primary string, cleanup func() error) (Result, error) {
+	var errs []error
+	if strings.TrimSpace(primary) != "" {
+		errs = append(errs, fmt.Errorf("%s", primary))
+	}
+	if perr := writePartialPrior(homeDir, projectID, runID, out); perr != nil {
+		errs = append(errs, fmt.Errorf("partial_checkpoint: %w", perr))
+	}
+	if cleanup != nil {
+		if cerr := cleanup(); cerr != nil {
+			errs = append(errs, fmt.Errorf("cleanup: %w", cerr))
+		}
+	}
+	if len(errs) == 0 {
+		return fail(out, StatusBlocked, primary)
+	}
+	return fail(out, StatusBlocked, errors.Join(errs...).Error())
+}
+
 func fail(out Result, status, msg string) (Result, error) {
 	out.Status = status
 	out.Message = msg
@@ -3281,6 +3338,114 @@ func AttemptID(workItemID, planDigest, runID string, generation int) string {
 	return fmt.Sprintf("att-%s-%s-g%d", workItemID, short(planDigest+"|"+runID), generation)
 }
 
+// validateEntirePriorOutcomes validates every PriorOutcomes row in pure preflight
+// as defense-in-depth: exact canonical terminal, class/CCD/depth/permission,
+// plan, coherent provider/model/capacity when capacity-bearing. Conflicts fail.
+func validateEntirePriorOutcomes(
+	outcomes []ChildOutcome,
+	itemByID map[string]workgraph.WorkItem,
+	contracts map[string]childContract,
+	planDigest, runID string,
+) error {
+	if len(outcomes) == 0 {
+		return nil
+	}
+	seenAtt := map[string]bool{}
+	for i, o := range outcomes {
+		wi := o.WorkItemID
+		att := o.AttemptID
+		if wi == "" || att == "" {
+			return fmt.Errorf("workflowrun: PriorOutcomes[%d] missing work_item/attempt (fail closed before side effects)", i)
+		}
+		if _, ok := itemByID[wi]; !ok {
+			return fmt.Errorf("workflowrun: PriorOutcomes ghost work_item %q not in current graph (fail closed before side effects)", wi)
+		}
+		if seenAtt[att] {
+			return fmt.Errorf("workflowrun: PriorOutcomes duplicate AttemptID %q (fail closed before side effects)", att)
+		}
+		seenAtt[att] = true
+		switch o.Terminal {
+		case string(workgraph.TermSucceeded), string(workgraph.TermFailed),
+			string(workgraph.TermCancelled), string(workgraph.TermSkipped):
+		default:
+			return fmt.Errorf("workflowrun: PriorOutcomes attempt %s invalid terminal %q (exact succeeded|failed|cancelled|skipped)", att, o.Terminal)
+		}
+		if o.Generation < 1 {
+			return fmt.Errorf("workflowrun: PriorOutcomes attempt %s generation %d < 1", att, o.Generation)
+		}
+		wantAtt := AttemptID(wi, planDigest, runID, o.Generation-1)
+		if att != wantAtt {
+			return fmt.Errorf("workflowrun: PriorOutcomes attempt %q != canonical %q", att, wantAtt)
+		}
+		if o.ExecutionPlanDigest != planDigest {
+			return fmt.Errorf("workflowrun: PriorOutcomes attempt %s plan_digest mismatch", att)
+		}
+		cc, ok := contracts[wi]
+		if !ok {
+			return fmt.Errorf("workflowrun: PriorOutcomes %q missing prevalidated child contract", wi)
+		}
+		if o.TaskClass == "" || o.TaskClass != cc.TaskClass {
+			return fmt.Errorf("workflowrun: PriorOutcomes attempt %s task_class %q != contract %q", att, o.TaskClass, cc.TaskClass)
+		}
+		if o.ChildContractDigest == "" || o.ChildContractDigest != cc.Digest {
+			return fmt.Errorf("workflowrun: PriorOutcomes attempt %s child_contract_digest mismatch", att)
+		}
+		// Depth/permission must be nonempty (contract binding includes them via CCD).
+		if o.Depth == "" {
+			return fmt.Errorf("workflowrun: PriorOutcomes attempt %s depth empty", att)
+		}
+		if o.Permission == "" {
+			return fmt.Errorf("workflowrun: PriorOutcomes attempt %s permission empty", att)
+		}
+		if o.Terminal == string(workgraph.TermSucceeded) {
+			if strings.TrimSpace(o.OutputEvidence) == "" {
+				return fmt.Errorf("workflowrun: PriorOutcomes succeeded attempt %s missing output_evidence", att)
+			}
+		}
+		// Coherent capacity/route identity when any capacity field present.
+		if o.AccountRef != "" || o.InstallRef != "" || o.WindowKind != "" || o.ReservationID != "" ||
+			o.Provider != "" || o.Model != "" {
+			if o.Provider == "" || o.Model == "" || o.Depth == "" || o.Permission == "" ||
+				o.AccountRef == "" || o.InstallRef == "" || o.WindowKind == "" {
+				return fmt.Errorf("workflowrun: PriorOutcomes attempt %s capacity/route-bearing incomplete", att)
+			}
+		}
+	}
+	return nil
+}
+
+// requirePriorSucceededSubsetOfOutcomes ensures every PriorSucceeded row is
+// full-struct equal to a PriorOutcomes row when the full set is provided.
+func requirePriorSucceededSubsetOfOutcomes(priors map[string]ChildOutcome, outcomes []ChildOutcome) error {
+	if len(priors) == 0 {
+		return nil
+	}
+	if len(outcomes) == 0 {
+		// PriorSucceeded alone remains valid for legacy single-seed resumes
+		// without a multi-attempt WorkflowKids set.
+		return nil
+	}
+	byAtt := map[string]ChildOutcome{}
+	for _, o := range outcomes {
+		// Byte-exact AttemptID keys (no TrimSpace normalize of durable identity).
+		byAtt[o.AttemptID] = o
+	}
+	for id, p := range priors {
+		att := p.AttemptID
+		o, ok := byAtt[att]
+		if !ok {
+			return fmt.Errorf("workflowrun: PriorSucceeded[%s] attempt %s not in PriorOutcomes (fail closed before side effects)", id, att)
+		}
+		if !reflect.DeepEqual(p, o) {
+			return fmt.Errorf("workflowrun: PriorSucceeded[%s] full-row mismatch vs PriorOutcomes attempt %s (fail closed before side effects)", id, att)
+		}
+		if o.Terminal != string(workgraph.TermSucceeded) {
+			return fmt.Errorf("workflowrun: PriorSucceeded[%s] maps to non-succeeded PriorOutcomes row (want exact succeeded, got %q)", id, o.Terminal)
+		}
+	}
+	return nil
+}
+
 // validateEntirePriorSucceededMap validates every PriorSucceeded entry during
 // pure preflight. Every key must be a current graph item; key must equal
 // ChildOutcome.WorkItemID; no ghost entries; full identity must match local
@@ -3337,13 +3502,14 @@ func validatePriorSucceededForReuse(prior ChildOutcome, workItemID, planDigest, 
 	if prior.WorkItemID != workItemID {
 		return fmt.Errorf("workflowrun: prior %s work_item_id %q != graph item %q (refuse mutate)", workItemID, prior.WorkItemID, workItemID)
 	}
-	if !strings.EqualFold(strings.TrimSpace(prior.Terminal), string(workgraph.TermSucceeded)) {
+	// Exact durable terminal identity — no EqualFold/TrimSpace normalize.
+	if prior.Terminal != string(workgraph.TermSucceeded) {
 		return fmt.Errorf("workflowrun: prior %s terminal %q != succeeded (fail closed; no re-exec)", workItemID, prior.Terminal)
 	}
-	if strings.TrimSpace(prior.AttemptID) == "" {
-		return fmt.Errorf("workflowrun: prior %s missing attempt_id (fail closed)", workItemID)
+	if prior.AttemptID == "" || prior.AttemptID != strings.TrimSpace(prior.AttemptID) {
+		return fmt.Errorf("workflowrun: prior %s missing or whitespace-padded attempt_id %q (fail closed)", workItemID, prior.AttemptID)
 	}
-	if strings.TrimSpace(prior.OutputEvidence) == "" {
+	if prior.OutputEvidence == "" {
 		return fmt.Errorf("workflowrun: prior %s missing output_evidence (fail closed)", workItemID)
 	}
 	if prior.Generation < 1 {
