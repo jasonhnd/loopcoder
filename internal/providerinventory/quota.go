@@ -688,19 +688,6 @@ func confidenceAllowedForSource(kind QuotaSourceKind, confidence Confidence) boo
 	}
 }
 
-// capConfidenceForSource downgrades confidence that exceeds a source kind's contract
-// (e.g. third-party CodexBar bridge cannot claim exact).
-func capConfidenceForSource(kind QuotaSourceKind, confidence Confidence) Confidence {
-	if confidenceAllowedForSource(kind, confidence) {
-		return confidence
-	}
-	// Exact → estimated for operator overlay / fixture; other illegal values → unknown.
-	if confidence == ConfidenceExact {
-		return ConfidenceEstimated
-	}
-	return ConfidenceUnknown
-}
-
 func unitForQuantity(kind QuantityKind, providerName string) string {
 	switch kind {
 	case QuantityInputTokens, QuantityOutputTokens, QuantityTotalTokens:

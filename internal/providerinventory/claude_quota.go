@@ -77,9 +77,20 @@ type claudeQuotaRow struct {
 	ScopePart  string
 }
 
-func inspectClaudeQuota(ctx context.Context, discovery *discoveryContext, adapter AdapterDeclaration, candidate candidate, installation ProviderInstallation, now time.Time, deps Deps) (QuotaTelemetrySource, []QuotaSnapshot, ProbeResult) {
+func inspectClaudeQuota(
+	ctx context.Context,
+	discovery *discoveryContext,
+	adapter AdapterDeclaration,
+	candidate candidate,
+	installation ProviderInstallation,
+	profiles []AccountProfile,
+	readiness []AuthReadiness,
+	now time.Time,
+	deps Deps,
+) (QuotaTelemetrySource, []QuotaSnapshot, ProbeResult) {
 	source := claudeQuotaSource(now)
 	installationID := installation.ProviderInstallationID
+	fallbackReason := ""
 	probe := baseProbe(adapter, now, deps)
 	probe.ProviderInstallationID = &installationID
 	probe.ProbeKind = "quota"
@@ -97,10 +108,19 @@ func inspectClaudeQuota(ctx context.Context, discovery *discoveryContext, adapte
 
 	unavailable := func(reason, terminal string) (QuotaTelemetrySource, []QuotaSnapshot, ProbeResult) {
 		snapshot := claudeQuotaUnavailableSnapshot(source, &installationID, now, reason, terminal)
+		if fallbackReason != "" {
+			snapshot.GapReasons = dedupeStrings(append(snapshot.GapReasons, "codexbar-primary-unavailable"))
+		}
 		probe.Outcome = OutcomeProbeFailed
 		probe.Confidence = ConfidenceUnavailable
 		probe.FreshnessState = FreshnessNotApplicable
 		probe.GapReasons = []string{reason}
+		if fallbackReason != "" {
+			probe.GapReasons = dedupeStrings(append(probe.GapReasons, "codexbar-primary-unavailable"))
+			probe.setParsedFields(map[string]string{
+				"codexbar_fallback_reason": fallbackReason,
+			})
+		}
 		probe.TerminalErrorCode = terminal
 		return source, []QuotaSnapshot{snapshot}, probe
 	}
@@ -113,6 +133,11 @@ func inspectClaudeQuota(ctx context.Context, discovery *discoveryContext, adapte
 		probe.SideEffectClass = "not-run"
 		return unavailable("unsupported-cli-version", "ErrUnsupportedVersion")
 	}
+	codexbar := inspectClaudeCodexBarQuota(ctx, discovery, adapter, installation, profiles, readiness, now, deps)
+	if codexbar.ok {
+		return codexbar.source, codexbar.snapshots, codexbar.probe
+	}
+	fallbackReason = codexbar.reason
 
 	root, argv, env, cleanup, err := prepareClaudeQuotaSandbox(candidate.path, deps)
 	if err != nil {
@@ -154,6 +179,9 @@ func inspectClaudeQuota(ctx context.Context, discovery *discoveryContext, adapte
 	}
 	if runErr != nil || result.TimedOut || result.Killed {
 		if result.TimedOut {
+			if claudeWorkspaceTrustPrompt(result.Output) {
+				return unavailable("quota-workspace-trust-prompt", "ErrClaudeQuotaWorkspaceTrustPrompt")
+			}
 			return unavailable("quota-probe-timeout", "ErrClaudeQuotaTimeout")
 		}
 		return unavailable("quota-probe-failed", "ErrClaudeQuotaExecutionFailed")
@@ -172,17 +200,28 @@ func inspectClaudeQuota(ctx context.Context, discovery *discoveryContext, adapte
 	if len(snapshots) == 0 {
 		return unavailable("unsupported-usage-surface", "ErrClaudeQuotaMalformedSurface")
 	}
+	for i := range snapshots {
+		snapshots[i].GapReasons = dedupeStrings(append(snapshots[i].GapReasons, "pty-fallback-after-codexbar-unavailable"))
+	}
 	probe.Outcome = OutcomeInstalled
 	probe.Confidence = ConfidenceExact
 	probe.setParsedFields(map[string]string{
-		"parser":         claudeQuotaSourceSchema,
-		"cli_version":    installation.Version,
-		"locale":         surface.Locale,
-		"terminal_width": strconv.Itoa(surface.Width),
-		"ansi":           strconv.FormatBool(surface.ANSI),
-		"snapshot_count": strconv.Itoa(len(snapshots)),
+		"parser":                   claudeQuotaSourceSchema,
+		"cli_version":              installation.Version,
+		"locale":                   surface.Locale,
+		"terminal_width":           strconv.Itoa(surface.Width),
+		"ansi":                     strconv.FormatBool(surface.ANSI),
+		"snapshot_count":           strconv.Itoa(len(snapshots)),
+		"codexbar_fallback_reason": fallbackReason,
 	})
 	return source, snapshots, probe
+}
+
+func claudeWorkspaceTrustPrompt(output string) bool {
+	normalized := strings.ToLower(ansiPattern.ReplaceAllString(output, ""))
+	return (strings.Contains(normalized, "trust") && strings.Contains(normalized, "workspace")) ||
+		(strings.Contains(normalized, "trust") && strings.Contains(normalized, "folder")) ||
+		strings.Contains(normalized, "yes, i trust")
 }
 
 func claudeQuotaSource(now time.Time) QuotaTelemetrySource {
