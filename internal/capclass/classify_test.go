@@ -323,6 +323,10 @@ func TestDefaultModelMap(t *testing.T) {
 	if !ok || cl != ClassLuna {
 		t.Fatalf("haiku %v %v", cl, ok)
 	}
+	cl, ok = LookupModel(m, "claude", "claude-opus-4-8")
+	if !ok || cl != ClassSoul {
+		t.Fatalf("observed opus %v %v", cl, ok)
+	}
 	// unknown model not in map
 	if _, ok := LookupModel(m, "codex", "not-a-real-model"); ok {
 		t.Fatal("expected miss")

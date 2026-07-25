@@ -153,6 +153,10 @@ func TestParseStreamJSONFailsClosedOnMalformedPartialAndCredentialOutput(t *test
 		{name: "malformed", output: "{not-json}\n"},
 		{name: "partial", output: `{"type":"system","subtype":"init","model":"claude-sonnet-5"}` + "\n"},
 		{name: "model-mismatch", output: strings.Replace(testClaudeStream(), `"claude-sonnet-5":{"inputTokens"`, `"claude-other":{"inputTokens"`, 1)},
+		{name: "noncanonical-aux-model", output: strings.Join([]string{
+			`{"type":"system","subtype":"init","model":"claude-sonnet-5"}`,
+			`{"type":"result","subtype":"success","is_error":false,"modelUsage":{"claude-sonnet-5":{"inputTokens":2,"outputTokens":1}," claude-haiku":{"inputTokens":1,"outputTokens":1}}}`,
+		}, "\n") + "\n"},
 		{name: "credential", output: testClaudeStream() + "\n{\"type\":\"status\",\"access_token\":\"secret\"}\n"},
 		{name: "email", output: testClaudeStream() + "\n{\"type\":\"status\",\"principal\":\"owner@example.com\"}\n"},
 	}
@@ -176,6 +180,36 @@ func TestParseStreamJSONAcceptsSuccessfulResultWithInitAndExactModelUsage(t *tes
 	}
 	if parsed.ActualModel != "claude-sonnet-5" || parsed.TotalTokens != 31 {
 		t.Fatalf("parsed = %#v", parsed)
+	}
+}
+
+func TestParseStreamJSONAcceptsInitBoundPrimaryAndAccountsAuxiliaryUsage(t *testing.T) {
+	stream := strings.Join([]string{
+		`{"type":"system","subtype":"init","model":"claude-opus-4-8[1m]","apiKeySource":"none"}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}`,
+		`{"type":"result","subtype":"success","is_error":false,"modelUsage":{"claude-opus-4-8[1m]":{"inputTokens":3000,"outputTokens":40,"cacheReadInputTokens":500,"cacheCreationInputTokens":2,"costUSD":0.020000},"claude-haiku-4-5-20251001":{"inputTokens":10,"outputTokens":1,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"costUSD":0.000010}}}`,
+	}, "\n") + "\n"
+	parsed, err := parseStreamJSON([]byte(stream))
+	if err != nil {
+		t.Fatalf("parseStreamJSON: %v", err)
+	}
+	if parsed.ActualModel != "claude-opus-4-8[1m]" {
+		t.Fatalf("actual model = %q", parsed.ActualModel)
+	}
+	if parsed.InputTokens != 3010 || parsed.OutputTokens != 41 ||
+		parsed.CacheReadInputTokens != 500 || parsed.CacheCreateInputTokens != 2 ||
+		parsed.TotalTokens != 3553 || parsed.CostUSDMicros != 20010 {
+		t.Fatalf("parsed aggregate usage = %#v", parsed)
+	}
+}
+
+func TestParseStreamJSONRejectsAmbiguousMultipleModelUsageWithoutInit(t *testing.T) {
+	stream := strings.Join([]string{
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}`,
+		`{"type":"result","subtype":"success","is_error":false,"modelUsage":{"claude-opus-4-8[1m]":{"inputTokens":20,"outputTokens":1},"claude-haiku-4-5-20251001":{"inputTokens":10,"outputTokens":1}}}`,
+	}, "\n") + "\n"
+	if _, err := parseStreamJSON([]byte(stream)); !errors.Is(err, ErrProbeOutput) {
+		t.Fatalf("err = %v, want ErrProbeOutput", err)
 	}
 }
 

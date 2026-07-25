@@ -20,6 +20,7 @@ func DefaultModelMap() ModelMap {
 			{Provider: "codex", ModelID: "gpt-5.1-codex-mini", Class: ClassLuna},
 			// Claude
 			{Provider: "claude", ModelID: "claude-opus-4-8[1m]", Class: ClassSoul},
+			{Provider: "claude", ModelID: "claude-opus-4-8", Class: ClassSoul},
 			{Provider: "claude", ModelID: "claude-opus-4-5", Class: ClassSoul},
 			{Provider: "claude", ModelID: "claude-sonnet-4-5", Class: ClassTera},
 			{Provider: "claude", ModelID: "claude-sonnet-5", Class: ClassTera},
