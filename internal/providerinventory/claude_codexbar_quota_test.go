@@ -141,6 +141,16 @@ func TestClaudeQuotaPrefersRealCodexBarUsageAndNeverLaunchesPTY(t *testing.T) {
 		strings.Join(request.Argv[1:], " ") != "usage --provider claude --format json" {
 		t.Fatalf("CodexBar request = %#v", request)
 	}
+	if !containsString(request.Env, "USER=local-account") {
+		t.Fatalf("CodexBar request omitted required macOS account selector: %#v", request.Env)
+	}
+	for _, entry := range request.Env {
+		key, _, _ := strings.Cut(entry, "=")
+		switch key {
+		case "HOME", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "COOKIE", "ACCESS_TOKEN", "REFRESH_TOKEN":
+			t.Fatalf("CodexBar request forwarded credential-bearing environment key %q", key)
+		}
+	}
 	sources := quotaSourcesFor(report, "claude")
 	if len(sources) != 1 || sources[0].SourceKind != QuotaSourceTrustedThirdPartyBridge ||
 		sources[0].SourceSchemaVersion != claudeCodexBarUsageSchema {
@@ -291,6 +301,12 @@ func claudeCodexBarDiscoveryDeps(t *testing.T, now time.Time) Deps {
 		switch key {
 		case "PATH":
 			return dir
+		case "USER":
+			return "local-account"
+		case "HOME":
+			return filepath.Join(dir, "must-not-forward-home")
+		case "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "COOKIE", "ACCESS_TOKEN", "REFRESH_TOKEN":
+			return "must-not-forward-secret"
 		case "LANG", "LC_ALL":
 			return "C"
 		default:

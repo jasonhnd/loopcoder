@@ -47,6 +47,31 @@ func TestCodexBarDisabledNeverDiscoversOrLaunches(t *testing.T) {
 	}
 }
 
+func TestCodexBarEnvironmentIsMinimalAndCredentialFree(t *testing.T) {
+	values := map[string]string{
+		"PATH":                    "/opt/homebrew/bin:/usr/bin:/bin",
+		"USER":                    "local-account",
+		"HOME":                    "/Users/local-account",
+		"ANTHROPIC_API_KEY":       "must-not-forward",
+		"CLAUDE_CODE_OAUTH_TOKEN": "must-not-forward",
+		"COOKIE":                  "must-not-forward",
+		"ACCESS_TOKEN":            "must-not-forward",
+		"REFRESH_TOKEN":           "must-not-forward",
+	}
+	env := codexBarEnv(func(key string) string { return values[key] })
+	if !containsString(env, "PATH="+values["PATH"]) ||
+		!containsString(env, "USER="+values["USER"]) {
+		t.Fatalf("CodexBar environment missing bounded execution/account keys: %#v", env)
+	}
+	for _, entry := range env {
+		key, _, _ := strings.Cut(entry, "=")
+		switch key {
+		case "HOME", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "COOKIE", "ACCESS_TOKEN", "REFRESH_TOKEN":
+			t.Fatalf("CodexBar environment forwarded forbidden key %q", key)
+		}
+	}
+}
+
 func TestCodexBarGenericUnsupportedAndDisabledTrustFailClosedWithoutLaunch(t *testing.T) {
 	bridgeCalls := 0
 	probeCalls := 0
