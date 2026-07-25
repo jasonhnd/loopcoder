@@ -57,6 +57,7 @@ type ProcessStart struct {
 // ChildExecInput is one LoopCoder-owned child launch request.
 type ChildExecInput struct {
 	ProjectID  string
+	RunID      string
 	GraphID    string
 	WorkItemID string
 	ClaimID    string
@@ -508,7 +509,14 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 		}, lerr
 	}
 
-	logPath := filepath.Join(wt, ".loopcoder-child-provider.log")
+	logPath, err := providerControlPlaneLogPath(p.HomeDir, in.ProjectID, in.RunID, in.AttemptID)
+	if err != nil {
+		return ChildExecResult{
+			Terminal: workgraph.TermFailed, FailureClass: "control_plane_path",
+			Message: err.Error(), WorktreePath: wt,
+			Provider: prov, Model: model, Depth: depth, ActualSource: "unknown",
+		}, err
+	}
 	prompt := strings.TrimSpace(in.Intent)
 	if prompt == "" {
 		prompt = "bounded LoopCoder child work item " + in.WorkItemID
@@ -1554,6 +1562,66 @@ func allocateChildWorktree(homeDir, projectID, graphID, workItemID, attemptID, r
 		return "", err
 	}
 	return root, nil
+}
+
+// providerControlPlaneLogPath keeps provider runtime artifacts outside the
+// provider-writable product worktree. Codex and other adapters derive their
+// prompt, summary, and schema paths from this log directory, so the provider
+// cannot delete or spoof its own authoritative metadata with ordinary
+// workspace-write access.
+func providerControlPlaneLogPath(homeDir, projectID, runID, attemptID string) (string, error) {
+	projectID = strings.TrimSpace(projectID)
+	runID = strings.TrimSpace(runID)
+	attemptID = strings.TrimSpace(attemptID)
+	if projectID == "" || runID == "" || attemptID == "" {
+		return "", fmt.Errorf("workflowrun: project_id, run_id, and attempt_id required for provider control plane")
+	}
+	root, err := ResolveDurableHome(homeDir)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return "", fmt.Errorf("workflowrun: create durable home: %w", err)
+	}
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("workflowrun: resolve durable home: %w", err)
+	}
+	controlRoot := filepath.Join(root, "provider-control")
+	dir := filepath.Join(controlRoot,
+		controlPlaneSegment(projectID),
+		controlPlaneSegment(runID),
+		controlPlaneSegment(attemptID))
+	if err := requirePathUnderRoot(controlRoot, dir); err != nil {
+		return "", fmt.Errorf("workflowrun: provider control plane path: %w", err)
+	}
+	current := root
+	for _, segment := range []string{
+		"provider-control",
+		controlPlaneSegment(projectID),
+		controlPlaneSegment(runID),
+		controlPlaneSegment(attemptID),
+	} {
+		current = filepath.Join(current, segment)
+		if err := os.Mkdir(current, 0o700); err != nil && !os.IsExist(err) {
+			return "", fmt.Errorf("workflowrun: create provider control plane: %w", err)
+		}
+		st, err := os.Lstat(current)
+		if err != nil {
+			return "", fmt.Errorf("workflowrun: inspect provider control plane: %w", err)
+		}
+		if st.Mode()&os.ModeSymlink != 0 || !st.IsDir() {
+			return "", fmt.Errorf("workflowrun: provider control plane component is not a non-symlink directory")
+		}
+		if err := os.Chmod(current, 0o700); err != nil {
+			return "", fmt.Errorf("workflowrun: secure provider control plane: %w", err)
+		}
+	}
+	return filepath.Join(dir, "provider.log"), nil
+}
+
+func controlPlaneSegment(value string) string {
+	return sanitizeBranch(value) + "-" + short("provider-control|"+value)
 }
 
 // materializeIsolatedGitWorkspace creates an exclusive git checkout at dest

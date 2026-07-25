@@ -112,6 +112,60 @@ func TestConcurrentChildWorktreesAreIsolated(t *testing.T) {
 	}
 }
 
+func TestProviderControlPlaneLogPathIsOutsideWritableWorktree(t *testing.T) {
+	home := t.TempDir()
+	logPath, err := providerControlPlaneLogPath(home, "proj-a", "run-a", "att-a-g0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree := filepath.Join(home, "projects", "proj-a", "runs", "wf-a", "worktree")
+	if err := requirePathUnderRoot(worktree, logPath); err == nil {
+		t.Fatalf("control-plane log must be outside writable worktree: %s", logPath)
+	}
+	controlRoot := filepath.Join(home, "provider-control")
+	controlRoot, err = filepath.EvalSymlinks(controlRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := requirePathUnderRoot(controlRoot, logPath); err != nil {
+		t.Fatalf("control-plane log escaped its private root: %v", err)
+	}
+	if filepath.Base(logPath) != "provider.log" {
+		t.Fatalf("log leaf = %q", filepath.Base(logPath))
+	}
+	st, err := os.Stat(filepath.Dir(logPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := st.Mode().Perm(); got != 0o700 {
+		t.Fatalf("control-plane directory mode = %o, want 700", got)
+	}
+
+	otherAttempt, err := providerControlPlaneLogPath(home, "proj-a", "run-a", "att-a-g1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherRun, err := providerControlPlaneLogPath(home, "proj-a", "run-b", "att-a-g0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if logPath == otherAttempt || logPath == otherRun || otherAttempt == otherRun {
+		t.Fatalf("run/attempt control paths must be distinct: %q %q %q", logPath, otherAttempt, otherRun)
+	}
+}
+
+func TestProviderControlPlaneLogPathRejectsSymlinkComponent(t *testing.T) {
+	home := t.TempDir()
+	target := t.TempDir()
+	controlRoot := filepath.Join(home, "provider-control")
+	if err := os.Symlink(target, controlRoot); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := providerControlPlaneLogPath(home, "proj-a", "run-a", "att-a-g0"); err == nil {
+		t.Fatal("symlinked control-plane root must fail closed")
+	}
+}
+
 // escapeRunner writes a product file to the durable project root (parent of runs/)
 // then returns success — Production must fail isolation and cleanup.
 type escapeRunner struct{}
@@ -139,7 +193,7 @@ func TestProductionFailClosedOnRootEscapeNoRelocate(t *testing.T) {
 		},
 	}
 	res, err := exec.Execute(context.Background(), ChildExecInput{
-		ProjectID: "disp-iso", GraphID: "g1", WorkItemID: "wi_implement",
+		ProjectID: "disp-iso", RunID: "run-iso", GraphID: "g1", WorkItemID: "wi_implement",
 		ClaimID: "c1", AttemptID: "att-1", Intent: "write notes",
 		Route:    ChildRoute{Provider: "antigravity", Model: "m", Depth: "medium"},
 		RepoPath: parent, ReadOnly: false,

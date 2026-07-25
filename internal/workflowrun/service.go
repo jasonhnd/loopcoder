@@ -1026,7 +1026,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 			readOnly := strings.EqualFold(cc.Permission, "read-only")
 
 			childIn := ChildExecInput{
-				ProjectID: projectID, GraphID: g.GraphID, WorkItemID: id,
+				ProjectID: projectID, RunID: runID, GraphID: g.GraphID, WorkItemID: id,
 				ClaimID: res.Claim.ClaimID, AttemptID: attemptID,
 				Intent: it.Intent, Route: route, RepoPath: req.RepoPath,
 				// Materialize child from goal branch so prior integrations are visible.
