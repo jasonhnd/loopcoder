@@ -271,7 +271,14 @@ func codexBarEnv(getenv func(string) string) []string {
 }
 
 func codexBarEnvKeys() []string {
-	return []string{"PATH", "PATHEXT", "SystemRoot", "windir", "ComSpec", "TEMP", "TMP"}
+	// CodexBar 0.45.2 needs USER when its Claude provider resolves the current
+	// macOS login/keychain context. Without it, the real machine-readable
+	// `codexbar usage --provider claude --format json` command returns a typed
+	// provider error even though the same account succeeds in the host
+	// environment. USER is an account selector, not credential material; its
+	// value is passed only to the bounded child and is never persisted. Keep
+	// HOME and every token/cookie/key variable outside this allowlist.
+	return []string{"PATH", "USER", "PATHEXT", "SystemRoot", "windir", "ComSpec", "TEMP", "TMP"}
 }
 
 func codexBarTrustClassAllowed(value string) bool {
