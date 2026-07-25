@@ -175,8 +175,8 @@ func lookPathPrimaryEligible(inst providerinventory.ProviderInstallation) bool {
 // Installed/Healthy/Authenticated for unattended routing. Explicit-config and
 // later PATH rows when the first hit fails are never production-eligible.
 type pathInstallPlan struct {
-	Alias               map[string]string // installID → canonical (self if no fuse)
-	ProductionEligible  map[string]bool   // LookPath-primary IDs only when eligible
+	Alias                map[string]string // installID → canonical (self if no fuse)
+	ProductionEligible   map[string]bool   // LookPath-primary IDs only when eligible
 	LookPathPrimaryByCmd map[string]string // commandKey → primary install id (even if ineligible)
 }
 

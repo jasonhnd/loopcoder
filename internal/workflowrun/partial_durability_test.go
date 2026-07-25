@@ -22,7 +22,7 @@ func fullPartialResult(projectID, runID string) Result {
 			WorkItemID: "wi_only", AttemptID: AttemptID("wi_only", plan, runID, 0),
 			Generation: 1, TaskClass: "tera", ExecutionPlanDigest: plan,
 			ChildContractDigest: "sha256:" + strings.Repeat("ef", 32),
-			Terminal: "cancelled", FailureClass: "forced_interrupt",
+			Terminal:            "cancelled", FailureClass: "forced_interrupt",
 			Permission: "bounded_write",
 		}},
 		AbortedAttempts: map[string]string{

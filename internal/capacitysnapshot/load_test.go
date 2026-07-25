@@ -15,8 +15,8 @@ func TestLoadRouteInventoryRehydratesDurableQuotaWithoutSnapshotFlag(t *testing.
 
 	// Live discover path: PATH install + auth ready + models, but quota not granted.
 	const (
-		inst   = "pinst_codex_load_rehydrate"
-		acc    = "acct-codex-load-rehydrate"
+		inst    = "pinst_codex_load_rehydrate"
+		acc     = "acct-codex-load-rehydrate"
 		catSnap = "mcatsnap_codex_load"
 	)
 	live := providerinventory.Report{
@@ -26,9 +26,9 @@ func TestLoadRouteInventoryRehydratesDurableQuotaWithoutSnapshotFlag(t *testing.
 		},
 		AuthReadiness: []providerinventory.AuthReadiness{{
 			AdapterID: "codex", ReadinessState: providerinventory.ReadinessReady,
-			FreshnessState:      providerinventory.FreshnessFresh,
-			Confidence:          providerinventory.ConfidenceExact,
-			ReadinessConfidence: providerinventory.ConfidenceExact,
+			FreshnessState:         providerinventory.FreshnessFresh,
+			Confidence:             providerinventory.ConfidenceExact,
+			ReadinessConfidence:    providerinventory.ConfidenceExact,
 			AccountProfileID:       ptrStr(acc),
 			ProviderInstallationID: ptrStr(inst),
 		}},
@@ -75,11 +75,11 @@ func TestLoadRouteInventoryRehydratesDurableQuotaWithoutSnapshotFlag(t *testing.
 			AccountProfileID:       ptrStr(acc),
 			ProviderInstallationID: ptrStr(inst),
 			RemainingValue:         &rem, Confidence: providerinventory.ConfidenceExact,
-			FreshnessState:         providerinventory.FreshnessFresh,
-			CapturedAt:             now.Format(time.RFC3339),
-			StaleAfter:             now.Add(24 * time.Hour).Format(time.RFC3339),
-			ResetAt:                now.Add(48 * time.Hour).Format(time.RFC3339),
-			ProviderQuantityName:   "primary_used_percent",
+			FreshnessState:       providerinventory.FreshnessFresh,
+			CapturedAt:           now.Format(time.RFC3339),
+			StaleAfter:           now.Add(24 * time.Hour).Format(time.RFC3339),
+			ResetAt:              now.Add(48 * time.Hour).Format(time.RFC3339),
+			ProviderQuantityName: "primary_used_percent",
 		}},
 	}
 

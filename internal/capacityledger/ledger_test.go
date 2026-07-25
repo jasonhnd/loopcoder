@@ -408,7 +408,7 @@ func TestObserveAfterRejectsRiseWithoutReset(t *testing.T) {
 	// with reset evidence OK
 	e2, err := l.ObserveAfterBound("p", "r", "a1", 0.98, "cli", "fresh", capacityledger.ObserveAfterOpts{
 		AccountRef: e.AccountRef, WindowKind: e.WindowKind,
-		InstallRef:    "i-test", ObservedAt: t0(),
+		InstallRef: "i-test", ObservedAt: t0(),
 		ResetObserved: true, ResetEvidence: "window_reset_observed",
 	})
 	if err != nil {

@@ -12,8 +12,8 @@ import (
 func TestFromInventory_ExplicitInstalledAuthQuotaNonRoutable(t *testing.T) {
 	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
 	const (
-		acc  = "acct-0c985592aa87678f5c9e10707f0871fcecb480055d14835cee750b19d47df695"
-		inst = "pinst_explicit_only"
+		acc   = "acct-0c985592aa87678f5c9e10707f0871fcecb480055d14835cee750b19d47df695"
+		inst  = "pinst_explicit_only"
 		rhash = "sha256:explicit-resolved"
 	)
 	rem := int64(80)
@@ -26,13 +26,13 @@ func TestFromInventory_ExplicitInstalledAuthQuotaNonRoutable(t *testing.T) {
 			AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
 			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
 			ReadinessConfidence: providerinventory.ConfidenceExact,
-			AccountProfileID: ptrStr(acc), ProviderInstallationID: ptrStr(inst),
+			AccountProfileID:    ptrStr(acc), ProviderInstallationID: ptrStr(inst),
 		}},
 		ModelCapabilities: []providerinventory.ModelCapability{mrModel("grok", "grok-4.5", "mc", nil)},
 		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{{
 			ModelCatalogSnapshotID: "mc", AdapterID: "grok",
 			CatalogSourceKind: providerinventory.CatalogSourceProviderMachineReadable,
-			Confidence: providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
+			Confidence:        providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
 			ProviderInstallationID: ptrStr(inst), EntryCount: 1,
 		}},
 		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
@@ -41,7 +41,7 @@ func TestFromInventory_ExplicitInstalledAuthQuotaNonRoutable(t *testing.T) {
 			Unit: "percent", WindowKind: providerinventory.WindowFixedWeek,
 			RemainingValue: &rem, LimitValue: int64Ptr(100),
 			Confidence: providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
-			ScopeKey: "provider:grok/account:" + acc + "/detail:x",
+			ScopeKey:   "provider:grok/account:" + acc + "/detail:x",
 			CapturedAt: now.Format(time.RFC3339),
 		}},
 	}
@@ -64,10 +64,10 @@ func TestFromInventory_ExplicitInstalledAuthQuotaNonRoutable(t *testing.T) {
 func TestFromInventory_FirstPATHUnusableSecondUsableNonRoutable(t *testing.T) {
 	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
 	const (
-		acc   = "acct-0c985592aa87678f5c9e10707f0871fcecb480055d14835cee750b19d47df695"
-		first = "pinst_path0_unusable"
+		acc    = "acct-0c985592aa87678f5c9e10707f0871fcecb480055d14835cee750b19d47df695"
+		first  = "pinst_path0_unusable"
 		second = "pinst_path1_usable"
-		rhash = "sha256:same"
+		rhash  = "sha256:same"
 	)
 	rem := int64(70)
 	p0 := exactFreshInstall("grok", first, rhash, "sha256:p0")
@@ -81,13 +81,13 @@ func TestFromInventory_FirstPATHUnusableSecondUsableNonRoutable(t *testing.T) {
 			AdapterID: "grok", ReadinessState: providerinventory.ReadinessReady,
 			FreshnessState: providerinventory.FreshnessFresh, Confidence: providerinventory.ConfidenceExact,
 			ReadinessConfidence: providerinventory.ConfidenceExact,
-			AccountProfileID: ptrStr(acc), ProviderInstallationID: ptrStr(second),
+			AccountProfileID:    ptrStr(acc), ProviderInstallationID: ptrStr(second),
 		}},
 		ModelCapabilities: []providerinventory.ModelCapability{mrModel("grok", "grok-4.5", "mc", nil)},
 		ModelCatalogSnapshots: []providerinventory.ModelCatalogSnapshot{{
 			ModelCatalogSnapshotID: "mc", AdapterID: "grok",
 			CatalogSourceKind: providerinventory.CatalogSourceProviderMachineReadable,
-			Confidence: providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
+			Confidence:        providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
 			ProviderInstallationID: ptrStr(second), EntryCount: 1,
 		}},
 		QuotaSnapshots: []providerinventory.QuotaSnapshot{{
@@ -96,7 +96,7 @@ func TestFromInventory_FirstPATHUnusableSecondUsableNonRoutable(t *testing.T) {
 			Unit: "percent", WindowKind: providerinventory.WindowFixedWeek,
 			RemainingValue: &rem, LimitValue: int64Ptr(100),
 			Confidence: providerinventory.ConfidenceExact, FreshnessState: providerinventory.FreshnessFresh,
-			ScopeKey: "provider:grok/account:" + acc + "/detail:x",
+			ScopeKey:   "provider:grok/account:" + acc + "/detail:x",
 			CapturedAt: now.Format(time.RFC3339),
 		}},
 	}
