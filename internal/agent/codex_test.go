@@ -150,6 +150,28 @@ func TestBuildCodexArgs(t *testing.T) {
 	}
 }
 
+func TestCodexLogReportsModelUnavailable(t *testing.T) {
+	for _, msg := range []string{
+		"ERROR: The gpt-5.3-codex model is not supported when using Codex with a ChatGPT account.",
+		`{"error":{"message":"Model does not exist or you do not have access to it"}}`,
+		"not recognized as a known model",
+	} {
+		if !codexLogReportsModelUnavailable([]byte(msg)) {
+			t.Fatalf("expected model_unavailable for %q", msg)
+		}
+	}
+	for _, msg := range []string{
+		"rate limit exceeded for model gpt-5.3-codex",
+		"authentication required",
+		"network timeout",
+		"the prompt says a model is unsupported",
+	} {
+		if codexLogReportsModelUnavailable([]byte(msg)) {
+			t.Fatalf("must not classify model_unavailable for %q", msg)
+		}
+	}
+}
+
 func TestBuildCodexArgsWithMCPServers(t *testing.T) {
 	got := BuildCodexArgs(Invocation{
 		WorktreePath: "wt",
