@@ -10,7 +10,10 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/providerinstall"
+	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
@@ -222,6 +225,64 @@ func TestClaudeRunnerRejectsBoundedWriteBeforeLaunch(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "cannot be isolated") {
 		t.Fatalf("result=%#v error=%v, want prelaunch bounded-write refusal", result, err)
+	}
+}
+
+func TestClaudeRunnerAffirmsPinnedSameExecutableAccount(t *testing.T) {
+	bin := t.TempDir()
+	executable := filepath.Join(bin, "claude")
+	script := `#!/bin/sh
+if [ "$1" = "auth" ] && [ "$2" = "status" ] && [ "$3" = "--json" ]; then
+  printf '%s\n' '{"loggedIn":true,"email":"same-account@example.invalid","authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}'
+  exit 0
+fi
+exit 91
+`
+	if err := os.WriteFile(executable, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	installID, err := providerinstall.ComputeInstallationID("claude", executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth, err := providerinventory.ParseClaudeAuthBinding(executable, []byte(`{"loggedIn":true,"email":"same-account@example.invalid","authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}`), 0, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
+		if cmd.Path != executable {
+			t.Fatalf("launched path = %q, want %q", cmd.Path, executable)
+		}
+		_, _ = io.WriteString(cmd.Stdout, `{"type":"result","subtype":"success","result":"done","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3},"modelUsage":{"claude-sonnet-5":{"inputTokens":2,"outputTokens":1}}}`)
+		return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: 0}, nil
+	})
+	defer restore()
+
+	result, err := ClaudeRunner{}.Run(context.Background(), Invocation{
+		WorktreePath: t.TempDir(),
+		Prompt:       "verify",
+		LogPath:      filepath.Join(t.TempDir(), "claude.log"),
+		ReadOnly:     true,
+		Model:        "claude-sonnet-5",
+		Effort:       "low",
+		AccountRef:   auth.AccountProfileID,
+		InstallRef:   installID,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.ActualAccountRef != auth.AccountProfileID || result.ActualSourceAccount != ActualSourceAuthBinding {
+		t.Fatalf("actual account = (%q,%q)", result.ActualAccountRef, result.ActualSourceAccount)
+	}
+	if result.ActualInstallRef != installID || result.ActualSourceInstall != ActualSourceInstallBinding {
+		t.Fatalf("actual install = (%q,%q)", result.ActualInstallRef, result.ActualSourceInstall)
+	}
+	if result.ActualModel != "claude-sonnet-5" || result.ActualSourceModel != ActualSourceProviderStream {
+		t.Fatalf("actual model = (%q,%q)", result.ActualModel, result.ActualSourceModel)
+	}
+	if result.ActualEffort != "low" || result.ActualSourceEffort != ActualSourceAcceptedInvocation {
+		t.Fatalf("actual effort = (%q,%q)", result.ActualEffort, result.ActualSourceEffort)
 	}
 }
 

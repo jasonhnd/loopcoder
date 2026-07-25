@@ -51,6 +51,8 @@ func RehydrateForAutoRoute(live, durable Report, now time.Time) Report {
 	durableModels := append([]ModelCapability(nil), durable.ModelCapabilities...)
 	// Catalog snapshots may carry ProviderInstallationID used for model attach.
 	durableCatalogs := rewriteCatalogInstallIDs(append([]ModelCatalogSnapshot(nil), durable.ModelCatalogSnapshots...), installAlias)
+	out.ModelCapabilities = filterUnverifiedClaudeMRModels(out.ModelCapabilities, out.ModelCatalogSnapshots, now)
+	durableModels = filterUnverifiedClaudeMRModels(durableModels, durableCatalogs, now)
 
 	liveTrust := trustworthyQuotaByProvider(out.QuotaSnapshots)
 	durableTrust := trustworthyQuotaByProvider(durableSnaps)
@@ -121,7 +123,7 @@ func RehydrateForAutoRoute(live, durable Report, now time.Time) Report {
 	// Models: fill missing live catalog entries from durable when still fresh.
 	out.ModelCapabilities = rehydrateModels(out.ModelCapabilities, durableModels)
 	// Catalog snapshots: fill when live has no exact MR catalog for adapter.
-	out.ModelCatalogSnapshots = rehydrateCatalogSnapshots(out.ModelCatalogSnapshots, durableCatalogs)
+	out.ModelCatalogSnapshots = rehydrateCatalogSnapshots(out.ModelCatalogSnapshots, durableCatalogs, now)
 
 	// Live Installations remain sole host truth for Installed presence. Do not
 	// append durable installs as live-installed (RC36 review).
@@ -315,7 +317,7 @@ func rewriteCatalogInstallIDs(snaps []ModelCatalogSnapshot, alias map[string]str
 	return out
 }
 
-func rehydrateCatalogSnapshots(live, durable []ModelCatalogSnapshot) []ModelCatalogSnapshot {
+func rehydrateCatalogSnapshots(live, durable []ModelCatalogSnapshot, now time.Time) []ModelCatalogSnapshot {
 	if len(durable) == 0 {
 		return live
 	}
@@ -324,6 +326,7 @@ func rehydrateCatalogSnapshots(live, durable []ModelCatalogSnapshot) []ModelCata
 		if s.CatalogSourceKind == CatalogSourceProviderMachineReadable &&
 			s.Confidence == ConfidenceExact &&
 			s.FreshnessState == FreshnessFresh &&
+			(!strings.EqualFold(strings.TrimSpace(s.AdapterID), "claude") || ValidClaudeVerifiedSnapshot(s, now)) &&
 			s.EntryCount > 0 {
 			hasLiveAdapter[strings.ToLower(strings.TrimSpace(s.AdapterID))] = true
 		}
@@ -336,6 +339,9 @@ func rehydrateCatalogSnapshots(live, durable []ModelCatalogSnapshot) []ModelCata
 		if d.CatalogSourceKind != CatalogSourceProviderMachineReadable {
 			continue
 		}
+		if strings.EqualFold(strings.TrimSpace(d.AdapterID), "claude") && !ValidClaudeVerifiedSnapshot(d, now) {
+			continue
+		}
 		if d.Confidence != ConfidenceExact {
 			continue
 		}
@@ -344,6 +350,26 @@ func rehydrateCatalogSnapshots(live, durable []ModelCatalogSnapshot) []ModelCata
 			continue
 		}
 		out = append(out, d)
+	}
+	return out
+}
+
+func filterUnverifiedClaudeMRModels(models []ModelCapability, snapshots []ModelCatalogSnapshot, now time.Time) []ModelCapability {
+	valid := map[string]ModelCatalogSnapshot{}
+	for _, snapshot := range snapshots {
+		if ValidClaudeVerifiedSnapshot(snapshot, now) {
+			valid[snapshot.ModelCatalogSnapshotID] = snapshot
+		}
+	}
+	out := make([]ModelCapability, 0, len(models))
+	for _, model := range models {
+		if !strings.EqualFold(strings.TrimSpace(model.AdapterID), "claude") || !machineReadableExactFreshSource(model) {
+			out = append(out, model)
+			continue
+		}
+		if snapshot, ok := valid[model.ModelCatalogSnapshotID]; ok && ValidClaudeVerifiedCapability(snapshot, model, now) {
+			out = append(out, model)
+		}
 	}
 	return out
 }

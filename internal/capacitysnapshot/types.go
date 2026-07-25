@@ -1,6 +1,10 @@
 package capacitysnapshot
 
-import "time"
+import (
+	"time"
+
+	"github.com/jasonhnd/loopcoder/internal/providerinventory"
+)
 
 const (
 	SchemaSnapshot = "loopcoder.capacity_snapshot.v1"
@@ -118,4 +122,7 @@ type Snapshot struct {
 	// UnattendedOK is true only when at least one account can feed auto-route.
 	UnattendedOK bool     `json:"unattended_ok"`
 	Reasons      []string `json:"reasons,omitempty"`
+	// ClaudeCatalogReceipts bind paid account-scoped model/depth capability
+	// probes into the immutable route snapshot digest.
+	ClaudeCatalogReceipts []providerinventory.ClaudeCapabilityProbeReceipt `json:"claude_catalog_receipts,omitempty"`
 }

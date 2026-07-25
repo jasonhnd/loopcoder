@@ -602,8 +602,9 @@ var staticContract = Contract{
 			MCPConfig:           true,
 			Cancellation:        true,
 			TokenUsageReporting: true,
-			// No exact login-account binding shared with capacity inventory.
-			ExactAccountAffirm: false, ExactInstallAffirm: true, ExactDepthAffirm: true,
+			// Exact account binding is re-observed from the same executable's
+			// machine-readable auth status immediately before invocation.
+			ExactAccountAffirm: true, ExactInstallAffirm: true, ExactDepthAffirm: true,
 			ExactModelAffirm: true, ExactPermissionAffirm: true, ProductionEligible: true,
 			// `claude auth status --json` is a local machine-readable status
 			// surface with declared non-secret fields; LoopCoder persists only

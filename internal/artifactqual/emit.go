@@ -28,6 +28,7 @@ type EmitInput struct {
 	InventoryReportDigest string
 	Children              []CanaryChild
 	ProviderObs           []CanaryProviderObs
+	ClaudeCatalogReceipts []CanaryClaudeCatalogReceipt
 	Events                []workflowrun.Event
 	Claims                []workclaim.Claim
 	LedgerEntries         []capacityledger.Entry
@@ -213,6 +214,7 @@ func EmitCanaryEvidence(in EmitInput) (CanaryEvidence, error) {
 		InventoryProvenance:   in.InventoryProvenance,
 		InventoryReportDigest: in.InventoryReportDigest,
 		ProviderObservations:  in.ProviderObs,
+		ClaudeCatalogReceipts: append([]CanaryClaudeCatalogReceipt(nil), in.ClaudeCatalogReceipts...),
 		Children:              in.Children,
 		UnavailableRetry:      in.Unavailable,
 		Restart:               restart,

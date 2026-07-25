@@ -22,6 +22,7 @@ func DefaultModelMap() ModelMap {
 			{Provider: "claude", ModelID: "claude-opus-4-8[1m]", Class: ClassSoul},
 			{Provider: "claude", ModelID: "claude-opus-4-5", Class: ClassSoul},
 			{Provider: "claude", ModelID: "claude-sonnet-4-5", Class: ClassTera},
+			{Provider: "claude", ModelID: "claude-sonnet-5", Class: ClassTera},
 			{Provider: "claude", ModelID: "claude-haiku-4-5", Class: ClassLuna},
 			// Gemini
 			{Provider: "gemini", ModelID: "gemini-2.5-pro", Class: ClassSoul},

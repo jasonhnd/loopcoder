@@ -197,6 +197,7 @@ loopcoder version                             # print version and build informat
 loopcoder models                              # list provider model/depth registry
 loopcoder models --provider antigravity       # list agy-backed model choices
 loopcoder providers refresh --repo .          # refresh bounded provider CLI installation inventory
+loopcoder providers verify-claude-model --repo . --project-id <project-id> --model sonnet --effort low # explicit paid account-bound verified subset
 loopcoder budget smoke --repo . --project-id <project-id> --format json # exercise local quota usage budget accounting
 loopcoder audit --repo . --layer sast         # run read-only security audit
 loopcoder doctor --repo .                     # read-only readiness and migration report
@@ -365,6 +366,13 @@ default; their readiness or telemetry is `unknown`/`unavailable` with
 `network-permission-denied` or `network-denied`. The initial auth schema
 intentionally has no `expires_at` field because no current adapter exposes a
 credential-blind machine-readable expiry value.
+
+`providers refresh` never launches a paid Claude model. A Claude production
+route requires an explicit, budgeted
+`providers verify-claude-model` capability probe whose provider stream returns
+the exact account-bound model. Static Claude IDs and aliases remain hints only.
+See
+[`docs/reference/claude-observation.md`](docs/reference/claude-observation.md).
 
 ### Budget Accounting
 

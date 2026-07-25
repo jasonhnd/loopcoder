@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -76,6 +77,17 @@ func (ClaudeRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 			return Result{ExitCode: -1}, err
 		}
 	}
+	effectiveEnv := environmentWithOverrides(os.Environ(), inv.Environment)
+	executable := "claude"
+	var binding *claudeInvocationBinding
+	if strings.TrimSpace(inv.AccountRef) != "" || strings.TrimSpace(inv.InstallRef) != "" {
+		observed, err := preflightClaudeInvocationBinding(ctx, inv, effectiveEnv)
+		if err != nil {
+			return Result{ExitCode: -1, FailureClass: "auth_refusal", ActualProvider: "claude"}, err
+		}
+		binding = &observed
+		executable = observed.Executable
+	}
 
 	logFile, err := createSensitiveFile(inv.LogPath)
 	if err != nil {
@@ -84,8 +96,9 @@ func (ClaudeRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	defer logFile.Close()
 
 	var stdout bytes.Buffer
-	cmd := exec.CommandContext(ctx, "claude", BuildClaudeArgs(inv)...)
+	cmd := exec.CommandContext(ctx, executable, BuildClaudeArgs(inv)...)
 	cmd.Dir = inv.WorktreePath
+	cmd.Env = effectiveEnv
 	cmd.Stdin = strings.NewReader(inv.Prompt)
 	cmd.Stdout = io.MultiWriter(logFile, &stdout)
 	cmd.Stderr = logFile
@@ -96,11 +109,19 @@ func (ClaudeRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 	summary := parseClaudeSummary(stdout.Bytes())
 	metadata := parseClaudeInvocation(stdout.Bytes(), inv)
 	result := resultWithSupervision(supervisedExitCode(supervision, runErr), summary, metadata, startedAt, endedAt, supervision, runErr, ctx)
-	exe := ""
-	if p, err := exec.LookPath("claude"); err == nil {
-		exe = p
+	exe := executable
+	if executable == "claude" {
+		if p, err := exec.LookPath("claude"); err == nil {
+			exe = p
+		}
 	}
 	AffirmBasicActual(&result, "claude", exe, inv)
+	if binding != nil {
+		result.ActualAccountRef = binding.Auth.AccountProfileID
+		result.ActualSourceAccount = ActualSourceAuthBinding
+		result.ActualInstallRef = binding.Auth.ProviderInstallationID
+		result.ActualSourceInstall = ActualSourceInstallBinding
+	}
 	if strings.TrimSpace(result.ActualInstallRef) != "" {
 		result.ActualSourceInstall = ActualSourceInstallBinding
 	}
@@ -117,11 +138,12 @@ func (ClaudeRunner) Run(ctx context.Context, inv Invocation) (Result, error) {
 		ClearAcceptedActual(&result)
 		return result, nil
 	}
-	// Claude has no exact login-account binding shared with inventory.
-	if want := strings.TrimSpace(inv.AccountRef); want != "" && strings.TrimSpace(result.ActualAccountRef) == "" {
-		result.FailureClass = "auth_refusal"
-		ClearAcceptedActual(&result)
-		return result, fmt.Errorf("claude: exact AccountRef %q required but runner cannot affirm login-account identity", want)
+	if binding != nil {
+		if err := confirmClaudeInvocationBinding(ctx, *binding, effectiveEnv); err != nil {
+			result.FailureClass = "auth_refusal"
+			ClearAcceptedActual(&result)
+			return result, err
+		}
 	}
 	// FULL success: exact --effort/--model/permission option positions only.
 	AffirmAcceptedInvocation(&result, inv, argv, true, AcceptedInvocationOpts{

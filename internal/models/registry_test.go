@@ -116,8 +116,12 @@ func TestDefaultRegistryReturnsCopies(t *testing.T) {
 	registry.Providers[0].Name = "changed"
 	registry.Providers[0].Models[0].Name = "changed"
 	registry.Providers[0].Models[0].Depths[0].Token = "changed"
+	registry.Providers[1].Models[0].Aliases[0] = "changed"
 	if got := models.DefaultRegistry().Providers[0]; got.Name != "codex" || got.Models[0].Name != "gpt-5.5" || got.Models[0].Depths[0].Token != "low" {
 		t.Fatalf("DefaultRegistry leaked mutation: %#v", got)
+	}
+	if got := models.DefaultRegistry().Providers[1].Models[0].Aliases[0]; got != "opus" {
+		t.Fatalf("DefaultRegistry leaked alias mutation: %q", got)
 	}
 
 	provider, ok := models.LookupProvider("codex")

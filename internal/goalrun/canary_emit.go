@@ -115,7 +115,8 @@ func EmitCanaryFromResult(res Result, opts CanaryEmitOptions) (artifactqual.Cana
 		InventoryProvenance:   string(opts.InventoryProvenance),
 		InventoryReportDigest: res.InventoryReportDigest,
 		Children:              children, ProviderObs: obs, Events: events, Claims: claims,
-		LedgerEntries: res.CapacityLedgerEntries, EventLogPath: evPath,
+		ClaudeCatalogReceipts: canaryClaudeCatalogReceipts(res),
+		LedgerEntries:         res.CapacityLedgerEntries, EventLogPath: evPath,
 		ReuseCount: res.ReuseCount, WorktreePeak: res.WorktreePeak, ProcessPeak: res.ProcessPeak,
 		// Occupancy measured from workflowrun.Result at return (never invent zeros).
 		WorktreeActive: res.Workflow.WorktreeActive, ProcessActive: res.Workflow.ProcessActive,
@@ -140,6 +141,17 @@ func EmitCanaryFromResult(res Result, opts CanaryEmitOptions) (artifactqual.Cana
 		return ev, err
 	}
 	return ev, nil
+}
+
+func canaryClaudeCatalogReceipts(res Result) []artifactqual.CanaryClaudeCatalogReceipt {
+	out := make([]artifactqual.CanaryClaudeCatalogReceipt, 0, len(res.ClaudeCatalogReceipts))
+	for _, receipt := range res.ClaudeCatalogReceipts {
+		out = append(out, artifactqual.CanaryClaudeCatalogReceipt{
+			InventoryReportDigest: res.InventoryReportDigest,
+			Receipt:               receipt,
+		})
+	}
+	return out
 }
 
 // repoFromPRURL extracts owner/repo from a GitHub PR URL when possible.
