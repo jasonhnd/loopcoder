@@ -11,6 +11,14 @@ Every document is exactly one of these types:
   guidance, kept up to date as the implementation changes.
 - Process meta in this directory: workflow, backlog, learnings, and this index.
 
+> **v0.9.0 is stopped and unreleased.** The owner stopped development on
+> 2026-07-26 after the exact-artifact product objective remained unaccepted.
+> Read the
+> [`v0.9.0 development suspension report`](v0.9.0-development-suspension-report-2026-07-26.md)
+> before using any v0.9 reference. Those references describe a stopped
+> implementation snapshot and do not authorize installation, resumption, or
+> release.
+
 ## Index
 
 - [`PROCESS.md`](PROCESS.md): mandatory doc-first workflow.
@@ -20,6 +28,7 @@ Every document is exactly one of these types:
 - [`product-evolution.md`](product-evolution.md): historical product decisions from v0.6 through v0.8 and links to their authoritative specs.
 - [`self-hosting-playbook.md`](self-hosting-playbook.md): mandatory scope, resource, progress, retry, verification, and cleanup controls for LoopCoder developing itself.
 - [`v0.8.0-retrospective.md`](v0.8.0-retrospective.md): sanitized engineering retrospective and corrective-action record for the v0.8.0 cycle.
+- [`v0.9.0-development-suspension-report-2026-07-26.md`](v0.9.0-development-suspension-report-2026-07-26.md): authoritative v0.9 project-stop record, including objective, chronology, quantitative scope, RC evidence, failure analysis, exact snapshot, lessons, and resume conditions.
 - [`reference/audit.md`](reference/audit.md): read-only security audit command.
 - [`reference/architecture.md`](reference/architecture.md): current system map.
 - [`reference/development-release-checklist.md`](reference/development-release-checklist.md): reusable intake-to-publication evidence checklist and GO/NO-GO matrix.

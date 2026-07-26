@@ -9,35 +9,28 @@
 [![Claude Code Skill](https://img.shields.io/badge/Claude%20Code-Skill-green.svg)](SKILL.md)
 [![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-black.svg)](docs/specs/0884-macos-arm64-only.md)
 
-[What it is](#what-it-is) | [v0.9 candidate quickstart](#v09-candidate-quickstart-pre-prod-not-the-public-release) | [The loop](#the-loop) | [Install](#install) | [Usage](#usage) | [Upgrade](#upgrade-from-070-080-to-081) | [How it works](#how-it-works) | [Design](#design)
+[What it is](#what-it-is) | [v0.9 stopped](#v09-development-stopped) | [The loop](#the-loop) | [Install](#install) | [Usage](#usage) | [Upgrade](#upgrade-from-070-080-to-081) | [How it works](#how-it-works) | [Design](#design)
 
 </div>
 
-## v0.9 candidate quickstart (pre-prod; not the public release)
+## v0.9 development stopped
 
-**Public install remains v0.8.1** until an owner GO publishes v0.9.0. The v0.9
-candidate lives on `pre-prod` and is documented in:
+The owner stopped v0.9.0 development on 2026-07-26 because the complete product
+acceptance objective was not achieved. v0.9.0 is **NO-GO, untagged, and
+unreleased**. `v0.8.1` remains the latest public release.
 
-- [`docs/reference/v0.9.0-quickstart.md`](docs/reference/v0.9.0-quickstart.md)
-- [`docs/reference/v0.9.0-capability-matrix.md`](docs/reference/v0.9.0-capability-matrix.md)
-  (must match `loopcoder capabilities --format json`)
+The stopped `pre-prod` SHA and internal `0.9.0-rc.61` archive are preserved as
+historical engineering evidence only. RC61 was draft-only and its final live
+consumer canary and exact-artifact qualifier were not run. Do not install,
+publish, or resume a v0.9 candidate without a new explicit owner decision.
 
-```bash
-# Against a candidate binary / exact RC archive — not assumed on public PATH
-loopcoder doctor --format json
-loopcoder capabilities --format json
-loopcoder run --repo <path> --issue <n> --provider <p> --model <m> --dry-run --format json
-loopcoder workflow run --fixture one --format json
-loopcoder migrate export-v08 --fixture --export-dir /tmp/v08-export
-loopcoder diagnose --project-id <id> --dry-run --format json
-loopcoder qualify --archive dist/loopcoder_*.tar.gz --digest <sha256>
-```
-
-Ordinary development uses isolated worktrees/PRs and a **human merge gate**. Do
-**not** run `loopcoder compile`, `dispatch`, or `tick` against this repository
-(self-bootstrap is unsupported). Prefer explicit direct run / auto-route,
-bounded workflow, global/project stores (no production `<repo>/.loopcoder`
-runtime writes), and terminal GitHub rehydration for cross-Mac handoff.
+Read the authoritative
+[`v0.9.0 development suspension report`](docs/v0.9.0-development-suspension-report-2026-07-26.md)
+for the objective, chronology, work completed, failed acceptance evidence,
+root-cause analysis, exact stop snapshot, lessons, and conditions for any
+future resume. The v0.9 quickstart and capability matrix remain in the
+repository as stopped-SHA implementation records; they are not current release
+instructions.
 
 ## What it is
 
@@ -534,6 +527,11 @@ optional (recommended for Gatekeeper-friendly public downloads). See the
 [`capability matrix`](docs/reference/v0.8.0-capability-matrix.md), and
 [host progress visibility contracts](docs/reference/progress-hosts.md). The
 repository keeps `gate: human-merge` for LoopCoder-core safety.
+
+v0.9.0 development was stopped by the owner on 2026-07-26. No v0.9 tag or
+public release exists, and the last internal draft archive did not complete the
+required live exact-artifact acceptance. See the
+[`v0.9.0 development suspension report`](docs/v0.9.0-development-suspension-report-2026-07-26.md).
 
 v0.7.0 remains available as the final legacy multi-platform release. v0.8.0
 remains the prior Darwin arm64 public tag. Historical
