@@ -54,8 +54,16 @@ func MeasureCROFromBinary(bin, workDir string, envBase []string) (CROMeasurement
 	}
 	home := filepath.Join(workDir, "cro-home")
 	_ = os.MkdirAll(home, 0o700)
+	taskPayload := filepath.Join(workDir, "cro-task.md")
+	if err := os.WriteFile(taskPayload, []byte("Measure structural capacity-aware routing for exact-artifact qualification.\n"), 0o600); err != nil {
+		return out, err
+	}
+	probeRepo, err := initProbeRepo(workDir, "cro-repo")
+	if err != nil {
+		return out, err
+	}
 	env := append([]string{}, envBase...)
-	env = append(env, "LOOPCODER_HOME="+home, "HOME="+home)
+	env = append(env, "LOOPCODER_HOME="+home, "HOME="+home, "LOOPCODER_TASK_PAYLOAD="+taskPayload)
 
 	// 1) WorkGraph decomposition via exact binary
 	t0 := time.Now()
@@ -88,31 +96,45 @@ func MeasureCROFromBinary(bin, workDir string, envBase []string) (CROMeasurement
 	}
 	t1 := time.Now()
 	routeOut, routeErr, routeCode := runBin(bin, env, workDir, "run",
-		"--repo", "acme/cro-qual", "--issue", "1343",
+		"--repo", probeRepo, "--issue", "1343",
 		"--auto-route", "--dry-run", "--format", "json",
 		"--ui-required", "terminal",
 		"--capacity-snapshot", snapPath)
 	combined := string(routeOut) + string(routeErr)
 	routed := strings.Contains(combined, "auto-route selected") || strings.Contains(combined, "task class=")
-	capLine := strings.Contains(combined, "capacity policy=")
-	out.RoutingOK = routed && (capLine || routeCode == 0)
-	out.AccountingOK = capLine && (strings.Contains(combined, "before=") || strings.Contains(combined, "capacity_before") || strings.Contains(combined, "reserved="))
+	out.RoutingOK = routed && routeCode == 0
 	if strings.Contains(combined, "use-before-reset") {
 		out.EvidenceRefs["policy"] = "probe:use_before_reset"
 	}
 	out.Probes = append(out.Probes, Probe{
-		Name: "cro_auto_route_capacity", ExitCode: routeCode, Passed: out.RoutingOK && out.AccountingOK,
+		Name: "cro_auto_route_capacity", ExitCode: routeCode, Passed: out.RoutingOK,
 		Duration: time.Since(t1), OutputDigest: digestBytes([]byte(combined)),
-		Reasons: reasonsIf(!out.RoutingOK || !out.AccountingOK, "routing/capacity path incomplete: "+truncate(combined, 200)),
+		Reasons: reasonsIf(!out.RoutingOK, "routing snapshot path incomplete: "+truncate(combined, 200)),
 	})
-	if out.AccountingOK {
-		out.EvidenceRefs["accounting"] = "probe:capacity_ledger_path"
-	}
 	if out.RoutingOK {
 		out.EvidenceRefs["routing"] = "probe:run_auto_route_capacity"
 	}
 
-	// 3) Multi-provider presence: providers status from binary if available
+	// 3) Structural accounting is a separate exact-binary reserve->commit->release
+	// smoke. run --dry-run correctly never reserves, so its output cannot prove
+	// accounting. This isolated budget probe remains structural only; real
+	// provider capacity before/actual/after still requires CanaryEvidence.
+	tBudget := time.Now()
+	budgetOut, budgetErr, budgetCode := runBin(bin, env, workDir, "budget", "smoke",
+		"--repo", probeRepo, "--project-id", "proj_cro_qualify",
+		"--idempotency-key", "cro-exact-binary-accounting", "--format", "json")
+	budgetCombined := string(budgetOut) + string(budgetErr)
+	out.AccountingOK = budgetCode == 0 && validateCROBudgetAccounting(budgetOut)
+	out.Probes = append(out.Probes, Probe{
+		Name: "cro_budget_accounting", ExitCode: budgetCode, Passed: out.AccountingOK,
+		Duration: time.Since(tBudget), OutputDigest: digestBytes([]byte(budgetCombined)),
+		Reasons: reasonsIf(!out.AccountingOK, "reserve/commit/release path incomplete: "+truncate(budgetCombined, 200)),
+	})
+	if out.AccountingOK {
+		out.EvidenceRefs["accounting"] = "probe:budget_reserve_commit_release"
+	}
+
+	// 4) Multi-provider presence: providers status from binary if available
 	t2 := time.Now()
 	provOut, _, provCode := runBin(bin, env, workDir, "providers", "status", "--format", "json")
 	out.Probes = append(out.Probes, Probe{
@@ -131,7 +153,7 @@ func MeasureCROFromBinary(bin, workDir string, envBase []string) (CROMeasurement
 		}
 	}
 
-	// 4) Structural only: plan carries multi-depth requirements (low+high).
+	// 5) Structural only: plan carries multi-depth requirements (low+high).
 	// Dry-run route preview may show requirement→selection text, but that is
 	// NOT real provider execution and MUST NOT set real_runtime multi_depth.
 	hasLow := strings.Contains(string(planOut), "depth=low")
@@ -145,7 +167,7 @@ func MeasureCROFromBinary(bin, workDir string, envBase []string) (CROMeasurement
 	goalOut, goalErr, goalCode := runBin(bin, env, workDir, "workflow", "goal",
 		"--goal", "implement multi-provider capacity-aware routing with tests and verification",
 		"--issue", "1343", "--format", "json", "--dry-run",
-		"--repo", workDir,
+		"--repo", probeRepo,
 		"--capacity-snapshot", snapPath)
 	goalCombined := string(goalOut) + string(goalErr)
 	// Parse Planned* structural fields; actual usage must stay empty on dry-run.
@@ -184,7 +206,7 @@ func MeasureCROFromBinary(bin, workDir string, envBase []string) (CROMeasurement
 		Reasons: []string{"structural_only: dry-run Planned* only; actual multi_provider/multi_depth stay false"},
 	})
 
-	// 5) Structural only: injected exhausted snapshot routing (deterministic).
+	// 6) Structural only: injected exhausted snapshot routing (deterministic).
 	// NOT real unavailable retry / no-dup claim evidence.
 	exPath := filepath.Join(workDir, "cro-exhausted-snapshot.json")
 	if err := writeCROExhaustedSnapshot(exPath); err != nil {
@@ -192,7 +214,7 @@ func MeasureCROFromBinary(bin, workDir string, envBase []string) (CROMeasurement
 	}
 	t4 := time.Now()
 	exOut, exErr, exCode := runBin(bin, env, workDir, "run",
-		"--repo", "acme/cro-excl", "--issue", "1343",
+		"--repo", probeRepo, "--issue", "1343",
 		"--auto-route", "--dry-run", "--format", "json",
 		"--ui-required", "terminal",
 		"--capacity-snapshot", exPath)
@@ -219,9 +241,54 @@ func MeasureCROFromBinary(bin, workDir string, envBase []string) (CROMeasurement
 		return out, fmt.Errorf("artifactqual: structural useful-capacity routing path not measured")
 	}
 	if !out.AccountingOK {
-		return out, fmt.Errorf("artifactqual: structural capacity accounting path not measured")
+		return out, fmt.Errorf("artifactqual: structural capacity accounting path not measured: %s", truncate(budgetCombined, 240))
 	}
 	return out, nil
+}
+
+func validateCROBudgetAccounting(raw []byte) bool {
+	type phase struct {
+		Reservation struct {
+			ID        string `json:"budget_reservation_id"`
+			Reserved  int64  `json:"reserved_value"`
+			Committed int64  `json:"committed_value"`
+			Released  int64  `json:"released_value"`
+			State     string `json:"state"`
+		} `json:"reservation"`
+		Replay bool `json:"replay"`
+	}
+	var payload struct {
+		OK        bool  `json:"ok"`
+		Reserved  phase `json:"reserved"`
+		Committed phase `json:"committed"`
+		Released  phase `json:"released"`
+	}
+	if json.Unmarshal(raw, &payload) != nil || !payload.OK {
+		return false
+	}
+	id := payload.Reserved.Reservation.ID
+	if id == "" || payload.Committed.Reservation.ID != id || payload.Released.Reservation.ID != id {
+		return false
+	}
+	if payload.Reserved.Replay || payload.Committed.Replay || payload.Released.Replay {
+		return false
+	}
+	if payload.Reserved.Reservation.State != "active" ||
+		payload.Reserved.Reservation.Reserved != 40 ||
+		payload.Reserved.Reservation.Committed != 0 ||
+		payload.Reserved.Reservation.Released != 0 {
+		return false
+	}
+	if payload.Committed.Reservation.State != "partially-committed" ||
+		payload.Committed.Reservation.Reserved != 15 ||
+		payload.Committed.Reservation.Committed != 25 ||
+		payload.Committed.Reservation.Released != 0 {
+		return false
+	}
+	return payload.Released.Reservation.State == "released" &&
+		payload.Released.Reservation.Reserved == 0 &&
+		payload.Released.Reservation.Committed == 25 &&
+		payload.Released.Reservation.Released == 15
 }
 
 func runBin(bin string, env []string, dir string, args ...string) (stdout, stderr []byte, code int) {

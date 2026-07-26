@@ -527,6 +527,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if args[0] == "supervise" {
 		return runDetachedCommandSupervisor(args[1:], stdout, stderr, deps)
 	}
+	if args[0] == "_qualify-ui-probe" {
+		return runQualifyUIProbe(args[1:], stdout, stderr, deps)
+	}
 
 	command, ok := findCommand(args[0])
 	if !ok {
