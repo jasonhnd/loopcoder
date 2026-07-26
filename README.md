@@ -32,6 +32,12 @@ future resume. The v0.9 quickstart and capability matrix remain in the
 repository as stopped-SHA implementation records; they are not current release
 instructions.
 
+For documentation inventory only, the stopped snapshot registered
+`loopcoder capabilities`, `loopcoder diagnose`, and `loopcoder qualify`.
+Their names are retained here so source and command documentation remain
+consistent; this is not an instruction to run them or evidence that a v0.9
+candidate was accepted.
+
 ## What it is
 
 loopcoder is a local delivery-loop toolkit. Its intended workflow turns a need
