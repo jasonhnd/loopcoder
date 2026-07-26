@@ -60,15 +60,17 @@ type ProcessStart struct {
 
 // ChildExecInput is one LoopCoder-owned child launch request.
 type ChildExecInput struct {
-	ProjectID  string
-	RunID      string
-	GraphID    string
-	WorkItemID string
-	ClaimID    string
-	AttemptID  string
-	Intent     string
-	Route      ChildRoute
-	RepoPath   string
+	ProjectID           string
+	RunID               string
+	GraphID             string
+	ExecutionPlanDigest string
+	GraphDigest         string
+	WorkItemID          string
+	ClaimID             string
+	AttemptID           string
+	Intent              string
+	Route               ChildRoute
+	RepoPath            string
 	// BaseRef is the git ref to materialize the child worktree from (goal branch
 	// HEAD after prior integrations). Empty → HEAD of RepoPath.
 	BaseRef string
@@ -132,6 +134,11 @@ type ChildExecResult struct {
 	ArgvDigest   string
 	FailureClass string
 	Message      string
+	// Structured verifier decision from the exact provider-machine-readable
+	// verdict. Empty on non-verifier children and all pre-verdict failures.
+	VerifierDecision        string
+	VerifierVerdictDigest   string
+	VerifierReviewedHeadSHA string
 	// InvokedRoute is the actual invocation metadata the executor used.
 	// Service exact-compares this to ChildExecInput.Route before success;
 	// never copy route from the request into ChildOutcome without this echo.
@@ -341,11 +348,32 @@ func (f FakeChildExecutor) Execute(ctx context.Context, in ChildExecInput) (Chil
 	// ForceProcessPID never attaches production authority to the current process.
 	// It is ignored for durable spawn identity (no OnProcessStart, SpawnObserved=false).
 	_ = f.ForceProcessPID
-	return withRoute(ChildExecResult{
+	result := ChildExecResult{
 		Terminal: workgraph.TermSucceeded, OutputEvidence: digest, WorktreePath: wt,
 		ExitCode: 0, FilesTouched: files, ActualSource: "unknown",
 		Message: "fake_executor_ok",
-	}, route), nil
+	}
+	if ClassifyTaskRole(in.WorkItemID, in.Intent, "") == RoleVerify &&
+		in.ExecutionPlanDigest != "" && in.GraphDigest != "" {
+		if head, herr := verifierReviewedHead(wt); herr == nil {
+			fixtureVerdict := VerifierVerdict{
+				Schema: VerifierVerdictSchema, Decision: VerifierDecisionPass,
+				ProjectID: in.ProjectID, RunID: in.RunID, GraphID: in.GraphID,
+				ExecutionPlanDigest: in.ExecutionPlanDigest, GraphDigest: in.GraphDigest,
+				WorkItemID: in.WorkItemID, AttemptID: in.AttemptID, ReviewedHeadSHA: head,
+				Summary:  "Fixture verifier found no blocking defects in the exact integrated test head.",
+				Findings: []VerifierFinding{},
+			}
+			if raw, merr := json.Marshal(fixtureVerdict); merr == nil {
+				if parsed, verdictDigest, perr := parseVerifierVerdict(string(raw), in, head); perr == nil {
+					result.VerifierDecision = parsed.Decision
+					result.VerifierVerdictDigest = verdictDigest
+					result.VerifierReviewedHeadSHA = parsed.ReviewedHeadSHA
+				}
+			}
+		}
+	}
+	return withRoute(result, route), nil
 }
 
 func appendInvocationCount(path, workItemID string) error {
@@ -550,6 +578,37 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	if prompt == "" {
 		prompt = "bounded LoopCoder child work item " + in.WorkItemID
 	}
+	role := ClassifyTaskRole(in.WorkItemID, in.Intent, "")
+	verifierHead := ""
+	verifierSchema := ""
+	if role == RoleVerify {
+		if in.ProjectID == "" || in.RunID == "" || in.GraphID == "" ||
+			in.ExecutionPlanDigest == "" || in.GraphDigest == "" ||
+			in.WorkItemID != "wi_verify" || in.AttemptID == "" {
+			return ChildExecResult{
+				Terminal: workgraph.TermFailed, FailureClass: FailureClassVerifierInvalid,
+				Message: "verifier invocation identity incomplete", WorktreePath: wt,
+				Provider: prov, Model: model, Depth: depth, ActualSource: "unknown",
+			}, fmt.Errorf("workflowrun: verifier invocation identity incomplete")
+		}
+		verifierHead, err = verifierReviewedHead(wt)
+		if err != nil {
+			return ChildExecResult{
+				Terminal: workgraph.TermFailed, FailureClass: FailureClassVerifierInvalid,
+				Message: err.Error(), WorktreePath: wt,
+				Provider: prov, Model: model, Depth: depth, ActualSource: "unknown",
+			}, err
+		}
+		verifierSchema, err = verifierVerdictSchema(in, verifierHead)
+		if err != nil {
+			return ChildExecResult{
+				Terminal: workgraph.TermFailed, FailureClass: FailureClassVerifierInvalid,
+				Message: err.Error(), WorktreePath: wt,
+				Provider: prov, Model: model, Depth: depth, ActualSource: "unknown",
+			}, err
+		}
+		prompt = verifierPrompt(prompt, in, verifierHead)
+	}
 	if in.Route.CapabilityProbeOnly {
 		if !in.ReadOnly || strings.TrimSpace(in.Route.Permission) != "read-only" {
 			return ChildExecResult{
@@ -590,6 +649,7 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 		BoundedWrite:        !in.ReadOnly,
 		DisableDelegation:   true,
 		CapabilityProbeOnly: in.Route.CapabilityProbeOnly,
+		OutputSchema:        verifierSchema,
 		Role:                "nested-bounded-write",
 		LogPath:             logPath,
 		RunID:               in.AttemptID,
@@ -807,8 +867,45 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	if digErr != nil {
 		return failProductDigest(digErr)
 	}
+	var verifierVerdict VerifierVerdict
+	verifierVerdictDigest := ""
+	if role == RoleVerify {
+		var verr error
+		verifierVerdict, verifierVerdictDigest, verr = parseVerifierVerdict(res.Summary, in, verifierHead)
+		if verr != nil {
+			out := ChildExecResult{
+				Terminal: workgraph.TermFailed, WorktreePath: wt,
+				FailureClass: FailureClassVerifierInvalid, Message: verr.Error(),
+				Provider: actualProv, Model: actualModel, Depth: actualDepth,
+				ActualSource: "unknown",
+				InvokedRoute: ChildRoute{
+					Provider: actualProv, Model: actualModel, Depth: actualDepth,
+					Permission: actualPerm, AccountRef: actualAcct, InstallRef: actualInstall,
+				},
+			}
+			bindSources(&out)
+			bindSpawn(&out)
+			out = attachUsage(out, res)
+			return out, verr
+		}
+		if merr := materializeStructuredVerifierVerdict(wt, verifierVerdict); merr != nil {
+			out := ChildExecResult{
+				Terminal: workgraph.TermFailed, WorktreePath: wt,
+				FailureClass: FailureClassVerifierVerdictMaterialization, Message: merr.Error(),
+				Provider: actualProv, Model: actualModel, Depth: actualDepth,
+				ActualSource: "unknown",
+			}
+			bindSources(&out)
+			bindSpawn(&out)
+			out = attachUsage(out, res)
+			return out, merr
+		}
+		digest, files, digErr = productOutputDigest(wt)
+		if digErr != nil {
+			return failProductDigest(digErr)
+		}
+	}
 	if strings.TrimSpace(digest) == "" {
-		role := ClassifyTaskRole(in.WorkItemID, in.Intent, "")
 		var merr error
 		var fc string
 		switch role {
@@ -913,6 +1010,20 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	invoked := observedInvokedRoute(
 		in.Route, actualProv, actualModel, actualDepth, actualPerm, actualAcct, actualInstall,
 	)
+	if role == RoleVerify {
+		if routeErr := exactRouteMatch(in.Route, invoked); routeErr != nil {
+			out := ChildExecResult{
+				Terminal: workgraph.TermFailed, OutputEvidence: digest, WorktreePath: wt,
+				ExitCode: 1, FailureClass: "route_mismatch", Message: routeErr.Error(),
+				Provider: actualProv, Model: actualModel, Depth: actualDepth,
+				FilesTouched: files, ActualSource: "unknown", InvokedRoute: invoked,
+			}
+			bindSources(&out)
+			bindSpawn(&out)
+			out = attachUsage(out, res)
+			return out, routeErr
+		}
+	}
 	// Production success requires a real spawn-time identity callback while the
 	// process was alive — never invent PID after Run returns.
 	if !spawnSeen {
@@ -934,10 +1045,38 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 		bindSpawn(&out)
 		return out, err
 	}
+	// A negative verifier verdict is authoritative only after the exact invoked
+	// route and supervised process identity have passed the same checks required
+	// for a positive verdict. A mismatched route must never mint durable
+	// verifier evidence, even though both paths fail closed before integration.
+	if role == RoleVerify && verifierVerdict.Decision != VerifierDecisionPass {
+		failureClass := FailureClassVerifierFailed
+		if verifierVerdict.Decision == VerifierDecisionNeedsHuman {
+			failureClass = FailureClassVerifierHuman
+		}
+		out := ChildExecResult{
+			Terminal: workgraph.TermFailed, OutputEvidence: digest, WorktreePath: wt,
+			ExitCode: res.ExitCode, FailureClass: failureClass,
+			Message:  verifierVerdict.Summary,
+			Provider: invoked.Provider, Model: invoked.Model, Depth: invoked.Depth,
+			FilesTouched:            files,
+			VerifierDecision:        verifierVerdict.Decision,
+			VerifierVerdictDigest:   verifierVerdictDigest,
+			VerifierReviewedHeadSHA: verifierVerdict.ReviewedHeadSHA,
+		}
+		bindSources(&out)
+		bindSpawn(&out)
+		out.InvokedRoute = invoked
+		out = attachUsage(out, res)
+		return out, nil
+	}
 	out := ChildExecResult{
 		Terminal: workgraph.TermSucceeded, OutputEvidence: digest, WorktreePath: wt,
-		ExitCode: 0, Message: firstNonEmpty(res.Summary, "provider_ok"),
+		ExitCode: 0, Message: firstNonEmpty(verifierVerdict.Summary, res.Summary, "provider_ok"),
 		Provider: invoked.Provider, Model: invoked.Model, Depth: invoked.Depth, FilesTouched: files,
+		VerifierDecision:        verifierVerdict.Decision,
+		VerifierVerdictDigest:   verifierVerdictDigest,
+		VerifierReviewedHeadSHA: verifierVerdict.ReviewedHeadSHA,
 	}
 	bindSources(&out)
 	bindSpawn(&out)

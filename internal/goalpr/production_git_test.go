@@ -99,10 +99,12 @@ func TestOpenProductionGitTracksReceiptWhenLoopCoderIsIgnored(t *testing.T) {
 	branch := "loopcoder/goal-" + runID
 	runGitTest(t, repo, "checkout", "-b", branch)
 	writeTestFile(t, filepath.Join(repo, "slug", "slug.go"), "package slug\n")
+	writeTestFile(t, filepath.Join(repo, "slug", "slug_test.go"), "package slug\n")
 	writeTestFile(t, filepath.Join(repo, "verdict.md"), "verified\n")
 	writeTestFile(t, filepath.Join(repo, ".loopcoder", "runtime", "state.json"), "{}\n")
-	runGitTest(t, repo, "add", "slug/slug.go", "verdict.md")
+	runGitTest(t, repo, "add", "slug/slug.go", "slug/slug_test.go", "verdict.md")
 	runGitTest(t, repo, "commit", "-m", "integrate product")
+	reviewedHead := strings.TrimSpace(runGitTest(t, repo, "rev-parse", "HEAD"))
 
 	off := false
 	host := &fakeHost{}
@@ -117,9 +119,18 @@ func TestOpenProductionGitTracksReceiptWhenLoopCoderIsIgnored(t *testing.T) {
 				OutputEvidence: fullSHA256("implement"), FilesTouched: []string{"slug/slug.go"},
 			},
 			{
+				WorkItemID: "wi_tests", TaskClass: "tera", Terminal: "succeeded",
+				AttemptID: "att-tests", Provider: "codex",
+				OutputEvidence: fullSHA256("tests"), FilesTouched: []string{"slug/slug_test.go"},
+				IntegrateCommitSHA: reviewedHead,
+			},
+			{
 				WorkItemID: "wi_verify", TaskClass: "soul", Terminal: "succeeded",
 				AttemptID: "att-verify", Provider: "claude",
 				OutputEvidence: fullSHA256("verify"), FilesTouched: []string{"verdict.md"},
+				VerifierDecision:        workflowrun.VerifierDecisionPass,
+				VerifierVerdictDigest:   fullSHA256("verdict"),
+				VerifierReviewedHeadSHA: reviewedHead,
 			},
 		},
 		InstallMeaningfulCI: &off,

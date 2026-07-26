@@ -170,7 +170,6 @@ func Open(ctx context.Context, req Request) (Result, error) {
 	if okKids == 0 {
 		return out, fmt.Errorf("%w: no succeeded children with output evidence", ErrNotReady)
 	}
-
 	base := strings.TrimSpace(req.BaseRef)
 	if base == "" {
 		base = "main"
@@ -203,6 +202,13 @@ func Open(ctx context.Context, req Request) (Result, error) {
 	if strings.Contains(strings.ToLower(body), "auto-merge: true") ||
 		strings.Contains(strings.ToLower(body), "automerged") {
 		return out, fmt.Errorf("%w: body must not request auto-merge", ErrAutoMerge)
+	}
+	// Bind the exact structured verifier verdict before any branch checkout, CI
+	// write, commit, receipt, push, or PR side effect. Provider exit-zero and
+	// prose are never sufficient.
+	verProv, verAtt, verEv := bindVerifierFromChildren(req.Children, req.IndependentVerifier, req.VerifierEvidence)
+	if verProv == "" || verAtt == "" || verEv == "" {
+		return out, fmt.Errorf("%w: passing structured wi_verify verdict required", ErrNotReady)
 	}
 
 	git := req.Git
@@ -262,12 +268,6 @@ func Open(ctx context.Context, req Request) (Result, error) {
 	}
 	if len(req.RequiredCheckNames) == 0 && installCI {
 		req.RequiredCheckNames = MeaningfulCheckNames()
-	}
-
-	// Bind independent verifier from structured children only (no pin/prose fallback).
-	verProv, verAtt, verEv := bindVerifierFromChildren(req.Children, req.IndependentVerifier, req.VerifierEvidence)
-	if verProv == "" || verAtt == "" || verEv == "" {
-		return out, fmt.Errorf("%w: verifier evidence required from structured wi_verify child", ErrNotReady)
 	}
 
 	// Durable receipt in-repo (product file, not hand-filled canary manifest).
@@ -412,7 +412,7 @@ func Open(ctx context.Context, req Request) (Result, error) {
 func bindVerifierFromChildren(children []workflowrun.ChildOutcome, pinProv, pinEv string) (provider, attemptID, evidence string) {
 	_ = pinProv
 	_ = pinEv
-	var verifyKids, implementKids []workflowrun.ChildOutcome
+	var verifyKids, implementKids, testKids []workflowrun.ChildOutcome
 	for _, c := range children {
 		if !strings.EqualFold(strings.TrimSpace(c.Terminal), "succeeded") {
 			continue
@@ -429,13 +429,19 @@ func bindVerifierFromChildren(children []workflowrun.ChildOutcome, pinProv, pinE
 				continue
 			}
 			implementKids = append(implementKids, c)
+		case "wi_tests":
+			if strings.TrimSpace(c.TaskClass) != "tera" {
+				continue
+			}
+			testKids = append(testKids, c)
 		}
 	}
-	if len(verifyKids) != 1 || len(implementKids) != 1 {
+	if len(verifyKids) != 1 || len(implementKids) != 1 || len(testKids) != 1 {
 		return "", "", ""
 	}
 	v := verifyKids[0]
 	imp := implementKids[0]
+	tests := testKids[0]
 	if strings.TrimSpace(v.Provider) == "" || strings.TrimSpace(v.AttemptID) == "" {
 		return "", "", ""
 	}
@@ -445,10 +451,30 @@ func bindVerifierFromChildren(children []workflowrun.ChildOutcome, pinProv, pinE
 	if !isExactSHA256Digest(v.OutputEvidence) {
 		return "", "", ""
 	}
+	if v.VerifierDecision != workflowrun.VerifierDecisionPass ||
+		!isExactSHA256Digest(v.VerifierVerdictDigest) ||
+		!isExactGitOID(v.VerifierReviewedHeadSHA) ||
+		strings.TrimSpace(tests.IntegrateCommitSHA) == "" ||
+		v.VerifierReviewedHeadSHA != tests.IntegrateCommitSHA {
+		return "", "", ""
+	}
 	if strings.EqualFold(strings.TrimSpace(v.Provider), strings.TrimSpace(imp.Provider)) {
 		return "", "", ""
 	}
 	return strings.TrimSpace(v.Provider), strings.TrimSpace(v.AttemptID), strings.TrimSpace(v.OutputEvidence)
+}
+
+func isExactGitOID(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // isExactSHA256Digest is true for "sha256:" + exactly 64 hex digits.

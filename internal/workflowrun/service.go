@@ -256,6 +256,12 @@ type ChildOutcome struct {
 	// ArgvDigest is redacted exact launched argv fingerprint when known.
 	ArgvDigest   string   `json:"argv_digest,omitempty"`
 	FilesTouched []string `json:"files_touched,omitempty"`
+	// Exact structured verifier receipt fields. These are required for
+	// wi_verify success reuse and goal-PR binding; prose/exit-zero is never a
+	// substitute.
+	VerifierDecision        string `json:"verifier_decision,omitempty"`
+	VerifierVerdictDigest   string `json:"verifier_verdict_digest,omitempty"`
+	VerifierReviewedHeadSHA string `json:"verifier_reviewed_head_sha,omitempty"`
 	// IntegrateCommitSHA is the goal-branch commit that absorbed this child (if any).
 	IntegrateCommitSHA string `json:"integrate_commit_sha,omitempty"`
 	// SupersedesAttemptID when this outcome is a generation-safe alternate.
@@ -1028,7 +1034,8 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 			readOnly := strings.EqualFold(cc.Permission, "read-only")
 
 			childIn := ChildExecInput{
-				ProjectID: projectID, RunID: runID, GraphID: g.GraphID, WorkItemID: id,
+				ProjectID: projectID, RunID: runID, GraphID: g.GraphID,
+				ExecutionPlanDigest: out.PlanDigest, GraphDigest: out.GraphDigest, WorkItemID: id,
 				ClaimID: res.Claim.ClaimID, AttemptID: attemptID,
 				Intent: it.Intent, Route: route, RepoPath: req.RepoPath,
 				// Materialize child from goal branch so prior integrations are visible.
@@ -1389,8 +1396,11 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 					Permission: childOut.ActualSources.Permission, Account: childOut.ActualSources.Account,
 					Install: childOut.ActualSources.Install,
 				},
-				ArgvDigest:   childOut.ArgvDigest,
-				FilesTouched: childOut.FilesTouched,
+				ArgvDigest:              childOut.ArgvDigest,
+				FilesTouched:            childOut.FilesTouched,
+				VerifierDecision:        childOut.VerifierDecision,
+				VerifierVerdictDigest:   childOut.VerifierVerdictDigest,
+				VerifierReviewedHeadSHA: childOut.VerifierReviewedHeadSHA,
 			}
 
 			term := childOut.Terminal
@@ -1541,6 +1551,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 					"generation":      fmt.Sprintf("%d", genn),
 				}
 				payload = mergePayloadStringMap(payload, childRoutePayloadFields(route))
+				payload = mergePayloadStringMap(payload, verifierVerdictPayloadFields(outc))
 				// Matching typed pair for Service forced cancel (not hard_kill_recovery).
 				// forced_interrupt/service_forced_interrupt is legal ONLY with the durable
 				// interrupt_id from the Service-emitted interrupt branch.
@@ -1619,6 +1630,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 					"output_evidence": evid,
 				}
 				payload = mergePayloadStringMap(payload, childRoutePayloadFields(route))
+				payload = mergePayloadStringMap(payload, verifierVerdictPayloadFields(outc))
 				if supersedes != "" {
 					payload["supersedes_attempt_id"] = supersedes
 					payload["retry_attempt_id"] = att
@@ -1933,7 +1945,8 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 							evFail.EventID, evClaim.EventID, evReroute.EventID, evLaunch.EventID, failedAttemptID, newAttemptID,
 						)
 						childIn2 := ChildExecInput{
-							ProjectID: projectID, RunID: runID, GraphID: g.GraphID, WorkItemID: id,
+							ProjectID: projectID, RunID: runID, GraphID: g.GraphID,
+							ExecutionPlanDigest: out.PlanDigest, GraphDigest: out.GraphDigest, WorkItemID: id,
 							ClaimID: res2.Claim.ClaimID, AttemptID: newAttemptID,
 							Intent: it.Intent, Route: altRoute, RepoPath: req.RepoPath,
 							BaseRef: firstNonEmpty(goalBranch, baseRef), ReadOnly: readOnly,
@@ -2116,9 +2129,12 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 								Permission: childOut2.ActualSources.Permission, Account: childOut2.ActualSources.Account,
 								Install: childOut2.ActualSources.Install,
 							},
-							ArgvDigest:          childOut2.ArgvDigest,
-							FilesTouched:        childOut2.FilesTouched,
-							SupersedesAttemptID: failedAttemptID, RerouteEventRef: rerouteRef,
+							ArgvDigest:              childOut2.ArgvDigest,
+							FilesTouched:            childOut2.FilesTouched,
+							VerifierDecision:        childOut2.VerifierDecision,
+							VerifierVerdictDigest:   childOut2.VerifierVerdictDigest,
+							VerifierReviewedHeadSHA: childOut2.VerifierReviewedHeadSHA,
+							SupersedesAttemptID:     failedAttemptID, RerouteEventRef: rerouteRef,
 						}
 						term2 := childOut2.Terminal
 						if term2 == workgraph.TermNone {
@@ -3637,6 +3653,17 @@ func validatePriorSucceededForReuse(prior ChildOutcome, workItemID, planDigest, 
 	if prior.ChildContractDigest != strings.ToLower(prior.ChildContractDigest) ||
 		prior.ChildContractDigest != strings.TrimSpace(prior.ChildContractDigest) {
 		return fmt.Errorf("workflowrun: prior %s child_contract_digest not lowercase canonical", workItemID)
+	}
+	if workItemID == "wi_verify" {
+		if prior.VerifierDecision != VerifierDecisionPass {
+			return fmt.Errorf("workflowrun: prior wi_verify decision %q != pass (fail closed before reuse)", prior.VerifierDecision)
+		}
+		if !isExactSHA256Digest(prior.VerifierVerdictDigest) {
+			return fmt.Errorf("workflowrun: prior wi_verify verifier_verdict_digest invalid")
+		}
+		if !isExactGitOID(prior.VerifierReviewedHeadSHA) {
+			return fmt.Errorf("workflowrun: prior wi_verify reviewed_head_sha invalid")
+		}
 	}
 	return nil
 }

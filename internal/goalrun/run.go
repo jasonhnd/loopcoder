@@ -4397,7 +4397,7 @@ func recordModelUnavailableExcludes(wres workflowrun.Result, record func(childID
 // except one raw-event-proven forced-interrupt implement predecessor followed
 // by its immediate same-route successful generation.
 func bindOpenPRVerifierFromChildren(children []workflowrun.ChildOutcome, events []workflowrun.Event) (provider, evidence string, ok bool) {
-	var verifyKids, implementKids []workflowrun.ChildOutcome
+	var verifyKids, implementKids, testKids []workflowrun.ChildOutcome
 	for _, c := range children {
 		// Exact WorkItemID literals only — whitespace-altered IDs never match.
 		switch c.WorkItemID {
@@ -4414,17 +4414,30 @@ func bindOpenPRVerifierFromChildren(children []workflowrun.ChildOutcome, events 
 				continue
 			}
 			implementKids = append(implementKids, c)
+		case "wi_tests":
+			testKids = append(testKids, c)
 		}
 	}
 	// Exactly one verifier. Implement may have either one direct success or the
 	// one exact forced-interrupt predecessor + its immediate successful retry.
-	if len(verifyKids) != 1 || (len(implementKids) != 1 && len(implementKids) != 2) {
+	if len(verifyKids) != 1 || len(testKids) != 1 ||
+		(len(implementKids) != 1 && len(implementKids) != 2) {
 		return "", "", false
 	}
 	v := verifyKids[0]
 	// Re-check exact success + class (invalid exact-ID rows already length-gated
 	// when mixed with valid ones via count!=1; single invalid still fails here).
 	if v.TaskClass != "soul" || v.Terminal != "succeeded" {
+		return "", "", false
+	}
+	tests := testKids[0]
+	if tests.TaskClass != "tera" || tests.Terminal != "succeeded" ||
+		tests.IntegrateCommitSHA == "" ||
+		v.VerifierDecision != workflowrun.VerifierDecisionPass ||
+		!openPRIsExactSHA256Digest(v.VerifierVerdictDigest) ||
+		!openPRIsExactGitOID(v.VerifierReviewedHeadSHA) ||
+		v.VerifierReviewedHeadSHA != tests.IntegrateCommitSHA ||
+		!exactVerifierVerdictEventBinding(v, events) {
 		return "", "", false
 	}
 	var imp workflowrun.ChildOutcome
@@ -4472,6 +4485,50 @@ func bindOpenPRVerifierFromChildren(children []workflowrun.ChildOutcome, events 
 		return "", "", false
 	}
 	return v.Provider, v.OutputEvidence, true
+}
+
+func exactVerifierVerdictEventBinding(verifier workflowrun.ChildOutcome, events []workflowrun.Event) bool {
+	terminalCount := 0
+	integrateCount := 0
+	for _, ev := range events {
+		if ev.WorkItemID != verifier.WorkItemID || ev.AttemptID != verifier.AttemptID {
+			continue
+		}
+		switch ev.Kind {
+		case "terminal":
+			terminalCount++
+			if ev.Terminal != "succeeded" || ev.Evidence != verifier.OutputEvidence ||
+				ev.FailureClass != "" {
+				return false
+			}
+			var payload map[string]string
+			if json.Unmarshal(ev.Payload, &payload) != nil ||
+				payload["verifier_decision"] != verifier.VerifierDecision ||
+				payload["verifier_verdict_digest"] != verifier.VerifierVerdictDigest ||
+				payload["verifier_reviewed_head_sha"] != verifier.VerifierReviewedHeadSHA {
+				return false
+			}
+		case "integrate":
+			integrateCount++
+			if ev.CommitSHA != verifier.IntegrateCommitSHA {
+				return false
+			}
+		}
+	}
+	return terminalCount == 1 && integrateCount == 1
+}
+
+func openPRIsExactGitOID(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func productOnlyChildOutcomes(children []workflowrun.ChildOutcome) []workflowrun.ChildOutcome {

@@ -120,6 +120,7 @@ func TestOpenCreatesPRHumanGateNoAutoMerge(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module example.com/n\n\ngo 1.22\n"), 0o600)
 
 	headOID := strings.Repeat("d", 40)
+	reviewedHead := strings.Repeat("c", 40)
 	verEvid := fullSHA256("verify")
 	g := &fakeGit{head: headOID}
 	h := &fakeHost{
@@ -135,9 +136,13 @@ func TestOpenCreatesPRHumanGateNoAutoMerge(t *testing.T) {
 			{WorkItemID: "wi_implement", TaskClass: "tera", Terminal: "succeeded", AttemptID: "att-i",
 				OutputEvidence: fullSHA256("impl"), Provider: "antigravity", FilesTouched: []string{"notes/notes.go"}},
 			{WorkItemID: "wi_tests", TaskClass: "tera", Terminal: "succeeded", AttemptID: "att-t",
-				OutputEvidence: fullSHA256("tests"), Provider: "antigravity", FilesTouched: []string{"notes/notes_test.go"}},
+				OutputEvidence: fullSHA256("tests"), Provider: "antigravity", FilesTouched: []string{"notes/notes_test.go"},
+				IntegrateCommitSHA: reviewedHead},
 			{WorkItemID: "wi_verify", TaskClass: "soul", Terminal: "succeeded", AttemptID: "att-v",
-				OutputEvidence: verEvid, Provider: "codex", FilesTouched: []string{"review.md"}},
+				OutputEvidence: verEvid, Provider: "codex", FilesTouched: []string{"review.md"},
+				VerifierDecision:        workflowrun.VerifierDecisionPass,
+				VerifierVerdictDigest:   fullSHA256("verdict"),
+				VerifierReviewedHeadSHA: reviewedHead},
 		},
 		InstallMeaningfulCI: &inst,
 		RequiredCheckNames:  goalpr.MeaningfulCheckNames(),
@@ -191,6 +196,62 @@ func TestOpenCreatesPRHumanGateNoAutoMerge(t *testing.T) {
 		if !strings.Contains(joined, frag) {
 			t.Fatalf("missing event %s in %v", frag, res.Events)
 		}
+	}
+}
+
+func TestOpenVerifierVerdictRefusalPrecedesAllMutatingSideEffects(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*workflowrun.ChildOutcome)
+	}{
+		{"negative", func(v *workflowrun.ChildOutcome) { v.VerifierDecision = workflowrun.VerifierDecisionFail }},
+		{"missing", func(v *workflowrun.ChildOutcome) { v.VerifierDecision = "" }},
+		{"malformed_digest", func(v *workflowrun.ChildOutcome) { v.VerifierVerdictDigest = "sha256:short" }},
+		{"reviewed_head_mismatch", func(v *workflowrun.ChildOutcome) { v.VerifierReviewedHeadSHA = strings.Repeat("e", 40) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := t.TempDir()
+			_ = os.MkdirAll(filepath.Join(repo, ".git"), 0o700)
+			_ = os.WriteFile(filepath.Join(repo, "product.go"), []byte("package product\n"), 0o600)
+			reviewedHead := strings.Repeat("c", 40)
+			verify := workflowrun.ChildOutcome{
+				WorkItemID: "wi_verify", TaskClass: "soul", Terminal: "succeeded",
+				AttemptID: "att-v", Provider: "claude", OutputEvidence: fullSHA256("verify"),
+				VerifierDecision:        workflowrun.VerifierDecisionPass,
+				VerifierVerdictDigest:   fullSHA256("verdict"),
+				VerifierReviewedHeadSHA: reviewedHead,
+			}
+			tc.mutate(&verify)
+			git := &fakeGit{head: strings.Repeat("d", 40)}
+			host := &fakeHost{}
+			result, err := goalpr.Open(context.Background(), goalpr.Request{
+				RepoPath: repo, ProjectID: "proj", RunID: "run-negative", GraphID: "g",
+				BaseRef: "main",
+				Children: []workflowrun.ChildOutcome{
+					{WorkItemID: "wi_implement", TaskClass: "tera", Terminal: "succeeded",
+						AttemptID: "att-i", Provider: "codex", OutputEvidence: fullSHA256("impl"),
+						FilesTouched: []string{"product.go"}},
+					{WorkItemID: "wi_tests", TaskClass: "tera", Terminal: "succeeded",
+						AttemptID: "att-t", Provider: "codex", OutputEvidence: fullSHA256("tests"),
+						IntegrateCommitSHA: reviewedHead, FilesTouched: []string{"product.go"}},
+					verify,
+				},
+				Git: git, Host: host,
+			})
+			if err == nil || !errors.Is(err, goalpr.ErrNotReady) {
+				t.Fatalf("expected not-ready: err=%v result=%+v", err, result)
+			}
+			if git.branch != "" || git.committed || git.pushed || git.addPath != "" ||
+				host.created || len(result.Events) != 0 || result.ReceiptPath != "" ||
+				len(result.CIFiles) != 0 {
+				t.Fatalf("verdict refusal occurred after side effect: git=%+v host=%+v result=%+v", git, host, result)
+			}
+			for _, rel := range []string{".loopcoder", ".github"} {
+				if _, statErr := os.Lstat(filepath.Join(repo, rel)); !os.IsNotExist(statErr) {
+					t.Fatalf("%s created before verdict acceptance: %v", rel, statErr)
+				}
+			}
+		})
 	}
 }
 
