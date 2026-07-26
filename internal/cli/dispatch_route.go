@@ -92,13 +92,27 @@ func resolveWorkerDispatchRouteProduction(ctx context.Context, input WorkerDispa
 	}
 	hostName := strings.TrimSpace(input.HostName)
 	if hostName == "" {
-		hostName = "loopcoder-cli"
+		// Must match a runtimecap host profile name; "loopcoder-cli" is not registered
+		// and hard-fails every candidate as role-unsupported / unknown_host.
+		if strings.TrimSpace(os.Getenv("PASEO_AGENT_ID")) != "" {
+			hostName = "paseo-style"
+		} else {
+			hostName = "generic-local"
+		}
 	}
 	actor := delivery.Actor{
 		ActorKind:         "system",
 		ActorID:           "loopcoder-dispatch",
 		Display:           "loopcoder dispatch",
-		DecisionAuthority: "worker-dispatch-route",
+		DecisionAuthority: "router",
+		Source:            "cli.dispatch",
+	}
+	// Policy pin/exclusion rows require ActorKind=user (validatePolicyInput).
+	pinActor := delivery.Actor{
+		ActorKind:         "user",
+		ActorID:           "local-user",
+		Display:           "local user",
+		DecisionAuthority: "user",
 		Source:            "cli.dispatch",
 	}
 	host := delivery.Host{
@@ -194,7 +208,7 @@ func resolveWorkerDispatchRouteProduction(ctx context.Context, input WorkerDispa
 		HostName:          hostName,
 		DecidedBy:         actor,
 		Host:              host,
-		PinActor:          actor,
+		PinActor:          pinActor,
 	}
 	if pinProvider := strings.TrimSpace(input.ExplicitProvider); pinProvider != "" {
 		request.Pin = &routing.CandidateConstraint{

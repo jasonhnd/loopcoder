@@ -23,7 +23,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the newest SQLite schema version this binary can use.
-	CurrentSchemaVersion = 31
+	CurrentSchemaVersion = 33
 
 	driverName = "sqlite"
 
@@ -454,6 +454,16 @@ var migrations = []migration{
 		name:       "versioned child execution requests",
 		statements: childExecutionRequestSchemaStatements,
 	},
+	{
+		version:    32,
+		name:       "v0.9 work graph versions and items",
+		statements: workGraphSchemaStatements,
+	},
+	{
+		version: 33,
+		name:    "provider execution authority spawn_phase",
+		apply:   migrateProviderExecutionSpawnPhase,
+	},
 }
 
 var requiredTables = []string{
@@ -526,6 +536,10 @@ var requiredTables = []string{
 	"availability_observations",
 	"availability_scores",
 	"circuit_breakers",
+	"workgraph_versions",
+	"workgraph_items",
+	"workgraph_dependencies",
+	"workgraph_events",
 }
 
 type migration struct {

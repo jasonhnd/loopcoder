@@ -174,8 +174,20 @@ func (ExecCodexRunner) Run(ctx context.Context, inv Invocation) (Result, error) 
 	}
 	defer logFile.Close()
 
+	// Effective execution environment (process + inv.Environment overrides).
+	effEnv := environmentWithOverrides(os.Environ(), inv.Environment)
+	// Preflight exact account from the SAME effective env before launch —
+	// never consume wrong-account capacity then reject afterward.
+	bind, aerr := preflightCodexAccountBinding(inv, effEnv)
+	if aerr != nil {
+		return Result{
+			ExitCode: -1, FailureClass: "auth_refusal",
+			ActualProvider: "codex",
+		}, aerr
+	}
+
 	cmd := exec.CommandContext(ctx, "codex", BuildCodexArgs(inv)...)
-	cmd.Env = environmentWithOverrides(os.Environ(), inv.Environment)
+	cmd.Env = effEnv
 	cmd.Stdin = prompt
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -196,19 +208,89 @@ func (ExecCodexRunner) Run(ctx context.Context, inv Invocation) (Result, error) 
 		}
 	}
 	result := resultWithSupervision(exitCode, summary, metadata, startedAt, endedAt, supervision, runErr, ctx)
+	exe := ""
+	if p, err := exec.LookPath("codex"); err == nil {
+		exe = p
+	}
+	AffirmBasicActual(&result, "codex", exe, inv)
+	// Re-affirm from the same effective env after launch (must match preflight).
+	post, perr := ParseCodexAuthFromEnv(effEnv)
+	if perr != nil {
+		result.FailureClass = "auth_refusal"
+		if runErr != nil {
+			return result, errors.Join(runErr, perr)
+		}
+		return result, perr
+	}
+	if post.AccountProfileID != bind.AccountProfileID {
+		result.FailureClass = "auth_refusal"
+		return result, fmt.Errorf("codex: account drifted during execution preflight=%s post=%s",
+			bind.AccountProfileID, post.AccountProfileID)
+	}
+	result.ActualAccountRef = bind.AccountProfileID
+	result.ActualSourceAccount = ActualSourceAuthBinding // auth.json binding, not stream
+	if strings.TrimSpace(result.ActualInstallRef) != "" {
+		result.ActualSourceInstall = ActualSourceInstallBinding
+	}
+	argv := append([]string{"codex"}, BuildCodexArgs(inv)...)
+	result.ArgvDigest = RedactedArgvDigest(argv)
+	if inv.CapabilityProbeOnly && result.ExitCode != 0 && codexLogReportsModelUnavailable(logBytes) {
+		result.FailureClass = "model_unavailable"
+	}
+	// Failures first — never accepted_invocation on partial/failed runs.
 	if runErr != nil {
+		ClearAcceptedActual(&result)
 		if logErr != nil {
 			return result, errors.Join(runErr, fmt.Errorf("read codex log: %w", logErr))
 		}
 		return result, runErr
 	}
 	if logErr != nil {
+		ClearAcceptedActual(&result)
 		return result, fmt.Errorf("read codex log: %w", logErr)
 	}
 	if metadataErr != nil {
+		ClearAcceptedActual(&result)
 		return result, metadataErr
 	}
+	if exitCode != 0 {
+		ClearAcceptedActual(&result)
+		return result, nil
+	}
+	// FULL success only: exact sandbox / -m / model_reasoning_effort options.
+	AffirmAcceptedInvocation(&result, inv, argv, true, AcceptedInvocationOpts{
+		PermissionNoFallback: true,
+		ModelNoFallback:      true,
+		EffortNoFallback:     true,
+	})
+	if want := strings.TrimSpace(inv.Effort); want != "" && strings.TrimSpace(result.ActualEffort) == "" {
+		result.FailureClass = "route_mismatch"
+		ClearAcceptedActual(&result)
+		return result, fmt.Errorf("codex: depth %q requested but not reported (actual effort unknown)", want)
+	}
 	return result, nil
+}
+
+// codexLogReportsModelUnavailable recognizes only provider/CLI terminal model
+// refusal phrases. It must not classify generic process errors or quota/auth
+// failures as model_unavailable.
+func codexLogReportsModelUnavailable(logBytes []byte) bool {
+	s := strings.ToLower(string(logBytes))
+	switch {
+	case strings.Contains(s, "model is not supported") &&
+		strings.Contains(s, "chatgpt account"):
+		return true
+	case strings.Contains(s, "model is not available") &&
+		strings.Contains(s, "chatgpt account"):
+		return true
+	case strings.Contains(s, "model") &&
+		strings.Contains(s, "does not exist or you do not have access"):
+		return true
+	case strings.Contains(s, "not recognized as a known model"):
+		return true
+	default:
+		return false
+	}
 }
 
 func codexPromptPath(logPath string) string {

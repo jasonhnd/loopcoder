@@ -11,6 +11,14 @@ Every document is exactly one of these types:
   guidance, kept up to date as the implementation changes.
 - Process meta in this directory: workflow, backlog, learnings, and this index.
 
+> **v0.9.0 is stopped and unreleased.** The owner stopped development on
+> 2026-07-26 after the exact-artifact product objective remained unaccepted.
+> Read the
+> [`v0.9.0 development suspension report`](v0.9.0-development-suspension-report-2026-07-26.md)
+> before using any v0.9 reference. Those references describe a stopped
+> implementation snapshot and do not authorize installation, resumption, or
+> release.
+
 ## Index
 
 - [`PROCESS.md`](PROCESS.md): mandatory doc-first workflow.
@@ -20,9 +28,81 @@ Every document is exactly one of these types:
 - [`product-evolution.md`](product-evolution.md): historical product decisions from v0.6 through v0.8 and links to their authoritative specs.
 - [`self-hosting-playbook.md`](self-hosting-playbook.md): mandatory scope, resource, progress, retry, verification, and cleanup controls for LoopCoder developing itself.
 - [`v0.8.0-retrospective.md`](v0.8.0-retrospective.md): sanitized engineering retrospective and corrective-action record for the v0.8.0 cycle.
+- [`v0.9.0-development-suspension-report-2026-07-26.md`](v0.9.0-development-suspension-report-2026-07-26.md): authoritative v0.9 project-stop record, including objective, chronology, quantitative scope, RC evidence, failure analysis, exact snapshot, lessons, and resume conditions.
 - [`reference/audit.md`](reference/audit.md): read-only security audit command.
 - [`reference/architecture.md`](reference/architecture.md): current system map.
 - [`reference/development-release-checklist.md`](reference/development-release-checklist.md): reusable intake-to-publication evidence checklist and GO/NO-GO matrix.
+- [`reference/evidence-tiers.md`](reference/evidence-tiers.md): local vs remote evidence ownership, pre-push budget, and required-check discovery.
+- [`reference/store-platform-conformance.md`](reference/store-platform-conformance.md): v0.9 compact-store darwin/arm64 boundary and conformance inventory.
+- [`architecture/v0.9.0-threat-model.md`](architecture/v0.9.0-threat-model.md): v0.9 threat model, data classes, and capability enforcement inventory.
+- [`reference/effective-policy.md`](reference/effective-policy.md): v0.9 effective-policy precedence, freeze, provenance, and digest.
+- [`reference/acceptance-harness.md`](reference/acceptance-harness.md): v0.9 deterministic acceptance fixtures and evidence manifests.
+- [`reference/direct-path-canaries.md`](reference/direct-path-canaries.md): V090-036 docs/Go visible direct-path canaries and evidence contract.
+- [`reference/silent-worker-multi-ui-canary.md`](reference/silent-worker-multi-ui-canary.md): V090-024 twelve-minute silent multi-UI visibility canary.
+- [`reference/provider-descriptor-spi.md`](reference/provider-descriptor-spi.md): V090-037 provider descriptor registry and conformance SPI.
+- [`reference/observation-source-plans.md`](reference/observation-source-plans.md): V090-038 ordered observation-source plans and snapshots.
+- [`reference/observation-refresh-cooldown.md`](reference/observation-refresh-cooldown.md): V090-039 adaptive refresh, health, and cooldown.
+- [`reference/codex-observation.md`](reference/codex-observation.md): V090-040 Codex discovery and model-catalog observation.
+- [`reference/codex-invocation.md`](reference/codex-invocation.md): V090-103 Codex invocation consolidation.
+- [`reference/codex-quota-windows.md`](reference/codex-quota-windows.md): V090-041 Codex quota-window normalization.
+- [`reference/claude-observation.md`](reference/claude-observation.md): V090-042 Claude Code discovery and catalog observation.
+- [`reference/claude-invocation.md`](reference/claude-invocation.md): V090-104 Claude Code invocation consolidation.
+- [`reference/claude-quota-windows.md`](reference/claude-quota-windows.md): V090-043 Claude Code quota-window normalization.
+- [`reference/gemini-observation.md`](reference/gemini-observation.md): V090-044 Gemini CLI discovery and catalog observation.
+- [`reference/gemini-invocation.md`](reference/gemini-invocation.md): V090-105 Gemini CLI invocation consolidation.
+- [`reference/gemini-quota-windows.md`](reference/gemini-quota-windows.md): V090-045 Gemini CLI quota-window normalization.
+- [`reference/antigravity-observation.md`](reference/antigravity-observation.md): V090-106 Antigravity discovery and catalog adapter.
+- [`reference/antigravity-invocation.md`](reference/antigravity-invocation.md): V090-107 Antigravity invocation consolidation.
+- [`reference/antigravity-quota-windows.md`](reference/antigravity-quota-windows.md): V090-108 Antigravity quota-window adapter.
+- [`reference/grok-observation.md`](reference/grok-observation.md): V090-046 Grok discovery and catalog consolidation.
+- [`reference/grok-invocation.md`](reference/grok-invocation.md): V090-109 Grok invocation consolidation.
+- [`reference/grok-quota-windows.md`](reference/grok-quota-windows.md): V090-047 Grok quota-window adapter.
+- [`reference/codexbar-bridge.md`](reference/codexbar-bridge.md): V090-048 optional CodexBar observation bridge.
+- [`reference/future-provider-kit.md`](reference/future-provider-kit.md): V090-049 future-provider registration kit.
+- [`reference/capability-classes.md`](reference/capability-classes.md): V090-050 task risk classes and Luna/Tera/Soul capability mapping.
+- [`reference/hard-eligibility.md`](reference/hard-eligibility.md): V090-051 hard eligibility and immutable-pin precedence.
+- [`reference/quota-policy.md`](reference/quota-policy.md): V090-052 quota burn urgency, reserve, and reliability policy.
+- [`reference/quota-modes.md`](reference/quota-modes.md): V090-099 quota policy modes, soft reservations, and usage attribution.
+- [`reference/route-decision.md`](reference/route-decision.md): V090-053 persisted route decision and explain surface.
+- [`reference/successor-fallback.md`](reference/successor-fallback.md): V090-054 successor attempt and fallback boundary.
+- [`reference/smart-routing-canary.md`](reference/smart-routing-canary.md): V090-055 smart-routing end-to-end acceptance canary.
+- [`reference/work-graph-contract.md`](reference/work-graph-contract.md): V090-056 Work Graph public contract and materialization boundary.
+- [`reference/work-graph-storage.md`](reference/work-graph-storage.md): V090-057 Work item and dependency schema (storage v32).
+- [`reference/work-graph-ready.md`](reference/work-graph-ready.md): V090-058 graph validation and deterministic ready set.
+- [`reference/work-claim.md`](reference/work-claim.md): V090-059 atomic work claim and guarded close.
+- [`reference/workflow-definition.md`](reference/workflow-definition.md): V090-060 explicit workflow definition and materialization.
+- [`reference/wave-schedule.md`](reference/wave-schedule.md): V090-061 deterministic bounded-wave scheduling.
+- [`reference/integration-receipts.md`](reference/integration-receipts.md): V090-100 ordered integration receipts and conflict boundary.
+- [`reference/native-child-containment.md`](reference/native-child-containment.md): V090-062 provider-native sub-agent containment.
+- [`reference/child-attempt-isolation.md`](reference/child-attempt-isolation.md): V090-063 cross-provider child-attempt isolation.
+- [`reference/workflow-lifecycle.md`](reference/workflow-lifecycle.md): V090-064 workflow cancellation, restart, and terminal compaction.
+- [`reference/bounded-workflow-canary.md`](reference/bounded-workflow-canary.md): V090-065 bounded-workflow end-to-end acceptance canary.
+- [`reference/multi-project-admission.md`](reference/multi-project-admission.md): V090-066 multi-project global admission and isolation.
+- [`reference/private-repository-redaction.md`](reference/private-repository-redaction.md): V090-067 private-repository redaction and consumer canary.
+- [`reference/cross-mac-rehydration.md`](reference/cross-mac-rehydration.md): V090-068 cross-Mac GitHub rehydration after terminal handoff.
+- [`reference/machine-authority-rebuild.md`](reference/machine-authority-rebuild.md): V090-086 machine-authority rebuild and reservation reconciliation.
+- [`reference/retention-garbage-collection.md`](reference/retention-garbage-collection.md): V090-087 event/log/runtime retention and garbage collection.
+- [`reference/v08-state-exporter.md`](reference/v08-state-exporter.md): V090-069 read-only v0.8 state exporter.
+- [`reference/v09-state-importer.md`](reference/v09-state-importer.md): V090-070 v0.9 project-state importer and migration report.
+- [`reference/compatibility-shims.md`](reference/compatibility-shims.md): V090-071 compatibility shims and old/new writer isolation.
+- [`reference/no-repo-local-sidecars.md`](reference/no-repo-local-sidecars.md): V090-072 remove repository-local runtime fallbacks and sidecars.
+- [`reference/legacy-storage-retirement.md`](reference/legacy-storage-retirement.md): V090-073 retire legacy v0.8 storage mutation paths.
+- [`reference/retire-lifecycle-writers.md`](reference/retire-lifecycle-writers.md): V090-074 retire parallel progress/report/relay/outbox writers.
+- [`reference/retire-duplicate-provider-writers.md`](reference/retire-duplicate-provider-writers.md): V090-075 retire duplicate provider inventory/router writers.
+- [`reference/remove-autonomous-entrypoints.md`](reference/remove-autonomous-entrypoints.md): V090-076 remove autonomous compile/tick/trigger/promotion entry points.
+- [`reference/remove-federation-leases.md`](reference/remove-federation-leases.md): V090-077 remove nested/federation/state-branch/cross-machine leases.
+- [`reference/cli-prune.md`](reference/cli-prune.md): V090-078 prune legacy CLI commands and superseded specifications.
+- [`reference/deadcode-sweep.md`](reference/deadcode-sweep.md): V090-079 final dependency/schema/dead-code sweep after parity.
+- [`reference/v0.9.0-capability-matrix.md`](reference/v0.9.0-capability-matrix.md): V090-080 v0.9.0 capability matrix (honest evidence tiers).
+- [`reference/v0.9.0-quickstart.md`](reference/v0.9.0-quickstart.md): V090-080 v0.9.0 install/doctor/ordinary-dev quickstart.
+- [`reference/support-bundle.md`](reference/support-bundle.md): V090-101 redacted diagnostic support bundle and no-telemetry default.
+- [`reference/darwin-arm64-packaging.md`](reference/darwin-arm64-packaging.md): V090-081 Darwin arm64 packaging, signing, and update metadata.
+- [`reference/install-migration-smoke.md`](reference/install-migration-smoke.md): V090-082 exact-artifact install, migration, and cleanup smoke.
+- [`reference/release-slo-scorecard.md`](reference/release-slo-scorecard.md): V090-102 release SLO scorecard and GO/NO-GO evidence compiler.
+- [`reference/rc-go-nogo.md`](reference/rc-go-nogo.md): V090-083 release-candidate consumer canary and GO/NO-GO record.
+- [`reference/authority-store.md`](reference/authority-store.md): v0.9 machine/project store topology and entry points.
+- [`reference/v09-home-layout.md`](reference/v09-home-layout.md): global `$LOOPCODER_HOME` layout and owner-only creation.
+- [`reference/project-authority-store.md`](reference/project-authority-store.md): project.db domain tables and immutable events.
 - [`reference/releasing.md`](reference/releasing.md): release documentation rules.
 - [`reference/self-bootstrap.md`](reference/self-bootstrap.md): v0.8.0 self-bootstrap acceptance checklist.
 - [`reference/stability-policy.md`](reference/stability-policy.md): 0.x stability policy.

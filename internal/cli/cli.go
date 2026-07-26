@@ -20,12 +20,17 @@ import (
 
 	"github.com/jasonhnd/loopcoder/internal/agent"
 	"github.com/jasonhnd/loopcoder/internal/audit"
+	"github.com/jasonhnd/loopcoder/internal/autoroute"
 	"github.com/jasonhnd/loopcoder/internal/budget"
+	"github.com/jasonhnd/loopcoder/internal/capacitysnapshot"
+	"github.com/jasonhnd/loopcoder/internal/claudecatalog"
 	compiler "github.com/jasonhnd/loopcoder/internal/compile"
 	"github.com/jasonhnd/loopcoder/internal/config"
 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
 	"github.com/jasonhnd/loopcoder/internal/detachedrun"
+	"github.com/jasonhnd/loopcoder/internal/directdelivery"
 	"github.com/jasonhnd/loopcoder/internal/doctor"
+	"github.com/jasonhnd/loopcoder/internal/eventstream"
 	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/hostprofile"
 	"github.com/jasonhnd/loopcoder/internal/inspect"
@@ -37,6 +42,7 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/orchestrationcost"
 	"github.com/jasonhnd/loopcoder/internal/perception"
 	"github.com/jasonhnd/loopcoder/internal/platform"
+	"github.com/jasonhnd/loopcoder/internal/preflight"
 	"github.com/jasonhnd/loopcoder/internal/process"
 	"github.com/jasonhnd/loopcoder/internal/progress"
 	"github.com/jasonhnd/loopcoder/internal/providerinventory"
@@ -54,6 +60,8 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/state"
 	"github.com/jasonhnd/loopcoder/internal/statebranch"
 	"github.com/jasonhnd/loopcoder/internal/storage"
+	"github.com/jasonhnd/loopcoder/internal/termui"
+	"github.com/jasonhnd/loopcoder/internal/uibridge"
 	"github.com/jasonhnd/loopcoder/internal/upgrade"
 	gh "github.com/jasonhnd/loopcoder/internal/vcs/github"
 	"github.com/jasonhnd/loopcoder/internal/verify"
@@ -73,26 +81,49 @@ type BuildInfo struct {
 }
 
 type Deps struct {
-	NewGitHubReader          func(repoPath string) orchestration.GitHubReader
-	NewIssueWriter           func(repoPath string) compiler.IssueWriter
-	NewPreProdWriter         func(repoPath string) orchestration.PreProdWriter
-	NewPromoteWriter         func(repoPath string) orchestration.PromotionWriter
-	ProcessAlive             func(pid int) bool
-	Now                      func() time.Time
+	NewGitHubReader  func(repoPath string) orchestration.GitHubReader
+	NewIssueWriter   func(repoPath string) compiler.IssueWriter
+	NewPreProdWriter func(repoPath string) orchestration.PreProdWriter
+	NewPromoteWriter func(repoPath string) orchestration.PromotionWriter
+	ProcessAlive     func(pid int) bool
+	Now              func() time.Time
+	// AutoRouteInventory is an optional auto-route inventory snapshot.
+	// When nil and auto-route is requested, production loads a live
+	// capacitysnapshot via LoadAutoRouteInventory (or the default loader).
+	// Tests may inject FakeInventory explicitly; never use a silent default matrix.
+	AutoRouteInventory *autoroute.Inventory
+	// LoadAutoRouteInventory optionally overrides production capacity loading.
+	// Default discovers provider inventory → capacitysnapshot → autoroute.Inventory.
+	LoadAutoRouteInventory func(ctx context.Context, repo string, now time.Time) (*autoroute.Inventory, error)
+	// RouteResolve optionally overrides autoroute.Resolve (tests only).
+	// Production default is autoroute.Resolve. Tests may wrap to capture Input.
+	RouteResolve func(in autoroute.Input) (autoroute.Result, error)
+	// LastCapacitySnapshot is the capacity truth used for soft reserve (CRO-007).
+	// Production loader sets this; tests may inject.
+	LastCapacitySnapshot *capacitysnapshot.Snapshot
+	// CapacityLedgerPath overrides durable ledger path (tests only).
+	CapacityLedgerPath string
+	// PreflightEvaluate optionally overrides production preflight.Evaluate (tests).
+	// When set, run path uses this instead of preflight.DefaultDeps probes.
+	PreflightEvaluate func(ctx context.Context, in preflight.Input) (preflight.Snapshot, error)
 	// WaitClock optionally overrides the provider-free wait clock for tests.
-	WaitClock                waitstate.Clock
-	RuntimeGOOS              string
-	RuntimeGOARCH            string
-	IsTerminal               func(w io.Writer) bool
-	TerminalWidth            func(w io.Writer) int
-	Stdin                    io.Reader
-	BuildInfo                BuildInfo
-	ComputeReadySet          func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
-	Tick                     func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
-	Discover                 func(ctx context.Context, opts perception.Options) (perception.Report, error)
-	Compile                  func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
-	Dispatch                 func(ctx context.Context, opts worker.Options) (worker.Result, error)
-	AgentLookup              func(provider string) (agent.Runner, error)
+	WaitClock       waitstate.Clock
+	RuntimeGOOS     string
+	RuntimeGOARCH   string
+	IsTerminal      func(w io.Writer) bool
+	TerminalWidth   func(w io.Writer) int
+	Stdin           io.Reader
+	BuildInfo       BuildInfo
+	ComputeReadySet func(ctx context.Context, opts orchestration.Options) (report.ReadySetReport, error)
+	Tick            func(ctx context.Context, opts orchestration.TickOptions) (orchestration.TickReport, error)
+	Discover        func(ctx context.Context, opts perception.Options) (perception.Report, error)
+	Compile         func(ctx context.Context, opts compiler.Options) (compiler.Report, error)
+	Dispatch        func(ctx context.Context, opts worker.Options) (worker.Result, error)
+	AgentLookup     func(provider string) (agent.Runner, error)
+	// Delivery optionally overrides production directdelivery ports.
+	// Production leaves this nil → real LocalGit/LocalRemote/GHClient/ObserveCI.
+	// Tests must inject Fake* ports explicitly (never silent production Fake defaults).
+	Delivery                 *directdelivery.Deps
 	Loopreview               func(ctx context.Context, opts loopreview.Options) (loopreview.Result, error)
 	Promote                  func(ctx context.Context, opts orchestration.PromoteOptions) (orchestration.PromoteReport, error)
 	Recover                  func(ctx context.Context, opts recovery.Options) (recovery.Result, error)
@@ -103,6 +134,7 @@ type Deps struct {
 	ProviderInventoryRefresh func(ctx context.Context, report providerinventory.Report, now time.Time) error
 	ProviderQuotaRefresh     func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.RefreshResult, error)
 	ProviderQuotaStatus      func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error)
+	ClaudeCatalogVerify      func(ctx context.Context, req claudecatalog.Request) (claudecatalog.Result, error)
 	RouteExplain             func(ctx context.Context, store storage.Store, request routing.StoredRouteRequest) (routing.RouteOperationResult, error)
 	RouteDecide              func(ctx context.Context, store storage.Store, request routing.StoredRouteRequest) (routing.RouteOperationResult, error)
 	// ResolveWorkerDispatchRoute selects provider/model/effort for ordinary
@@ -133,41 +165,51 @@ type Deps struct {
 }
 
 var commands = []Command{
+	// Direct-path primary surface (V090-025): lead help with these.
+	{Name: "run", Summary: "primary direct-path run (explicit pin or auto-route; delivery to human gate)"},
+	{Name: "workflow", Summary: "bounded multi-item workflow execution through the direct-run lifecycle"},
+	{Name: "status", Summary: "render local delivery run status"},
+	{Name: "events", Summary: "follow project UI report stream (cursor replay + follow + optional loopback bridge)"},
+	{Name: "cancel", Summary: "request cancellation for a detached run"},
+	{Name: "doctor", Summary: "run read-only preflight checks"},
+	{Name: "diagnose", Summary: "plan or write a local redacted support bundle (no network upload)"},
+	{Name: "capabilities", Summary: "print authoritative v0.9 capability matrix (same table as doctor codes)"},
+	{Name: "qualify", Summary: "executable exact-archive qualification (no fixture booleans in release mode)"},
+	{Name: "providers", Summary: "refresh bounded provider CLI installation inventory"},
+	// Remaining commands (legacy / compatibility remain available).
 	{Name: "attest", Summary: "emit conductor self-report"},
 	{Name: "version", Summary: "print version and build information"},
 	{Name: "models", Summary: "list static provider model and depth registry entries"},
 	{Name: "projects", Summary: "manage the machine-local project registry"},
-	{Name: "providers", Summary: "refresh bounded provider CLI installation inventory"},
 	{Name: "route", Summary: "explain or persist a provider-neutral route decision"},
 	{Name: "wait", Summary: "provider-free local waits (quota-reset, …)"},
 	{Name: "delivery", Summary: "plan and gate v0.8 DeliveryRun approvals"},
 	{Name: "budget", Summary: "exercise local quota usage budget accounting"},
 	{Name: "audit", Summary: "run a read-only repository security audit"},
-	{Name: "doctor", Summary: "run read-only preflight checks"},
 	{Name: "init", Summary: "scaffold loopcoder files in the current repository"},
 	{Name: "discover", Summary: "discover CI failures and file GitHub issues"},
-	{Name: "compile", Summary: "compile ROADMAP.md into GitHub issues"},
-	{Name: "tick", Summary: "run one unattended delivery pass"},
-	{Name: "trigger", Summary: "run automation triggers for tick"},
+	{Name: "compile", Summary: "compile ROADMAP.md into GitHub issues (compatibility)"},
+	{Name: "tick", Summary: "run one unattended delivery pass (compatibility; not self-bootstrap)"},
+	{Name: "trigger", Summary: "run automation triggers for tick (compatibility)"},
 	{Name: "promote", Summary: "promote pre-prod to main"},
 	{Name: "upgrade", Summary: "self-update from GitHub Releases"},
-	{Name: "migrate", Summary: "plan storage upgrades or import legacy repo-local state"},
+	{Name: "migrate", Summary: "plan storage upgrades, v0.8 export, and v0.9 import"},
+	{Name: "export-v08", Summary: "compatibility alias for migrate export-v08 (read-only v0.8 export)"},
+	{Name: "import-v09", Summary: "compatibility alias for migrate import-v09 (dry-run default)"},
 	{Name: "skill", Summary: "install bundled playbook skill files"},
-	{Name: "dispatch", Summary: "dispatch one issue worker"},
-	{Name: "nested", Summary: "submit and execute a nested child plan"},
+	{Name: "dispatch", Summary: "dispatch one issue worker (compatibility)"},
+	{Name: "nested", Summary: "submit and execute a nested child plan (compatibility)"},
 	{Name: "relay", Summary: "flush or list pending local report relay blocks"},
 	{Name: "report", Summary: "list local reporter records"},
 	{Name: "ready-set", Summary: "classify ready and blocked work"},
-	{Name: "status", Summary: "render local delivery run status"},
 	{Name: "attach", Summary: "attach to durable detached run progress"},
 	{Name: "resume", Summary: "reconcile a local run"},
 	{Name: "state", Summary: "publish or pull durable run state"},
 	{Name: "lease", Summary: "manage the conductor lease"},
 	{Name: "recover", Summary: "recover or retry a worker attempt"},
-	{Name: "cancel", Summary: "request cancellation for a detached run"},
 	{Name: "loopreview", Summary: "run an independent read-only PR verifier"},
 	{Name: "verify-local", Summary: "run local verification gates"},
-	{Name: "dispatch-wave", Summary: "dispatch one ready issue wave"},
+	{Name: "dispatch-wave", Summary: "dispatch one ready issue wave (compatibility)"},
 	{Name: "hook", Summary: "run an embedded loopcoder conductor hook (used by Claude Code hook settings)"},
 	{Name: "ps", Summary: "list loopcoder-managed worker processes"},
 	{Name: "kill", Summary: "terminate loopcoder-managed processes (never by bare name)"},
@@ -186,8 +228,11 @@ func Commands() []Command {
 }
 
 // Run executes the CLI and returns a process exit code.
+// Real process entry setup (SIGINT/SIGTERM → CommandContext cancel) is shared
+// with RunWithBuildInfo via ensureProcessEntry — never skipped for published
+// binaries, and never installed from RunWithDeps test call sites.
 func Run(args []string, stdout, stderr io.Writer) int {
-	installShutdownOnSignal(stderr)
+	ensureProcessEntry(stderr)
 	return RunWithDeps(args, stdout, stderr, DefaultDeps())
 }
 
@@ -198,7 +243,12 @@ func normalizeCLINow(now func() time.Time) func() time.Time {
 	return DefaultDeps().Now
 }
 
+// RunWithBuildInfo is the production main entry (cmd/loopcoder/main.go). It must
+// share the same process entry setup as Run so release artifacts install the
+// durable interrupt signal handler; skipping it left SIGTERM at default
+// disposition (exit -15) with no ledger interrupt event.
 func RunWithBuildInfo(args []string, stdout, stderr io.Writer, build BuildInfo) int {
+	ensureProcessEntry(stderr)
 	deps := DefaultDeps()
 	deps.BuildInfo = build
 	return RunWithDeps(args, stdout, stderr, deps)
@@ -272,6 +322,30 @@ func DefaultDeps() Deps {
 		},
 		ProviderQuotaStatus: func(ctx context.Context, req providerinventory.RefreshRequest) (providerinventory.QuotaRefreshStatus, error) {
 			return quotaLifecycle.Status(ctx, req)
+		},
+		ClaudeCatalogVerify: func(ctx context.Context, req claudecatalog.Request) (claudecatalog.Result, error) {
+			now := req.Now
+			if now == nil {
+				now = time.Now
+			}
+			store, err := providerinventory.OpenDefaultStore(ctx, providerinventory.DefaultDeps(), now)
+			if err != nil {
+				return claudecatalog.Result{}, err
+			}
+			defer store.Close()
+			result, err := claudecatalog.Verify(ctx, store, req, claudecatalog.DefaultDeps())
+			if err != nil {
+				if result.Report.SchemaVersion != "" {
+					if persistErr := providerinventory.Refresh(ctx, store, result.Report, now().UTC()); persistErr != nil {
+						return claudecatalog.Result{}, errors.Join(err, persistErr)
+					}
+				}
+				return result, err
+			}
+			if err := providerinventory.Refresh(ctx, store, result.Report, now().UTC()); err != nil {
+				return claudecatalog.Result{}, err
+			}
+			return result, nil
 		},
 		RouteExplain: routing.ExplainStoredRoute,
 		RouteDecide:  routing.DecideStoredRoute,
@@ -453,6 +527,9 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if args[0] == "supervise" {
 		return runDetachedCommandSupervisor(args[1:], stdout, stderr, deps)
 	}
+	if args[0] == "_qualify-ui-probe" {
+		return runQualifyUIProbe(args[1:], stdout, stderr, deps)
+	}
 
 	command, ok := findCommand(args[0])
 	if !ok {
@@ -461,6 +538,15 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 2
 	}
 
+	if command.Name == "run" {
+		return runRun(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "workflow" {
+		return runWorkflow(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "events" {
+		return runEvents(args[1:], stdout, stderr, deps)
+	}
 	if command.Name == "ready-set" {
 		return runReadySet(args[1:], stdout, stderr, deps)
 	}
@@ -503,6 +589,15 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if command.Name == "doctor" {
 		return runDoctor(args[1:], stdout, stderr, deps)
 	}
+	if command.Name == "diagnose" {
+		return runDiagnose(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "capabilities" {
+		return runCapabilities(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "qualify" {
+		return runQualify(args[1:], stdout, stderr, deps)
+	}
 	if command.Name == "init" {
 		return runInit(args[1:], stdout, stderr, deps)
 	}
@@ -526,6 +621,12 @@ func RunWithDeps(args []string, stdout, stderr io.Writer, deps Deps) int {
 	}
 	if command.Name == "migrate" {
 		return runMigrate(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "export-v08" {
+		return runMigrateExportV08(args[1:], stdout, stderr, deps)
+	}
+	if command.Name == "import-v09" {
+		return runMigrateImportV09(args[1:], stdout, stderr, deps)
 	}
 	if command.Name == "skill" {
 		return runSkill(args[1:], stdout, stderr, deps)
@@ -799,6 +900,21 @@ func PrintCommandHelp(w io.Writer, command Command) {
 		fmt.Fprintln(w, "  --poll duration        follow poll interval (default 250ms)")
 		fmt.Fprintln(w, "  --follow-for duration  optional bounded follow duration for tests/scripts")
 		fmt.Fprintln(w, "  --format string        output format: text or jsonl (default \"text\")")
+	}
+	if command.Name == "events" {
+		fmt.Fprintln(w, "  --project-id string   project id (required unless --repo resolves a registration)")
+		fmt.Fprintln(w, "  --repo string         repository path to resolve project id (default \".\")")
+		fmt.Fprintln(w, "  --run string          optional run id filter")
+		fmt.Fprintln(w, "  --after int           resume after this sequence (default 0 = from start)")
+		fmt.Fprintln(w, "  --follow              follow new reports after replay")
+		fmt.Fprintln(w, "  --format string       output format: jsonl or human (default \"jsonl\")")
+		fmt.Fprintln(w, "  --poll duration       follow poll interval (default 250ms)")
+		fmt.Fprintln(w, "  --follow-for duration optional bounded follow duration")
+		fmt.Fprintln(w, "  --client-id string    UI client id (default \"terminal\")")
+		fmt.Fprintln(w, "  --session-id string   UI session id (default auto)")
+		fmt.Fprintln(w, "  --keepalive           emit non-semantic jsonl keepalives while idle")
+		fmt.Fprintln(w, "  --bridge              start loopback HTTP/SSE UI bridge and print handshake JSON")
+		fmt.Fprintln(w, "  --bridge-for duration how long to keep the bridge open (default 30s; 0=until interrupt)")
 	}
 	if command.Name == "report" {
 		fmt.Fprintln(w, "  --repo string      repository path (default \".\")")
@@ -1547,6 +1663,10 @@ func runMigrate(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return runMigrateLocalState(args[1:], stdout, stderr, deps)
 	case "storage":
 		return runMigrateStorage(args[1:], stdout, stderr, deps)
+	case "export-v08":
+		return runMigrateExportV08(args[1:], stdout, stderr, deps)
+	case "import-v09":
+		return runMigrateImportV09(args[1:], stdout, stderr, deps)
 	default:
 		fmt.Fprintf(stderr, "migrate: unknown subcommand %q\n\n", args[0])
 		printMigrateHelp(stderr)
@@ -1558,18 +1678,27 @@ func printMigrateHelp(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  loopcoder migrate local-state --repo <path> [--dry-run] [--format text|json]")
 	fmt.Fprintln(w, "  loopcoder migrate storage [--database <path>] [--apply] [--format text|json]")
+	fmt.Fprintln(w, "  loopcoder migrate export-v08 --export-dir <path> [--source-dir <path>|--fixture] [--format text|json]")
+	fmt.Fprintln(w, "  loopcoder migrate import-v09 --export-dir <path> [--apply] [--format text|json]")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Plan or apply machine-local storage changes.")
+	fmt.Fprintln(w, "Plan or apply machine-local storage changes and v0.8→v0.9 migration.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Subcommands:")
 	fmt.Fprintln(w, "  local-state   import v0.6.x repo-local run, relay, recovery, and report records")
 	fmt.Fprintln(w, "  storage       plan or apply the v0.7-to-v0.8 SQLite schema migration")
+	fmt.Fprintln(w, "  export-v08    read-only v0.8 export to a neutral bundle (outside customer repo)")
+	fmt.Fprintln(w, "  import-v09    dry-run or apply v0.9 import from an export-v08 bundle")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Compatibility aliases: loopcoder export-v08 / loopcoder import-v09")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
 	fmt.Fprintln(w, "  --repo        repository path for local-state (default \".\")")
 	fmt.Fprintln(w, "  --dry-run     scan without writing machine-local storage")
 	fmt.Fprintln(w, "  --database    SQLite path for storage (default LOOPCODER_HOME/data/loopcoder.db)")
-	fmt.Fprintln(w, "  --apply       apply the storage plan; omitted means read-only planning")
+	fmt.Fprintln(w, "  --apply       apply the storage/import plan; omitted means dry-run/planning")
+	fmt.Fprintln(w, "  --export-dir  destination (export) or source (import) for v0.8 bundles")
+	fmt.Fprintln(w, "  --source-dir  directory of v0.8 JSON sources for export-v08")
+	fmt.Fprintln(w, "  --fixture     use built-in representative v0.8 sources for export-v08")
 	fmt.Fprintln(w, "  --format      output format: text or json (default \"text\")")
 	fmt.Fprintln(w, "  --help        show command help")
 }
@@ -1865,14 +1994,17 @@ func printProvidersHelp(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  loopcoder providers refresh [flags]")
 	fmt.Fprintln(w, "  loopcoder providers status [flags]")
+	fmt.Fprintln(w, "  loopcoder providers verify-claude-model [flags]")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Refresh bounded provider CLI installation inventory and show cached quota status.")
+	fmt.Fprintln(w, "Refresh bounded provider inventory, show cached quota status, or explicitly run one paid account-bound Claude capability probe.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
-	fmt.Fprintln(w, "  --repo string          repository path (default \".\")")
-	fmt.Fprintln(w, "  --base-branch string   base branch for .delivery.yml fallback (default \"main\")")
-	fmt.Fprintln(w, "  --format string        output format: text or json (default \"text\")")
-	fmt.Fprintln(w, "  --help                 show help")
+	fmt.Fprintln(w, "  --repo string                    repository path (default \".\")")
+	fmt.Fprintln(w, "  --base-branch string             base branch for .delivery.yml fallback (default \"main\")")
+	fmt.Fprintln(w, "  --grant-quota-telemetry string   comma-separated adapter ids (or \"all\") granted network for quota telemetry")
+	fmt.Fprintln(w, "  --format string                  output format: text or json (default \"text\")")
+	fmt.Fprintln(w, "  verify-claude-model additionally requires --project-id (or a registered project) and accepts --model, --effort, --account-ref, --install-ref, and --timeout")
+	fmt.Fprintln(w, "  --help                           show help")
 }
 
 func printBudgetHelp(w io.Writer) {
@@ -1913,7 +2045,10 @@ func runProviders(args []string, stdout, stderr io.Writer, deps Deps) int {
 		if subcommand == "status" {
 			return runProvidersStatus(args, stdout, stderr, deps)
 		}
-		fmt.Fprintf(stderr, "providers: unsupported subcommand %q (want refresh or status)\n", subcommand)
+		if subcommand == "verify-claude-model" {
+			return runProvidersVerifyClaudeModel(args, stdout, stderr, deps)
+		}
+		fmt.Fprintf(stderr, "providers: unsupported subcommand %q (want refresh, status, or verify-claude-model)\n", subcommand)
 		return 2
 	}
 
@@ -1922,9 +2057,11 @@ func runProviders(args []string, stdout, stderr io.Writer, deps Deps) int {
 	repoPath := "."
 	baseBranch := lcdefaults.BaseBranch
 	format := "text"
+	grantQuotaTelemetry := ""
 	fs.StringVar(&repoPath, "repo", ".", "repository path")
 	fs.StringVar(&baseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
 	fs.StringVar(&format, "format", "text", "output format")
+	fs.StringVar(&grantQuotaTelemetry, "grant-quota-telemetry", "", "comma-separated adapter ids (or \"all\") granted network for quota telemetry")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -1950,13 +2087,39 @@ func runProviders(args []string, stdout, stderr io.Writer, deps Deps) int {
 		fmt.Fprintf(stderr, "providers refresh: %v\n", err)
 		return 1
 	}
+	networkGrants, err := parseQuotaTelemetryGrants(grantQuotaTelemetry)
+	if err != nil {
+		fmt.Fprintf(stderr, "providers refresh: %v\n", err)
+		return 2
+	}
 	now := deps.Now()
+	// When quota/auth grants are present, request refresh for those adapters so
+	// multi-provider durable capacity is collected (not only worker/verifier).
+	var refreshProviders []string
+	for _, g := range networkGrants {
+		id := strings.TrimSpace(g.ProviderID)
+		if id == "" {
+			continue
+		}
+		dup := false
+		for _, p := range refreshProviders {
+			if p == id {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			refreshProviders = append(refreshProviders, id)
+		}
+	}
 	if deps.ProviderQuotaRefresh != nil {
 		result, err := deps.ProviderQuotaRefresh(context.Background(), providerinventory.RefreshRequest{
-			RepoPath: resolvedRepo,
-			Config:   cfg,
-			Trigger:  providerinventory.RefreshTriggerExplicit,
-			Now:      func() time.Time { return now },
+			RepoPath:      resolvedRepo,
+			Config:        cfg,
+			NetworkGrants: networkGrants,
+			Providers:     refreshProviders,
+			Trigger:       providerinventory.RefreshTriggerExplicit,
+			Now:           func() time.Time { return now },
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "providers refresh: %v\n", err)
@@ -1975,9 +2138,10 @@ func runProviders(args []string, stdout, stderr io.Writer, deps Deps) int {
 		return 0
 	}
 	report, err := deps.ProviderInventory(context.Background(), providerinventory.Options{
-		RepoPath: resolvedRepo,
-		Config:   cfg,
-		Now:      func() time.Time { return now },
+		RepoPath:      resolvedRepo,
+		Config:        cfg,
+		NetworkGrants: networkGrants,
+		Now:           func() time.Time { return now },
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "providers refresh: %v\n", err)
@@ -2049,6 +2213,135 @@ func runProviders(args []string, stdout, stderr io.Writer, deps Deps) int {
 	return 0
 }
 
+func runProvidersVerifyClaudeModel(args []string, stdout, stderr io.Writer, deps Deps) int {
+	if deps.ProviderInventory == nil {
+		deps.ProviderInventory = DefaultDeps().ProviderInventory
+	}
+	if deps.ClaudeCatalogVerify == nil {
+		deps.ClaudeCatalogVerify = DefaultDeps().ClaudeCatalogVerify
+	}
+	if deps.Now == nil {
+		deps.Now = DefaultDeps().Now
+	}
+	fs := flag.NewFlagSet("providers verify-claude-model", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	repoPath := "."
+	baseBranch := lcdefaults.BaseBranch
+	projectID := ""
+	deliveryRunID := ""
+	model := "sonnet"
+	effort := "low"
+	accountRef := ""
+	installRef := ""
+	format := "text"
+	timeout := claudecatalog.DefaultTimeout
+	reservedTokens := int64(32768)
+	fs.StringVar(&repoPath, "repo", ".", "repository path")
+	fs.StringVar(&baseBranch, "base-branch", lcdefaults.BaseBranch, "base branch")
+	fs.StringVar(&projectID, "project-id", "", "project id")
+	fs.StringVar(&deliveryRunID, "delivery-run-id", "", "delivery run id")
+	fs.StringVar(&model, "model", "sonnet", "adapter-declared Claude model alias or full ID")
+	fs.StringVar(&effort, "effort", "low", "Claude effort: low, medium, high, xhigh, or max")
+	fs.StringVar(&accountRef, "account-ref", "", "required opaque account profile id")
+	fs.StringVar(&installRef, "install-ref", "", "required provider installation id")
+	fs.DurationVar(&timeout, "timeout", claudecatalog.DefaultTimeout, "bounded paid probe timeout")
+	fs.Int64Var(&reservedTokens, "reserve-tokens", 32768, "bounded token reservation")
+	fs.StringVar(&format, "format", "text", "output format")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(stderr, "providers verify-claude-model: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format != "text" && format != "json" {
+		fmt.Fprintf(stderr, "providers verify-claude-model: invalid --format %q; want text or json\n", format)
+		return 2
+	}
+	if timeout < time.Second || timeout > 5*time.Minute {
+		fmt.Fprintln(stderr, "providers verify-claude-model: --timeout must be between 1s and 5m")
+		return 2
+	}
+	if reservedTokens <= 0 || reservedTokens > 1_000_000 {
+		fmt.Fprintln(stderr, "providers verify-claude-model: --reserve-tokens must be between 1 and 1000000")
+		return 2
+	}
+	resolvedRepo, err := resolveRepo(repoPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "providers verify-claude-model: %v\n", err)
+		return 2
+	}
+	if strings.TrimSpace(projectID) == "" {
+		if project, resolveErr := registry.Resolve(context.Background(), registry.Options{RepoPath: resolvedRepo}, registry.DefaultDeps()); resolveErr == nil {
+			projectID = project.ProjectID
+		}
+	}
+	if strings.TrimSpace(projectID) == "" {
+		fmt.Fprintln(stderr, "providers verify-claude-model: --project-id is required when the repository is not registered")
+		return 2
+	}
+	cfg, err := loadDeliveryConfig(resolvedRepo, baseBranch, false)
+	if err != nil {
+		fmt.Fprintf(stderr, "providers verify-claude-model: %v\n", err)
+		return 1
+	}
+	inventory, err := deps.ProviderInventory(context.Background(), providerinventory.Options{
+		RepoPath:        resolvedRepo,
+		Config:          cfg,
+		Now:             deps.Now,
+		ActiveProviders: []string{"claude"},
+		IdentityOnly:    true,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "providers verify-claude-model: identity inventory: %v\n", err)
+		return 1
+	}
+	result, err := deps.ClaudeCatalogVerify(context.Background(), claudecatalog.Request{
+		RepoPath:       resolvedRepo,
+		ProjectID:      strings.TrimSpace(projectID),
+		DeliveryRunID:  strings.TrimSpace(deliveryRunID),
+		Model:          strings.TrimSpace(model),
+		Effort:         strings.TrimSpace(effort),
+		AccountRef:     strings.TrimSpace(accountRef),
+		InstallRef:     strings.TrimSpace(installRef),
+		Timeout:        timeout,
+		ReservedTokens: reservedTokens,
+		Now:            deps.Now,
+		Inventory:      inventory,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "providers verify-claude-model: %v\n", err)
+		return 1
+	}
+	if format == "json" {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(result); err != nil {
+			fmt.Fprintf(stderr, "providers verify-claude-model: write output: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	receipt := result.Receipt
+	fmt.Fprintf(stdout, "Claude verified subset recorded: requested=%s actual=%s effort=%s install=%s account=%s tokens_reserved=%d tokens_actual=%d tokens_released=%d budget=%s freshness=%s expires_at=%s inventory=%s\n",
+		receipt.RequestedModel,
+		receipt.ActualModel,
+		receipt.AcceptedEffort,
+		receipt.ProviderInstallationID,
+		receipt.AccountProfileID,
+		receipt.ReservedTokens,
+		receipt.CommittedTokens,
+		receipt.ReleasedTokens,
+		receipt.BudgetState,
+		receipt.FreshnessState,
+		receipt.ExpiresAt,
+		result.Report.InventoryFingerprint,
+	)
+	fmt.Fprintln(stdout, "The probe is paid and bounded; raw prompt/result/session/principal/credential material was not retained.")
+	return 0
+}
+
 func runProvidersStatus(args []string, stdout, stderr io.Writer, deps Deps) int {
 	if deps.ProviderQuotaStatus == nil {
 		deps.ProviderQuotaStatus = DefaultDeps().ProviderQuotaStatus
@@ -2110,6 +2403,58 @@ func runProvidersStatus(args []string, stdout, stderr io.Writer, deps Deps) int 
 	}
 	renderProviderQuotaStatusText(stdout, status)
 	return 0
+}
+
+// defaultRuntimeHostName returns a runtimecap-registered host profile name.
+// Unknown names hard-fail every route candidate as role-unsupported.
+func defaultRuntimeHostName() string {
+	if strings.TrimSpace(os.Getenv("PASEO_AGENT_ID")) != "" {
+		return "paseo-style"
+	}
+	return "generic-local"
+}
+
+// parseQuotaTelemetryGrants builds explicit network grants for quota telemetry
+// and co-grants auth/catalog inventory so multi-provider unattended readiness
+// can be observed after refresh (auth + models + quota, not quota alone).
+// Accepts comma-separated adapter ids, or "all" for the common official adapters.
+func parseQuotaTelemetryGrants(raw string) ([]providerinventory.NetworkGrant, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	adapters := []string{}
+	if strings.EqualFold(raw, "all") {
+		adapters = []string{"codex", "claude", "gemini", "antigravity", "grok"}
+	} else {
+		for _, part := range strings.Split(raw, ",") {
+			part = strings.TrimSpace(strings.ToLower(part))
+			if part == "" {
+				continue
+			}
+			adapters = append(adapters, part)
+		}
+	}
+	if len(adapters) == 0 {
+		return nil, fmt.Errorf("invalid --grant-quota-telemetry %q; want adapter ids or \"all\"", raw)
+	}
+	purposes := []providerinventory.NetworkPurpose{
+		providerinventory.NetworkPurposeQuotaTelemetry,
+		providerinventory.NetworkPurposeAuthReadiness,
+		providerinventory.NetworkPurposeModelCatalog,
+		providerinventory.NetworkPurposeAuthCatalogInventory,
+	}
+	grants := make([]providerinventory.NetworkGrant, 0, len(adapters)*len(purposes))
+	for _, adapterID := range adapters {
+		for _, purpose := range purposes {
+			grants = append(grants, providerinventory.NetworkGrant{
+				ProviderID: adapterID,
+				Purpose:    purpose,
+				Scope:      providerinventory.NetworkScopeMachineInventory,
+			})
+		}
+	}
+	return grants, nil
 }
 
 func renderProviderRefreshText(stdout io.Writer, result providerinventory.RefreshResult) {
@@ -4746,7 +5091,7 @@ func runDispatch(args []string, stdout, stderr io.Writer, deps Deps) int {
 			ExplicitProvider: explicitProvider,
 			ExplicitModel:    explicitModel,
 			ExplicitEffort:   explicitEffort,
-			HostName:         "loopcoder-cli",
+			HostName:         defaultRuntimeHostName(),
 			Now:              deps.Now(),
 		})
 		if routeErr != nil {
@@ -6291,7 +6636,7 @@ func runLoopreview(args []string, stdout, stderr io.Writer, deps Deps) int {
 			ExplicitProvider: explicitProvider,
 			ExplicitModel:    explicitModel,
 			ExplicitEffort:   explicitEffort,
-			HostName:         "loopcoder-cli",
+			HostName:         defaultRuntimeHostName(),
 			Now:              deps.Now(),
 		})
 		if routeErr != nil {
@@ -6803,6 +7148,145 @@ func runStatusProgressReceipts(opts statusProgressOptions, stdout, stderr io.Wri
 		fmt.Fprintf(stderr, "status: write output: %v\n", err)
 		return 1
 	}
+	return 0
+}
+
+// runEvents is the production UI report transport entry point (V090-RB01).
+// It is not an alias of runReport.
+func runEvents(args []string, stdout, stderr io.Writer, deps Deps) int {
+	fs := flag.NewFlagSet("events", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var (
+		projectID string
+		repoPath  string
+		runID     string
+		after     int64
+		follow    bool
+		format    string
+		poll      time.Duration
+		followFor time.Duration
+		clientID  string
+		sessionID string
+		keepalive bool
+		bridge    bool
+		bridgeFor time.Duration
+	)
+	fs.StringVar(&projectID, "project-id", "", "project id")
+	fs.StringVar(&repoPath, "repo", ".", "repository path used to resolve project id when --project-id is empty")
+	fs.StringVar(&runID, "run", "", "optional run id filter")
+	fs.Int64Var(&after, "after", 0, "resume after this sequence")
+	fs.BoolVar(&follow, "follow", false, "follow new reports after replay")
+	fs.StringVar(&format, "format", "jsonl", "output format: jsonl or human")
+	fs.DurationVar(&poll, "poll", eventstream.DefaultPoll, "follow poll interval")
+	fs.DurationVar(&followFor, "follow-for", 0, "optional bounded follow duration")
+	fs.StringVar(&clientID, "client-id", "terminal", "UI client id")
+	fs.StringVar(&sessionID, "session-id", "", "UI session id")
+	fs.BoolVar(&keepalive, "keepalive", false, "emit non-semantic jsonl keepalives while idle")
+	fs.BoolVar(&bridge, "bridge", false, "start loopback HTTP/SSE UI bridge and print handshake JSON")
+	fs.DurationVar(&bridgeFor, "bridge-for", 30*time.Second, "bridge lifetime (0 waits until context cancel)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format != "jsonl" && format != "human" {
+		fmt.Fprintf(stderr, "events: --format must be jsonl or human\n")
+		return 2
+	}
+	if sessionID == "" {
+		sessionID = fmt.Sprintf("sess-%d", time.Now().UnixNano())
+	}
+	now := deps.Now
+	if now == nil {
+		now = time.Now
+	}
+	ctx := context.Background()
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		resolved, err := resolveRepo(repoPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "events: resolve repo: %v\n", err)
+			return 1
+		}
+		roots, err := runtimepath.Resolve(ctx, resolved)
+		if err != nil {
+			fmt.Fprintf(stderr, "events: resolve project: %v\n", err)
+			return 1
+		}
+		if !roots.Registered || strings.TrimSpace(roots.ProjectID) == "" {
+			fmt.Fprintf(stderr, "events: --project-id required when repository is not registered\n")
+			return 1
+		}
+		projectID = roots.ProjectID
+	}
+
+	store, err := eventstream.Open(projectID, now)
+	if err != nil {
+		fmt.Fprintf(stderr, "events: open report store: %v\n", err)
+		return 1
+	}
+
+	if bridge {
+		b, hs, err := store.StartBridge(uibridge.Config{
+			ProjectID: projectID,
+			OwnerID:   clientID,
+			Now:       now,
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "events: start bridge: %v\n", err)
+			return 1
+		}
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(hs); err != nil {
+			_ = b.Close()
+			fmt.Fprintf(stderr, "events: write handshake: %v\n", err)
+			return 1
+		}
+		bridgeCtx := ctx
+		var cancel context.CancelFunc
+		if bridgeFor > 0 {
+			bridgeCtx, cancel = context.WithTimeout(ctx, bridgeFor)
+			defer cancel()
+		}
+		<-bridgeCtx.Done()
+		if err := b.Close(); err != nil {
+			fmt.Fprintf(stderr, "events: close bridge: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+
+	mode := termui.ModeJSONL
+	if format == "human" {
+		mode = termui.ModeHuman
+	}
+	followCtx := ctx
+	var cancel context.CancelFunc
+	if follow && followFor > 0 {
+		followCtx, cancel = context.WithTimeout(ctx, followFor)
+		defer cancel()
+	} else if !follow {
+		// snapshot only
+	} else {
+		// unbounded follow: still require cancel from outside; for safety use no deadline
+	}
+	res, err := store.Follow(followCtx, eventstream.FollowOptions{
+		ClientID:  clientID,
+		SessionID: sessionID,
+		After:     after,
+		RunID:     strings.TrimSpace(runID),
+		Mode:      mode,
+		Out:       stdout,
+		Poll:      poll,
+		Keepalive: keepalive && format == "jsonl",
+		Follow:    follow,
+	})
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		fmt.Fprintf(stderr, "events: follow: %v\n", err)
+		return 1
+	}
+	// success even on bounded timeout after partial render
+	_ = res
 	return 0
 }
 

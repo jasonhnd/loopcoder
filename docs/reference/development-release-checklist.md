@@ -8,6 +8,14 @@ Use one copy per version. Store final evidence in that version's GO/NO-GO
 record; do not paste machine-local reports, credentials, absolute paths, or raw
 provider transcripts into GitHub.
 
+## Evidence ownership
+
+Local pre-push is a 60-second focused sentinel only. Full test, race, security,
+packaging, signing, and exact-archive smoke belong to remote evidence tiers.
+See [`evidence-tiers.md`](evidence-tiers.md) for the ownership table,
+required-check discovery rule (Greptile is optional), and SHA/digest recording
+requirements.
+
 ## State Definitions
 
 | State | Required evidence |

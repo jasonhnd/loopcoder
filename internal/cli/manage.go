@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -19,18 +20,77 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
-// installShutdownOnSignal terminates this loopcoder instance's managed child
-// process groups on SIGINT/SIGTERM, so a Ctrl-C'd loopcoder never leaks a
-// running provider CLI. It only ever touches processes THIS loopcoder spawned
-// (via the in-process kill-group registry) — never a process by bare name
-// (spec 0390, Decision 11).
+// rootCmdCtx is cancelled on SIGINT/SIGTERM so long-running commands
+// (workflow goal) can write interrupt events + partial checkpoints before exit.
+// Hard os.Exit alone left the event ledger without interrupt, which blocks
+// exact-binary canary evidence (fail-closed: no hand-written interrupted=true).
+var (
+	rootCmdCtx    context.Context
+	rootCmdCancel context.CancelFunc
+
+	// processEntryOnce ensures production entrypoints install the SIGINT/SIGTERM
+	// handler exactly once. Run and RunWithBuildInfo share this setup; RunWithDeps
+	// does not, so unit tests that call RunWithDeps repeatedly cannot leak
+	// Notify goroutines/handlers.
+	processEntryOnce sync.Once
+)
+
+func init() {
+	rootCmdCtx, rootCmdCancel = context.WithCancel(context.Background())
+}
+
+// CommandContext returns the process root context cancelled on SIGINT/SIGTERM.
+// Commands that must record forced-interrupt evidence should use this instead
+// of context.Background().
+func CommandContext() context.Context {
+	if rootCmdCtx == nil {
+		return context.Background()
+	}
+	return rootCmdCtx
+}
+
+// ensureProcessEntry is the single real CLI process setup shared by Run and
+// RunWithBuildInfo (cmd/loopcoder/main.go uses RunWithBuildInfo). It installs
+// signal handling at most once per process.
+//
+// RunWithDeps intentionally never calls this: tests exercise the command surface
+// many times in one process without installing a process-global handler.
+func ensureProcessEntry(stderr io.Writer) {
+	processEntryOnce.Do(func() {
+		installShutdownOnSignal(stderr)
+	})
+}
+
+// installShutdownOnSignal cancels CommandContext, terminates this loopcoder
+// instance's managed child process groups, then exits after a short grace so
+// workflow can flush interrupt ledger + partial. Second signal exits immediately.
+// It only ever touches processes THIS loopcoder spawned (via the in-process
+// kill-group registry) — never a process by bare name (spec 0390, Decision 11).
+//
+// Shell background jobs (&) often inherit SIGINT/SIGTERM as SIG_IGN. Call
+// signal.Reset before Notify so disposition returns to default and Notify can
+// deliver external kill -INT/-TERM into this handler (durable interrupt ledger).
+//
+// Callers must go through ensureProcessEntry so Notify is registered only once.
 func installShutdownOnSignal(stderr io.Writer) {
-	ch := make(chan os.Signal, 1)
+	signal.Reset(os.Interrupt, syscall.SIGTERM)
+	ch := make(chan os.Signal, 2)
 	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-ch
+		if rootCmdCancel != nil {
+			rootCmdCancel()
+		}
 		if n := supervisedexec.Shutdown(); n > 0 {
 			fmt.Fprintf(stderr, "\n[loopcoder] interrupted; terminated %d managed process group(s)\n", n)
+		} else {
+			fmt.Fprintf(stderr, "\n[loopcoder] interrupted; cancelling in-flight workflow\n")
+		}
+		// Grace: allow goalrun/workflowrun to observe cancel, append interrupt
+		// events, fsync partial, and return. Second signal or timeout force-exits.
+		select {
+		case <-ch:
+		case <-time.After(8 * time.Second):
 		}
 		os.Exit(130)
 	}()

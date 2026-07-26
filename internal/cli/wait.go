@@ -287,30 +287,30 @@ func runStoredWait(stdout, stderr io.Writer, deps Deps, req storedWaitRequest) i
 		return 1
 	}
 	return renderWaitReport(stdout, stderr, req.Format, req.Label, report, len(receipts), map[string]any{
-		"run_id":          runID,
-		"project_id":      roots.ProjectID,
-		"next_probe_at":   report.Snapshot.NextProbeAt,
-		"last_code":       report.Snapshot.LastCode,
-		"checkpoint_dir":  checkpointDir,
-		"provider_calls":  report.ProviderInvocations,
+		"run_id":         runID,
+		"project_id":     roots.ProjectID,
+		"next_probe_at":  report.Snapshot.NextProbeAt,
+		"last_code":      report.Snapshot.LastCode,
+		"checkpoint_dir": checkpointDir,
+		"provider_calls": report.ProviderInvocations,
 	})
 }
 
 func renderWaitReport(stdout, stderr io.Writer, format, kind string, report waitstate.Report, receiptCount int, extra map[string]any) int {
 	out := map[string]any{
-		"kind":                    kind,
-		"wait_id":                 report.WaitID,
-		"stop_reason":             report.StopReason,
-		"provider_calls":          report.ProviderInvocations,
-		"receipt_count":           receiptCount,
-		"polls":                   report.Polls,
-		"wake_decisions":          report.WakeDecisions,
-		"wake_delivered":          report.WakeDelivered,
-		"duplicate_suppressions":  report.DuplicateSuppressions,
-		"duration_ms":             report.DurationMS,
-		"last_state":              report.Snapshot.LastState,
-		"last_code":               report.Snapshot.LastCode,
-		"next_probe_at":           report.Snapshot.NextProbeAt,
+		"kind":                   kind,
+		"wait_id":                report.WaitID,
+		"stop_reason":            report.StopReason,
+		"provider_calls":         report.ProviderInvocations,
+		"receipt_count":          receiptCount,
+		"polls":                  report.Polls,
+		"wake_decisions":         report.WakeDecisions,
+		"wake_delivered":         report.WakeDelivered,
+		"duplicate_suppressions": report.DuplicateSuppressions,
+		"duration_ms":            report.DurationMS,
+		"last_state":             report.Snapshot.LastState,
+		"last_code":              report.Snapshot.LastCode,
+		"next_probe_at":          report.Snapshot.NextProbeAt,
 	}
 	for key, value := range extra {
 		out[key] = value

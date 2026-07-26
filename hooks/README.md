@@ -125,6 +125,28 @@ Auto-enforcement also activates when the gitignored
 `.loopcoder/conductor-workspace` marker is present, which
 `loopcoder skill install` writes into installed repos.
 
+## Pre-push sentinel (ordinary development)
+
+Ordinary development uses a local-focused evidence tier instead of
+repository-wide tests before every push. Install the git hook from the
+repository root:
+
+```sh
+ln -sf ../../hooks/pre-push .git/hooks/pre-push
+```
+
+Or run the same checks without installing a hook:
+
+```sh
+bash scripts/pre-push-sentinel.sh
+```
+
+The sentinel records `tested_commit_sha`, runs `gofmt`, `git diff --check`, and
+a narrow deterministic test filter. It must finish within 60 seconds and must
+not run `go test ./...` or a full race suite. Required PR and release evidence
+remain remote; see
+[`docs/reference/evidence-tiers.md`](../docs/reference/evidence-tiers.md).
+
 ## Test
 
 The hook logic lives in Go. Run the tests with:
@@ -132,3 +154,22 @@ The hook logic lives in Go. Run the tests with:
 ```sh
 go test ./internal/conductorhooks/...
 ```
+
+For the ordinary-development pre-push gate:
+
+```sh
+bash scripts/pre-push-sentinel.sh
+```
+
+## Git `core.hooksPath` (v0.9.0 stabilization)
+
+For ordinary development clones, point Git at this directory so the repository
+sentinel runs instead of any global full-repository pre-push hook:
+
+```bash
+git config core.hooksPath hooks
+git config --get core.hooksPath   # must print: hooks
+```
+
+`pre-push` in this directory only executes `scripts/pre-push-sentinel.sh`
+(local-focused, under 60s). It never runs `go test ./...`.

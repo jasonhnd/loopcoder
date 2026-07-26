@@ -622,6 +622,7 @@ func evaluateRuntimeCompatibility(contract runtimecap.Contract, hostName string,
 
 func evaluateQuota(requirement taskrequirements.TaskRequirement, deadlineClass DeadlineClass, candidate Candidate, quotaByID map[string]providerinventory.QuotaSnapshot, policy Policy, optimization OptimizationPolicy, now time.Time) []RejectionReason {
 	var reasons []RejectionReason
+	var exhaustedSecondary []RejectionReason
 	var sawFreshExact bool
 	var sawFreshEstimate bool
 	var sawUsableCapacity bool
@@ -633,6 +634,22 @@ func evaluateQuota(requirement taskrequirements.TaskRequirement, deadlineClass D
 			return nil
 		}
 		return []RejectionReason{reason(RejectQuotaConfidenceInsufficient, taskrequirements.ErrRequirementConfidenceInsufficientCode, "fresh quota capacity evidence is required", nil, nil)}
+	}
+	// When mixed multi-window telemetry exists (weekly % + zero credits +
+	// reset credits), keep only non-conflicting windows that still report
+	// remaining capacity so secondary empty balances cannot fail the route.
+	preferredIDs := make([]string, 0, len(activeSnapshotIDs))
+	for _, id := range activeSnapshotIDs {
+		snapshot, ok := quotaByID[id]
+		if !ok || len(snapshot.ConflictSet) > 0 {
+			continue
+		}
+		if snapshot.RemainingValue != nil && *snapshot.RemainingValue > 0 {
+			preferredIDs = append(preferredIDs, id)
+		}
+	}
+	if len(preferredIDs) > 0 {
+		activeSnapshotIDs = preferredIDs
 	}
 	candidate.QuotaSnapshotIDs = activeSnapshotIDs
 	optimization = normalizeHardOptimizationPolicy(optimization)
@@ -671,19 +688,29 @@ func evaluateQuota(requirement taskrequirements.TaskRequirement, deadlineClass D
 			reasons = append(reasons, reason(RejectQuotaConfidenceInsufficient, taskrequirements.ErrRequirementConfidenceInsufficientCode, "quota remaining capacity evidence is missing", nil, []string{snapshot.QuotaSnapshotID}))
 			snapshotUsable = false
 		} else if *snapshot.RemainingValue <= 0 {
-			reasons = append(reasons, reason(RejectQuotaExhausted, taskrequirements.ErrRequirementConfidenceInsufficientCode, "quota reports no remaining capacity", nil, []string{snapshot.QuotaSnapshotID}))
+			// Secondary zero-balance windows (for example credits=0 beside a
+			// weekly primary percent) must not alone reject the candidate when
+			// another window still has capacity. Defer until the usable check.
+			exhaustedSecondary = append(exhaustedSecondary, reason(RejectQuotaExhausted, taskrequirements.ErrRequirementConfidenceInsufficientCode, "quota reports no remaining capacity", nil, []string{snapshot.QuotaSnapshotID}))
 			snapshotUsable = false
+			// Skip reset/deadline evaluation for exhausted secondary windows.
+			continue
 		}
 		if !now.IsZero() {
-			resetAt, ok := parseTime(snapshot.ResetAt)
-			if !ok || !resetAt.After(now.UTC()) {
-				reasons = append(reasons, reason(RejectQuotaResetIncompatible, taskrequirements.ErrRequirementConfidenceInsufficientCode, "quota reset evidence is missing or expired", nil, []string{snapshot.QuotaSnapshotID}))
-				snapshotUsable = false
-			} else {
-				band := resetBandForDuration(optimization.ResetBands, resetAt.Sub(now.UTC()))
-				if !taskClassAllowedInBand(string(deadlineClass), band.MaxTaskClass) {
-					reasons = append(reasons, reason(RejectQuotaResetIncompatible, taskrequirements.ErrCapabilityUnsupportedCode, "deadline class "+string(deadlineClass)+" exceeds reset window "+band.Name+" max "+band.MaxTaskClass, nil, []string{snapshot.QuotaSnapshotID}))
+			// Unbounded / non-window balances (credits) often omit reset_at.
+			// Only fixed/rolling windows require a future reset bound.
+			requiresResetWindow := snapshot.WindowKind != "unbounded" && strings.TrimSpace(string(snapshot.ResetSemantics)) != "none"
+			if requiresResetWindow || strings.TrimSpace(snapshot.ResetAt) != "" {
+				resetAt, ok := parseTime(snapshot.ResetAt)
+				if !ok || !resetAt.After(now.UTC()) {
+					reasons = append(reasons, reason(RejectQuotaResetIncompatible, taskrequirements.ErrRequirementConfidenceInsufficientCode, "quota reset evidence is missing or expired", nil, []string{snapshot.QuotaSnapshotID}))
 					snapshotUsable = false
+				} else {
+					band := resetBandForDuration(optimization.ResetBands, resetAt.Sub(now.UTC()))
+					if !taskClassAllowedInBand(string(deadlineClass), band.MaxTaskClass) {
+						reasons = append(reasons, reason(RejectQuotaResetIncompatible, taskrequirements.ErrCapabilityUnsupportedCode, "deadline class "+string(deadlineClass)+" exceeds reset window "+band.Name+" max "+band.MaxTaskClass, nil, []string{snapshot.QuotaSnapshotID}))
+						snapshotUsable = false
+					}
 				}
 			}
 		}
@@ -698,6 +725,7 @@ func evaluateQuota(requirement taskrequirements.TaskRequirement, deadlineClass D
 		reasons = append(reasons, reason(RejectQuotaConfidenceInsufficient, taskrequirements.ErrRequirementConfidenceInsufficientCode, "quota confidence is insufficient", nil, candidate.QuotaSnapshotIDs))
 	}
 	if !sawUsableCapacity {
+		reasons = append(reasons, exhaustedSecondary...)
 		reasons = append(reasons, reason(RejectQuotaConfidenceInsufficient, taskrequirements.ErrRequirementConfidenceInsufficientCode, "no usable fresh quota capacity evidence remains", nil, candidate.QuotaSnapshotIDs))
 	}
 	return reasons

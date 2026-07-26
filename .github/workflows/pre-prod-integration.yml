@@ -1,0 +1,173 @@
+# Bounded merge-sha integration for pre-prod (NOT a full re-run of PR CI).
+# Distinct check names only: integration-verify, integration-canary.
+name: pre-prod-integration
+
+on:
+  push:
+    branches:
+      - pre-prod
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GO_VERSION: "1.26.5"
+
+jobs:
+  integration-verify:
+    name: integration-verify
+    runs-on: macos-15
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+          cache: true
+
+      - name: Record tested commit SHA
+        run: |
+          set -euo pipefail
+          printf 'evidence_tier=merge-sha\n'
+          printf 'integration_job=integration-verify\n'
+          printf 'tested_commit_sha=%s\n' "$(git rev-parse HEAD)"
+          printf 'workflow_path=.github/workflows/pre-prod-integration.yml\n'
+          printf 'event_name=%s\n' "${GITHUB_EVENT_NAME}"
+          printf 'head_branch=%s\n' "${GITHUB_REF_NAME}"
+
+      - name: YAML validity (workflows + delivery)
+        run: |
+          set -euo pipefail
+          ruby -e '
+            require "yaml"
+            paths = [".delivery.yml"] + Dir.glob([".github/workflows/**/*.yml", ".github/workflows/**/*.yaml"]).select { |path| File.file?(path) }
+            paths.sort.each { |path| YAML.load_file(path) }
+            puts "yaml_ok files=#{paths.size}"
+          '
+
+      - name: Stabilization policy + authorization fixtures
+        run: |
+          set -euo pipefail
+          go test . -count=1 -timeout=2m -run 'TestStabilizationGatePolicy|TestV080WorkflowPolicy'
+          go test ./internal/evidence -count=1 -timeout=2m -run 'TestDocsOnly|TestPolicy|TestUnlinked|TestMultiple|TestNonPlanned|TestBodyOnly|TestPlannedWith|TestClosed|TestAuthLabel|TestLatest|TestBootstrap|TestBaseSHA'
+          IMPLEMENTATION_AUTH_OFFLINE=1 bash scripts/check-implementation-authorization.sh
+          bash scripts/assert-pre-prod-green_test.sh
+
+  integration-canary:
+    name: integration-canary
+    runs-on: macos-15
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+          cache: true
+
+      - name: Record tested commit SHA
+        run: |
+          set -euo pipefail
+          printf 'evidence_tier=merge-sha\n'
+          printf 'integration_job=integration-canary\n'
+          printf 'tested_commit_sha=%s\n' "$(git rev-parse HEAD)"
+          printf 'workflow_path=.github/workflows/pre-prod-integration.yml\n'
+
+      - name: Provider-free integration canary (hard wall clock 5m)
+        timeout-minutes: 5
+        env:
+          # doctor hard-requires `gh auth status`; without a token the canary
+          # exits 1 under set -e before JSON asserts can report the cause.
+          GH_TOKEN: ${{ github.token }}
+          GH_FORCE_TTY: "0"
+          NO_COLOR: "1"
+        run: |
+          set -euo pipefail
+          START="$(date +%s)"
+          REPO_ROOT="$(pwd)"
+          # Canonical absolute path (matches doctor --repo resolution via filepath.Abs).
+          CANONICAL_REPO="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "${REPO_ROOT}")"
+          # Snapshot worktree (tracked + untracked names only).
+          BEFORE="$(git -C "${REPO_ROOT}" status --porcelain)"
+
+          go build -o /tmp/loopcoder-canary ./cmd/loopcoder
+          test -x /tmp/loopcoder-canary
+
+          # Prove gh is authenticated in this job (same hard check doctor runs).
+          command -v gh >/dev/null
+          gh auth status
+
+          HOME_ISO="$(mktemp -d)"
+          export LOOPCODER_HOME="${HOME_ISO}"
+          # Isolated home: register this repo, then doctor/report JSON.
+          /tmp/loopcoder-canary projects register --repo "${REPO_ROOT}" --format json >"${HOME_ISO}/register.json"
+          python3 -c '
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          pid = (d.get("project") or {}).get("project_id")
+          assert isinstance(pid, str) and pid.strip(), d
+          print("canary_register_ok project_id=%s" % pid)
+          ' "${HOME_ISO}/register.json"
+
+          # Capture doctor CLI status separately: JSON is still written on hard fails.
+          set +e
+          /tmp/loopcoder-canary doctor --repo "${REPO_ROOT}" --format json >"${HOME_ISO}/doctor.json" 2>"${HOME_ISO}/doctor.err"
+          DOC_CLI=$?
+          set -e
+          python3 -c '
+          import json, sys
+          path, want, cli = sys.argv[1], sys.argv[2], int(sys.argv[3])
+          d = json.load(open(path))
+          if d.get("repo_path") != want:
+            raise SystemExit("doctor.repo_path mismatch got=%r want=%r" % (d.get("repo_path"), want))
+          if d.get("exit_code") != 0:
+            fails = [c for c in (d.get("checks") or []) if c.get("status") == "fail"]
+            for c in fails[:12]:
+              print("doctor_fail name=%s hard=%s msg=%s" % (c.get("name"), c.get("hard"), (c.get("message") or "")[:200]), file=sys.stderr)
+            raise SystemExit("doctor.exit_code=%s cli=%s" % (d.get("exit_code"), cli))
+          checks = d.get("checks")
+          if not isinstance(checks, list) or len(checks) == 0:
+            raise SystemExit("doctor.checks empty")
+          print("canary_doctor_ok checks=%d exit_code=0 cli=%d" % (len(checks), cli))
+          ' "${HOME_ISO}/doctor.json" "${CANONICAL_REPO}" "${DOC_CLI}"
+
+          set +e
+          /tmp/loopcoder-canary report --repo "${REPO_ROOT}" --format json >"${HOME_ISO}/report.json" 2>"${HOME_ISO}/report.err"
+          REP_CLI=$?
+          set -e
+          python3 -c '
+          import json, sys
+          path, cli = sys.argv[1], int(sys.argv[2])
+          d = json.load(open(path))
+          if d.get("schema_version") != "loopcoder.report_query.v1":
+            raise SystemExit("report.schema_version=%r" % (d.get("schema_version"),))
+          if not isinstance(d.get("reports"), list):
+            raise SystemExit("report.reports not list")
+          if not isinstance(d.get("records"), list):
+            raise SystemExit("report.records not list")
+          if not isinstance(d.get("observability"), dict):
+            raise SystemExit("report.observability not object")
+          if cli != 0:
+            raise SystemExit("report cli exit=%d" % cli)
+          print("canary_report_ok schema=%s" % d.get("schema_version"))
+          ' "${HOME_ISO}/report.json" "${REP_CLI}"
+
+          AFTER="$(git -C "${REPO_ROOT}" status --porcelain)"
+          if [ "${BEFORE}" != "${AFTER}" ]; then
+            echo "repository worktree changed during canary:" >&2
+            echo "BEFORE=${BEFORE}" >&2
+            echo "AFTER=${AFTER}" >&2
+            exit 1
+          fi
+
+          END="$(date +%s)"
+          ELAPSED="$((END - START))"
+          printf 'integration_canary_elapsed_seconds=%s\n' "${ELAPSED}"
+          if [ "${ELAPSED}" -gt 300 ]; then
+            echo "integration-canary exceeded 300s wall clock" >&2
+            exit 1
+          fi

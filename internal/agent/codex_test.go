@@ -150,6 +150,28 @@ func TestBuildCodexArgs(t *testing.T) {
 	}
 }
 
+func TestCodexLogReportsModelUnavailable(t *testing.T) {
+	for _, msg := range []string{
+		"ERROR: The gpt-5.3-codex model is not supported when using Codex with a ChatGPT account.",
+		`{"error":{"message":"Model does not exist or you do not have access to it"}}`,
+		"not recognized as a known model",
+	} {
+		if !codexLogReportsModelUnavailable([]byte(msg)) {
+			t.Fatalf("expected model_unavailable for %q", msg)
+		}
+	}
+	for _, msg := range []string{
+		"rate limit exceeded for model gpt-5.3-codex",
+		"authentication required",
+		"network timeout",
+		"the prompt says a model is unsupported",
+	} {
+		if codexLogReportsModelUnavailable([]byte(msg)) {
+			t.Fatalf("must not classify model_unavailable for %q", msg)
+		}
+	}
+}
+
 func TestBuildCodexArgsWithMCPServers(t *testing.T) {
 	got := BuildCodexArgs(Invocation{
 		WorktreePath: "wt",
@@ -259,7 +281,21 @@ func TestBuildCodexReadOnlyVerifierArgs(t *testing.T) {
 	assertArgsDoNotContain(t, got, "dangerously-bypass-approvals-and-sandbox", "approval", "plan")
 }
 
+// ensurePackageCodexAuth installs a minimal CODEX_HOME/auth.json so CI runners
+// without ~/.codex can exercise preflight account binding. Strips ambient API key.
+func ensurePackageCodexAuth(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	raw := []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"not-a-jwt","account_id":"537689fe-5e19-45f1-96f2-5f6b99373698"}}`)
+	if err := os.WriteFile(filepath.Join(dir, "auth.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HOME", dir)
+	t.Setenv("OPENAI_API_KEY", "")
+}
+
 func TestCodexRunnerCreatesSensitiveFilesPrivate(t *testing.T) {
+	ensurePackageCodexAuth(t)
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "codex.log")
 	restore := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
@@ -297,6 +333,7 @@ func TestCodexRunnerCreatesSensitiveFilesPrivate(t *testing.T) {
 }
 
 func TestCodexRunnerSurfacesLogReadError(t *testing.T) {
+	ensurePackageCodexAuth(t)
 	logPath := filepath.Join(t.TempDir(), "codex.log")
 	restore := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
 		if file, ok := cmd.Stdout.(*os.File); ok {
@@ -348,6 +385,7 @@ func TestCodexRunnerDistinguishesMetadataParseFailureFromProviderFailure(t *test
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			ensurePackageCodexAuth(t)
 			restore := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
 				_, _ = io.WriteString(cmd.Stdout, "model: gpt-5\nreasoning effort: high\n")
 				return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: tt.exitCode}, tt.providerErr

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Project status
+
+- **v0.9.0 development stopped; no release** - the owner stopped v0.9.0
+  development on 2026-07-26 because the complete exact-artifact product
+  acceptance objective was not achieved. The stopped `pre-prod` SHA is
+  `30cabdaf77d749c8305349f7f6a87189014b8af8`. Internal
+  `0.9.0-rc.61` was draft-only; its archive was built and bound to that SHA,
+  but its live consumer canary and qualifier were not run. No v0.9 tag or
+  public release exists, and `v0.8.1` remains the latest public release. The
+  objective, full chronology, completed work, failed RC58-RC60 evidence,
+  root-cause and accountability analysis, exact snapshot, lessons, and future
+  resume conditions are recorded in the
+  [`v0.9.0 development suspension report`](docs/v0.9.0-development-suspension-report-2026-07-26.md).
+
 ### Changed
 
 - **Release smoke is Go + bash only (spec 1058)** - removed

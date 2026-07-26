@@ -10,7 +10,10 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/providerinstall"
+	"github.com/jasonhnd/loopcoder/internal/providerinventory"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
@@ -225,6 +228,64 @@ func TestClaudeRunnerRejectsBoundedWriteBeforeLaunch(t *testing.T) {
 	}
 }
 
+func TestClaudeRunnerAffirmsPinnedSameExecutableAccount(t *testing.T) {
+	bin := t.TempDir()
+	executable := filepath.Join(bin, "claude")
+	script := `#!/bin/sh
+if [ "$1" = "auth" ] && [ "$2" = "status" ] && [ "$3" = "--json" ]; then
+  printf '%s\n' '{"loggedIn":true,"email":"same-account@example.invalid","authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}'
+  exit 0
+fi
+exit 91
+`
+	if err := os.WriteFile(executable, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	installID, err := providerinstall.ComputeInstallationID("claude", executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth, err := providerinventory.ParseClaudeAuthBinding(executable, []byte(`{"loggedIn":true,"email":"same-account@example.invalid","authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}`), 0, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore := stubRunSupervised(t, func(_ context.Context, cmd *exec.Cmd, _ supervisedexec.Options) (supervisedexec.Result, error) {
+		if cmd.Path != executable {
+			t.Fatalf("launched path = %q, want %q", cmd.Path, executable)
+		}
+		_, _ = io.WriteString(cmd.Stdout, `{"type":"result","subtype":"success","result":"done","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3},"modelUsage":{"claude-sonnet-5":{"inputTokens":2,"outputTokens":1}}}`)
+		return supervisedexec.Result{Outcome: supervisedexec.OutcomeCompleted, ExitCode: 0}, nil
+	})
+	defer restore()
+
+	result, err := ClaudeRunner{}.Run(context.Background(), Invocation{
+		WorktreePath: t.TempDir(),
+		Prompt:       "verify",
+		LogPath:      filepath.Join(t.TempDir(), "claude.log"),
+		ReadOnly:     true,
+		Model:        "claude-sonnet-5",
+		Effort:       "low",
+		AccountRef:   auth.AccountProfileID,
+		InstallRef:   installID,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.ActualAccountRef != auth.AccountProfileID || result.ActualSourceAccount != ActualSourceAuthBinding {
+		t.Fatalf("actual account = (%q,%q)", result.ActualAccountRef, result.ActualSourceAccount)
+	}
+	if result.ActualInstallRef != installID || result.ActualSourceInstall != ActualSourceInstallBinding {
+		t.Fatalf("actual install = (%q,%q)", result.ActualInstallRef, result.ActualSourceInstall)
+	}
+	if result.ActualModel != "claude-sonnet-5" || result.ActualSourceModel != ActualSourceProviderStream {
+		t.Fatalf("actual model = (%q,%q)", result.ActualModel, result.ActualSourceModel)
+	}
+	if result.ActualEffort != "low" || result.ActualSourceEffort != ActualSourceAcceptedInvocation {
+		t.Fatalf("actual effort = (%q,%q)", result.ActualEffort, result.ActualSourceEffort)
+	}
+}
+
 func TestBuildClaudeReadOnlyVerifierArgs(t *testing.T) {
 	schema := `{"type":"object"}`
 	got := BuildClaudeArgs(Invocation{
@@ -269,10 +330,11 @@ func TestParseClaudeStreamJSONOutput(t *testing.T) {
 			inv:         Invocation{Effort: "max"},
 			wantSummary: `{"verdict":"pass","findings":[],"evidence":"streamed final event","spec_conformance":"pass"}`,
 			wantModel:   "claude-opus-4-8[1m]",
-			wantEffort:  "max",
-			wantInput:   testInt64Ptr(33346),
-			wantOutput:  testInt64Ptr(4),
-			wantTotal:   testInt64Ptr(33350),
+			// Effort is never seeded from request — stream does not echo effort.
+			wantEffort: "",
+			wantInput:  testInt64Ptr(33346),
+			wantOutput: testInt64Ptr(4),
+			wantTotal:  testInt64Ptr(33350),
 		},
 		{
 			name: "result event without structured output returns result text",
@@ -293,7 +355,8 @@ func TestParseClaudeStreamJSONOutput(t *testing.T) {
 {"type":"result"`),
 			inv:         Invocation{Effort: "xhigh"},
 			wantSummary: "",
-			wantEffort:  "xhigh",
+			// Request effort is never treated as observed.
+			wantEffort: "",
 		},
 		{
 			name: "last result event wins",
@@ -405,9 +468,10 @@ func TestParseClaudeInvocation(t *testing.T) {
 					}
 				}
 			}`),
-			inv:        Invocation{Effort: "high"},
-			wantModel:  "claude-opus-4-20250514",
-			wantEffort: "high",
+			inv:       Invocation{Effort: "high"},
+			wantModel: "claude-opus-4-20250514",
+			// Stream does not echo effort — never seed from request.
+			wantEffort: "",
 			wantInput:  testInt64Ptr(1234),
 			wantOutput: testInt64Ptr(567),
 			wantTotal:  testInt64Ptr(1801),
@@ -438,7 +502,7 @@ func TestParseClaudeInvocation(t *testing.T) {
 			wantOutput: testInt64Ptr(71),
 		},
 		{
-			name: "pinned model present wins over higher token auxiliary",
+			name: "stream primary model wins; request pin never seeds actual model",
 			output: []byte(`{
 				"type": "result",
 				"subtype": "success",
@@ -454,8 +518,9 @@ func TestParseClaudeInvocation(t *testing.T) {
 					}
 				}
 			}`),
-			inv:       Invocation{Model: "claude-opus-4-8[1m]"},
-			wantModel: "claude-opus-4-8[1m]",
+			inv: Invocation{Model: "claude-opus-4-8[1m]"},
+			// Primary by token volume is haiku; request pin is not a source of truth.
+			wantModel: "claude-haiku-4-5-20251001",
 		},
 		{
 			name: "pinned model absent falls back to primary model",
@@ -509,10 +574,10 @@ func TestParseClaudeInvocation(t *testing.T) {
 			wantTotal: testInt64Ptr(42),
 		},
 		{
-			name:       "invalid json keeps invocation effort only",
+			name:       "invalid json never seeds effort from request",
 			output:     []byte(`not json`),
 			inv:        Invocation{Effort: "xhigh"},
-			wantEffort: "xhigh",
+			wantEffort: "",
 		},
 	}
 

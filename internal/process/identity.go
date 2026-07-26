@@ -17,6 +17,72 @@ type Identity struct {
 	AmbiguityReason      string
 }
 
+// VerifyClass is a typed process-proof result. Callers must not parse error strings.
+type VerifyClass int
+
+const (
+	// VerifyExactLive: pid alive and birth/pgid/executable match authority.
+	VerifyExactLive VerifyClass = iota
+	// VerifyDead: pid is not alive.
+	VerifyDead
+	// VerifyMismatch: pid alive but birth/pgid/executable explicitly differs (observable reuse).
+	VerifyMismatch
+	// VerifyUnobservable: alive (or unknown) but permission/read/parse/ambiguous — fail closed.
+	VerifyUnobservable
+)
+
+// VerifyError carries a typed classification for VerifySnapshot failures.
+type VerifyError struct {
+	Class VerifyClass
+	Msg   string
+}
+
+func (e *VerifyError) Error() string {
+	if e == nil {
+		return "process verify error"
+	}
+	return e.Msg
+}
+
+// ClassifySnapshot returns a typed proof class without string parsing.
+func ClassifySnapshot(identity Identity) VerifyClass {
+	if identity.PID <= 0 {
+		return VerifyUnobservable
+	}
+	if identity.PGID <= 0 ||
+		strings.TrimSpace(identity.ProcessBirthIdentity) == "" ||
+		strings.TrimSpace(identity.ExecutableIdentity) == "" ||
+		identity.Ambiguous {
+		return VerifyUnobservable
+	}
+	if !Alive(identity.PID) {
+		return VerifyDead
+	}
+	pgid, ok := processGroup(identity.PID)
+	if !ok {
+		// Cannot read process group while pid appears alive → unobservable.
+		return VerifyUnobservable
+	}
+	if pgid != identity.PGID {
+		return VerifyMismatch
+	}
+	birth := strings.TrimSpace(processBirthIdentity(identity.PID))
+	if birth == "" {
+		return VerifyUnobservable
+	}
+	if birth != strings.TrimSpace(identity.ProcessBirthIdentity) {
+		return VerifyMismatch
+	}
+	executable := strings.TrimSpace(processExecutableIdentity(identity.PID))
+	if executable == "" {
+		return VerifyUnobservable
+	}
+	if executable != strings.TrimSpace(identity.ExecutableIdentity) {
+		return VerifyMismatch
+	}
+	return VerifyExactLive
+}
+
 func Snapshot(pid int, observedAt time.Time) (Identity, error) {
 	if pid <= 0 {
 		return Identity{}, fmt.Errorf("pid must be positive")
@@ -50,25 +116,16 @@ func Snapshot(pid int, observedAt time.Time) (Identity, error) {
 }
 
 func VerifySnapshot(identity Identity) error {
-	if identity.PID <= 0 {
-		return fmt.Errorf("process authority pid is missing")
+	switch ClassifySnapshot(identity) {
+	case VerifyExactLive:
+		return nil
+	case VerifyDead:
+		return &VerifyError{Class: VerifyDead, Msg: "process is not alive"}
+	case VerifyMismatch:
+		return &VerifyError{Class: VerifyMismatch, Msg: "process authority identity mismatch"}
+	default:
+		return &VerifyError{Class: VerifyUnobservable, Msg: "process authority identity is ambiguous or unobservable"}
 	}
-	if identity.PGID <= 0 || strings.TrimSpace(identity.ProcessBirthIdentity) == "" || strings.TrimSpace(identity.ExecutableIdentity) == "" || identity.Ambiguous {
-		return fmt.Errorf("process authority identity is ambiguous")
-	}
-	if !Alive(identity.PID) {
-		return fmt.Errorf("process is not alive")
-	}
-	if pgid, ok := processGroup(identity.PID); !ok || pgid != identity.PGID {
-		return fmt.Errorf("process authority group mismatch")
-	}
-	if birth := strings.TrimSpace(processBirthIdentity(identity.PID)); birth == "" || birth != identity.ProcessBirthIdentity {
-		return fmt.Errorf("process authority birth identity mismatch")
-	}
-	if executable := strings.TrimSpace(processExecutableIdentity(identity.PID)); executable == "" || executable != identity.ExecutableIdentity {
-		return fmt.Errorf("process authority executable mismatch")
-	}
-	return nil
 }
 
 func psIdentityField(pid int, args ...string) string {

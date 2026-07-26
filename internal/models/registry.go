@@ -26,6 +26,7 @@ type Provider struct {
 
 type Model struct {
 	Name         string
+	Aliases      []string
 	Depths       []Depth
 	DefaultDepth string
 }
@@ -85,11 +86,25 @@ var staticRegistry = Registry{
 			Vendor:       "OpenAI Codex",
 			CLI:          "codex",
 			DefaultModel: "gpt-5.5",
-			DefaultDepth: "high",
+			// DefaultDepth is the catalog default for unspecified ordinary work;
+			// depthpolicy selects lower/higher from task difficulty (CRO-005).
+			DefaultDepth: "medium",
 			Models: []Model{
 				{
+					// Prefer gpt-5.5: ChatGPT-account Codex rejects gpt-5.3-codex.
+					// capacitysnapshot filters gpt-5.3-codex from unattended inventory.
 					Name:         "gpt-5.5",
-					DefaultDepth: "high",
+					DefaultDepth: "medium",
+					Depths: []Depth{
+						{Token: "low", Label: "low"},
+						{Token: "medium", Label: "medium"},
+						{Token: "high", Label: "high"},
+						{Token: "xhigh", Label: "xhigh"},
+					},
+				},
+				{
+					Name:         "gpt-5.3-codex",
+					DefaultDepth: "medium",
 					Depths: []Depth{
 						{Token: "low", Label: "low"},
 						{Token: "medium", Label: "medium"},
@@ -104,17 +119,37 @@ var staticRegistry = Registry{
 			DisplayName:  "Claude",
 			Vendor:       "Anthropic",
 			CLI:          "claude",
-			DefaultModel: "claude-opus-4-8[1m]",
-			DefaultDepth: "max",
+			DefaultModel: "claude-sonnet-4-5",
+			DefaultDepth: "medium",
 			Models: []Model{
 				{
 					Name:         "claude-opus-4-8[1m]",
-					DefaultDepth: "max",
+					Aliases:      []string{"opus"},
+					DefaultDepth: "high",
 					Depths: []Depth{
 						{Token: "low", Label: "low"},
 						{Token: "medium", Label: "medium"},
 						{Token: "high", Label: "high"},
 						{Token: "max", Label: "max"},
+					},
+				},
+				{
+					Name:         "claude-sonnet-4-5",
+					Aliases:      []string{"sonnet"},
+					DefaultDepth: "medium",
+					Depths: []Depth{
+						{Token: "low", Label: "low"},
+						{Token: "medium", Label: "medium"},
+						{Token: "high", Label: "high"},
+					},
+				},
+				{
+					Name:         "claude-haiku-4-5",
+					Aliases:      []string{"haiku"},
+					DefaultDepth: "low",
+					Depths: []Depth{
+						{Token: "low", Label: "low"},
+						{Token: "medium", Label: "medium"},
 					},
 				},
 			},
@@ -125,28 +160,34 @@ var staticRegistry = Registry{
 			Vendor:       "Google Antigravity",
 			CLI:          "agy",
 			DefaultModel: "Gemini 3.1 Pro",
-			DefaultDepth: "High",
+			DefaultDepth: "medium",
 			Models: []Model{
 				{
 					Name:         "Gemini 3.1 Pro",
-					DefaultDepth: "High",
+					DefaultDepth: "medium",
 					Depths: []Depth{
-						{Token: "Low", Label: "Low"},
-						{Token: "High", Label: "High"},
+						{Token: "low", Label: "low"},
+						{Token: "medium", Label: "medium"},
+						{Token: "high", Label: "high"},
 					},
 				},
 				{
 					Name:         "Opus 4.6",
-					DefaultDepth: "Thinking",
+					DefaultDepth: "high",
 					Depths: []Depth{
-						{Token: "Thinking", Label: "Thinking"},
+						{Token: "medium", Label: "medium"},
+						{Token: "high", Label: "high"},
+						{Token: "xhigh", Label: "xhigh"},
 					},
 				},
 				{
+					// Live `agy models` currently exposes only GPT-OSS 120B (Medium).
+					// Do not invent low/high support in the static catalog — routing
+					// must fail closed or pick another model for those depths.
 					Name:         "GPT-OSS 120B",
-					DefaultDepth: "Medium",
+					DefaultDepth: "medium",
 					Depths: []Depth{
-						{Token: "Medium", Label: "Medium"},
+						{Token: "medium", Label: "medium"},
 					},
 				},
 			},
@@ -156,6 +197,8 @@ var staticRegistry = Registry{
 			DisplayName: "Grok Build",
 			Vendor:      "xAI",
 			CLI:         "grok",
+			// Grok requires dynamic inventory for authoritative model/depth lists.
+			// Static catalog remains empty by design (account-observed only).
 		},
 	},
 }
@@ -371,6 +414,7 @@ func cloneProvider(provider Provider) Provider {
 }
 
 func cloneModel(model Model) Model {
+	model.Aliases = append([]string(nil), model.Aliases...)
 	model.Depths = append([]Depth(nil), model.Depths...)
 	return model
 }

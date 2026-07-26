@@ -929,6 +929,60 @@ func TestAuthProbeTimeoutYieldsUnknownReadiness(t *testing.T) {
 	}
 }
 
+func TestDiscoverClaudeAuthStatusNeverPersistsEmailDisplay(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, executableName("claude"))
+	writeExecutable(t, exe)
+	deps := fakeDeps(t, map[string]string{filepath.Clean(exe): "claude 2.1.210"})
+	deps.Getenv = func(key string) string {
+		if key == "PATH" {
+			return dir
+		}
+		return ""
+	}
+	deps.RunProbe = func(_ context.Context, req ProbeExecution) (ProbeExecutionResult, error) {
+		if len(req.Argv) >= 4 && req.Argv[1] == "auth" && req.Argv[2] == "status" && req.Argv[3] == "--json" {
+			return ProbeExecutionResult{Stdout: `{
+				"loggedIn": true,
+				"email": "person@example.com",
+				"display": "person@example.com",
+				"orgName": "person@example.com",
+				"authMethod": "claude.ai",
+				"apiProvider": "firstParty",
+				"subscriptionType": "max"
+			}`, ExitCode: 0}, nil
+		}
+		return ProbeExecutionResult{Stdout: "claude 2.1.210\n", ExitCode: 0}, nil
+	}
+
+	report, err := Discover(context.Background(), Options{
+		Config: config.Config{Adapters: config.Adapters{Worker: "claude"}},
+		Now:    fixedInventoryNow,
+	}, deps)
+	if err != nil {
+		t.Fatalf("Discover returned error: %v", err)
+	}
+	if len(report.AccountProfiles) != 1 {
+		t.Fatalf("account profiles = %d, want 1: %#v", len(report.AccountProfiles), report.AccountProfiles)
+	}
+	if got := report.AccountProfiles[0].ProfileDisplay; !strings.HasPrefix(got, "profile-") || strings.Contains(got, "@") {
+		t.Fatalf("profile display retained email identity: %q", got)
+	}
+	for _, probe := range report.ProbeResults {
+		if probe.AdapterID == "claude" && probe.ProbeKind == "auth-readiness" &&
+			(strings.Contains(probe.StdoutSummary, "@") || strings.Contains(probe.StderrSummary, "@")) {
+			t.Fatalf("auth probe retained email identity: %#v", probe)
+		}
+	}
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("Marshal report: %v", err)
+	}
+	if strings.Contains(string(data), "person@example.com") || strings.Contains(string(data), "p***@example.com") {
+		t.Fatalf("serialized report retained Claude email identity: %s", data)
+	}
+}
+
 func TestInaccessibleAuthArtifactYieldsTypedUnknown(t *testing.T) {
 	deps := fakeDeps(t, nil)
 	deps.Lstat = func(string) (os.FileInfo, error) {
@@ -1246,4 +1300,23 @@ func hasArg(arg string) bool {
 
 func fixedInventoryNow() time.Time {
 	return time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
+}
+
+func TestParseGrokTextModelsSkipsLoginBanner(t *testing.T) {
+	output := "You are logged in with grok.com.\n\nDefault model: grok-4.5\n\nAvailable models:\n  * grok-4.5 (default)\n  * grok-code-fast-1\n"
+	entries := parseGrokTextModels(output)
+	ids := make([]string, 0, len(entries))
+	for _, e := range entries {
+		ids = append(ids, e.ModelID)
+	}
+	for _, bad := range []string{"You", "Default", "Available"} {
+		for _, id := range ids {
+			if id == bad {
+				t.Fatalf("parsed banner word as model id %q from %#v", bad, ids)
+			}
+		}
+	}
+	if len(ids) < 1 || ids[0] != "grok-4.5" {
+		t.Fatalf("ids = %#v, want grok-4.5 first", ids)
+	}
 }

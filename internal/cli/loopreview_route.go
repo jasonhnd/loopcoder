@@ -73,13 +73,24 @@ func resolveVerifierDispatchRouteProduction(ctx context.Context, input VerifierD
 	runID := fmt.Sprintf("loopreview-pr-%d", input.PRNumber)
 	hostName := strings.TrimSpace(input.HostName)
 	if hostName == "" {
-		hostName = "loopcoder-cli"
+		if strings.TrimSpace(os.Getenv("PASEO_AGENT_ID")) != "" {
+			hostName = "paseo-style"
+		} else {
+			hostName = "generic-local"
+		}
 	}
 	actor := delivery.Actor{
 		ActorKind:         "system",
 		ActorID:           "loopcoder-loopreview",
 		Display:           "loopcoder loopreview",
-		DecisionAuthority: "verifier-dispatch-route",
+		DecisionAuthority: "router",
+		Source:            "cli.loopreview",
+	}
+	pinActor := delivery.Actor{
+		ActorKind:         "user",
+		ActorID:           "local-user",
+		Display:           "local user",
+		DecisionAuthority: "user",
 		Source:            "cli.loopreview",
 	}
 	host := delivery.Host{
@@ -184,7 +195,7 @@ func resolveVerifierDispatchRouteProduction(ctx context.Context, input VerifierD
 		HostName:          hostName,
 		DecidedBy:         actor,
 		Host:              host,
-		PinActor:          actor,
+		PinActor:          pinActor,
 	}
 	if pin := strings.TrimSpace(input.ExplicitProvider); pin != "" {
 		request.Pin = &routing.CandidateConstraint{
