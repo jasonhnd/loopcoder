@@ -77,6 +77,10 @@ type Git interface {
 	RevParse(ctx context.Context, repo, rev string) (string, error)
 	CheckoutNewBranch(ctx context.Context, repo, branch, startPoint string) error
 	AddPath(ctx context.Context, repo, rel string) error
+	// AddGoalPRReceipt stages the one LoopCoder-owned receipt even when the
+	// repository intentionally ignores .loopcoder/. Implementations must reject
+	// every path outside .loopcoder/goal-pr/<run>-receipt.json.
+	AddGoalPRReceipt(ctx context.Context, repo, rel string) error
 	Commit(ctx context.Context, repo, message string) error
 	PushUpstream(ctx context.Context, repo, branch string) error
 	HeadOID(ctx context.Context, repo string) (string, error)
@@ -290,7 +294,7 @@ func Open(ctx context.Context, req Request) (Result, error) {
 	out.ReceiptPath = abs
 	emit("receipt.write:" + rel)
 
-	if err := git.AddPath(ctx, repo, rel); err != nil {
+	if err := git.AddGoalPRReceipt(ctx, repo, rel); err != nil {
 		return out, fmt.Errorf("%w: add: %v", ErrGit, err)
 	}
 	msg := fmt.Sprintf("loopcoder: goal PR receipt for %s (human gate, no auto-merge)", req.RunID)
@@ -512,6 +516,38 @@ func (ProductionGit) CheckoutNewBranch(ctx context.Context, repo, branch, startP
 func (ProductionGit) AddPath(ctx context.Context, repo, rel string) error {
 	_, err := runGit(ctx, repo, "add", "--", rel)
 	return err
+}
+
+func (ProductionGit) AddGoalPRReceipt(ctx context.Context, repo, rel string) error {
+	if err := validateGoalPRReceiptPath(rel); err != nil {
+		return err
+	}
+	// The repository may intentionally ignore all runtime .loopcoder state.
+	// Force exactly this validated, product-owned receipt path; never a parent
+	// directory, glob, caller-selected runtime file, or arbitrary ignored path.
+	_, err := runGit(ctx, repo, "add", "-f", "--", rel)
+	return err
+}
+
+func validateGoalPRReceiptPath(rel string) error {
+	if rel == "" || filepath.IsAbs(rel) || filepath.Clean(rel) != rel {
+		return fmt.Errorf("goalpr: invalid receipt path %q", rel)
+	}
+	slash := filepath.ToSlash(rel)
+	parts := strings.Split(slash, "/")
+	if len(parts) != 3 || parts[0] != ".loopcoder" || parts[1] != "goal-pr" {
+		return fmt.Errorf("goalpr: invalid receipt path %q", rel)
+	}
+	name := parts[2]
+	const suffix = "-receipt.json"
+	if !strings.HasSuffix(name, suffix) {
+		return fmt.Errorf("goalpr: invalid receipt path %q", rel)
+	}
+	run := strings.TrimSuffix(name, suffix)
+	if run == "" || run == "." || run == ".." || sanitize(run) != run {
+		return fmt.Errorf("goalpr: invalid receipt path %q", rel)
+	}
+	return nil
 }
 
 func (ProductionGit) Commit(ctx context.Context, repo, message string) error {

@@ -35,6 +35,10 @@ func (f *fakeGit) AddPath(ctx context.Context, repo, rel string) error {
 	f.addPath = rel
 	return nil
 }
+func (f *fakeGit) AddGoalPRReceipt(ctx context.Context, repo, rel string) error {
+	f.addPath = rel
+	return nil
+}
 func (f *fakeGit) Commit(ctx context.Context, repo, message string) error {
 	if f.failCommit {
 		return errors.New("commit fail")
