@@ -4624,10 +4624,22 @@ func exactForcedInterruptRetryBinding(failed, retry workflowrun.ChildOutcome, ev
 			}
 		case "reuse":
 			c.reuse++
+			// A later zero-launch resume may append any number of exact reuse
+			// observations for the successful retry. They do not replace the
+			// original claim/launch/terminal/integrate chain. Fail closed on a
+			// reuse of the interrupted predecessor or on altered terminal /
+			// evidence identity.
+			if child.AttemptID != retry.AttemptID ||
+				ev.Terminal != "succeeded" || ev.FailureClass != "" ||
+				ev.Evidence != retry.OutputEvidence || ev.CommitSHA != "" {
+				return false
+			}
 		}
 	}
 	return failedCounts == (counts{claim: 1, launch: 1, pid: 1, interrupt: 1, terminal: 1}) &&
-		retryCounts == (counts{claim: 1, launch: 1, pid: 1, terminal: 1, integrate: 1}) &&
+		retryCounts.claim == 1 && retryCounts.launch == 1 &&
+		retryCounts.pid == 1 && retryCounts.terminal == 1 &&
+		retryCounts.integrate == 1 &&
 		interruptID != ""
 }
 
