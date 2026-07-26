@@ -289,6 +289,20 @@ func TestPersistedClosedClaimTerminalReuse_ZeroSecondLaunch(t *testing.T) {
 	if r2.ReuseCount < 1 {
 		t.Fatalf("ReuseCount=%d", r2.ReuseCount)
 	}
+	var reused *workflowrun.ChildOutcome
+	for i := range r2.Children {
+		if r2.Children[i].WorkItemID == "only" && r2.Children[i].Terminal == "succeeded" {
+			reused = &r2.Children[i]
+			break
+		}
+	}
+	if reused == nil {
+		t.Fatalf("missing recovered child: %+v", r2.Children)
+	}
+	if reused.InstallRef == "" || reused.WindowKind == "" ||
+		reused.ReservationID == "" || reused.RouteReason == "" {
+		t.Fatalf("recovered route identity incomplete: %+v", reused)
+	}
 	events := loadEvents(t, home, project, runID)
 	validateAllChildEvents(t, events, workflowrun.EventWriteIdentity{
 		ProjectID: events[0].ProjectID, RunID: runID,

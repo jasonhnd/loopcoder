@@ -399,6 +399,25 @@ func stampRoute(out ChildExecResult, route ChildRoute) ChildExecResult {
 	return out
 }
 
+// observedInvokedRoute binds capacity-window identity only after the runner
+// affirmed the exact account and installation selected for this invocation.
+// This applies to typed non-success results too: model_unavailable is durable
+// route evidence, but requested window/reservation values must never be copied
+// across an absent or mismatched account/install observation.
+func observedInvokedRoute(requested ChildRoute, provider, model, depth, permission, account, install string) ChildRoute {
+	invoked := ChildRoute{
+		Provider: provider, Model: model, Depth: depth, Permission: permission,
+		AccountRef: account, InstallRef: install,
+		CapabilityProbeOnly: requested.CapabilityProbeOnly,
+	}
+	if account != "" && account == strings.TrimSpace(requested.AccountRef) &&
+		install != "" && install == strings.TrimSpace(requested.InstallRef) {
+		invoked.WindowKind = strings.TrimSpace(requested.WindowKind)
+		invoked.ReservationID = strings.TrimSpace(requested.ReservationID)
+	}
+	return invoked
+}
+
 // Execute implements ChildExecutor for production.
 func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput) (ChildExecResult, error) {
 	route := in.Route
@@ -699,11 +718,9 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 		}
 		bindSources(&out)
 		bindSpawn(&out)
-		out.InvokedRoute = ChildRoute{
-			Provider: actualProv, Model: actualModel, Depth: actualDepth,
-			Permission: actualPerm, AccountRef: actualAcct, InstallRef: actualInstall,
-			CapabilityProbeOnly: in.Route.CapabilityProbeOnly,
-		}
+		out.InvokedRoute = observedInvokedRoute(
+			in.Route, actualProv, actualModel, actualDepth, actualPerm, actualAcct, actualInstall,
+		)
 		out = attachUsage(out, res)
 		return out, rerr
 	}
@@ -717,11 +734,9 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 		}
 		bindSources(&out)
 		bindSpawn(&out)
-		out.InvokedRoute = ChildRoute{
-			Provider: actualProv, Model: actualModel, Depth: actualDepth,
-			Permission: actualPerm, AccountRef: actualAcct, InstallRef: actualInstall,
-			CapabilityProbeOnly: in.Route.CapabilityProbeOnly,
-		}
+		out.InvokedRoute = observedInvokedRoute(
+			in.Route, actualProv, actualModel, actualDepth, actualPerm, actualAcct, actualInstall,
+		)
 		out = attachUsage(out, res)
 		return out, nil
 	}
@@ -732,11 +747,9 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 			Message:  "declared-only capability probe succeeded but is not an authoritative production route",
 			Provider: actualProv, Model: actualModel, Depth: actualDepth,
 			FilesTouched: files, ActualSource: "unknown",
-			InvokedRoute: ChildRoute{
-				Provider: actualProv, Model: actualModel, Depth: actualDepth,
-				Permission: actualPerm, AccountRef: actualAcct, InstallRef: actualInstall,
-				CapabilityProbeOnly: true,
-			},
+			InvokedRoute: observedInvokedRoute(
+				in.Route, actualProv, actualModel, actualDepth, actualPerm, actualAcct, actualInstall,
+			),
 		}
 		bindSources(&out)
 		bindSpawn(&out)
@@ -897,19 +910,9 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	}
 	// Invoked route from runner-affirmed actuals only — never request fallbacks.
 	// Window/reservation attach only after exact account+install match.
-	invoked := ChildRoute{
-		Provider:   actualProv,
-		Model:      actualModel,
-		Depth:      actualDepth,
-		Permission: actualPerm,
-		AccountRef: actualAcct,
-		InstallRef: actualInstall,
-	}
-	if actualAcct != "" && strings.EqualFold(actualAcct, strings.TrimSpace(in.Route.AccountRef)) &&
-		actualInstall != "" && actualInstall == strings.TrimSpace(in.Route.InstallRef) {
-		invoked.WindowKind = strings.TrimSpace(in.Route.WindowKind)
-		invoked.ReservationID = strings.TrimSpace(in.Route.ReservationID)
-	}
+	invoked := observedInvokedRoute(
+		in.Route, actualProv, actualModel, actualDepth, actualPerm, actualAcct, actualInstall,
+	)
 	// Production success requires a real spawn-time identity callback while the
 	// process was alive — never invent PID after Run returns.
 	if !spawnSeen {
