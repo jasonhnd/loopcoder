@@ -28,14 +28,40 @@ func TestBindOpenPRVerifierFromChildren(t *testing.T) {
 	goodVerify := workflowrun.ChildOutcome{
 		WorkItemID: "wi_verify", TaskClass: "soul", Terminal: "succeeded",
 		Provider: "codex", AttemptID: "att-v-1", OutputEvidence: verEvid,
+		VerifierDecision:        workflowrun.VerifierDecisionPass,
+		VerifierVerdictDigest:   fullSHA256Seed("verdict-ok"),
+		VerifierReviewedHeadSHA: strings.Repeat("c", 40),
+		IntegrateCommitSHA:      strings.Repeat("d", 40),
 	}
 	goodImpl := workflowrun.ChildOutcome{
 		WorkItemID: "wi_implement", TaskClass: "tera", Terminal: "succeeded",
 		Provider: "grok", AttemptID: "att-i-1", OutputEvidence: implEvid,
 	}
+	goodTests := workflowrun.ChildOutcome{
+		WorkItemID: "wi_tests", TaskClass: "tera", Terminal: "succeeded",
+		Provider: "grok", AttemptID: "att-t-1", OutputEvidence: fullSHA256Seed("tests-ok"),
+		IntegrateCommitSHA: strings.Repeat("c", 40),
+	}
+	kids := func(values ...workflowrun.ChildOutcome) []workflowrun.ChildOutcome {
+		return append([]workflowrun.ChildOutcome{goodTests}, values...)
+	}
+	verifierEvents := func(v workflowrun.ChildOutcome) []workflowrun.Event {
+		raw, err := json.Marshal(map[string]string{
+			"verifier_decision":          v.VerifierDecision,
+			"verifier_verdict_digest":    v.VerifierVerdictDigest,
+			"verifier_reviewed_head_sha": v.VerifierReviewedHeadSHA,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return []workflowrun.Event{
+			{Kind: "integrate", WorkItemID: v.WorkItemID, AttemptID: v.AttemptID, CommitSHA: v.IntegrateCommitSHA},
+			{Kind: "terminal", WorkItemID: v.WorkItemID, AttemptID: v.AttemptID, Terminal: "succeeded", Evidence: v.OutputEvidence, Payload: raw},
+		}
+	}
 
 	t.Run("positive_exact", func(t *testing.T) {
-		prov, evid, ok := bindOpenPRVerifierFromChildren([]workflowrun.ChildOutcome{goodImpl, goodVerify}, nil)
+		prov, evid, ok := bindOpenPRVerifierFromChildren(kids(goodImpl, goodVerify), verifierEvents(goodVerify))
 		if !ok {
 			t.Fatal("want ok")
 		}
@@ -47,7 +73,7 @@ func TestBindOpenPRVerifierFromChildren(t *testing.T) {
 	t.Run("wi_verify_notes_fails", func(t *testing.T) {
 		notes := goodVerify
 		notes.WorkItemID = "wi_verify_notes"
-		_, _, ok := bindOpenPRVerifierFromChildren([]workflowrun.ChildOutcome{goodImpl, notes}, nil)
+		_, _, ok := bindOpenPRVerifierFromChildren(kids(goodImpl, notes), verifierEvents(goodVerify))
 		if ok {
 			t.Fatal("substring id must fail")
 		}
@@ -56,7 +82,7 @@ func TestBindOpenPRVerifierFromChildren(t *testing.T) {
 	t.Run("short_digest_fails", func(t *testing.T) {
 		v := goodVerify
 		v.OutputEvidence = "sha256:short"
-		_, _, ok := bindOpenPRVerifierFromChildren([]workflowrun.ChildOutcome{goodImpl, v}, nil)
+		_, _, ok := bindOpenPRVerifierFromChildren(kids(goodImpl, v), verifierEvents(goodVerify))
 		if ok {
 			t.Fatal("short digest must fail")
 		}
@@ -65,7 +91,7 @@ func TestBindOpenPRVerifierFromChildren(t *testing.T) {
 	t.Run("same_provider_case_insensitive_fails", func(t *testing.T) {
 		v := goodVerify
 		v.Provider = "GROK"
-		_, _, ok := bindOpenPRVerifierFromChildren([]workflowrun.ChildOutcome{goodImpl, v}, nil)
+		_, _, ok := bindOpenPRVerifierFromChildren(kids(goodImpl, v), verifierEvents(goodVerify))
 		if ok {
 			t.Fatal("same provider must fail")
 		}
@@ -74,7 +100,7 @@ func TestBindOpenPRVerifierFromChildren(t *testing.T) {
 	t.Run("duplicate_exact_verify_fails", func(t *testing.T) {
 		v2 := goodVerify
 		v2.AttemptID = "att-v-2"
-		_, _, ok := bindOpenPRVerifierFromChildren([]workflowrun.ChildOutcome{goodImpl, goodVerify, v2}, nil)
+		_, _, ok := bindOpenPRVerifierFromChildren(kids(goodImpl, goodVerify, v2), verifierEvents(goodVerify))
 		if ok {
 			t.Fatal("duplicate verify must fail")
 		}
@@ -83,7 +109,7 @@ func TestBindOpenPRVerifierFromChildren(t *testing.T) {
 	t.Run("missing_verify_attempt_fails", func(t *testing.T) {
 		v := goodVerify
 		v.AttemptID = ""
-		_, _, ok := bindOpenPRVerifierFromChildren([]workflowrun.ChildOutcome{goodImpl, v}, nil)
+		_, _, ok := bindOpenPRVerifierFromChildren(kids(goodImpl, v), verifierEvents(goodVerify))
 		if ok {
 			t.Fatal("missing attempt must fail")
 		}
@@ -92,7 +118,7 @@ func TestBindOpenPRVerifierFromChildren(t *testing.T) {
 	t.Run("wrong_class_fails", func(t *testing.T) {
 		v := goodVerify
 		v.TaskClass = "tera"
-		_, _, ok := bindOpenPRVerifierFromChildren([]workflowrun.ChildOutcome{goodImpl, v}, nil)
+		_, _, ok := bindOpenPRVerifierFromChildren(kids(goodImpl, v), verifierEvents(goodVerify))
 		if ok {
 			t.Fatal("wrong class must fail")
 		}
@@ -101,12 +127,12 @@ func TestBindOpenPRVerifierFromChildren(t *testing.T) {
 	t.Run("whitespace_work_item_id_fails", func(t *testing.T) {
 		v := goodVerify
 		v.WorkItemID = " wi_verify"
-		_, _, ok := bindOpenPRVerifierFromChildren([]workflowrun.ChildOutcome{goodImpl, v}, nil)
+		_, _, ok := bindOpenPRVerifierFromChildren(kids(goodImpl, v), verifierEvents(goodVerify))
 		if ok {
 			t.Fatal("whitespace WorkItemID must fail")
 		}
 		v.WorkItemID = "wi_verify "
-		_, _, ok = bindOpenPRVerifierFromChildren([]workflowrun.ChildOutcome{goodImpl, v}, nil)
+		_, _, ok = bindOpenPRVerifierFromChildren(kids(goodImpl, v), verifierEvents(goodVerify))
 		if ok {
 			t.Fatal("trailing whitespace WorkItemID must fail")
 		}
@@ -116,9 +142,41 @@ func TestBindOpenPRVerifierFromChildren(t *testing.T) {
 		// Exact wi_verify id but failed terminal — fail closed.
 		v := goodVerify
 		v.Terminal = "failed"
-		_, _, ok := bindOpenPRVerifierFromChildren([]workflowrun.ChildOutcome{goodImpl, v}, nil)
+		_, _, ok := bindOpenPRVerifierFromChildren(kids(goodImpl, v), verifierEvents(goodVerify))
 		if ok {
 			t.Fatal("failed exact verify must fail")
+		}
+	})
+
+	t.Run("verdict_mutations_fail", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			mutate func(*workflowrun.ChildOutcome)
+		}{
+			{"decision", func(v *workflowrun.ChildOutcome) { v.VerifierDecision = workflowrun.VerifierDecisionFail }},
+			{"digest", func(v *workflowrun.ChildOutcome) { v.VerifierVerdictDigest = "sha256:short" }},
+			{"reviewed_head", func(v *workflowrun.ChildOutcome) { v.VerifierReviewedHeadSHA = strings.Repeat("e", 40) }},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				v := goodVerify
+				tc.mutate(&v)
+				if _, _, ok := bindOpenPRVerifierFromChildren(kids(goodImpl, v), verifierEvents(goodVerify)); ok {
+					t.Fatal("verdict mutation must fail")
+				}
+			})
+		}
+	})
+
+	t.Run("raw_terminal_verdict_mismatch_fails", func(t *testing.T) {
+		events := verifierEvents(goodVerify)
+		var payload map[string]string
+		if err := json.Unmarshal(events[1].Payload, &payload); err != nil {
+			t.Fatal(err)
+		}
+		payload["verifier_decision"] = workflowrun.VerifierDecisionFail
+		events[1].Payload, _ = json.Marshal(payload)
+		if _, _, ok := bindOpenPRVerifierFromChildren(kids(goodImpl, goodVerify), events); ok {
+			t.Fatal("raw terminal verdict mismatch must fail")
 		}
 	})
 
@@ -152,7 +210,20 @@ func TestBindOpenPRVerifierFromChildren_ExactForcedInterruptRetry(t *testing.T) 
 	verify := workflowrun.ChildOutcome{
 		WorkItemID: "wi_verify", TaskClass: "soul", Terminal: "succeeded",
 		Provider: "claude", AttemptID: "att-wi_verify-exact-g0",
-		OutputEvidence: fullSHA256Seed("verify-success"),
+		OutputEvidence:          fullSHA256Seed("verify-success"),
+		VerifierDecision:        workflowrun.VerifierDecisionPass,
+		VerifierVerdictDigest:   fullSHA256Seed("verdict-success"),
+		VerifierReviewedHeadSHA: strings.Repeat("c", 40),
+		IntegrateCommitSHA:      strings.Repeat("d", 40),
+		Generation:              1,
+		ExecutionPlanDigest:     plan,
+		ChildContractDigest:     fullSHA256Seed("verify-contract"),
+	}
+	testsChild := workflowrun.ChildOutcome{
+		WorkItemID: "wi_tests", TaskClass: "tera", Terminal: "succeeded",
+		Provider: "codex", AttemptID: "att-wi_tests-exact-g0",
+		OutputEvidence:     fullSHA256Seed("tests-success"),
+		IntegrateCommitSHA: strings.Repeat("c", 40),
 	}
 
 	payload := func(child workflowrun.ChildOutcome, extra map[string]string) json.RawMessage {
@@ -204,6 +275,16 @@ func TestBindOpenPRVerifierFromChildren_ExactForcedInterruptRetry(t *testing.T) 
 		event("terminal", retry, map[string]string{
 			"terminal": "succeeded", "output_evidence": retry.OutputEvidence,
 		}),
+		event("claim", verify, nil),
+		event("launch", verify, nil),
+		event("pid", verify, nil),
+		event("integrate", verify, map[string]string{"commit_sha": verify.IntegrateCommitSHA}),
+		event("terminal", verify, map[string]string{
+			"terminal": "succeeded", "output_evidence": verify.OutputEvidence,
+			"verifier_decision":          verify.VerifierDecision,
+			"verifier_verdict_digest":    verify.VerifierVerdictDigest,
+			"verifier_reviewed_head_sha": verify.VerifierReviewedHeadSHA,
+		}),
 	}
 	events[3].Terminal, events[3].FailureClass = "cancelled", "forced_interrupt"
 	events[4].Terminal, events[4].FailureClass = "cancelled", "forced_interrupt"
@@ -211,8 +292,11 @@ func TestBindOpenPRVerifierFromChildren_ExactForcedInterruptRetry(t *testing.T) 
 	events[8].CommitSHA = retry.IntegrateCommitSHA
 	events[9].Terminal = "succeeded"
 	events[9].Evidence = retry.OutputEvidence
+	events[13].CommitSHA = verify.IntegrateCommitSHA
+	events[14].Terminal = "succeeded"
+	events[14].Evidence = verify.OutputEvidence
 
-	kids := []workflowrun.ChildOutcome{failed, retry, verify}
+	kids := []workflowrun.ChildOutcome{failed, retry, testsChild, verify}
 	if provider, evidence, ok := bindOpenPRVerifierFromChildren(kids, events); !ok {
 		t.Fatal("exact forced-interrupt retry must bind")
 	} else if provider != "claude" || evidence != verify.OutputEvidence {
