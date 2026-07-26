@@ -86,6 +86,24 @@ func TestValidateCanaryEvidenceRequiresRealRuntime(t *testing.T) {
 	}
 }
 
+func TestValidateCanaryClaimFenceGenerationMayLagAttemptGeneration(t *testing.T) {
+	now := time.Date(2026, 7, 22, 21, 0, 0, 0, time.UTC)
+	ev, digest, sha := baseValidCanary(now)
+	ev.RawClaims = append(ev.RawClaims, workclaim.Claim{
+		Schema: workclaim.SchemaClaim, ClaimID: "wcl-late", ProjectID: ev.ProjectID,
+		GraphID: "g", GraphVersion: 1, WorkItemID: "wi_late",
+		AttemptID: "att-wi_late-g1", ExecutorID: workflowrun.WorkflowrunExecutorID,
+		Generation: 1, State: workclaim.StateClosed, Terminal: "succeeded",
+		OutputEvidence: deterministicSHA256Evidence("late"),
+	})
+	ev.DurableEvidenceDigest = artifactqual.DigestDurableEvidence(ev)
+	ev.ContentDigest = artifactqual.DigestCanaryBody(ev)
+	v := artifactqual.ValidateCanaryEvidence(ev, digest, sha, now)
+	if strings.Contains(strings.Join(v.Reasons, ";"), "raw_claim_envelope_invalid") {
+		t.Fatalf("independent claim fence generation must not invalidate raw envelope: %v", v.Reasons)
+	}
+}
+
 func validPR(head string) *artifactqual.CanaryPR {
 	return &artifactqual.CanaryPR{
 		URL: "https://github.com/jasonhnd/loopcoder/pull/9999", Number: 9999,
@@ -239,10 +257,7 @@ func completeRawCanaryEvidence(ev *artifactqual.CanaryEvidence, now time.Time) {
 	retry.FilesTouched = []string{"product/wi_retry.md"}
 	failed := retry
 	failed.AttemptID = "att-wi_retry-g0"
-	failed.Provider = "claude"
-	failed.Model = "claude-opus"
-	failed.AccountRef = "acct-claude"
-	failed.InstallRef = "pinst_claude-wi_retry"
+	failed.Model = "gpt-unavailable"
 	failed.Terminal = "failed"
 	failed.OutputEvidence = failedEvidence
 	failed.RealProviderExecuted = false
@@ -292,7 +307,7 @@ func completeRawCanaryEvidence(ev *artifactqual.CanaryEvidence, now time.Time) {
 	modelUnavailable := event("wev-u-3", "model_unavailable", "wi_retry", failed.AttemptID, 1)
 	modelUnavailable.FailureClass, modelUnavailable.Terminal, modelUnavailable.Evidence =
 		"model_unavailable", "failed", failedEvidence
-	modelUnavailable.Payload = []byte(`{"attempt_id":"att-wi_retry-g0","failure_class":"model_unavailable","model":"claude-opus","provider":"claude","work_item_id":"wi_retry"}`)
+	modelUnavailable.Payload = []byte(`{"attempt_id":"att-wi_retry-g0","failure_class":"model_unavailable","model":"gpt-unavailable","provider":"codex","work_item_id":"wi_retry"}`)
 	failedTerminal := event("wev-u-4", "terminal", "wi_retry", failed.AttemptID, 1)
 	failedTerminal.FailureClass, failedTerminal.Terminal, failedTerminal.Evidence =
 		"model_unavailable", "failed", failedEvidence
@@ -344,7 +359,7 @@ func completeRawCanaryEvidence(ev *artifactqual.CanaryEvidence, now time.Time) {
 	}
 	ev.RawLedgerEntries = ledger
 	ev.UnavailableRetry = &artifactqual.CanaryUnavailableRetry{
-		ExcludedProvider: "claude", ExcludedReason: "model_unavailable",
+		ExcludedProvider: "codex", ExcludedReason: "model_unavailable",
 		RetryAttemptID: retry.AttemptID, NoDuplicateClaim: true,
 		NoDuplicateFiles: true, NoDoubleCapacity: true,
 	}
@@ -352,30 +367,39 @@ func completeRawCanaryEvidence(ev *artifactqual.CanaryEvidence, now time.Time) {
 		ev.Restart = validRestart(5)
 	}
 	ev.Restart.ChildCountUseful = 5
-	for i := range ev.ProviderObservations {
-		var match *artifactqual.CanaryChild
-		for j := range ev.Children {
-			if ev.Children[j].RealProviderExecuted &&
-				ev.Children[j].Provider == ev.ProviderObservations[i].Provider {
-				match = &ev.Children[j]
-				break
-			}
-		}
-		if match != nil {
-			ev.ProviderObservations[i].AccountRef = match.AccountRef
-			ev.ProviderObservations[i].InstallRef = match.InstallRef
-			ev.ProviderObservations[i].WindowKind = match.WindowKind
-			ev.ProviderObservations[i].Source = match.AfterSource
-			ev.ProviderObservations[i].Freshness = match.AfterFreshness
-			ev.ProviderObservations[i].Confidence = match.AfterConfidence
-			ev.ProviderObservations[i].Remaining = match.CapacityAfter
-			ev.ProviderObservations[i].CapturedAt = match.AfterObservedAt
-			ev.ProviderObservations[i].ResetAt = match.ResetAt
-			ev.ProviderObservations[i].InventoryReportDigest = afterDigest
+	ev.ProviderObservations = nil
+	for i := range ledger {
+		entry := ledger[i]
+		before := entry.Before
+		ev.ProviderObservations = append(ev.ProviderObservations, artifactqual.CanaryProviderObs{
+			Provider: entry.Provider, AccountRef: entry.AccountRef,
+			InstallRef: entry.InstallRef, WindowKind: entry.WindowKind,
+			Source: entry.BeforeSource, Freshness: entry.Freshness,
+			Confidence: string(entry.Confidence), Remaining: &before,
+			CapturedAt: timeValueForTest(entry.BeforeCapturedAt), ResetAt: entry.ResetAt,
+			InventoryReportDigest: entry.BeforeInventoryDigest,
+		})
+		if entry.After != nil {
+			after := *entry.After
+			ev.ProviderObservations = append(ev.ProviderObservations, artifactqual.CanaryProviderObs{
+				Provider: entry.Provider, AccountRef: entry.AccountRef,
+				InstallRef: entry.InstallRef, WindowKind: entry.WindowKind,
+				Source: entry.AfterSource, Freshness: entry.AfterFreshness,
+				Confidence: string(entry.AfterConfidence), Remaining: &after,
+				CapturedAt: timeValueForTest(entry.AfterObservedAt), ResetAt: entry.ResetAt,
+				InventoryReportDigest: entry.AfterInventoryDigest,
+			})
 		}
 	}
 	ev.DurableEvidenceDigest = artifactqual.DigestDurableEvidence(*ev)
 	ev.ContentDigest = artifactqual.DigestCanaryBody(*ev)
+}
+
+func timeValueForTest(value *time.Time) time.Time {
+	if value == nil {
+		return time.Time{}
+	}
+	return value.UTC()
 }
 
 // deterministicSHA256Evidence returns sha256: + 64 hex derived from seed (not a real hash).

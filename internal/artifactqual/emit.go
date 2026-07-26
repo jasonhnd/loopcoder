@@ -1,11 +1,14 @@
 package artifactqual
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -134,7 +137,7 @@ func EmitCanaryEvidence(in EmitInput) (CanaryEvidence, error) {
 	}
 
 	// Repo-local runtime: lstat <repo>/.loopcoder — never invent clean.
-	repoChecked, repoPresent := measureRepoLocalRuntime(in.RepoPath)
+	repoChecked, repoPresent := measureRepoLocalRuntime(in.RepoPath, in.ProjectID, in.RunID)
 	noRepoLocal := repoChecked && !repoPresent
 
 	var restart *CanaryRestart
@@ -384,24 +387,97 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
-// measureRepoLocalRuntime lstats <repo>/.loopcoder.
+// measureRepoLocalRuntime inspects <repo>/.loopcoder.
 // Returns (checked=false, present=false) on empty path or measurement error (fail closed).
 // Returns (true, true) when the path exists; (true, false) when absent (ErrNotExist).
-func measureRepoLocalRuntime(repoPath string) (checked bool, present bool) {
+// The sole exception is the exact, regular, git-tracked goal-pr receipt owned by
+// this run. goalpr deliberately force-adds that immutable human-gate evidence
+// under an otherwise ignored namespace; it is product evidence, not live
+// runtime state. Any sibling, symlink, untracked receipt, or path mismatch still
+// reports runtime present.
+func measureRepoLocalRuntime(repoPath, projectID, runID string) (checked bool, present bool) {
 	repoPath = strings.TrimSpace(repoPath)
 	if repoPath == "" {
 		return false, false
 	}
 	p := filepath.Join(repoPath, ".loopcoder")
-	_, err := os.Lstat(p)
-	if err == nil {
-		return true, true
-	}
+	info, err := os.Lstat(p)
 	if os.IsNotExist(err) {
 		return true, false
 	}
-	// Permission / IO error: cannot claim clean.
-	return false, false
+	if err != nil {
+		// Permission / IO error: cannot claim clean.
+		return false, false
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return true, true
+	}
+	if runID == "" || runID != strings.TrimSpace(runID) ||
+		filepath.Base(runID) != runID || strings.ContainsAny(runID, `/\`) {
+		return true, true
+	}
+	wantRel := filepath.ToSlash(filepath.Join(".loopcoder", "goal-pr", runID+"-receipt.json"))
+	wantAbs := filepath.Join(repoPath, filepath.FromSlash(wantRel))
+	files := 0
+	walkErr := filepath.Walk(p, func(path string, entry os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, relErr := filepath.Rel(repoPath, path)
+		if relErr != nil {
+			return relErr
+		}
+		rel = filepath.ToSlash(rel)
+		if entry.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("symlink not allowed: %s", rel)
+		}
+		if entry.IsDir() {
+			if rel != ".loopcoder" && rel != ".loopcoder/goal-pr" {
+				return fmt.Errorf("unexpected runtime directory: %s", rel)
+			}
+			return nil
+		}
+		if !entry.Mode().IsRegular() || path != wantAbs || rel != wantRel {
+			return fmt.Errorf("unexpected runtime file: %s", rel)
+		}
+		files++
+		return nil
+	})
+	if walkErr != nil || files != 1 {
+		return true, true
+	}
+	if info, statErr := os.Stat(wantAbs); statErr != nil || info.Size() <= 0 || info.Size() > 8<<20 {
+		return true, true
+	}
+	rawReceipt, readErr := os.ReadFile(wantAbs)
+	if readErr != nil {
+		return true, true
+	}
+	var receipt struct {
+		Schema    string `json:"schema"`
+		ProjectID string `json:"project_id"`
+		RunID     string `json:"run_id"`
+		HumanGate bool   `json:"human_gate"`
+		AutoMerge bool   `json:"auto_merge"`
+	}
+	if json.Unmarshal(rawReceipt, &receipt) != nil ||
+		receipt.Schema != "loopcoder.goalpr.receipt.v1" ||
+		receipt.ProjectID != projectID ||
+		receipt.RunID != runID || !receipt.HumanGate || receipt.AutoMerge {
+		return true, true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "ls-files", "--error-unmatch", "--", wantRel)
+	raw, err := cmd.Output()
+	if err != nil || string(raw) != wantRel+"\n" {
+		return true, true
+	}
+	committed, err := exec.CommandContext(ctx, "git", "-C", repoPath, "show", "HEAD:"+wantRel).Output()
+	if err != nil || !bytes.Equal(committed, rawReceipt) {
+		return true, true
+	}
+	return true, false
 }
 
 // WriteCanaryEvidence writes the manifest atomically (owner-only mode).

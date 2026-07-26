@@ -133,7 +133,7 @@ func TestProductFilesOnly_ExcludesProviderRuntimeRoots(t *testing.T) {
 	run("git", "add", "README.md")
 	run("git", "commit", "-m", "init")
 
-	for _, rel := range []string{".cache/go-build/a", ".tmp/test/b"} {
+	for _, rel := range []string{".cache/go-build/a", ".gomodcache/cache/download/example.invalid/mod.lock", ".tmp/test/b"} {
 		path := filepath.Join(dir, filepath.FromSlash(rel))
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			t.Fatal(err)

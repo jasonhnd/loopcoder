@@ -689,7 +689,7 @@ func TestA715_ArtifactqualConsumesDurableFacts(t *testing.T) {
 	// One-field mutation after emission must be caught even when both manifest
 	// digests are recomputed. Persist and reload it so the assertion crosses the
 	// exact file boundary rather than validating an in-memory helper object.
-	produced.RawClaims[0].Generation++
+	produced.RawClaims[0].Generation = 0
 	produced.DurableEvidenceDigest = artifactqual.DigestDurableEvidence(produced)
 	produced.ContentDigest = artifactqual.DigestCanaryBody(produced)
 	mutatedPath := filepath.Join(t.TempDir(), "mutated_canary_evidence.json")

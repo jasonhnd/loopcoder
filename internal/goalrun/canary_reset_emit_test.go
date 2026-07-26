@@ -44,8 +44,55 @@ func TestCanaryChildrenFromReports_PropagatesCapacityResetAt(t *testing.T) {
 		t.Fatalf("ResetAt=%v want %v", kids[0].ResetAt, reset.UTC())
 	}
 	obs := canaryProviderObsFromReports(res)
-	if len(obs) != 1 || obs[0].ResetAt == nil || !obs[0].ResetAt.Equal(reset.UTC()) {
-		t.Fatalf("provider obs ResetAt=%v", obs)
+	if len(obs) != 2 {
+		t.Fatalf("provider obs=%v want exact before and after", obs)
+	}
+	for _, observation := range obs {
+		if observation.ResetAt == nil || !observation.ResetAt.Equal(reset.UTC()) {
+			t.Fatalf("provider obs ResetAt=%v", obs)
+		}
+	}
+}
+
+func TestCanaryProviderObsFromReports_PreservesDistinctResumeSnapshots(t *testing.T) {
+	before1 := 0.93
+	before2 := 0.91
+	after2 := 0.90
+	t1 := time.Date(2026, 7, 26, 6, 0, 0, 0, time.UTC)
+	t2 := t1.Add(time.Minute)
+	t3 := t2.Add(time.Minute)
+	res := Result{Children: []ChildReport{
+		{
+			ChildID: "wi_research", Provider: "codex", AccountRef: "acct",
+			InstallRef: "install", WindowKind: "weekly",
+			CapacityBefore: &before1, CapacityBeforeSource: "official",
+			CapacityBeforeFreshness: "fresh", CapacityBeforeConfidence: "exact",
+			CapacityBeforeInventoryDigest: "digest-before-1", CapacityBeforeCapturedAt: t1,
+		},
+		{
+			ChildID: "wi_tests", Provider: "codex", AccountRef: "acct",
+			InstallRef: "install", WindowKind: "weekly",
+			CapacityBefore: &before2, CapacityBeforeSource: "official",
+			CapacityBeforeFreshness: "fresh", CapacityBeforeConfidence: "exact",
+			CapacityBeforeInventoryDigest: "digest-before-2", CapacityBeforeCapturedAt: t2,
+			CapacityAfter: &after2, CapacityAfterState: "observed",
+			CapacityAfterSource: "official", CapacityAfterFreshness: "fresh",
+			CapacityAfterConfidence: "exact", CapacityAfterInventoryDigest: "digest-after-2",
+			CapacityAfterObservedAt: t3,
+		},
+	}}
+	obs := canaryProviderObsFromReports(res)
+	if len(obs) != 3 {
+		t.Fatalf("observations=%d want distinct before1,before2,after2: %+v", len(obs), obs)
+	}
+	got := map[string]bool{}
+	for _, observation := range obs {
+		got[observation.InventoryReportDigest] = true
+	}
+	for _, digest := range []string{"digest-before-1", "digest-before-2", "digest-after-2"} {
+		if !got[digest] {
+			t.Fatalf("missing exact snapshot %s: %+v", digest, obs)
+		}
 	}
 }
 
