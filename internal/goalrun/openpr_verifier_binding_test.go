@@ -242,6 +242,58 @@ func TestBindOpenPRVerifierFromChildren_ExactForcedInterruptRetry(t *testing.T) 
 		}
 		in[index].Payload = raw
 	}
+	t.Run("repeated_exact_durable_reuse", func(t *testing.T) {
+		gotEvents := cloneEvents()
+		for i := 0; i < 2; i++ {
+			reuse := event("reuse", retry, nil)
+			reuse.EventID += "-" + strconv.Itoa(i)
+			reuse.Terminal = "succeeded"
+			reuse.Evidence = retry.OutputEvidence
+			gotEvents = append(gotEvents, reuse)
+		}
+		if provider, evidence, ok := bindOpenPRVerifierFromChildren(kids, gotEvents); !ok {
+			t.Fatal("exact repeated durable reuse must preserve binding")
+		} else if provider != "claude" || evidence != verify.OutputEvidence {
+			t.Fatalf("provider=%q evidence=%q", provider, evidence)
+		}
+	})
+	t.Run("durable_reuse_mutations_fail_closed", func(t *testing.T) {
+		tests := []struct {
+			name   string
+			mutate func(*workflowrun.Event)
+		}{
+			{"interrupted_predecessor", func(ev *workflowrun.Event) {
+				*ev = event("reuse", failed, nil)
+				ev.EventID += "-failed"
+				ev.Terminal = "cancelled"
+				ev.FailureClass = "forced_interrupt"
+				ev.Evidence = failed.OutputEvidence
+			}},
+			{"missing_terminal", func(ev *workflowrun.Event) {
+				ev.Terminal = ""
+			}},
+			{"altered_evidence", func(ev *workflowrun.Event) {
+				ev.Evidence = fullSHA256Seed("other-reuse")
+			}},
+			{"unexpected_commit", func(ev *workflowrun.Event) {
+				ev.CommitSHA = strings.Repeat("b", 40)
+			}},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				gotEvents := cloneEvents()
+				reuse := event("reuse", retry, nil)
+				reuse.EventID += "-mutation"
+				reuse.Terminal = "succeeded"
+				reuse.Evidence = retry.OutputEvidence
+				tc.mutate(&reuse)
+				gotEvents = append(gotEvents, reuse)
+				if _, _, ok := bindOpenPRVerifierFromChildren(kids, gotEvents); ok {
+					t.Fatal("mutated durable reuse must fail closed")
+				}
+			})
+		}
+	})
 	tests := []struct {
 		name   string
 		mutate func(*[]workflowrun.ChildOutcome, *[]workflowrun.Event)
