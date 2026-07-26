@@ -161,7 +161,7 @@ func TestReconcileCapacityGroups_SingleWindowDeltaNotMultiplied(t *testing.T) {
 		})
 	}
 
-	reconcileCapacityGroups(children, led, holds, &snapAfter)
+	reconcileCapacityGroups(children, led, holds, &snapAfter, false)
 
 	const wantAgg = 0.06 // 0.90 − 0.84 once — never 0.18
 	var sumActual float64

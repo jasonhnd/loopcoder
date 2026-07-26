@@ -599,7 +599,7 @@ func runtimeOnlyProductPath(rel string) bool {
 		first = rel[:i]
 	}
 	switch first {
-	case ".cache", ".tmp":
+	case ".cache", ".gomodcache", ".tmp":
 		return true
 	default:
 		return false

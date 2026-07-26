@@ -288,54 +288,56 @@ func canaryProviderObsFromReports(res Result) []artifactqual.CanaryProviderObs {
 	var out []artifactqual.CanaryProviderObs
 	for _, c := range res.Children {
 		p := strings.ToLower(strings.TrimSpace(c.Provider))
-		if p == "" || p == "fixture" || seen[p] {
+		if p == "" || p == "fixture" {
 			continue
 		}
-		if c.CapacityBefore == nil && c.CapacityAfter == nil {
-			continue
+		// A resumed run legitimately spans multiple immutable inventory
+		// snapshots. Emit every distinct structured before/after observation so
+		// each raw ledger row can bind to its exact digest instead of being
+		// rewritten to the final run snapshot.
+		appendObs := func(rem *float64, src, fresh, conf, invDigest string, capAt time.Time) {
+			if rem == nil || src == "" || fresh == "" || invDigest == "" || capAt.IsZero() {
+				return
+			}
+			key := strings.Join([]string{
+				p, c.AccountRef, c.InstallRef, c.WindowKind, src, fresh, conf,
+				invDigest, capAt.UTC().Format(time.RFC3339Nano),
+				fmt.Sprintf("%.17g", *rem), formatTimePtr(c.CapacityResetAt),
+			}, "\x00")
+			if seen[key] {
+				return
+			}
+			seen[key] = true
+			out = append(out, artifactqual.CanaryProviderObs{
+				Provider: c.Provider, AccountRef: c.AccountRef,
+				InstallRef: c.InstallRef, WindowKind: c.WindowKind,
+				Source: src, Freshness: fresh, Confidence: conf,
+				Remaining: rem, CapturedAt: capAt.UTC(),
+				ResetAt:               copyTimeUTC(c.CapacityResetAt),
+				InventoryReportDigest: invDigest,
+			})
 		}
-		// Prefer real observed-after evidence; else real before-window evidence.
-		// Never invent Source/Freshness/CapturedAt via time.Now or "capacity_snapshot".
-		var (
-			rem       *float64
-			src       string
-			fresh     string
-			conf      string
-			invDigest string
-			capAt     time.Time
+		appendObs(
+			c.CapacityBefore, c.CapacityBeforeSource, c.CapacityBeforeFreshness,
+			c.CapacityBeforeConfidence, c.CapacityBeforeInventoryDigest,
+			c.CapacityBeforeCapturedAt,
 		)
-		if c.CapacityAfter != nil && c.CapacityAfterState == "observed" {
-			rem = c.CapacityAfter
-			src = c.CapacityAfterSource
-			fresh = c.CapacityAfterFreshness
-			conf = c.CapacityAfterConfidence
-			invDigest = c.CapacityAfterInventoryDigest
-			capAt = c.CapacityAfterObservedAt
-		} else if c.CapacityBefore != nil {
-			rem = c.CapacityBefore
-			src = c.CapacityBeforeSource
-			fresh = c.CapacityBeforeFreshness
-			conf = c.CapacityBeforeConfidence
-			invDigest = c.CapacityBeforeInventoryDigest
-			capAt = c.CapacityBeforeCapturedAt
-		} else {
-			continue
+		if c.CapacityAfterState == "observed" {
+			appendObs(
+				c.CapacityAfter, c.CapacityAfterSource, c.CapacityAfterFreshness,
+				c.CapacityAfterConfidence, c.CapacityAfterInventoryDigest,
+				c.CapacityAfterObservedAt,
+			)
 		}
-		// Incomplete structured evidence: skip rather than fabricate.
-		if rem == nil || src == "" || fresh == "" || invDigest == "" || capAt.IsZero() {
-			continue
-		}
-		seen[p] = true
-		out = append(out, artifactqual.CanaryProviderObs{
-			Provider: c.Provider, AccountRef: c.AccountRef,
-			InstallRef: c.InstallRef, WindowKind: c.WindowKind,
-			Source: src, Freshness: fresh, Confidence: conf,
-			Remaining: rem, CapturedAt: capAt.UTC(),
-			ResetAt:               copyTimeUTC(c.CapacityResetAt),
-			InventoryReportDigest: invDigest,
-		})
 	}
 	return out
+}
+
+func formatTimePtr(value *time.Time) string {
+	if value == nil {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339Nano)
 }
 
 // copyTimeUTC returns a UTC copy of t, or nil when t is nil.

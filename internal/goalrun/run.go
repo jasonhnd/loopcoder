@@ -759,6 +759,16 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 					} else {
 						cr.CapacityNote = firstNonEmpty(cr.CapacityNote, "resume_ledger_reload")
 					}
+					// A forced interrupt can prevent the post-run provider
+					// observation after this child has already succeeded. Keep
+					// that exact reservation live across the durable resume so
+					// the resumed process can observe and reconcile it. Never
+					// reopen released/reconciled entries.
+					if ent.State == "reserved" || ent.State == "observed" {
+						holds[cr.AttemptID] = capacityHold{
+							projectID: projectID, runID: runID, attemptID: cr.AttemptID,
+						}
+					}
 				} else {
 					// Missing durable entry: leave capacity fields unknown; note fail-closed.
 					cr.CapacityNote = firstNonEmpty(cr.CapacityNote, "resume") +
@@ -1357,6 +1367,7 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 	}
 	merged, wresMerged, merr := applyChildOutcomes(
 		out.Children, wres, ledger, holds, postSnap,
+		wres.Interrupted && wantAuto,
 		projectID, runID, execPlanDigest, graphDigest, g.GraphID, g.Version,
 		cpForMerge, partForMerge,
 	)
@@ -1535,6 +1546,13 @@ func Execute(ctx context.Context, req Request) (Result, error) {
 					if e.State == "reconciled" || e.State == "released" {
 						continue
 					}
+				}
+				// A succeeded child with an exact service-forced interrupt
+				// elsewhere in the same run must retain its reservation for
+				// resume-time after observation. Releasing here would erase
+				// the only arithmetic bridge between before and after.
+				if wres.Interrupted && wantAuto && succeededAttempt(out.Children, att) {
+					continue
 				}
 				rel, err := ledger.Release(h.projectID, h.runID, h.attemptID, "child_failed_or_cancelled")
 				if err != nil {
@@ -1855,6 +1873,7 @@ func applyChildOutcomes(
 	ledger *capacityledger.Ledger,
 	holds map[string]capacityHold,
 	postSnap *capacitysnapshot.Snapshot,
+	preserveSucceededUnknown bool,
 	projectID, runID, planDigest, graphDigest, graphID string,
 	graphVersion int,
 	cp *Checkpoint,
@@ -1991,7 +2010,7 @@ func applyChildOutcomes(
 	// Capacity: group-reconcile only live holds (AttemptID keys). Released MU prior
 	// holds are absent; their capacity is loaded from the ledger by AttemptID next.
 	if ledger != nil && len(holds) > 0 {
-		reconcileCapacityGroups(children, ledger, holds, postSnap)
+		reconcileCapacityGroups(children, ledger, holds, postSnap, preserveSucceededUnknown)
 	}
 	// Authoritative per-attempt ledger population (explicit project/run; no hold inference).
 	// Historical aborted rows may lack capacity holds — only bind capacity-bearing reports.
@@ -3259,7 +3278,7 @@ type capacityGroupMember struct {
 
 // reconcileCapacityGroups observes one After per exact identity group and
 // allocates the single aggregate Before−After delta across members.
-func reconcileCapacityGroups(children []ChildReport, ledger *capacityledger.Ledger, holds map[string]capacityHold, postSnap *capacitysnapshot.Snapshot) {
+func reconcileCapacityGroups(children []ChildReport, ledger *capacityledger.Ledger, holds map[string]capacityHold, postSnap *capacitysnapshot.Snapshot, preserveSucceededUnknown bool) {
 	groups := map[capacityGroupKey][]capacityGroupMember{}
 	var groupOrder []capacityGroupKey
 	for i := range children {
@@ -3337,6 +3356,10 @@ func reconcileCapacityGroups(children []ChildReport, ledger *capacityledger.Ledg
 			!strings.EqualFold(fr, "fresh") {
 			for _, m := range members {
 				children[m.idx].CapacityGroupID = groupID
+				if preserveSucceededUnknown && m.launched && m.termOK {
+					children[m.idx].CapacityNote += "; after_observation=deferred_for_forced_resume"
+					continue
+				}
 				children[m.idx].CapacityNote += "; after_observation=unavailable_or_window_mismatch"
 				releaseCapacityUnknown(&children[m.idx], ledger, m.hold, "executed_usage_unknown")
 			}
@@ -3446,6 +3469,15 @@ func reconcileCapacityGroups(children []ChildReport, ledger *capacityledger.Ledg
 			}
 		}
 	}
+}
+
+func succeededAttempt(children []ChildReport, attemptID string) bool {
+	for _, child := range children {
+		if child.AttemptID == attemptID && child.Terminal == string(workgraph.TermSucceeded) {
+			return true
+		}
+	}
+	return false
 }
 
 // allocateGroupDelta splits totalDelta across launched members.

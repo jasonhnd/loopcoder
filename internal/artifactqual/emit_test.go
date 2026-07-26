@@ -2,6 +2,7 @@ package artifactqual_test
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -334,6 +335,80 @@ func TestEmit_RepoLocalLoopcoderNotClean(t *testing.T) {
 	}
 	if !ev.Restart.RepoLocalRuntimePresent || ev.Restart.NoRepoLocalRuntime {
 		t.Fatalf("repo-local .loopcoder must fail closed: %+v", ev.Restart)
+	}
+}
+
+func TestEmit_ExactTrackedGoalPRReceiptIsNotRuntime(t *testing.T) {
+	repo := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.invalid",
+			"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.invalid",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	runGit("init")
+	runGit("config", "user.name", "test")
+	runGit("config", "user.email", "test@example.invalid")
+	const runID = "run_exact_receipt"
+	receipt := filepath.Join(repo, ".loopcoder", "goal-pr", runID+"-receipt.json")
+	if err := os.MkdirAll(filepath.Dir(receipt), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(receipt, []byte(`{"schema":"loopcoder.goalpr.receipt.v1","project_id":"disp-x","run_id":"run_exact_receipt","human_gate":true,"auto_merge":false}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "-f", "--", ".loopcoder/goal-pr/"+runID+"-receipt.json")
+	runGit("commit", "-m", "track exact receipt")
+
+	payload := []byte(`{"failure_class":"forced_interrupt","interrupt_class":"service_forced_interrupt","interrupt_id":"iint-receipt","terminal":"cancelled"}`)
+	ev, err := artifactqual.EmitCanaryEvidence(artifactqual.EmitInput{
+		ArchiveDigest: "aa", PreProdSHA: "bb", ProjectID: "disp-x", RunID: runID,
+		InventoryProvenance: "live_discover", InventoryReportDigest: "sha256:inventory",
+		BinaryVersion: "v", BinaryCommit: "c",
+		Events: []workflowrun.Event{
+			{Kind: "launch", WorkItemID: "b", AttemptID: "att-b-g0"},
+			{Kind: "interrupt", WorkItemID: "b", AttemptID: "att-b-g0", FailureClass: "forced_interrupt", Payload: payload},
+			{Kind: "terminal", WorkItemID: "b", AttemptID: "att-b-g0", Terminal: "cancelled", FailureClass: "forced_interrupt", Payload: payload},
+			{Kind: "reuse", WorkItemID: "b", AttemptID: "att-b-g0"},
+			{Kind: "launch", WorkItemID: "b", AttemptID: "att-b-g1", Generation: 2},
+		},
+		Resumed: true, ProcessPeak: 1, WorktreePeak: 1,
+		ActiveOccupancyMeasured: true, RepoPath: repo,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ev.Restart.RepoLocalRuntimeChecked || ev.Restart.RepoLocalRuntimePresent ||
+		!ev.Restart.NoRepoLocalRuntime {
+		t.Fatalf("exact tracked receipt must be exempt: %+v", ev.Restart)
+	}
+
+	if err := os.WriteFile(filepath.Join(repo, ".loopcoder", "runtime.tmp"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ev, err = artifactqual.EmitCanaryEvidence(artifactqual.EmitInput{
+		ArchiveDigest: "aa", PreProdSHA: "bb", ProjectID: "disp-x", RunID: runID,
+		InventoryProvenance: "live_discover", InventoryReportDigest: "sha256:inventory",
+		BinaryVersion: "v", BinaryCommit: "c", Events: []workflowrun.Event{
+			{Kind: "launch", WorkItemID: "b", AttemptID: "att-b-g0"},
+			{Kind: "interrupt", WorkItemID: "b", AttemptID: "att-b-g0", FailureClass: "forced_interrupt", Payload: payload},
+			{Kind: "terminal", WorkItemID: "b", AttemptID: "att-b-g0", Terminal: "cancelled", FailureClass: "forced_interrupt", Payload: payload},
+			{Kind: "reuse", WorkItemID: "b", AttemptID: "att-b-g0"},
+			{Kind: "launch", WorkItemID: "b", AttemptID: "att-b-g1", Generation: 2},
+		},
+		Resumed: true, ProcessPeak: 1, WorktreePeak: 1,
+		ActiveOccupancyMeasured: true, RepoPath: repo,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ev.Restart.RepoLocalRuntimePresent || ev.Restart.NoRepoLocalRuntime {
+		t.Fatalf("receipt exception must fail closed with any sibling: %+v", ev.Restart)
 	}
 }
 

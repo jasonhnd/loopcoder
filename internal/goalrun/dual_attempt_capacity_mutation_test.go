@@ -134,7 +134,7 @@ func TestDualAttempt_CapacityMisattributeMutations(t *testing.T) {
 		t.Fatal(err)
 	}
 	priorRes, altRes := kids2[0].ReservationID, kids2[1].ReservationID
-	reconcileCapacityGroups(kids2, led, holdsBad, &snap)
+	reconcileCapacityGroups(kids2, led, holdsBad, &snap, false)
 	if kids2[0].ReservationID != priorRes || kids2[1].ReservationID != altRes {
 		t.Fatalf("WorkItemID-keyed hold mutated reservations: prior %s→%s alt %s→%s",
 			priorRes, kids2[0].ReservationID, altRes, kids2[1].ReservationID)

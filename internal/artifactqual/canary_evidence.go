@@ -321,6 +321,17 @@ func ValidateCanaryEvidence(ev CanaryEvidence, archiveDigest, preProdSHA string,
 	}
 	if ev.InventoryReportDigest == "" || ev.InventoryReportDigest != strings.TrimSpace(ev.InventoryReportDigest) {
 		add("inventory_report_digest_missing_or_noncanonical")
+	} else {
+		bound := false
+		for _, observation := range ev.ProviderObservations {
+			if observation.InventoryReportDigest == ev.InventoryReportDigest {
+				bound = true
+				break
+			}
+		}
+		if !bound {
+			add("inventory_report_digest_unbound")
+		}
 	}
 	if exp := strings.TrimSpace(expect.ExpectedProjectID); exp != "" && exp != strings.TrimSpace(ev.ProjectID) {
 		add("expected_project_id_mismatch")
@@ -821,7 +832,7 @@ func validateRawCapacityEvidence(ev CanaryEvidence) (bool, []string) {
 			add("raw_ledger_before_evidence_mismatch:" + child.AttemptID)
 		}
 		if entry.BeforeInventoryDigest == "" ||
-			entry.BeforeInventoryDigest != ev.InventoryReportDigest {
+			!beforeLedgerObservationBound(ev.ProviderObservations, entry) {
 			add("raw_ledger_before_inventory_digest_mismatch:" + child.AttemptID)
 		}
 		if child.CapacityBefore == nil || !floatEqual(*child.CapacityBefore, entry.Before) ||
@@ -841,7 +852,8 @@ func validateRawCapacityEvidence(ev CanaryEvidence) (bool, []string) {
 			child.AfterFreshness != entry.AfterFreshness ||
 			child.AfterConfidence != string(entry.AfterConfidence) ||
 			!child.AfterObservedAt.Equal(timeValue(entry.AfterObservedAt)) ||
-			entry.AfterInventoryDigest == "" {
+			entry.AfterInventoryDigest == "" ||
+			!afterLedgerObservationBound(ev.ProviderObservations, entry) {
 			add("raw_ledger_after_mismatch:" + child.AttemptID)
 		}
 		if entry.Before < 0 || entry.Before > 1 || entry.Reserved <= 0 ||
@@ -1039,8 +1051,10 @@ func validateRawUnavailableRetry(ev CanaryEvidence, summary CanaryUnavailableRet
 			rentry.Actual != nil && rentry.After != nil && rentry.ReservationID != "" &&
 			fentry.ReservationID != rentry.ReservationID &&
 			fentry.Provider == summary.ExcludedProvider &&
-			fentry.BeforeInventoryDigest == ev.InventoryReportDigest &&
-			rentry.BeforeInventoryDigest == ev.InventoryReportDigest
+			fentry.BeforeInventoryDigest != "" &&
+			fentry.BeforeInventoryDigest == rentry.BeforeInventoryDigest &&
+			beforeLedgerObservationBound(ev.ProviderObservations, fentry) &&
+			beforeLedgerObservationBound(ev.ProviderObservations, rentry)
 	}
 	if !noDoubleCapacity {
 		add("unavailable_retry_raw_ledger_invalid_or_duplicate")
@@ -1180,8 +1194,9 @@ func validateRawDurableEnvelope(ev CanaryEvidence) []string {
 	} else {
 		seenClaimID := map[string]bool{}
 		seenAttempt := map[string]bool{}
+		generations := map[string]map[int64]bool{}
+		claimEnvelopeInvalid := false
 		for _, claim := range ev.RawClaims {
-			generation := workflowrun.ParseAttemptGeneration(claim.AttemptID)
 			if claim.Schema != workclaim.SchemaClaim ||
 				claim.ClaimID == "" || claim.ClaimID != strings.TrimSpace(claim.ClaimID) ||
 				seenClaimID[claim.ClaimID] ||
@@ -1192,15 +1207,84 @@ func validateRawDurableEnvelope(ev CanaryEvidence) []string {
 				claim.AttemptID == "" || claim.AttemptID != strings.TrimSpace(claim.AttemptID) ||
 				seenAttempt[claim.AttemptID] ||
 				claim.ExecutorID != workflowrun.WorkflowrunExecutorID ||
-				generation < 0 || claim.Generation != int64(generation+1) {
-				reasons = append(reasons, "raw_claim_envelope_invalid")
+				workflowrun.ParseAttemptGeneration(claim.AttemptID) < 0 ||
+				claim.Generation <= 0 {
+				claimEnvelopeInvalid = true
 				break
 			}
+			logical := strings.Join([]string{
+				claim.ProjectID, claim.GraphID, fmt.Sprintf("%d", claim.GraphVersion), claim.WorkItemID,
+			}, "\x00")
+			if generations[logical] == nil {
+				generations[logical] = map[int64]bool{}
+			}
+			if generations[logical][claim.Generation] {
+				claimEnvelopeInvalid = true
+				break
+			}
+			generations[logical][claim.Generation] = true
 			seenClaimID[claim.ClaimID] = true
 			seenAttempt[claim.AttemptID] = true
 		}
+		if !claimEnvelopeInvalid {
+			for _, byGeneration := range generations {
+				for generation := int64(1); generation <= int64(len(byGeneration)); generation++ {
+					if !byGeneration[generation] {
+						claimEnvelopeInvalid = true
+						break
+					}
+				}
+				if claimEnvelopeInvalid {
+					break
+				}
+			}
+		}
+		if claimEnvelopeInvalid {
+			reasons = append(reasons, "raw_claim_envelope_invalid")
+		}
 	}
 	return reasons
+}
+
+func beforeLedgerObservationBound(observations []CanaryProviderObs, entry capacityledger.Entry) bool {
+	for _, obs := range observations {
+		if obs.Provider == entry.Provider &&
+			obs.AccountRef == entry.AccountRef &&
+			obs.InstallRef == entry.InstallRef &&
+			obs.WindowKind == entry.WindowKind &&
+			obs.InventoryReportDigest == entry.BeforeInventoryDigest &&
+			obs.Source == entry.BeforeSource &&
+			obs.Freshness == entry.Freshness &&
+			obs.Confidence == string(entry.Confidence) &&
+			obs.CapturedAt.Equal(timeValue(entry.BeforeCapturedAt)) &&
+			timesEqual(obs.ResetAt, entry.ResetAt) &&
+			obs.Remaining != nil && floatEqual(*obs.Remaining, entry.Before) {
+			return true
+		}
+	}
+	return false
+}
+
+func afterLedgerObservationBound(observations []CanaryProviderObs, entry capacityledger.Entry) bool {
+	if entry.After == nil {
+		return false
+	}
+	for _, obs := range observations {
+		if obs.Provider == entry.Provider &&
+			obs.AccountRef == entry.AccountRef &&
+			obs.InstallRef == entry.InstallRef &&
+			obs.WindowKind == entry.WindowKind &&
+			obs.InventoryReportDigest == entry.AfterInventoryDigest &&
+			obs.Source == entry.AfterSource &&
+			obs.Freshness == entry.AfterFreshness &&
+			obs.Confidence == string(entry.AfterConfidence) &&
+			obs.CapturedAt.Equal(timeValue(entry.AfterObservedAt)) &&
+			timesEqual(obs.ResetAt, entry.ResetAt) &&
+			obs.Remaining != nil && floatEqual(*obs.Remaining, *entry.After) {
+			return true
+		}
+	}
+	return false
 }
 
 func timeValue(value *time.Time) time.Time {

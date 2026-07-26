@@ -84,6 +84,53 @@ func TestValidateCanary_MissingAfterMetadataRejected(t *testing.T) {
 	}
 }
 
+func TestValidateCanary_RawLedgerBindsExactPriorResumeSnapshot(t *testing.T) {
+	now := time.Date(2026, 7, 22, 21, 0, 0, 0, time.UTC)
+	ev, dig, sha := baseValidCanary(now)
+	if len(ev.RawLedgerEntries) == 0 {
+		t.Fatal("missing raw ledger fixture")
+	}
+	entry := &ev.RawLedgerEntries[0]
+	const priorDigest = "sha256:prior-resume-inventory"
+	oldDigest := entry.BeforeInventoryDigest
+	entry.BeforeInventoryDigest = priorDigest
+	bound := false
+	for i := range ev.ProviderObservations {
+		observation := &ev.ProviderObservations[i]
+		if observation.Provider == entry.Provider &&
+			observation.AccountRef == entry.AccountRef &&
+			observation.InstallRef == entry.InstallRef &&
+			observation.WindowKind == entry.WindowKind &&
+			observation.InventoryReportDigest == oldDigest &&
+			observation.Source == entry.BeforeSource &&
+			observation.CapturedAt.Equal(*entry.BeforeCapturedAt) {
+			observation.InventoryReportDigest = priorDigest
+			bound = true
+			break
+		}
+	}
+	if !bound {
+		t.Fatal("failed to locate exact prior observation")
+	}
+	ev.ContentDigest = artifactqual.DigestCanaryBody(ev)
+	v := artifactqual.ValidateCanaryEvidence(ev, dig, sha, now)
+	if strings.Contains(strings.Join(v.Reasons, ";"), "raw_ledger_before_inventory_digest_mismatch") {
+		t.Fatalf("exact prior snapshot must remain valid across resume: %v", v.Reasons)
+	}
+
+	for i := range ev.ProviderObservations {
+		if ev.ProviderObservations[i].InventoryReportDigest == priorDigest {
+			ev.ProviderObservations[i].InventoryReportDigest = "sha256:tampered"
+			break
+		}
+	}
+	ev.ContentDigest = artifactqual.DigestCanaryBody(ev)
+	v = artifactqual.ValidateCanaryEvidence(ev, dig, sha, now)
+	if !strings.Contains(strings.Join(v.Reasons, ";"), "raw_ledger_before_inventory_digest_mismatch") {
+		t.Fatalf("unbound prior snapshot must fail closed: %v", v.Reasons)
+	}
+}
+
 func TestValidateCanary_DerivedAfterOnlyRejected(t *testing.T) {
 	now := time.Date(2026, 7, 22, 21, 0, 0, 0, time.UTC)
 	ev, dig, sha := baseValidCanary(now)

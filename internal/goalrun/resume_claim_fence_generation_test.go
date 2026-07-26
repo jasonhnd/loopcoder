@@ -2,11 +2,14 @@ package goalrun_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/autoroute"
+	"github.com/jasonhnd/loopcoder/internal/capacitysnapshot"
 	"github.com/jasonhnd/loopcoder/internal/goalrun"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/workclaim"
@@ -74,12 +77,22 @@ func TestResumePreviouslyUnlaunchedSiblingWithLaggingClaimFence(t *testing.T) {
 	// Pass 1: research succeeds, implement is interrupted, tests never launch.
 	ctx1, cancel1 := context.WithCancel(context.Background())
 	calls1 := map[string]int{}
+	baseLoad1 := env.loadInv()
+	inventoryCalls1 := 0
 	res1, err1 := goalrun.Execute(ctx1, goalrun.Request{
 		ProjectID: projectID, RunID: runID,
 		Goal: goal, Issue: "1437", Actor: "owner", Owner: "worker",
-		Provider: "codex", Model: "gpt-5.5",
+		Provider: "auto", Model: "auto",
 		HomeDir: home, Now: func() time.Time { return now },
-		Decompose: threeChild, LoadInventory: env.loadInv(), OpenLedger: env.openLed(),
+		Decompose: threeChild,
+		LoadInventory: func(ctx context.Context, repo string, at time.Time) (autoroute.Inventory, capacitysnapshot.Snapshot, error) {
+			inventoryCalls1++
+			if inventoryCalls1 > 1 {
+				return autoroute.Inventory{}, capacitysnapshot.Snapshot{}, errors.New("post-interrupt observation unavailable")
+			}
+			return baseLoad1(ctx, repo, at)
+		},
+		OpenLedger: env.openLed(),
 		Executor: testspawn.Executor{
 			HomeDir: home, Now: func() time.Time { return now }, Calls: calls1,
 			HangIDs: map[string]bool{"wi_implement": true},
@@ -96,6 +109,9 @@ func TestResumePreviouslyUnlaunchedSiblingWithLaggingClaimFence(t *testing.T) {
 	if calls1["wi_research"] != 1 || calls1["wi_implement"] != 1 || calls1["wi_tests"] != 0 {
 		t.Fatalf("pass1 calls=%+v", calls1)
 	}
+	if inventoryCalls1 < 2 {
+		t.Fatalf("pass1 inventory calls=%d want initial plus failed post observation", inventoryCalls1)
+	}
 
 	// Pass 2: research reuses, implement retries at -g1, and the previously
 	// unlaunched tests child first claims at -g1 with claim fence generation 1.
@@ -103,7 +119,7 @@ func TestResumePreviouslyUnlaunchedSiblingWithLaggingClaimFence(t *testing.T) {
 	res2, err2 := goalrun.Execute(context.Background(), goalrun.Request{
 		ProjectID: projectID, RunID: runID, Resume: true,
 		Goal: goal, Issue: "1437", Actor: "owner", Owner: "worker",
-		Provider: "codex", Model: "gpt-5.5",
+		Provider: "auto", Model: "auto",
 		HomeDir: home, Now: func() time.Time { return now.Add(time.Minute) },
 		Decompose: threeChild, LoadInventory: env.loadInv(), OpenLedger: env.openLed(),
 		Executor: testspawn.Executor{
@@ -115,6 +131,16 @@ func TestResumePreviouslyUnlaunchedSiblingWithLaggingClaimFence(t *testing.T) {
 	}
 	if calls2["wi_research"] != 0 || calls2["wi_implement"] != 1 || calls2["wi_tests"] != 1 {
 		t.Fatalf("pass2 calls=%+v", calls2)
+	}
+	var researchCapacityBound bool
+	for _, child := range res2.Children {
+		if child.ChildID == "wi_research" && child.Terminal == "succeeded" {
+			researchCapacityBound = child.CapacityActual != nil &&
+				child.CapacityAfter != nil && child.CapacityState == "reconciled"
+		}
+	}
+	if !researchCapacityBound {
+		t.Fatalf("pass2 must reconcile pre-interrupt succeeded research capacity: %+v", res2.Children)
 	}
 	testsAttempt := ""
 	for _, child := range res2.Workflow.Children {
@@ -197,7 +223,7 @@ func TestResumePreviouslyUnlaunchedSiblingWithLaggingClaimFence(t *testing.T) {
 	res3, err3 := goalrun.Execute(context.Background(), goalrun.Request{
 		ProjectID: projectID, RunID: runID, Resume: true,
 		Goal: goal, Issue: "1437", Actor: "owner", Owner: "worker",
-		Provider: "codex", Model: "gpt-5.5",
+		Provider: "auto", Model: "auto",
 		HomeDir: home, Now: func() time.Time { return now.Add(2 * time.Minute) },
 		Decompose: threeChild, LoadInventory: env.loadInv(), OpenLedger: env.openLed(),
 		Executor: testspawn.Executor{
