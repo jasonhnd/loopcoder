@@ -1749,9 +1749,34 @@ func releaseChildWorktree(repoPath, wtPath string) error {
 	if wtPath == "" {
 		return nil
 	}
+	// Capture strict ownership before git removal. A failed
+	// `git worktree remove --force` may deregister the worktree and remove its
+	// marker before stopping at a read-only Go module cache.
+	owned, ownedErr := inspectOwnedChildWorktree(repoPath, wtPath)
 	var errs []string
 	if rerr := releaseIntegrateWorktree(repoPath, wtPath); rerr != nil {
-		errs = append(errs, rerr.Error())
+		// Go intentionally makes downloaded module trees read-only. Providers
+		// may place such a cache at the exact runtime-only .cache/gomod path.
+		// Normalize only directories in that exact owned subtree, then retry
+		// the ordinary git/filesystem release. Never broaden this to arbitrary
+		// worktree contents.
+		recovered := false
+		if _, serr := os.Lstat(wtPath); serr == nil {
+			if ownedErr != nil {
+				errs = append(errs, fmt.Sprintf("owned module-cache cleanup refused: %v", ownedErr))
+			} else if nerr := makeOwnedModuleCacheRemovable(owned); nerr != nil {
+				if !os.IsNotExist(nerr) {
+					errs = append(errs, fmt.Sprintf("owned module-cache cleanup refused: %v", nerr))
+				}
+			} else if retryErr := releaseIntegrateWorktree(repoPath, wtPath); retryErr != nil {
+				errs = append(errs, fmt.Sprintf("release retry after owned module-cache cleanup: %v", retryErr))
+			} else {
+				recovered = true
+			}
+		}
+		if !recovered {
+			errs = append(errs, rerr.Error())
+		}
 	}
 	// Filesystem agreement: path must be gone after release.
 	if _, err := os.Stat(wtPath); err == nil {
@@ -1783,6 +1808,207 @@ func releaseChildWorktree(repoPath, wtPath string) error {
 		return nil
 	}
 	return fmt.Errorf("workflowrun: releaseChildWorktree: %s", strings.Join(errs, "; "))
+}
+
+const (
+	ownedWorktreeMarker             = ".loopcoder-owned-worktree"
+	maxOwnedModuleCacheEntries      = 100_000
+	maxOwnedWorktreeMarkerReadBytes = 8 << 10
+)
+
+type ownedChildWorktreeProof struct {
+	root     string
+	rootInfo os.FileInfo
+}
+
+type ownedCleanupDir struct {
+	path string
+	info os.FileInfo
+}
+
+// inspectOwnedChildWorktree proves that wtPath is the exact LoopCoder-created
+// path described by its marker. It runs before git cleanup because git may
+// remove the marker before encountering a read-only descendant.
+func inspectOwnedChildWorktree(repoPath, wtPath string) (ownedChildWorktreeProof, error) {
+	abs, err := filepath.Abs(strings.TrimSpace(wtPath))
+	if err != nil {
+		return ownedChildWorktreeProof{}, err
+	}
+	rootInfo, err := os.Lstat(abs)
+	if err != nil {
+		return ownedChildWorktreeProof{}, err
+	}
+	if rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
+		return ownedChildWorktreeProof{}, fmt.Errorf("worktree root is not a non-symlink directory")
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return ownedChildWorktreeProof{}, fmt.Errorf("resolve worktree root: %w", err)
+	}
+	if filepath.Base(resolved) != "worktree" ||
+		filepath.Base(filepath.Dir(filepath.Dir(resolved))) != "runs" {
+		return ownedChildWorktreeProof{}, fmt.Errorf("worktree path is outside the owned runs layout")
+	}
+	raw, err := readSecureRegularProductBytes(resolved, ownedWorktreeMarker, maxOwnedWorktreeMarkerReadBytes)
+	if err != nil {
+		return ownedChildWorktreeProof{}, fmt.Errorf("read ownership marker: %w", err)
+	}
+	fields, err := parseOwnedWorktreeMarker(raw)
+	if err != nil {
+		return ownedChildWorktreeProof{}, err
+	}
+	expectedRunDir := "wf_" + short(fields["graph"]+"|"+fields["work_item"]+"|"+fields["attempt"])
+	if filepath.Base(filepath.Dir(resolved)) != expectedRunDir {
+		return ownedChildWorktreeProof{}, fmt.Errorf("ownership marker does not bind the worktree path")
+	}
+	if !sameCanonicalPath(fields["repo"], strings.TrimSpace(repoPath)) {
+		return ownedChildWorktreeProof{}, fmt.Errorf("ownership marker repo mismatch")
+	}
+	current, err := os.Lstat(resolved)
+	if err != nil {
+		return ownedChildWorktreeProof{}, err
+	}
+	if current.Mode()&os.ModeSymlink != 0 || !current.IsDir() || !os.SameFile(rootInfo, current) {
+		return ownedChildWorktreeProof{}, fmt.Errorf("worktree root identity changed during ownership proof")
+	}
+	return ownedChildWorktreeProof{root: resolved, rootInfo: current}, nil
+}
+
+func parseOwnedWorktreeMarker(raw []byte) (map[string]string, error) {
+	fields := make(map[string]string, 5)
+	lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+	if len(lines) != 5 {
+		return nil, fmt.Errorf("ownership marker must contain exactly five fields")
+	}
+	allowed := map[string]bool{
+		"graph": true, "work_item": true, "attempt": true, "repo": true, "base": true,
+	}
+	for _, line := range lines {
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 || !allowed[parts[0]] {
+			return nil, fmt.Errorf("ownership marker contains an invalid field")
+		}
+		if _, exists := fields[parts[0]]; exists {
+			return nil, fmt.Errorf("ownership marker contains a duplicate field")
+		}
+		fields[parts[0]] = parts[1]
+	}
+	if len(fields) != len(allowed) ||
+		strings.TrimSpace(fields["graph"]) == "" ||
+		strings.TrimSpace(fields["work_item"]) == "" ||
+		strings.TrimSpace(fields["attempt"]) == "" {
+		return nil, fmt.Errorf("ownership marker identity is incomplete")
+	}
+	return fields, nil
+}
+
+func sameCanonicalPath(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == "" || b == "" {
+		return a == b
+	}
+	absA, errA := filepath.Abs(a)
+	absB, errB := filepath.Abs(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	infoA, errA := os.Stat(absA)
+	infoB, errB := os.Stat(absB)
+	return errA == nil && errB == nil && os.SameFile(infoA, infoB)
+}
+
+// makeOwnedModuleCacheRemovable adds owner rwx only to non-symlink
+// directories in the exact .cache/gomod subtree. Files remain untouched:
+// deleting a read-only file requires write permission on its parent directory,
+// not chmod on the file itself. Validation is a complete bounded first pass;
+// mutation starts only after every entry is proven directory or regular file.
+func makeOwnedModuleCacheRemovable(proof ownedChildWorktreeProof) error {
+	currentRoot, err := os.Lstat(proof.root)
+	if err != nil {
+		return err
+	}
+	if currentRoot.Mode()&os.ModeSymlink != 0 || !currentRoot.IsDir() ||
+		!os.SameFile(proof.rootInfo, currentRoot) {
+		return fmt.Errorf("owned worktree root identity changed")
+	}
+	cacheRoot, err := resolveSecureUnderWorktree(proof.root, filepath.Join(".cache", "gomod"))
+	if err != nil {
+		return err
+	}
+	if err := requireNonSymlinkDir(cacheRoot); err != nil {
+		return err
+	}
+	dirs := make([]ownedCleanupDir, 0, 64)
+	entries := 0
+	err = filepath.Walk(cacheRoot, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		entries++
+		if entries > maxOwnedModuleCacheEntries {
+			return fmt.Errorf("module cache exceeds %d entries", maxOwnedModuleCacheEntries)
+		}
+		if err := requirePathUnderRoot(cacheRoot, path); err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("module cache symlink refused: %s", path)
+		}
+		switch {
+		case info.IsDir():
+			dirs = append(dirs, ownedCleanupDir{path: path, info: info})
+		case info.Mode().IsRegular():
+			// No chmod needed for regular files.
+		default:
+			return fmt.Errorf("module cache special file refused: %s (mode=%v)", path, info.Mode())
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for _, dir := range dirs {
+		current, err := os.Lstat(dir.path)
+		if err != nil {
+			return err
+		}
+		if current.Mode()&os.ModeSymlink != 0 || !current.IsDir() ||
+			!os.SameFile(dir.info, current) {
+			return fmt.Errorf("module cache directory identity changed: %s", dir.path)
+		}
+		fd, err := os.Open(dir.path)
+		if err != nil {
+			return fmt.Errorf("open module cache directory %s: %w", dir.path, err)
+		}
+		fdInfo, statErr := fd.Stat()
+		if statErr != nil {
+			_ = fd.Close()
+			return fmt.Errorf("stat module cache directory fd %s: %w", dir.path, statErr)
+		}
+		if !fdInfo.IsDir() || !os.SameFile(current, fdInfo) {
+			_ = fd.Close()
+			return fmt.Errorf("module cache directory open identity changed: %s", dir.path)
+		}
+		if current.Mode().Perm()&0o700 != 0o700 {
+			if err := fd.Chmod(current.Mode() | 0o700); err != nil {
+				_ = fd.Close()
+				return fmt.Errorf("chmod module cache directory %s: %w", dir.path, err)
+			}
+		}
+		if err := fd.Close(); err != nil {
+			return fmt.Errorf("close module cache directory %s: %w", dir.path, err)
+		}
+		post, err := os.Lstat(dir.path)
+		if err != nil {
+			return err
+		}
+		if post.Mode()&os.ModeSymlink != 0 || !post.IsDir() ||
+			!os.SameFile(current, post) {
+			return fmt.Errorf("module cache directory identity changed after chmod: %s", dir.path)
+		}
+	}
+	return nil
 }
 
 // gitWorktreeListContains reports whether path appears in `git worktree list --porcelain`.
