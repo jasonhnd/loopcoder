@@ -935,11 +935,13 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 					return fail(out, StatusBlocked, fmt.Sprintf(
 						"terminal reuse %s generation %d != attempt suffix+1 %d", id, reuseGen, wantG))
 				}
-				if res.Claim != nil && res.Claim.Generation > 0 {
-					if int64(reuseGen) != res.Claim.Generation {
-						return fail(out, StatusBlocked, fmt.Sprintf(
-							"terminal reuse %s generation %d != claim %d", id, reuseGen, res.Claim.Generation))
-					}
+				// The claim-fence generation is an independent domain and may
+				// lag the attempt/event generation after a run-wide resume
+				// bump. Exact claim/authority fencing is validated separately;
+				// reuseGen stays bound to the attempt suffix.
+				if res.Claim != nil && res.Claim.Generation <= 0 {
+					return fail(out, StatusBlocked, fmt.Sprintf(
+						"terminal reuse %s claim generation must be positive, got %d", id, res.Claim.Generation))
 				}
 				if reuseGen <= 0 {
 					return fail(out, StatusBlocked, fmt.Sprintf("terminal reuse %s missing positive generation", id))
@@ -2843,6 +2845,13 @@ func reconstructOutcomeFromDurable(c *workclaim.Claim, elog *EventLog, projectID
 		return ChildOutcome{}, err
 	}
 	att := strings.TrimSpace(c.AttemptID)
+	attemptGen, err := ClaimGenerationFromAttemptID(att)
+	if err != nil {
+		return ChildOutcome{}, err
+	}
+	if c.Generation <= 0 {
+		return ChildOutcome{}, fmt.Errorf("claim generation must be positive got %d", c.Generation)
+	}
 	var termEv *Event
 	var launchEv *Event
 	for i := range events {
@@ -2864,12 +2873,13 @@ func reconstructOutcomeFromDurable(c *workclaim.Claim, elog *EventLog, projectID
 				}
 				continue
 			}
-			// Exact positive generation equal to claim — generation 0 is never a wildcard.
+			// Event generation is bound to the attempt suffix. Claim.Generation
+			// is a separate claim-fence domain and is validated independently.
 			if ev.Generation <= 0 {
 				return ChildOutcome{}, fmt.Errorf("terminal generation must be positive got %d", ev.Generation)
 			}
-			if int64(ev.Generation) != c.Generation {
-				return ChildOutcome{}, fmt.Errorf("terminal generation %d != claim %d", ev.Generation, c.Generation)
+			if ev.Generation != attemptGen {
+				return ChildOutcome{}, fmt.Errorf("terminal generation %d != attempt generation %d", ev.Generation, attemptGen)
 			}
 			if strings.TrimSpace(ev.ProjectID) != "" && strings.TrimSpace(ev.ProjectID) != projectID {
 				return ChildOutcome{}, fmt.Errorf("terminal project_id mismatch")
@@ -2889,8 +2899,8 @@ func reconstructOutcomeFromDurable(c *workclaim.Claim, elog *EventLog, projectID
 			if ev.Generation <= 0 {
 				return ChildOutcome{}, fmt.Errorf("launch generation must be positive got %d", ev.Generation)
 			}
-			if int64(ev.Generation) != c.Generation {
-				return ChildOutcome{}, fmt.Errorf("launch generation %d != claim %d", ev.Generation, c.Generation)
+			if ev.Generation != attemptGen {
+				return ChildOutcome{}, fmt.Errorf("launch generation %d != attempt generation %d", ev.Generation, attemptGen)
 			}
 			if strings.TrimSpace(ev.ProjectID) != "" && strings.TrimSpace(ev.ProjectID) != projectID {
 				return ChildOutcome{}, fmt.Errorf("launch project_id mismatch")
@@ -3133,9 +3143,16 @@ func reconcileClaimsWithEventLog(cs *workclaim.Store, elog *EventLog, projectID,
 		if tev.Generation <= 0 {
 			return fmt.Errorf("terminal generation must be positive for attempt %q got %d", att, tev.Generation)
 		}
-		if int64(tev.Generation) != c.Generation {
-			return fmt.Errorf("terminal generation %d != claim generation %d for attempt %q",
-				tev.Generation, c.Generation, att)
+		wantGen, gerr := ClaimGenerationFromAttemptID(att)
+		if gerr != nil {
+			return gerr
+		}
+		if tev.Generation != wantGen {
+			return fmt.Errorf("terminal generation %d != attempt generation %d for attempt %q",
+				tev.Generation, wantGen, att)
+		}
+		if c.Generation <= 0 {
+			return fmt.Errorf("claim generation must be positive for attempt %q got %d", att, c.Generation)
 		}
 	}
 	// Auto-recover: open claim + exact terminal → Close from durable terminal.

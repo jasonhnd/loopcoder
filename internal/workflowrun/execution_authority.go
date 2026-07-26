@@ -1012,7 +1012,7 @@ func validateRecoverCandidates(
 			}
 			auth = loaded
 		}
-		if err := validateAuthorityForRecover(auth, projectID, runID, att, int64(gen)); err != nil {
+		if err := validateAuthorityForRecover(auth, projectID, runID, att); err != nil {
 			return nil, fmt.Errorf("workflowrun: recover validate %s/%s: %w", id, att, err)
 		}
 
@@ -1063,8 +1063,11 @@ func validateRecoverCandidates(
 		if c.WorkItemID != id || c.AttemptID != att {
 			return nil, fmt.Errorf("workflowrun: recover validate %s: claim work/attempt mismatch", att)
 		}
-		if c.Generation != int64(gen) {
-			return nil, fmt.Errorf("workflowrun: recover validate %s: claim gen %d != attempt gen %d", att, c.Generation, gen)
+		// Claim.Generation is the independent claim-fence generation. It may
+		// legitimately lag the attempt/event generation when a previously
+		// unlaunched sibling first claims after a run-wide resume bump.
+		if c.Generation <= 0 {
+			return nil, fmt.Errorf("workflowrun: recover validate %s: claim generation must be positive, got %d", att, c.Generation)
 		}
 		if strings.TrimSpace(c.ExecutorID) != WorkflowrunExecutorID {
 			return nil, fmt.Errorf("workflowrun: recover validate %s: claim executor %q want exact %q", att, c.ExecutorID, WorkflowrunExecutorID)
@@ -1692,7 +1695,7 @@ func requireLaunchRoutePayload(le Event) (map[string]string, error) {
 	return out, nil
 }
 
-func validateAuthorityForRecover(auth storage.ProviderExecutionAuthority, projectID, runID, attemptID string, claimGen int64) error {
+func validateAuthorityForRecover(auth storage.ProviderExecutionAuthority, projectID, runID, attemptID string) error {
 	if strings.TrimSpace(auth.SchemaVersion) != storage.ProviderExecutionAuthoritySchema {
 		return fmt.Errorf("authority schema_version %q != %q", auth.SchemaVersion, storage.ProviderExecutionAuthoritySchema)
 	}
@@ -1707,8 +1710,8 @@ func validateAuthorityForRecover(auth storage.ProviderExecutionAuthority, projec
 		strings.TrimSpace(auth.AttemptID) != strings.TrimSpace(attemptID) {
 		return fmt.Errorf("authority project/run/attempt fence mismatch")
 	}
-	if auth.ClaimGeneration != claimGen {
-		return fmt.Errorf("authority gen %d != attempt gen %d", auth.ClaimGeneration, claimGen)
+	if auth.ClaimGeneration <= 0 {
+		return fmt.Errorf("authority claim_generation must be positive, got %d", auth.ClaimGeneration)
 	}
 	if strings.TrimSpace(auth.OwnerID) == "" {
 		return fmt.Errorf("authority owner_id missing")
