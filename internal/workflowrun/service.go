@@ -2938,8 +2938,10 @@ func reconstructOutcomeFromDurable(c *workclaim.Claim, elog *EventLog, projectID
 		out.Depth = m["depth"]
 		out.Permission = m["permission"]
 		out.AccountRef = m["account_ref"]
+		out.InstallRef = m["install_ref"]
 		out.WindowKind = m["window_kind"]
 		out.ReservationID = m["reservation_id"]
+		out.RouteReason = m["route_reason"]
 		// Prefer claim/event assignment digests; payload may reaffirm them.
 		if tc := strings.TrimSpace(m["task_class"]); tc != "" && strings.TrimSpace(out.TaskClass) == "" {
 			out.TaskClass = tc

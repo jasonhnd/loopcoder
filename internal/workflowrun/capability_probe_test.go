@@ -60,7 +60,10 @@ func TestProductionCapabilityProbePreservesAttemptedMUIdentity(t *testing.T) {
 	}
 	if result.FailureClass != "model_unavailable" ||
 		result.InvokedRoute.Model != "gpt-5.3-codex" ||
-		result.InvokedRoute.AccountRef != account {
+		result.InvokedRoute.AccountRef != account ||
+		result.InvokedRoute.InstallRef != "pinst-test" ||
+		result.InvokedRoute.WindowKind != "weekly" ||
+		result.InvokedRoute.ReservationID != "sres-probe" {
 		t.Fatalf("attempted identity missing: %+v", result)
 	}
 	if result.ActualSources.Model != agent.ActualSourceAttemptedInvocation {
@@ -78,6 +81,52 @@ func TestProductionCapabilityProbePreservesAttemptedMUIdentity(t *testing.T) {
 	if strings.Contains(string(evidence), "product prompt must not reach provider") ||
 		!strings.Contains(string(evidence), "fixed read-only capability probe") {
 		t.Fatalf("probe evidence retained product intent or lost fixed marker: %s", evidence)
+	}
+}
+
+func TestProductionCapabilityProbeDoesNotBindCapacityOnAccountMismatch(t *testing.T) {
+	repo := t.TempDir()
+	initGitRepo(t, repo)
+	runner := &capabilityProbeRunner{result: agent.Result{
+		ExitCode: -1, FailureClass: "model_unavailable",
+		ActualProvider: "codex", ActualAccountRef: "acct-other", ActualInstallRef: "pinst-test",
+	}}
+	executor := ProductionChildExecutor{
+		HomeDir: t.TempDir(),
+		Lookup:  func(string) (agent.Runner, error) { return runner, nil },
+	}
+	result, _ := executor.Execute(context.Background(), ChildExecInput{
+		ProjectID: "proj-probe-mismatch", RunID: "run-probe-mismatch", GraphID: "g-probe",
+		WorkItemID: "wi_research", AttemptID: "att-probe-mismatch-g0",
+		Route: ChildRoute{
+			Provider: "codex", Model: "gpt-5.3-codex", Depth: "low",
+			Permission: "read-only", AccountRef: "acct-expected", InstallRef: "pinst-test",
+			WindowKind: "weekly", ReservationID: "sres-probe",
+			CapabilityProbeOnly: true,
+		},
+		RepoPath: repo, BaseRef: "HEAD", ReadOnly: true,
+	})
+	if result.InvokedRoute.AccountRef != "acct-other" {
+		t.Fatalf("observed account lost: %+v", result.InvokedRoute)
+	}
+	if result.InvokedRoute.WindowKind != "" || result.InvokedRoute.ReservationID != "" {
+		t.Fatalf("mismatched account inherited requested capacity identity: %+v", result.InvokedRoute)
+	}
+
+	runner.result.ActualAccountRef = "ACCT-EXPECTED"
+	result, _ = executor.Execute(context.Background(), ChildExecInput{
+		ProjectID: "proj-probe-case", RunID: "run-probe-case", GraphID: "g-probe",
+		WorkItemID: "wi_research", AttemptID: "att-probe-case-g0",
+		Route: ChildRoute{
+			Provider: "codex", Model: "gpt-5.3-codex", Depth: "low",
+			Permission: "read-only", AccountRef: "acct-expected", InstallRef: "pinst-test",
+			WindowKind: "weekly", ReservationID: "sres-probe",
+			CapabilityProbeOnly: true,
+		},
+		RepoPath: repo, BaseRef: "HEAD", ReadOnly: true,
+	})
+	if result.InvokedRoute.WindowKind != "" || result.InvokedRoute.ReservationID != "" {
+		t.Fatalf("case-variant opaque account inherited requested capacity identity: %+v", result.InvokedRoute)
 	}
 }
 
