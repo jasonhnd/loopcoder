@@ -1,7 +1,6 @@
-# Release Candidate Draft dispatcher (main-only install for workflow_dispatch visibility).
-# Owner-authorized minimal default-branch exception for v0.9.0 qualification.
-# Builds from an exact pre-prod SHA; does NOT create a public tag or GitHub Release.
-# Product code remains on pre-prod; this file exists on main solely so Actions can dispatch it.
+# Immutable v0.9.0 draft archive builder (V090-RB08 / #1319).
+# Builds once from an explicitly selected protected pre-prod SHA.
+# Does NOT create a public tag or published GitHub Release.
 name: Release Candidate Draft
 
 on:
@@ -63,17 +62,24 @@ jobs:
             echo "commit_sha too short" >&2
             exit 1
           fi
-          resolved="$(git rev-parse --verify "${sha}^{commit}" 2>/dev/null || true)"
-          if [[ -z "${resolved}" ]]; then
-            echo "unknown commit sha ${sha}" >&2
-            exit 1
+          # Must resolve on pre-prod ancestry
+          if ! git merge-base --is-ancestor "${sha}" origin/pre-prod 2>/dev/null && \
+             ! git merge-base --is-ancestor "${sha}" pre-prod 2>/dev/null; then
+            # also allow exact pre-prod tip match via rev-parse
+            resolved="$(git rev-parse --verify "${sha}^{commit}" 2>/dev/null || true)"
+            if [[ -z "${resolved}" ]]; then
+              echo "unknown commit sha ${sha}" >&2
+              exit 1
+            fi
+            if ! git branch -r --contains "${resolved}" | grep -q 'origin/pre-prod'; then
+              echo "sha ${resolved} is not on origin/pre-prod" >&2
+              exit 1
+            fi
+            sha="${resolved}"
+          else
+            sha="$(git rev-parse --verify "${sha}^{commit}")"
           fi
-          if ! git merge-base --is-ancestor "${resolved}" origin/pre-prod 2>/dev/null && \
-             ! git branch -r --contains "${resolved}" | grep -q 'origin/pre-prod'; then
-            echo "sha ${resolved} is not on origin/pre-prod" >&2
-            exit 1
-          fi
-          sha="${resolved}"
+          # refuse dirty tree in the checked out workspace for safety
           if [[ -n "$(git status --porcelain)" ]]; then
             echo "workspace dirty" >&2
             exit 1

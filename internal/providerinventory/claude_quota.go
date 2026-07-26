@@ -2,6 +2,7 @@ package providerinventory
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -15,10 +16,13 @@ import (
 
 const (
 	claudeQuotaSourceSchema = "claude.rendered_usage_status.v1"
-	claudeQuotaTimeout      = 10 * time.Second
-	claudeQuotaOutputBytes  = 64 * 1024
-	claudeQuotaColumns      = 100
-	claudeQuotaRows         = 30
+	// Interactive /usage needs headroom after cold start + auth seed.
+	claudeQuotaTimeout     = 90 * time.Second
+	claudeQuotaOutputBytes = 64 * 1024
+	claudeQuotaColumns     = 100
+	claudeQuotaRows        = 30
+	// Delay before slash commands so the TUI can finish bootstrapping.
+	claudeQuotaInputDelay = 3 * time.Second
 )
 
 var (
@@ -73,9 +77,20 @@ type claudeQuotaRow struct {
 	ScopePart  string
 }
 
-func inspectClaudeQuota(ctx context.Context, discovery *discoveryContext, adapter AdapterDeclaration, candidate candidate, installation ProviderInstallation, now time.Time, deps Deps) (QuotaTelemetrySource, []QuotaSnapshot, ProbeResult) {
+func inspectClaudeQuota(
+	ctx context.Context,
+	discovery *discoveryContext,
+	adapter AdapterDeclaration,
+	candidate candidate,
+	installation ProviderInstallation,
+	profiles []AccountProfile,
+	readiness []AuthReadiness,
+	now time.Time,
+	deps Deps,
+) (QuotaTelemetrySource, []QuotaSnapshot, ProbeResult) {
 	source := claudeQuotaSource(now)
 	installationID := installation.ProviderInstallationID
+	fallbackReason := ""
 	probe := baseProbe(adapter, now, deps)
 	probe.ProviderInstallationID = &installationID
 	probe.ProbeKind = "quota"
@@ -93,10 +108,19 @@ func inspectClaudeQuota(ctx context.Context, discovery *discoveryContext, adapte
 
 	unavailable := func(reason, terminal string) (QuotaTelemetrySource, []QuotaSnapshot, ProbeResult) {
 		snapshot := claudeQuotaUnavailableSnapshot(source, &installationID, now, reason, terminal)
+		if fallbackReason != "" {
+			snapshot.GapReasons = dedupeStrings(append(snapshot.GapReasons, "codexbar-primary-unavailable"))
+		}
 		probe.Outcome = OutcomeProbeFailed
 		probe.Confidence = ConfidenceUnavailable
 		probe.FreshnessState = FreshnessNotApplicable
 		probe.GapReasons = []string{reason}
+		if fallbackReason != "" {
+			probe.GapReasons = dedupeStrings(append(probe.GapReasons, "codexbar-primary-unavailable"))
+			probe.setParsedFields(map[string]string{
+				"codexbar_fallback_reason": fallbackReason,
+			})
+		}
 		probe.TerminalErrorCode = terminal
 		return source, []QuotaSnapshot{snapshot}, probe
 	}
@@ -109,6 +133,11 @@ func inspectClaudeQuota(ctx context.Context, discovery *discoveryContext, adapte
 		probe.SideEffectClass = "not-run"
 		return unavailable("unsupported-cli-version", "ErrUnsupportedVersion")
 	}
+	codexbar := inspectClaudeCodexBarQuota(ctx, discovery, adapter, installation, profiles, readiness, now, deps)
+	if codexbar.ok {
+		return codexbar.source, codexbar.snapshots, codexbar.probe
+	}
+	fallbackReason = codexbar.reason
 
 	root, argv, env, cleanup, err := prepareClaudeQuotaSandbox(candidate.path, deps)
 	if err != nil {
@@ -120,10 +149,13 @@ func inspectClaudeQuota(ctx context.Context, discovery *discoveryContext, adapte
 	probe.EnvironmentKeys = environmentKeys(env)
 
 	result, runErr := deps.RunClaudePTY(ctx, ClaudePTYRequest{
-		Argv:               argv,
-		Env:                env,
-		Cwd:                root,
-		Input:              "/usage\n/exit\n",
+		Argv: argv,
+		Env:  env,
+		Cwd:  root,
+		// Enter dismisses residual prompts; then /usage and /exit.
+		// "2" selects dark theme if first-run UI still appears; then /usage.
+		// "1" accepts workspace trust if still shown; then /usage + /exit.
+		Input:              "1\n/usage\n/exit\n",
 		Timeout:            claudeQuotaTimeout,
 		StdoutLimitBytes:   claudeQuotaOutputBytes,
 		StderrLimitBytes:   StderrLimitBytes,
@@ -147,6 +179,9 @@ func inspectClaudeQuota(ctx context.Context, discovery *discoveryContext, adapte
 	}
 	if runErr != nil || result.TimedOut || result.Killed {
 		if result.TimedOut {
+			if claudeWorkspaceTrustPrompt(result.Output) {
+				return unavailable("quota-workspace-trust-prompt", "ErrClaudeQuotaWorkspaceTrustPrompt")
+			}
 			return unavailable("quota-probe-timeout", "ErrClaudeQuotaTimeout")
 		}
 		return unavailable("quota-probe-failed", "ErrClaudeQuotaExecutionFailed")
@@ -165,17 +200,28 @@ func inspectClaudeQuota(ctx context.Context, discovery *discoveryContext, adapte
 	if len(snapshots) == 0 {
 		return unavailable("unsupported-usage-surface", "ErrClaudeQuotaMalformedSurface")
 	}
+	for i := range snapshots {
+		snapshots[i].GapReasons = dedupeStrings(append(snapshots[i].GapReasons, "pty-fallback-after-codexbar-unavailable"))
+	}
 	probe.Outcome = OutcomeInstalled
 	probe.Confidence = ConfidenceExact
 	probe.setParsedFields(map[string]string{
-		"parser":         claudeQuotaSourceSchema,
-		"cli_version":    installation.Version,
-		"locale":         surface.Locale,
-		"terminal_width": strconv.Itoa(surface.Width),
-		"ansi":           strconv.FormatBool(surface.ANSI),
-		"snapshot_count": strconv.Itoa(len(snapshots)),
+		"parser":                   claudeQuotaSourceSchema,
+		"cli_version":              installation.Version,
+		"locale":                   surface.Locale,
+		"terminal_width":           strconv.Itoa(surface.Width),
+		"ansi":                     strconv.FormatBool(surface.ANSI),
+		"snapshot_count":           strconv.Itoa(len(snapshots)),
+		"codexbar_fallback_reason": fallbackReason,
 	})
 	return source, snapshots, probe
+}
+
+func claudeWorkspaceTrustPrompt(output string) bool {
+	normalized := strings.ToLower(ansiPattern.ReplaceAllString(output, ""))
+	return (strings.Contains(normalized, "trust") && strings.Contains(normalized, "workspace")) ||
+		(strings.Contains(normalized, "trust") && strings.Contains(normalized, "folder")) ||
+		strings.Contains(normalized, "yes, i trust")
 }
 
 func claudeQuotaSource(now time.Time) QuotaTelemetrySource {
@@ -204,9 +250,13 @@ func claudeQuotaSource(now time.Time) QuotaTelemetrySource {
 }
 
 func claudeQuotaSourceArgv() []string {
+	// Keep tool denylist aligned with current Claude Code tool names only.
+	// Obsolete names (MultiEdit, LS, …) emit startup warnings and slow the
+	// interactive surface that hosts /usage.
 	return []string{
 		"claude",
-		"--disallowedTools", "Bash,Edit,MultiEdit,Write,Read,Glob,Grep,LS,Task,WebFetch,WebSearch,NotebookRead,NotebookEdit",
+		"--bare",
+		"--disallowedTools", "Bash,Edit,Write,Read,Glob,Grep,Task,WebFetch,WebSearch,NotebookEdit",
 		"--mcp-config", "loopcoder-empty-mcp.json",
 		"--strict-mcp-config",
 	}
@@ -252,6 +302,15 @@ func prepareClaudeQuotaSandbox(executable string, deps Deps) (string, []string, 
 			return "", nil, nil, func() {}, err
 		}
 	}
+	// Seed allowlisted Claude auth/config files into the private HOME so
+	// interactive /usage can complete. Without this, the PTY hangs on login
+	// because credentials live under ~/.claude and env secrets are denied.
+	// File contents never enter probe records (output is redacted separately).
+	// Trust the sandbox cwd so the workspace trust dialog is skipped.
+	if err := seedClaudeQuotaAuthHome(filepath.Join(root, "home"), root, deps); err != nil {
+		cleanup()
+		return "", nil, nil, func() {}, err
+	}
 	mcpPath := filepath.Join(root, "loopcoder-empty-mcp.json")
 	if err := deps.WriteFile(mcpPath, []byte(`{"mcpServers":{}}`+"\n"), 0o600); err != nil {
 		cleanup()
@@ -266,6 +325,87 @@ func prepareClaudeQuotaSandbox(executable string, deps Deps) (string, []string, 
 	}
 	env := claudeQuotaEnvironment(deps.Getenv, root)
 	return root, argv, env, cleanup, nil
+}
+
+// seedClaudeQuotaAuthHome copies a minimal allowlist of Claude Code local auth
+// artifacts into the sandbox home. Missing sources are OK (probe will fail
+// closed as before). No credential env vars are introduced.
+//
+// Writes a redacted ~/.claude.json stub that:
+//   - hasCompletedOnboarding=true (skip theme picker)
+//   - trusts sandboxCwd (skip "Is this a project you trust?" dialog)
+//
+// cwd must match the PTY working directory or the trust dialog reappears.
+func seedClaudeQuotaAuthHome(sandboxHome, sandboxCwd string, deps Deps) error {
+	if sandboxHome == "" {
+		return errors.New("claude quota sandbox home empty")
+	}
+	realHome := ""
+	if deps.UserHomeDir != nil {
+		if h, err := deps.UserHomeDir(); err == nil {
+			realHome = strings.TrimSpace(h)
+		}
+	}
+	if realHome == "" && deps.Getenv != nil {
+		realHome = strings.TrimSpace(deps.Getenv("HOME"))
+	}
+	if realHome == "" {
+		return nil
+	}
+	srcRoot := filepath.Join(realHome, ".claude")
+	dstRoot := filepath.Join(sandboxHome, ".claude")
+	if err := os.MkdirAll(dstRoot, 0o700); err != nil {
+		return err
+	}
+	// Credentials only — do not copy host settings.json (hooks/plugins/deny
+	// rules inject obsolete MultiEdit/LS warnings and slow TUI bootstrap).
+	credSrc := filepath.Join(srcRoot, ".credentials.json")
+	if info, err := os.Lstat(credSrc); err == nil && info.Mode().IsRegular() && info.Size() > 0 && info.Size() <= 256*1024 {
+		if raw, err := os.ReadFile(credSrc); err == nil {
+			if err := os.WriteFile(filepath.Join(dstRoot, ".credentials.json"), raw, 0o600); err != nil {
+				return err
+			}
+		}
+	}
+	// Minimal settings: skip prompts without host hooks/plugins.
+	minimalSettings := []byte(`{
+  "tui": "fullscreen",
+  "skipDangerousModePermissionPrompt": true,
+  "skipWorkflowUsageWarning": true
+}
+`)
+	if err := os.WriteFile(filepath.Join(dstRoot, "settings.json"), minimalSettings, 0o600); err != nil {
+		return err
+	}
+	// Global state: skip theme/onboarding + workspace trust for the probe cwd.
+	// Do not copy the full host ~/.claude.json (projects map, caches, PII).
+	cwd := strings.TrimSpace(sandboxCwd)
+	if cwd == "" {
+		cwd = sandboxHome
+	}
+	// Escape JSON string for path.
+	cwdJSON, _ := json.Marshal(cwd)
+	onboardStub := []byte(fmt.Sprintf(`{
+  "hasCompletedOnboarding": true,
+  "lastOnboardingVersion": "2.1.210",
+  "numStartups": 10,
+  "theme": "dark",
+  "optionAsMetaKeyInstalled": true,
+  "effortCalloutV2Dismissed": true,
+  "projects": {
+    %s: {
+      "hasTrustDialogAccepted": true,
+      "hasCompletedProjectOnboarding": true,
+      "projectOnboardingSeenCount": 1,
+      "allowedTools": []
+    }
+  }
+}
+`, string(cwdJSON)))
+	if err := os.WriteFile(filepath.Join(sandboxHome, ".claude.json"), onboardStub, 0o600); err != nil {
+		return err
+	}
+	return nil
 }
 
 func claudeQuotaEnvKeys() []string {

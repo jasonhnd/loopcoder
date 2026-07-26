@@ -71,6 +71,9 @@ push access.
 
    ```text
    loopcoder doctor --repo .
+loopcoder diagnose --project-id <id> --dry-run --format json
+loopcoder capabilities --format json
+loopcoder qualify --archive dist/x.tar.gz --digest <sha256>
    ```
 
 6. Confirm local report querying works. A fresh repository may have no reports
@@ -101,6 +104,9 @@ Command side effects in the first-run path:
 | `loopcoder doctor --repo .` | Read-only diagnostics in the first-run path; use `--format json` for the machine-readable form. |
 | `loopcoder report --repo .` | Read-only local report query. |
 | `loopcoder status --repo .` | Read-only local run status. |
+| `loopcoder run --repo . --issue <n> --provider <p> --model <m>` | Primary direct-path command (explicit pin or `--auto-route` / omitted route). |
+| `loopcoder workflow run --fixture one\|chain` | Bounded multi-item workflow execution through the direct-run lifecycle (human gate). |
+| `loopcoder events --repo .` | Report/event follow surface (thin alias until dedicated follow lands). |
 | `loopcoder attach --repo . --run <run-id>` | Read-only durable detached run progress follow. |
 | `loopcoder cancel --repo . --run <run-id>` | Requests cancellation for a LoopCoder-owned detached run. |
 | `loopcoder state push --repo .` | Explicitly writes run summaries to the dedicated state branch. |
@@ -113,6 +119,10 @@ legacy repo-local import before applying it:
 loopcoder projects register --repo .
 loopcoder projects show --repo .
 loopcoder migrate local-state --repo . --dry-run
+loopcoder migrate export-v08 --export-dir /tmp/v08-export --fixture
+loopcoder migrate import-v09 --export-dir /tmp/v08-export
+loopcoder export-v08 --export-dir /tmp/v08-export --fixture
+loopcoder import-v09 --export-dir /tmp/v08-export
 ```
 
 `loopcoder projects register --repo .` writes or refreshes this checkout's row

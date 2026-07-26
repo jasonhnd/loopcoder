@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/codexauth"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
 )
 
@@ -40,6 +41,10 @@ type CodexAppServerRequest struct {
 	StdoutLimitBytes   int
 	StderrLimitBytes   int
 	CombinedLimitBytes int
+	// Drive, when non-nil, runs the JSON-RPC session after process start.
+	// When nil, the default quota session (account/read + rateLimits/read) is used.
+	// Catalog collection supplies its own Drive (account/read + model/list pages).
+	Drive func(ctx context.Context, stdin io.Writer, events <-chan codexProtocolStdoutEvent) error
 }
 
 type CodexAppServerResult struct {
@@ -307,14 +312,22 @@ func runCodexAppServer(ctx context.Context, req CodexAppServerRequest) (CodexApp
 		err    error
 	}, 1)
 	go func() {
-		result, err := supervisedexec.Run(runCtx, cmd, supervisedexec.Options{HardCap: req.Timeout, LivenessMode: supervisedexec.LivenessModeLogOnly, Role: "codex-quota-app-server"})
+		role := "codex-app-server"
+		if req.Drive == nil {
+			role = "codex-quota-app-server"
+		}
+		result, err := supervisedexec.Run(runCtx, cmd, supervisedexec.Options{HardCap: req.Timeout, LivenessMode: supervisedexec.LivenessModeLogOnly, Role: role})
 		capture.close()
 		runCh <- struct {
 			result supervisedexec.Result
 			err    error
 		}{result: result, err: err}
 	}()
-	protocolErr := driveCodexAppServerProtocolEvents(runCtx, stdin, capture.events)
+	drive := req.Drive
+	if drive == nil {
+		drive = driveCodexAppServerProtocolEvents
+	}
+	protocolErr := drive(runCtx, stdin, capture.events)
 	stopCapture()
 	_ = stdin.Close()
 	if protocolErr != nil {
@@ -610,7 +623,15 @@ func validateCodexInitializeResponse(result json.RawMessage) error {
 }
 
 func snapshotsFromCodexRateLimits(source QuotaTelemetrySource, installationID *string, cliVersion string, account, limits map[string]any, frames []json.RawMessage, now time.Time) ([]QuotaSnapshot, error) {
+	// Account scope intentionally empty for capacity join. Codex AuthReadiness stamps
+	// shared codexauth acct-+64hex (parseCodexLoginStatus). Rate-limit RPC must not
+	// invent a second principal-derived ID from account/read — empty-account rows
+	// rebind only to the sole Ready AuthReadiness AccountProfileID on the same live
+	// installation (capacitysnapshot). Nonempty conflicting principals are never
+	// overwritten or treated as equivalent.
+	// Never emit account:unknown. Never stamp an unrelated opaque hash as AccountProfileID.
 	accountScope := codexAccountScope(account)
+	// codexCanonicalAccountProfileID remains available for catalog/tests; quota does not stamp it.
 	raw := bytes.Join(rawJSONFrames(frames), []byte("\n"))
 	if credentialMaterialLike(string(raw)) {
 		return nil, ErrQuotaCredentialMaterial
@@ -631,6 +652,8 @@ func snapshotsFromCodexRateLimits(source QuotaTelemetrySource, installationID *s
 	if len(snapshots) == 0 {
 		return nil, fmt.Errorf("%w: no supported quota fields", ErrCodexQuotaMalformed)
 	}
+	// Do NOT stamp AccountProfileID from codexCanonicalAccountProfileID here.
+	// That ID scheme is not the AuthReadiness status ID used for capacity routing.
 	sort.Slice(snapshots, func(i, j int) bool {
 		return snapshots[i].QuotaSnapshotID < snapshots[j].QuotaSnapshotID
 	})
@@ -1141,16 +1164,45 @@ func codexProtocolSummary(output string) string {
 }
 
 func codexAccountScope(account map[string]any) string {
+	// Capacity ScopeKey must not invent an account segment from account/read.
+	// AuthReadiness already carries the shared codexauth AccountProfileID; putting a
+	// raw principal or alternate hash into ScopeKey can split rate-limit windows from
+	// the authenticated install account. Empty is correct; capacity rebinds to sole
+	// AuthReadiness AccountProfileID on the same installation when unambiguous.
+	// Never emit account:unknown.
+	_ = account
+	return ""
+}
+
+// codexCanonicalAccountProfileID returns the shared opaque acct- binding used by
+// inventory and agent execution (internal/codexauth). Empty when not exact-routable.
+//
+// Only account/read RPC-affirmed identity fields are accepted. Never falls back to
+// a local auth.json (that would stamp RPC quota under a different process identity).
+// Never invents from email/plan alone. Canonical hash is provider+stable principal
+// only (plan is separate evidence).
+func codexCanonicalAccountProfileID(account map[string]any) string {
 	for _, container := range []map[string]any{account, codexMapField(account, "account"), codexMapField(account, "profile")} {
 		if container == nil {
 			continue
 		}
-		value := codexStringField(container, "id", "account_id", "accountID", "profile_id", "profileID")
-		if safeScopeToken(value) {
-			return value
+		id := codexStringField(container,
+			"id", "account_id", "accountID", "chatgpt_account_id", "chatgptAccountId",
+			"chatgpt_user_id", "chatgptUserId",
+		)
+		if id == "" || strings.Contains(id, "@") {
+			continue
+		}
+		if strings.EqualFold(id, "unknown") || strings.EqualFold(id, "root") {
+			continue
+		}
+		// plan ignored for identity; codexauth.CanonicalAccountProfileID is principal-only.
+		if acct := codexauth.CanonicalAccountProfileID(id, "", ""); acct != "" {
+			return acct
 		}
 	}
-	return "unknown"
+	// Fail unknown — do not invent from local auth file or email/planType.
+	return ""
 }
 
 func codexStringField(fields map[string]any, keys ...string) string {

@@ -37,6 +37,12 @@ jobs:
           test "${actual_goos}" = "darwin"
           test "${actual_goarch}" = "arm64"
 
+      - name: Record tested commit SHA
+        run: |
+          set -euo pipefail
+          printf 'evidence_tier=pull-request\n'
+          printf 'tested_commit_sha=%s\n' "${GITHUB_SHA}"
+
       - name: YAML validity check
         run: |
           set -euo pipefail
@@ -48,14 +54,35 @@ jobs:
             paths.sort.each { |path| YAML.load_file(path) }
           '
 
+      - name: Implementation authorization (status:planned rejection)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Always run offline fixtures; additionally evaluate the PR when event is pull_request.
+          IMPLEMENTATION_AUTH_OFFLINE=1 bash scripts/check-implementation-authorization.sh
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            PR_NUMBER="${{ github.event.pull_request.number }}" \
+              REPO="${{ github.repository }}" \
+              bash scripts/check-implementation-authorization.sh
+          fi
+
+      - name: assert-pre-prod-green offline provenance fixtures
+        run: |
+          set -euo pipefail
+          bash scripts/assert-pre-prod-green_test.sh
+
       - name: CI check mapping check
-        run: go test . -run TestV080WorkflowPolicy -count=1
+        run: go test . -run 'TestV080WorkflowPolicy|TestStabilizationGatePolicy' -count=1
 
       - name: Repository workflow policy
-        run: go test . -run TestV080WorkflowPolicy -count=1
+        run: go test . -run 'TestV080WorkflowPolicy|TestStabilizationGatePolicy' -count=1
 
       - name: Release draft staging unit test
         run: bash scripts/stage-draft-release_test.sh
+
+      - name: Release candidate script gates
+        run: bash scripts/build-release-candidate_test.sh
 
       - name: Installer unit test
         run: bash scripts/install_test.sh
@@ -88,6 +115,12 @@ jobs:
           printf 'Go host tuple: %s/%s\n' "${actual_goos}" "${actual_goarch}"
           test "${actual_goos}" = "darwin"
           test "${actual_goarch}" = "arm64"
+
+      - name: Record tested commit SHA
+        run: |
+          set -euo pipefail
+          printf 'evidence_tier=pull-request\n'
+          printf 'tested_commit_sha=%s\n' "${GITHUB_SHA}"
 
       - name: Go build
         run: go build ./cmd/loopcoder
@@ -123,6 +156,12 @@ jobs:
           test "${actual_goos}" = "darwin"
           test "${actual_goarch}" = "arm64"
 
+      - name: Record tested commit SHA
+        run: |
+          set -euo pipefail
+          printf 'evidence_tier=pull-request\n'
+          printf 'tested_commit_sha=%s\n' "${GITHUB_SHA}"
+
       - name: Go test changed packages (race detector)
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -148,6 +187,12 @@ jobs:
           printf 'Go host tuple: %s/%s\n' "${actual_goos}" "${actual_goarch}"
           test "${actual_goos}" = "darwin"
           test "${actual_goarch}" = "arm64"
+
+      - name: Record tested commit SHA
+        run: |
+          set -euo pipefail
+          printf 'evidence_tier=pull-request\n'
+          printf 'tested_commit_sha=%s\n' "${GITHUB_SHA}"
 
       - name: Install audit tools
         run: |

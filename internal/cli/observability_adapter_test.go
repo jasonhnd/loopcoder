@@ -28,7 +28,6 @@ import (
 	"github.com/jasonhnd/loopcoder/internal/worker"
 )
 
-
 func observabilityDispatchRoute(deps Deps) Deps {
 	if deps.ResolveWorkerDispatchRoute == nil {
 		deps.ResolveWorkerDispatchRoute = func(_ context.Context, input WorkerDispatchRouteInput) (WorkerDispatchRouteResult, error) {

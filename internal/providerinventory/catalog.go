@@ -67,38 +67,39 @@ const (
 )
 
 type ModelCatalogSnapshot struct {
-	SchemaVersion          string            `json:"schema_version"`
-	RecordVersion          int               `json:"record_version"`
-	ModelCatalogSnapshotID string            `json:"model_catalog_snapshot_id"`
-	AdapterID              string            `json:"adapter_id"`
-	ProviderInstallationID *string           `json:"provider_installation_id,omitempty"`
-	AccountProfileID       *string           `json:"account_profile_id,omitempty"`
-	AuthReadinessID        *string           `json:"auth_readiness_id,omitempty"`
-	CatalogSourceKind      CatalogSourceKind `json:"catalog_source_kind"`
-	CatalogSourceReference string            `json:"catalog_source_reference"`
-	SourceSchemaVersion    string            `json:"source_schema_version,omitempty"`
-	ProviderCLIVersion     string            `json:"provider_cli_version,omitempty"`
-	SourcePrecedence       int               `json:"source_precedence"`
-	EntryCount             int               `json:"entry_count"`
-	ConflictCount          int               `json:"conflict_count"`
-	StalePolicy            string            `json:"stale_policy"`
-	InventoryFingerprint   string            `json:"inventory_fingerprint"`
-	CreatedAt              string            `json:"created_at"`
-	UpdatedAt              string            `json:"updated_at"`
-	CreatedBy              ActorProvenance   `json:"created_by"`
-	UpdatedBy              ActorProvenance   `json:"updated_by"`
-	Host                   HostProvenance    `json:"host"`
-	PolicyVersion          string            `json:"policy_version"`
-	CapturedAt             string            `json:"captured_at"`
-	StaleAfter             string            `json:"stale_after,omitempty"`
-	FreshnessState         FreshnessState    `json:"freshness_state"`
-	Confidence             Confidence        `json:"confidence"`
-	SideEffectClass        string            `json:"side_effect_class"`
-	Classification         string            `json:"classification"`
-	Source                 SourceDescriptor  `json:"source"`
-	Evidence               EvidenceSummary   `json:"evidence"`
-	GapReasons             []string          `json:"gap_reasons"`
-	TerminalErrorCode      string            `json:"terminal_error_code,omitempty"`
+	SchemaVersion          string                        `json:"schema_version"`
+	RecordVersion          int                           `json:"record_version"`
+	ModelCatalogSnapshotID string                        `json:"model_catalog_snapshot_id"`
+	AdapterID              string                        `json:"adapter_id"`
+	ProviderInstallationID *string                       `json:"provider_installation_id,omitempty"`
+	AccountProfileID       *string                       `json:"account_profile_id,omitempty"`
+	AuthReadinessID        *string                       `json:"auth_readiness_id,omitempty"`
+	CatalogSourceKind      CatalogSourceKind             `json:"catalog_source_kind"`
+	CatalogSourceReference string                        `json:"catalog_source_reference"`
+	SourceSchemaVersion    string                        `json:"source_schema_version,omitempty"`
+	ProviderCLIVersion     string                        `json:"provider_cli_version,omitempty"`
+	SourcePrecedence       int                           `json:"source_precedence"`
+	EntryCount             int                           `json:"entry_count"`
+	ConflictCount          int                           `json:"conflict_count"`
+	StalePolicy            string                        `json:"stale_policy"`
+	InventoryFingerprint   string                        `json:"inventory_fingerprint"`
+	CreatedAt              string                        `json:"created_at"`
+	UpdatedAt              string                        `json:"updated_at"`
+	CreatedBy              ActorProvenance               `json:"created_by"`
+	UpdatedBy              ActorProvenance               `json:"updated_by"`
+	Host                   HostProvenance                `json:"host"`
+	PolicyVersion          string                        `json:"policy_version"`
+	CapturedAt             string                        `json:"captured_at"`
+	StaleAfter             string                        `json:"stale_after,omitempty"`
+	FreshnessState         FreshnessState                `json:"freshness_state"`
+	Confidence             Confidence                    `json:"confidence"`
+	SideEffectClass        string                        `json:"side_effect_class"`
+	Classification         string                        `json:"classification"`
+	Source                 SourceDescriptor              `json:"source"`
+	Evidence               EvidenceSummary               `json:"evidence"`
+	GapReasons             []string                      `json:"gap_reasons"`
+	TerminalErrorCode      string                        `json:"terminal_error_code,omitempty"`
+	CapabilityProbeReceipt *ClaudeCapabilityProbeReceipt `json:"capability_probe_receipt,omitempty"`
 }
 
 type ModelCapability struct {
@@ -410,12 +411,13 @@ func buildCatalogSnapshot(adapter AdapterDeclaration, providerInstallationID *st
 func catalogEntryFromModel(adapterID string, model models.Model) CatalogInputEntry {
 	provider, providerOK := runtimecap.LookupProvider(adapterID)
 	entry := CatalogInputEntry{
-		CanonicalModelID:    model.Name,
-		DisplayName:         model.Name,
-		LifecycleState:      LifecycleAvailable,
+		CanonicalModelID: model.Name,
+		DisplayName:      model.Name,
+		LifecycleState:   LifecycleAvailable,
 		// Adapter-declared static registry models are product-available for routing.
 		// Account restriction and auth readiness remain separate gates.
 		AvailabilityState:   AvailabilityAvailable,
+		Aliases:             append([]string(nil), model.Aliases...),
 		ReadOnly:            CapabilityUnknown,
 		JSONOutput:          CapabilityUnknown,
 		NestedSubagents:     CapabilityUnknown,

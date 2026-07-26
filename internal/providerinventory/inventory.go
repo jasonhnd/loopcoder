@@ -24,9 +24,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jasonhnd/loopcoder/internal/codexauth"
 	"github.com/jasonhnd/loopcoder/internal/config"
+	"github.com/jasonhnd/loopcoder/internal/grokauth"
 	"github.com/jasonhnd/loopcoder/internal/home"
 	"github.com/jasonhnd/loopcoder/internal/models"
+	"github.com/jasonhnd/loopcoder/internal/providerinstall"
 	"github.com/jasonhnd/loopcoder/internal/runtimecap"
 	"github.com/jasonhnd/loopcoder/internal/storage"
 	"github.com/jasonhnd/loopcoder/internal/supervisedexec"
@@ -590,24 +593,29 @@ type Options struct {
 	Now             func() time.Time
 	NetworkGrants   []NetworkGrant
 	ActiveProviders []string
+	// IdentityOnly limits discovery to installation/version/auth/catalog hints.
+	// It is used immediately before explicit paid capability probes and never
+	// launches quota or model-usage surfaces.
+	IdentityOnly bool
 }
 
 type Deps struct {
-	Getenv       func(string) string
-	LookupEnv    func(string) (string, bool)
-	UserHomeDir  func() (string, error)
-	Lstat        func(string) (os.FileInfo, error)
-	Abs          func(string) (string, error)
-	EvalSymlinks func(string) (string, error)
-	RunProbe     func(context.Context, ProbeExecution) (ProbeExecutionResult, error)
-	RunCodexRPC  func(context.Context, CodexAppServerRequest) (CodexAppServerResult, error)
-	RunClaudePTY func(context.Context, ClaudePTYRequest) (ClaudePTYResult, error)
-	RunGrokACP   func(context.Context, GrokACPBillingRequest) (GrokACPBillingResult, error)
-	RunCodexBar  func(context.Context, CodexBarRequest) (CodexBarResult, error)
-	MkdirTemp    func(string, string) (string, error)
-	RemoveAll    func(string) error
-	WriteFile    func(string, []byte, os.FileMode) error
-	RandomID     func() string
+	Getenv         func(string) string
+	LookupEnv      func(string) (string, bool)
+	UserHomeDir    func() (string, error)
+	Lstat          func(string) (os.FileInfo, error)
+	Abs            func(string) (string, error)
+	EvalSymlinks   func(string) (string, error)
+	RunProbe       func(context.Context, ProbeExecution) (ProbeExecutionResult, error)
+	RunCodexRPC    func(context.Context, CodexAppServerRequest) (CodexAppServerResult, error)
+	RunClaudePTY   func(context.Context, ClaudePTYRequest) (ClaudePTYResult, error)
+	RunGrokACP     func(context.Context, GrokACPBillingRequest) (GrokACPBillingResult, error)
+	RunGrokCredits func(context.Context, GrokCreditsBillingRequest) (GrokCreditsBillingResult, error)
+	RunCodexBar    func(context.Context, CodexBarRequest) (CodexBarResult, error)
+	MkdirTemp      func(string, string) (string, error)
+	RemoveAll      func(string) error
+	WriteFile      func(string, []byte, os.FileMode) error
+	RandomID       func() string
 }
 
 type ProbeExecution struct {
@@ -639,21 +647,22 @@ type cachedProbeResult struct {
 
 func DefaultDeps() Deps {
 	return Deps{
-		Getenv:       os.Getenv,
-		LookupEnv:    os.LookupEnv,
-		UserHomeDir:  os.UserHomeDir,
-		Lstat:        os.Lstat,
-		Abs:          filepath.Abs,
-		EvalSymlinks: filepath.EvalSymlinks,
-		RunProbe:     runProbeCommand,
-		RunCodexRPC:  runCodexAppServer,
-		RunClaudePTY: runClaudeUsagePTY,
-		RunGrokACP:   runGrokACPBilling,
-		RunCodexBar:  runCodexBarQuota,
-		MkdirTemp:    os.MkdirTemp,
-		RemoveAll:    os.RemoveAll,
-		WriteFile:    os.WriteFile,
-		RandomID:     randomProbeID,
+		Getenv:         os.Getenv,
+		LookupEnv:      os.LookupEnv,
+		UserHomeDir:    os.UserHomeDir,
+		Lstat:          os.Lstat,
+		Abs:            filepath.Abs,
+		EvalSymlinks:   filepath.EvalSymlinks,
+		RunProbe:       runProbeCommand,
+		RunCodexRPC:    runCodexAppServer,
+		RunClaudePTY:   runClaudeUsagePTY,
+		RunGrokACP:     runGrokACPBilling,
+		RunGrokCredits: runGrokCreditsBilling,
+		RunCodexBar:    runCodexBarQuota,
+		MkdirTemp:      os.MkdirTemp,
+		RemoveAll:      os.RemoveAll,
+		WriteFile:      os.WriteFile,
+		RandomID:       randomProbeID,
 	}
 }
 
@@ -779,29 +788,47 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 				if authProbe != nil {
 					probes = append(probes, *authProbe)
 				}
-				if adapter.AdapterID == "codex" && !adapterQuotaAttempted {
+				if !opts.IdentityOnly && adapter.AdapterID == "codex" && !adapterQuotaAttempted {
 					source, snapshots, quotaProbe := inspectCodexQuota(ctx, discovery, adapter, candidate, installation, now, deps)
 					quotaTelemetrySources = append(quotaTelemetrySources, source)
 					quotaSnapshots = append(quotaSnapshots, snapshots...)
 					probes = append(probes, quotaProbe)
 					adapterQuotaAttempted = true
 					adapterQuotaCollected = quotaProbe.Outcome == OutcomeInstalled && len(snapshots) > 0 && snapshots[0].Confidence == ConfidenceExact
+					// Official app-server model/list catalog (MR exact/fresh when granted).
+					// Separate bounded session from quota; same transport security class.
+					catSnap, catCaps, catalogProbe := inspectCodexCatalog(ctx, discovery, adapter, candidate, installation, now, deps)
+					modelCatalogSnapshots = append(modelCatalogSnapshots, catSnap)
+					modelCapabilities = append(modelCapabilities, catCaps...)
+					probes = append(probes, catalogProbe)
+					if catalogProbe.NetworkDeclared && catalogProbe.NetworkPermission == NetworkDenied {
+						gaps = append(gaps, "provider-codex-catalog-network-permission-denied")
+					}
 				}
-				if adapter.AdapterID == "claude" && !adapterQuotaAttempted {
-					source, snapshots, quotaProbe := inspectClaudeQuota(ctx, discovery, adapter, candidate, installation, now, deps)
+				if !opts.IdentityOnly && adapter.AdapterID == "claude" && !adapterQuotaAttempted {
+					source, snapshots, quotaProbe := inspectClaudeQuota(ctx, discovery, adapter, candidate, installation, profiles, readiness, now, deps)
 					quotaTelemetrySources = append(quotaTelemetrySources, source)
 					quotaSnapshots = append(quotaSnapshots, snapshots...)
 					probes = append(probes, quotaProbe)
 					adapterQuotaAttempted = true
 					adapterQuotaCollected = quotaProbe.Outcome == OutcomeInstalled && len(snapshots) > 0 && snapshots[0].Confidence == ConfidenceExact
 				}
-				if adapter.AdapterID == "grok" && !adapterQuotaAttempted {
+				if !opts.IdentityOnly && adapter.AdapterID == "grok" && !adapterQuotaAttempted {
 					source, snapshots, quotaProbe := inspectGrokACPBilling(ctx, discovery, adapter, candidate, installation, now, deps)
 					quotaTelemetrySources = append(quotaTelemetrySources, source)
 					quotaSnapshots = append(quotaSnapshots, snapshots...)
 					probes = append(probes, quotaProbe)
 					adapterQuotaAttempted = true
 					adapterQuotaCollected = quotaProbe.Outcome == OutcomeInstalled && len(snapshots) > 0
+				}
+				if !opts.IdentityOnly && adapter.AdapterID == "antigravity" && !adapterQuotaAttempted {
+					source, snapshots, quotaProbe := inspectAntigravityQuota(ctx, discovery, adapter, installation, now, deps)
+					quotaTelemetrySources = append(quotaTelemetrySources, source)
+					quotaSnapshots = append(quotaSnapshots, snapshots...)
+					probes = append(probes, quotaProbe)
+					adapterQuotaAttempted = true
+					adapterQuotaCollected = quotaProbe.Outcome == OutcomeInstalled && len(snapshots) > 0 &&
+						snapshots[0].Confidence != ConfidenceUnavailable
 				}
 				if adapter.AdapterID == "grok" {
 					nativeProbe := inspectGrokNativeFederation(ctx, discovery, adapter, candidate, installation, now, deps)
@@ -838,12 +865,15 @@ func Discover(ctx context.Context, opts Options, deps Deps) (Report, error) {
 			if adapter.AdapterID == "claude" {
 				quotaSource, quotaSnapshot = quotaTelemetryFallbackForAdapter(adapter, now, "quota-collection-not-granted", "ErrQuotaCollectionGrantRequired")
 			}
+			if adapter.AdapterID == "antigravity" {
+				quotaSource, quotaSnapshot = quotaTelemetryFallbackForAdapter(adapter, now, "quota-collection-not-granted", "ErrQuotaCollectionGrantRequired")
+			}
 			quotaTelemetrySources = append(quotaTelemetrySources, quotaSource)
 			quotaSnapshots = append(quotaSnapshots, quotaSnapshot)
 			gaps = append(gaps, "provider-"+adapter.AdapterID+"-quota-unsupported")
 		}
 	}
-	if opts.Config.ProviderInventory.CodexBar.Enabled {
+	if !opts.IdentityOnly && opts.Config.ProviderInventory.CodexBar.Enabled {
 		sources, snapshots, codexbarProbes := inspectCodexBarQuota(ctx, opts.Config.ProviderInventory.CodexBar, now, deps)
 		quotaTelemetrySources = append(quotaTelemetrySources, sources...)
 		quotaSnapshots = append(quotaSnapshots, snapshots...)
@@ -1284,9 +1314,12 @@ func discoverCandidates(adapter AdapterDeclaration, deps Deps) []candidate {
 // is installed and at least one bound auth-readiness record is ready.
 // Spec: usable MUST NOT be true from install evidence alone.
 func promoteUsableInstallations(installations []ProviderInstallation, readiness []AuthReadiness) {
+	// Spec: usable MUST NOT be true from install evidence alone, and must not
+	// flip yes for stale/estimated/unknown Ready auth (same exact+fresh gate as
+	// capacity Authenticated and rehydrate recovery).
 	readyInstallations := map[string]bool{}
 	for _, auth := range readiness {
-		if auth.ReadinessState != ReadinessReady {
+		if !ExactFreshReadyAuth(auth) {
 			continue
 		}
 		if auth.ProviderInstallationID == nil {
@@ -1341,6 +1374,13 @@ func inspectCandidate(ctx context.Context, adapter AdapterDeclaration, candidate
 	stderr, stderrFindings := redactProviderOutput(result.Stderr)
 	probe.StdoutSummary = stdout
 	probe.StderrSummary = stderr
+	if adapter.AuthProbeParser == "claude-auth-status-json" {
+		// Claude's machine status may contain an account email. Parse it only
+		// into an opaque durable identity hash; never persist even a partially
+		// redacted address in probe summaries.
+		probe.StdoutSummary = "claude auth status machine JSON received"
+		probe.StderrSummary = ""
+	}
 	probe.SecretFindingCount = stdoutFindings + stderrFindings
 	probe.TimedOut = result.TimedOut
 	probe.Killed = result.Killed
@@ -1551,6 +1591,9 @@ func inspectAuthCommand(ctx context.Context, discovery *discoveryContext, adapte
 		"profile_count": fmt.Sprintf("%d", len(parsed)),
 		"parser":        firstNonEmpty(adapter.AuthProbeParser, "allowlisted-text-auth-status"),
 	})
+	if adapter.AuthProbeParser == "claude-auth-status-json" {
+		probe.StdoutSummary = fmt.Sprintf("claude auth status machine JSON accepted profiles %d", len(parsed))
+	}
 	if result.ExitCode != 0 {
 		probe.Confidence = ConfidenceUnknown
 		probe.GapReasons = []string{"auth-probe-nonzero-exit"}
@@ -1714,11 +1757,149 @@ func parseAuthStatus(adapter AdapterDeclaration, output string, exitCode int) []
 	switch adapter.AuthProbeParser {
 	case "claude-auth-status-json":
 		return parseClaudeAuthStatus(output, exitCode)
+	case "codex-login-status":
+		return parseCodexLoginStatus(output, exitCode)
 	case "grok-models":
 		return parseGrokModelsAuthStatus(output, exitCode)
+	case "agy-models":
+		return parseAgyModelsAuthStatus(output, exitCode)
 	default:
 		return parseTextAuthStatus(adapter.AdapterID, output)
 	}
+}
+
+// parseCodexLoginStatus classifies `codex login status` and binds AccountProfileID
+// through shared codexauth (same opaque acct-+64hex as agent preflight).
+//
+// RC38 root cause: the codex-login-status parser name was declared but not wired,
+// so status text fell through to parseTextAuthStatus → acct_<base32>. Capacity
+// then hashed that via opaqueAccountRef into a second acct-<sha256> that never
+// equals codexauth.CanonicalAccountProfileID(principal), so preflight refused
+// with account mismatch before OnProviderStart (no authority row).
+func parseCodexLoginStatus(output string, exitCode int) []parsedAuthStatus {
+	state, scope, summary, refresh, gaps, recognized := classifyAuthLine(output)
+	if !recognized {
+		// Known Codex login-status phrases when classifyAuthLine is conservative.
+		lower := strings.ToLower(output)
+		switch {
+		case strings.Contains(lower, "logged in"):
+			state = ReadinessReady
+			scope = AuthorizationUnknown
+			summary = "model authorization unknown"
+			gaps = []string{"authorization-scope-unknown"}
+			recognized = true
+		case strings.Contains(lower, "not logged") || strings.Contains(lower, "not authenticated"):
+			state = ReadinessNotAuthenticated
+			scope = AuthorizationNotApplicable
+			summary = "provider reports not authenticated"
+			gaps = []string{"provider-reports-not-authenticated"}
+			recognized = true
+		case strings.Contains(lower, "expired") || strings.Contains(lower, "refresh required"):
+			state = ReadinessExpired
+			scope = AuthorizationUnknown
+			summary = "provider reports expired credentials"
+			refresh = true
+			gaps = []string{"provider-reports-expired"}
+			recognized = true
+		}
+	}
+	if !recognized {
+		return parseTextAuthStatus("codex", output)
+	}
+	// Prefer shared codexauth AccountProfileID (same as agent preflight / ExactRouteAffirm).
+	// Never invent from status display text alone. Never use ambient OPENAI_API_KEY.
+	if bind, berr := codexauth.ParseActive("", os.Getenv, time.Now().UTC()); berr == nil && bind.ExactRoutable {
+		return []parsedAuthStatus{{
+			ReferenceHash: bind.AccountProfileID, // acct-+64hex; accountProfileID pass-through
+			Display:       "codex-auth",
+			EvidenceKind:  EvidenceStatusCommand,
+			State:         state,
+			ScopeState:    scope,
+			ScopeSummary:  summary,
+			Refresh:       refresh,
+			Gaps:          gaps,
+			AccountKind:   "codexauth-shared",
+		}}
+	}
+	// Status classified but no exact identity → ready/unknown is non-routable.
+	if state == ReadinessReady {
+		gaps = append(append([]string(nil), gaps...), "missing-exact-account-identity")
+	}
+	return []parsedAuthStatus{{
+		ReferenceHash: "sha256:" + hashHex("codex", "login-status", string(state), strings.Join(gaps, ",")),
+		Display:       "codex-profile",
+		EvidenceKind:  EvidenceStatusCommand,
+		State:         state,
+		ScopeState:    scope,
+		ScopeSummary:  summary,
+		Refresh:       refresh,
+		Gaps:          gaps,
+	}}
+}
+
+// parseAgyModelsAuthStatus treats a successful `agy models` listing as auth-ready
+// reachability evidence (authorization scope still unknown). Empty/error output
+// stays not-authenticated or unknown without inventing capacity.
+func parseAgyModelsAuthStatus(output string, exitCode int) []parsedAuthStatus {
+	lower := strings.ToLower(output)
+	if networkFailureText(lower) {
+		return []parsedAuthStatus{{
+			ReferenceHash: "sha256:" + hashHex("antigravity", "models-status", "network"),
+			Display:       "antigravity-profile",
+			EvidenceKind:  EvidenceStatusCommand,
+			State:         ReadinessUnknown,
+			ScopeState:    AuthorizationUnknown,
+			ScopeSummary:  "model inventory network unavailable",
+			Gaps:          []string{"catalog-network-unavailable"},
+		}}
+	}
+	// Count non-empty model id lines (agy models prints one id per line).
+	lines := 0
+	for _, line := range strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Skip help-ish noise.
+		if strings.HasPrefix(line, "Usage:") || strings.HasPrefix(line, "Available") {
+			continue
+		}
+		if strings.Contains(strings.ToLower(line), "not logged") || strings.Contains(strings.ToLower(line), "not authenticated") {
+			return []parsedAuthStatus{{
+				ReferenceHash: "sha256:" + hashHex("antigravity", "models-status", "not-auth"),
+				Display:       "antigravity-profile",
+				EvidenceKind:  EvidenceStatusCommand,
+				State:         ReadinessNotAuthenticated,
+				ScopeState:    AuthorizationNotApplicable,
+				ScopeSummary:  "provider reports not authenticated",
+				Gaps:          []string{"provider-reports-not-authenticated"},
+			}}
+		}
+		lines++
+	}
+	if exitCode == 0 && lines > 0 {
+		return []parsedAuthStatus{{
+			ReferenceHash: "sha256:" + hashHex("antigravity", "models-status", "ready", fmt.Sprintf("%d", lines)),
+			Display:       "antigravity-profile",
+			EvidenceKind:  EvidenceStatusCommand,
+			State:         ReadinessReady,
+			ScopeState:    AuthorizationUnknown,
+			ScopeSummary:  "model authorization unknown",
+			Gaps:          []string{"authorization-scope-unknown"},
+		}}
+	}
+	if exitCode != 0 {
+		return []parsedAuthStatus{{
+			ReferenceHash: "sha256:" + hashHex("antigravity", "models-status", "exit", fmt.Sprintf("%d", exitCode)),
+			Display:       "antigravity-profile",
+			EvidenceKind:  EvidenceStatusCommand,
+			State:         ReadinessUnknown,
+			ScopeState:    AuthorizationUnknown,
+			ScopeSummary:  "agy models nonzero exit",
+			Gaps:          []string{"auth-probe-nonzero-exit"},
+		}}
+	}
+	return parseTextAuthStatus("antigravity", output)
 }
 
 func parseGrokModelsAuthStatus(output string, exitCode int) []parsedAuthStatus {
@@ -1742,6 +1923,23 @@ func parseGrokModelsAuthStatus(output string, exitCode int) []parsedAuthStatus {
 	if !recognized {
 		return parseTextAuthStatus("grok", output)
 	}
+	// Prefer shared grokauth AccountProfileID (same as quota + runner).
+	// Never invent account from "grok models ready" display text alone.
+	if bind, berr := grokauth.ParseActive("", os.Getenv, time.Now().UTC()); berr == nil && bind.ExactRoutable {
+		return []parsedAuthStatus{{
+			ReferenceHash: bind.AccountProfileID, // already "acct-"+64hex; accountProfileID pass-through
+			Display:       "grok-auth",
+			EvidenceKind:  EvidenceStatusCommand,
+			State:         state,
+			ScopeState:    scope,
+			ScopeSummary:  summary,
+			Refresh:       refresh,
+			Gaps:          gaps,
+			AccountKind:   "grokauth-shared",
+		}}
+	}
+	// No exact auth identity: ready for catalog but non-routable account.
+	gaps = append(gaps, "missing-exact-account-identity")
 	return []parsedAuthStatus{{
 		ReferenceHash: "sha256:" + hashHex("grok", "models-status", string(state), strings.Join(gaps, ",")),
 		Display:       "grok-profile",
@@ -1853,11 +2051,9 @@ func parseClaudeAuthStatus(output string, exitCode int) []parsedAuthStatus {
 	for index, profile := range profiles {
 		state, scope, summary, refresh, gaps, _ := classifyAuthLine(firstNonEmpty(profile.Status, status.Status, boolAuthStatus(status.LoggedIn, exitCode)))
 		reference := firstNonEmpty(profile.ID, profile.Email, profile.OrgID, profile.OrgName, fmt.Sprintf("claude-profile-%d", index))
-		display := safeSummary(firstNonEmpty(profile.Display, profile.Email, profile.OrgName, fmt.Sprintf("profile-%d", index+1)))
-		display = emailPattern.ReplaceAllStringFunc(display, redactEmail)
-		if strings.TrimSpace(display) == "" || secretLike(display) {
-			display = "profile-" + hashBase32("claude", reference)[:8]
-		}
+		// Email may contribute to the in-memory reference hash, but it is
+		// never retained as a profile display or diagnostic.
+		display := claudeMachineProfileDisplay(profile.Display, profile.OrgName, reference, index)
 		summaryParts := []string{}
 		if profile.APIProvider != "" {
 			summaryParts = append(summaryParts, "api_provider="+boundedToken(safeSummary(profile.APIProvider), 48))
@@ -1886,6 +2082,21 @@ func parseClaudeAuthStatus(output string, exitCode int) []parsedAuthStatus {
 		})
 	}
 	return parsed
+}
+
+func claudeMachineProfileDisplay(display, orgName, reference string, index int) string {
+	candidate := strings.TrimSpace(firstNonEmpty(display, orgName))
+	// Claude may mirror the principal email into either display or orgName.
+	// Fail closed before and after generic redaction: even a partially redacted
+	// address remains account material and must not enter durable records.
+	if candidate == "" || strings.Contains(candidate, "@") || secretLike(candidate) {
+		return "profile-" + hashBase32("claude", reference, fmt.Sprintf("%d", index))[:8]
+	}
+	candidate = safeSummary(candidate)
+	if candidate == "" || strings.Contains(candidate, "@") || secretLike(candidate) {
+		return "profile-" + hashBase32("claude", reference, fmt.Sprintf("%d", index))[:8]
+	}
+	return candidate
 }
 
 func boolAuthStatus(loggedIn bool, exitCode int) string {
@@ -1975,7 +2186,7 @@ func authRecordsFromParsed(adapter AdapterDeclaration, installationID string, pa
 		auth.GapReasons = append([]string(nil), item.Gaps...)
 		auth.Confidence = auth.ReadinessConfidence
 		display := safeSummary(item.Display)
-		if strings.TrimSpace(display) == "" {
+		if strings.TrimSpace(display) == "" || (adapter.AdapterID == "claude" && strings.Contains(display, "@")) {
 			display = "profile-" + hashBase32(accountID)[:8]
 		}
 		collisionSet := []string{}
@@ -2096,6 +2307,18 @@ func readinessConfidence(state ReadinessState) Confidence {
 }
 
 func accountProfileID(adapterID, source, referenceHash string) string {
+	// Shared Grok/Codex auth already produces exact-routable "acct-"+64hex — pass through.
+	// Never re-hash these into acct_<base32> (RC38 split inventory vs agent preflight).
+	if strings.HasPrefix(referenceHash, "acct-") && len(referenceHash) == 5+64 {
+		return strings.ToLower(referenceHash)
+	}
+	// Claude's machine-readable status is shared by discovery, paid catalog
+	// probes, and the runner preflight. Use the exact-routable acct- form so the
+	// capacity layer preserves it verbatim instead of wrapping acct_<base32>
+	// into a second opaque identity.
+	if strings.EqualFold(strings.TrimSpace(adapterID), "claude") {
+		return "acct-" + hashHex("claude-auth-binding-v1", adapterID, source, referenceHash)
+	}
 	return "acct_" + hashBase32(adapterID, source, referenceHash)[:32]
 }
 
@@ -2218,7 +2441,14 @@ func inspectCatalogCommand(ctx context.Context, discovery *discoveryContext, ada
 		return unavailable(probe.GapReasons, probe.TerminalErrorCode)
 	}
 
-	sources, modelGaps := catalogSourcesFromGrokModels(adapter, installation.Version, output)
+	// Antigravity must never reuse the Grok/xAI catalog parser or attribution.
+	var sources []CatalogSourceInput
+	var modelGaps []string
+	if isAgyCatalogAdapter(adapter) {
+		sources, modelGaps = catalogSourcesFromAgyModels(adapter, installation.Version, output)
+	} else {
+		sources, modelGaps = catalogSourcesFromGrokModels(adapter, installation.Version, output)
+	}
 	if len(sources) == 0 {
 		probe.Outcome = OutcomeInstalledUnusable
 		probe.Confidence = ConfidenceUnknown
@@ -2228,10 +2458,14 @@ func inspectCatalogCommand(ctx context.Context, discovery *discoveryContext, ada
 	}
 	probe.Outcome = OutcomeInstalled
 	probe.Confidence = ConfidenceExact
+	parserName := firstNonEmpty(adapter.CatalogProbeParser, "provider-text")
+	if isAgyCatalogAdapter(adapter) {
+		parserName = "agy-models"
+	}
 	probe.setParsedFields(map[string]string{
 		"model_count":  fmt.Sprintf("%d", countCatalogEntries(sources)),
 		"source_count": fmt.Sprintf("%d", len(sources)),
-		"parser":       firstNonEmpty(adapter.CatalogProbeParser, "provider-text"),
+		"parser":       parserName,
 	})
 	if len(modelGaps) > 0 {
 		probe.GapReasons = append(probe.GapReasons, modelGaps...)
@@ -2394,7 +2628,14 @@ func parseGrokTextModels(output string) []grokModelEntry {
 			continue
 		}
 		lower := strings.ToLower(line)
-		if strings.Contains(lower, "available models") || strings.HasPrefix(lower, "model ") || strings.HasPrefix(lower, "alias ") || strings.Contains(lower, "not authenticated") || networkFailureText(lower) {
+		if strings.Contains(lower, "available models") ||
+			strings.HasPrefix(lower, "model ") ||
+			strings.HasPrefix(lower, "alias ") ||
+			strings.HasPrefix(lower, "default model") ||
+			strings.HasPrefix(lower, "you are ") ||
+			strings.Contains(lower, "logged in") ||
+			strings.Contains(lower, "not authenticated") ||
+			networkFailureText(lower) {
 			continue
 		}
 		entry := grokModelEntry{}
@@ -2575,9 +2816,15 @@ func looksLikeModelID(value string) bool {
 		return false
 	}
 	switch lower {
-	case "default", "name", "description", "provider", "custom", "models":
+	case "default", "name", "description", "provider", "custom", "models", "you", "available":
 		return false
 	default:
+		// Reject bare English words from human-readable `grok models` banners
+		// (e.g. "You are logged in…"). Real model ids include a digit, hyphen,
+		// slash, or dot (grok-4.5, gpt-5.5, vendor/model).
+		if !strings.ContainsAny(value, "0123456789-./_") {
+			return false
+		}
 		return true
 	}
 }
@@ -2941,6 +3188,26 @@ func configuredProviderNames(cfg config.Config) []string {
 	return out
 }
 
+// refreshableProvider reports whether an adapter may be refreshed when
+// explicitly requested (e.g. --grant-quota-telemetry all). Includes delivery
+// worker/verifier plus static registry providers so multi-company capacity
+// can be persisted without elevating every Status listing.
+func refreshableProvider(cfg config.Config, provider string) bool {
+	provider = strings.TrimSpace(provider)
+	if provider == "" {
+		return false
+	}
+	for _, p := range configuredProviderNames(cfg) {
+		if p == provider {
+			return true
+		}
+	}
+	if _, ok := models.LookupProvider(provider); ok {
+		return true
+	}
+	return false
+}
+
 func filterAdapterDeclarations(adapters []AdapterDeclaration, active []string) []AdapterDeclaration {
 	if len(active) == 0 {
 		return adapters
@@ -3062,7 +3329,16 @@ func canonicalPath(path string, deps Deps) string {
 }
 
 func installationID(adapterID string, identity ExecutableIdentity, path, platform string) string {
-	return "pinst_" + hashBase32(adapterID, identity.Basename, identity.PathHash, hashHex(path), platform)[:32]
+	// Delegate to shared algorithm so runners can affirm the same pinst_*.
+	// identity + platform kept for call-site compatibility; path drives the hash.
+	_ = identity
+	_ = platform
+	id, err := providerinstall.ComputeInstallationID(adapterID, path)
+	if err != nil || id == "" {
+		// Fallback identical formula (should not hit when path is valid).
+		return "pinst_" + hashBase32(adapterID, identity.Basename, identity.PathHash, hashHex(path), platform)[:32]
+	}
+	return id
 }
 
 func adapterDeclarationID(adapter AdapterDeclaration) string {
@@ -3823,6 +4099,9 @@ func normalizeDeps(deps Deps) Deps {
 	}
 	if deps.RunGrokACP == nil {
 		deps.RunGrokACP = defaults.RunGrokACP
+	}
+	if deps.RunGrokCredits == nil {
+		deps.RunGrokCredits = defaults.RunGrokCredits
 	}
 	if deps.RunCodexBar == nil {
 		deps.RunCodexBar = defaults.RunCodexBar

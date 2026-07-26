@@ -1830,18 +1830,24 @@ func expectedModelsOutput() string {
 	return "provider: codex\n" +
 		"vendor: OpenAI Codex\n" +
 		"cli: codex\n" +
-		"default: gpt-5.5 / high\n" +
+		"default: gpt-5.5 / medium\n" +
 		"models:\n" +
 		"  - gpt-5.5\n" +
-		"    depths: low, medium, high*, xhigh\n" +
+		"    depths: low, medium*, high, xhigh\n" +
+		"  - gpt-5.3-codex\n" +
+		"    depths: low, medium*, high, xhigh\n" +
 		"\n" +
 		"provider: claude\n" +
 		"vendor: Anthropic\n" +
 		"cli: claude\n" +
-		"default: claude-opus-4-8[1m] / max\n" +
+		"default: claude-sonnet-4-5 / medium\n" +
 		"models:\n" +
 		"  - claude-opus-4-8[1m]\n" +
-		"    depths: low, medium, high, max*\n" +
+		"    depths: low, medium, high*, max\n" +
+		"  - claude-sonnet-4-5\n" +
+		"    depths: low, medium*, high\n" +
+		"  - claude-haiku-4-5\n" +
+		"    depths: low*, medium\n" +
 		"\n" +
 		expectedAntigravityModelsOutput() +
 		"\n" +
@@ -1857,14 +1863,14 @@ func expectedAntigravityModelsOutput() string {
 	return "provider: antigravity\n" +
 		"vendor: Google Antigravity\n" +
 		"cli: agy\n" +
-		"default: Gemini 3.1 Pro / High\n" +
+		"default: Gemini 3.1 Pro / medium\n" +
 		"models:\n" +
 		"  - Gemini 3.1 Pro\n" +
-		"    depths: Low, High*\n" +
+		"    depths: low, medium*, high\n" +
 		"  - Opus 4.6\n" +
-		"    depths: Thinking*\n" +
+		"    depths: medium, high*, xhigh\n" +
 		"  - GPT-OSS 120B\n" +
-		"    depths: Medium*\n"
+		"    depths: medium*\n"
 }
 
 func TestAuditCommandRunsInjectedAuditAndRendersJSON(t *testing.T) {
@@ -2237,7 +2243,7 @@ func TestRelayGateExemptsEscapeAndInspectionCommands(t *testing.T) {
 	t.Run("help", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
 		exitCode := RunWithDeps([]string{"dispatch",
-		"--provider", "codex", "--help"}, &stdout, &stderr, Deps{})
+			"--provider", "codex", "--help"}, &stdout, &stderr, Deps{})
 		if exitCode != 0 {
 			t.Fatalf("help exit = %d, stderr=%q", exitCode, stderr.String())
 		}
@@ -7797,7 +7803,7 @@ func TestDispatchHostProfiledNonInteractiveDefaultsToDetached(t *testing.T) {
 				"--repo", repo,
 				"--issue-number", "964",
 				"--issue-title", "Default detached",
-		"--provider", "codex",
+				"--provider", "codex",
 			}, &stdout, &stderr, Deps{
 				Now: func() time.Time { return now },
 				Dispatch: func(context.Context, worker.Options) (worker.Result, error) {

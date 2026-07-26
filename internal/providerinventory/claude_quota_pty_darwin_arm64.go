@@ -97,12 +97,6 @@ func runClaudeUsagePTY(ctx context.Context, req ClaudePTYRequest) (ClaudePTYResu
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		_ = cmd.Process.Kill()
 	}
-	drain := func() (claudePTYWaitResult, claudePTYReadResult) {
-		closeMaster()
-		wr := <-waitCh
-		rr := <-readCh
-		return wr, rr
-	}
 	drainRemaining := func(waitDone bool, wr claudePTYWaitResult, readDone bool, rr claudePTYReadResult) (claudePTYWaitResult, claudePTYReadResult) {
 		closeMaster()
 		if !waitDone {
@@ -114,21 +108,48 @@ func runClaudeUsagePTY(ctx context.Context, req ClaudePTYRequest) (ClaudePTYResu
 		return wr, rr
 	}
 
+	// Defer slash-command input until after cold start so /usage is not
+	// swallowed by the bootstrap banner (otherwise the probe times out with
+	// only permission-rule warnings in the buffer).
+	// Short unit-test timeouts skip the delay so they remain deterministic.
+	inputErrCh := make(chan error, 1)
 	if req.Input != "" {
-		if _, err := io.WriteString(master, req.Input); err != nil {
-			killProcessTree()
-			wr, rr := drain()
-			out := claudePTYResultFrom(output, wr, rr, false, killed)
-			return out, fmt.Errorf("claude pty write: %w", err)
-		}
+		go func() {
+			delay := claudeQuotaInputDelay
+			if delay <= 0 {
+				delay = 3 * time.Second
+			}
+			if req.Timeout > 0 && req.Timeout < delay+2*time.Second {
+				delay = 0
+			}
+			if delay > 0 {
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+					inputErrCh <- ctx.Err()
+					return
+				}
+			}
+			_, err := io.WriteString(master, req.Input)
+			inputErrCh <- err
+		}()
 	}
 
 	var wr claudePTYWaitResult
 	var rr claudePTYReadResult
 	waitDone := false
 	readDone := false
+	inputDone := req.Input == ""
 	for {
 		select {
+		case err := <-inputErrCh:
+			inputDone = true
+			if err != nil {
+				killProcessTree()
+				wr, rr = drainRemaining(waitDone, wr, readDone, rr)
+				out := claudePTYResultFrom(output, wr, rr, false, killed)
+				return out, fmt.Errorf("claude pty write: %w", err)
+			}
 		case wr = <-waitCh:
 			waitDone = true
 			if !readDone {
@@ -157,6 +178,7 @@ func runClaudeUsagePTY(ctx context.Context, req ClaudePTYRequest) (ClaudePTYResu
 		case <-timer.C:
 			killProcessTree()
 			wr, rr = drainRemaining(waitDone, wr, readDone, rr)
+			_ = inputDone
 			return claudePTYResultFrom(output, wr, rr, true, killed), context.DeadlineExceeded
 		case <-ctx.Done():
 			killProcessTree()

@@ -9,6 +9,13 @@ import (
 
 func deriveInventoryObservations(inventory providerinventory.Report, now time.Time) []Observation {
 	var out []Observation
+	usableInstallations := map[string]bool{}
+	for _, installation := range inventory.Installations {
+		if installation.InstallationState == providerinventory.InstallationInstalled && installation.UsableForInvocation == "yes" {
+			usableInstallations[installation.ProviderInstallationID] = true
+			usableInstallations[installation.AdapterID] = true
+		}
+	}
 	for _, probe := range inventory.ProbeResults {
 		scope := Scope{
 			ProjectID:              ptrValue(probe.ProjectID),
@@ -22,6 +29,12 @@ func deriveInventoryObservations(inventory providerinventory.Report, now time.Ti
 		var reasons []ReasonCode
 		gaps := append([]string(nil), probe.GapReasons...)
 		if probe.Outcome != providerinventory.OutcomeInstalled {
+			// Networked telemetry probes (quota/catalog) can flake without
+			// meaning the installation is unusable for launch. Skip those
+			// secondary failures when a usable installation already exists.
+			if probe.NetworkDeclared && (usableInstallations[ptrValue(probe.ProviderInstallationID)] || usableInstallations[probe.AdapterID]) {
+				continue
+			}
 			kind = ObservationProbeFailure
 			failure = ReasonInstallationUnavailable
 			reasons = append(reasons, ReasonInstallationUnavailable)
@@ -111,10 +124,18 @@ func deriveInventoryObservations(inventory providerinventory.Report, now time.Ti
 			failure = ReasonRateLimited429
 			reasons = append(reasons, ReasonRateLimited429)
 		case strings.EqualFold(snapshot.TerminalErrorCode, "ErrQuotaSnapshotMalformed") || containsReason(snapshot.GapReasons, ReasonMalformedResponse):
+			if adapterHasRemainingCapacity(inventory.QuotaSnapshots, snapshot.AdapterID) {
+				continue
+			}
 			kind = ObservationMalformedResponse
 			failure = ReasonMalformedResponse
 			reasons = append(reasons, ReasonMalformedResponse)
 		case snapshot.Confidence == providerinventory.ConfidenceExact && snapshot.FreshnessState == providerinventory.FreshnessFresh && snapshot.RemainingValue != nil && *snapshot.RemainingValue <= 0:
+			// Skip secondary empty windows when another window for the same
+			// adapter still reports remaining capacity (e.g. credits=0 vs weekly %).
+			if adapterHasRemainingCapacity(inventory.QuotaSnapshots, snapshot.AdapterID) {
+				continue
+			}
 			kind = ObservationQuotaExhausted
 			failure = ReasonQuotaExhausted
 			reasons = append(reasons, ReasonQuotaExhausted)
@@ -138,4 +159,19 @@ func deriveInventoryObservations(inventory providerinventory.Report, now time.Ti
 		}))
 	}
 	return out
+}
+
+func adapterHasRemainingCapacity(snapshots []providerinventory.QuotaSnapshot, adapterID string) bool {
+	for _, snapshot := range snapshots {
+		if snapshot.AdapterID != adapterID {
+			continue
+		}
+		if snapshot.Confidence != providerinventory.ConfidenceExact || snapshot.FreshnessState != providerinventory.FreshnessFresh {
+			continue
+		}
+		if snapshot.RemainingValue != nil && *snapshot.RemainingValue > 0 {
+			return true
+		}
+	}
+	return false
 }

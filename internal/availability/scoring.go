@@ -238,6 +238,26 @@ func scoreQuota(scope Scope, snapshots []providerinventory.QuotaSnapshot, budget
 			best = &snapshots[i]
 		}
 	}
+	// Prefer a fresh exact window with remaining capacity over a later-captured
+	// exhausted secondary window (for example zero credits alongside weekly %).
+	var bestUsable *providerinventory.QuotaSnapshot
+	for i := range snapshots {
+		snapshot := snapshots[i]
+		if !scopeMatchesQuota(scope, snapshot) {
+			continue
+		}
+		if len(snapshot.ConflictSet) > 0 {
+			continue
+		}
+		if snapshot.Confidence == providerinventory.ConfidenceExact && snapshot.FreshnessState == providerinventory.FreshnessFresh && snapshot.RemainingValue != nil && *snapshot.RemainingValue > 0 {
+			if bestUsable == nil || snapshot.CapturedAt > bestUsable.CapturedAt || (snapshot.CapturedAt == bestUsable.CapturedAt && snapshot.QuotaSnapshotID > bestUsable.QuotaSnapshotID) {
+				bestUsable = &snapshots[i]
+			}
+		}
+	}
+	if bestUsable != nil {
+		best = bestUsable
+	}
 	if best != nil {
 		component.Confidence = best.Confidence
 		component.FreshnessState = best.FreshnessState

@@ -9,9 +9,34 @@
 [![Claude Code Skill](https://img.shields.io/badge/Claude%20Code-Skill-green.svg)](SKILL.md)
 [![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-black.svg)](docs/specs/0884-macos-arm64-only.md)
 
-[What it is](#what-it-is) | [The loop](#the-loop) | [Install](#install) | [Usage](#usage) | [Upgrade](#upgrade-from-070-080-to-081) | [How it works](#how-it-works) | [Design](#design)
+[What it is](#what-it-is) | [v0.9 stopped](#v09-development-stopped) | [The loop](#the-loop) | [Install](#install) | [Usage](#usage) | [Upgrade](#upgrade-from-070-080-to-081) | [How it works](#how-it-works) | [Design](#design)
 
 </div>
+
+## v0.9 development stopped
+
+The owner stopped v0.9.0 development on 2026-07-26 because the complete product
+acceptance objective was not achieved. v0.9.0 is **NO-GO, untagged, and
+unreleased**. `v0.8.1` remains the latest public release.
+
+The stopped `pre-prod` SHA and internal `0.9.0-rc.61` archive are preserved as
+historical engineering evidence only. RC61 was draft-only and its final live
+consumer canary and exact-artifact qualifier were not run. Do not install,
+publish, or resume a v0.9 candidate without a new explicit owner decision.
+
+Read the authoritative
+[`v0.9.0 development suspension report`](docs/v0.9.0-development-suspension-report-2026-07-26.md)
+for the objective, chronology, work completed, failed acceptance evidence,
+root-cause analysis, exact stop snapshot, lessons, and conditions for any
+future resume. The v0.9 quickstart and capability matrix remain in the
+repository as stopped-SHA implementation records; they are not current release
+instructions.
+
+For documentation inventory only, the stopped snapshot registered
+`loopcoder capabilities`, `loopcoder diagnose`, and `loopcoder qualify`.
+Their names are retained here so source and command documentation remain
+consistent; this is not an instruction to run them or evidence that a v0.9
+candidate was accepted.
 
 ## What it is
 
@@ -141,6 +166,10 @@ loopcoder migrate storage --apply --format json
 loopcoder skill install --repo .
 loopcoder projects register --repo .
 loopcoder migrate local-state --repo . --dry-run
+loopcoder migrate export-v08 --export-dir /tmp/v08-export --fixture
+loopcoder migrate import-v09 --export-dir /tmp/v08-export
+loopcoder export-v08 --export-dir /tmp/v08-export --fixture
+loopcoder import-v09 --export-dir /tmp/v08-export
 loopcoder doctor --repo .
 ```
 
@@ -167,6 +196,7 @@ loopcoder version                             # print version and build informat
 loopcoder models                              # list provider model/depth registry
 loopcoder models --provider antigravity       # list agy-backed model choices
 loopcoder providers refresh --repo .          # refresh bounded provider CLI installation inventory
+loopcoder providers verify-claude-model --repo . --project-id <project-id> --model sonnet --effort low # explicit paid account-bound verified subset
 loopcoder budget smoke --repo . --project-id <project-id> --format json # exercise local quota usage budget accounting
 loopcoder audit --repo . --layer sast         # run read-only security audit
 loopcoder doctor --repo .                     # read-only readiness and migration report
@@ -194,6 +224,9 @@ loopcoder relay list    --repo .              # inspect pending local relay bloc
 loopcoder relay flush   --repo .              # print pending relay blocks verbatim and clear them
 loopcoder resume        --repo .              # reconcile a run after an interruption
 loopcoder status        --repo .              # render local-only run status
+loopcoder run           --repo . --issue N --provider P --model M  # primary direct-path (explicit pin or auto-route)
+loopcoder workflow run  --fixture one|chain   # bounded multi-item workflow through direct-run lifecycle
+loopcoder events        --repo .              # follow/list report events (thin surface)
 loopcoder attach        --repo . --run <run-id> # follow durable detached run progress
 loopcoder cancel        --repo . --run <run-id> # request detached run cancellation
 loopcoder report        --repo .              # list recent local reporter records
@@ -332,6 +365,13 @@ default; their readiness or telemetry is `unknown`/`unavailable` with
 `network-permission-denied` or `network-denied`. The initial auth schema
 intentionally has no `expires_at` field because no current adapter exposes a
 credential-blind machine-readable expiry value.
+
+`providers refresh` never launches a paid Claude model. A Claude production
+route requires an explicit, budgeted
+`providers verify-claude-model` capability probe whose provider stream returns
+the exact account-bound model. Static Claude IDs and aliases remain hints only.
+See
+[`docs/reference/claude-observation.md`](docs/reference/claude-observation.md).
 
 ### Budget Accounting
 
@@ -493,6 +533,11 @@ optional (recommended for Gatekeeper-friendly public downloads). See the
 [`capability matrix`](docs/reference/v0.8.0-capability-matrix.md), and
 [host progress visibility contracts](docs/reference/progress-hosts.md). The
 repository keeps `gate: human-merge` for LoopCoder-core safety.
+
+v0.9.0 development was stopped by the owner on 2026-07-26. No v0.9 tag or
+public release exists, and the last internal draft archive did not complete the
+required live exact-artifact acceptance. See the
+[`v0.9.0 development suspension report`](docs/v0.9.0-development-suspension-report-2026-07-26.md).
 
 v0.7.0 remains available as the final legacy multi-platform release. v0.8.0
 remains the prior Darwin arm64 public tag. Historical

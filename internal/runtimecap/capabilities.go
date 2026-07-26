@@ -63,6 +63,16 @@ type ProviderRuntime struct {
 	ConformanceVersion       string
 	KnownLimitations         []string
 	UnsupportedSuggestions   map[ProviderCapability]string
+	// Exact route dimension proof support for capacity-bound product routes.
+	// Single authoritative table used by auto-route AND explicit pin.
+	// Fixture is never listed — production-ineligible.
+	ExactAccountAffirm    bool // auth_binding after launch (auth.json / grokauth)
+	ExactInstallAffirm    bool // install_binding from launched executable pinst
+	ExactDepthAffirm      bool // stream or accepted_invocation exact effort
+	ExactModelAffirm      bool // stream or accepted_invocation exact model
+	ExactPermissionAffirm bool // accepted_invocation from exact sandbox/permission options
+	// ProductionEligible is false for fixture/test-only adapters.
+	ProductionEligible bool
 }
 
 type ProviderModelCapability struct {
@@ -148,6 +158,32 @@ func HostNames() []string {
 
 func LookupProvider(name string) (ProviderRuntime, bool) {
 	return DefaultContract().LookupProvider(name)
+}
+
+// ExactRouteAffirmation is the single authoritative exact-dimension proof
+// contract for capacity-bound product routes (auto-route and explicit pin).
+// Unknown/fixture providers are never production-eligible.
+type ExactRouteAffirmation struct {
+	Account            bool
+	Install            bool
+	Depth              bool
+	Model              bool
+	Permission         bool
+	ProductionEligible bool
+}
+
+// ExactRouteAffirm returns proof support for provider. Fixture and unknown
+// names return ProductionEligible=false (never capacity-bound product winners).
+func ExactRouteAffirm(provider string) ExactRouteAffirmation {
+	p, ok := LookupProvider(strings.TrimSpace(provider))
+	if !ok || !p.ProductionEligible {
+		return ExactRouteAffirmation{}
+	}
+	return ExactRouteAffirmation{
+		Account: p.ExactAccountAffirm, Install: p.ExactInstallAffirm,
+		Depth: p.ExactDepthAffirm, Model: p.ExactModelAffirm,
+		Permission: p.ExactPermissionAffirm, ProductionEligible: p.ProductionEligible,
+	}
 }
 
 func LookupHost(name string) (HostRuntime, bool) {
@@ -540,6 +576,8 @@ var staticContract = Contract{
 			MCPConfig:           true,
 			Cancellation:        true,
 			TokenUsageReporting: true,
+			ExactAccountAffirm:  true, ExactInstallAffirm: true, ExactDepthAffirm: true,
+			ExactModelAffirm: true, ExactPermissionAffirm: true, ProductionEligible: true,
 			// `codex login status` is the provider-sanctioned local status
 			// command; it reports login state without requiring LoopCoder to
 			// read Codex credential files or token-bearing config.
@@ -564,6 +602,10 @@ var staticContract = Contract{
 			MCPConfig:           true,
 			Cancellation:        true,
 			TokenUsageReporting: true,
+			// Exact account binding is re-observed from the same executable's
+			// machine-readable auth status immediately before invocation.
+			ExactAccountAffirm: true, ExactInstallAffirm: true, ExactDepthAffirm: true,
+			ExactModelAffirm: true, ExactPermissionAffirm: true, ProductionEligible: true,
 			// `claude auth status --json` is a local machine-readable status
 			// surface with declared non-secret fields; LoopCoder persists only
 			// redacted displays, hashes, and summarized authorization metadata.
@@ -588,6 +630,9 @@ var staticContract = Contract{
 			MCPConfig:           true,
 			Cancellation:        true,
 			TokenUsageReporting: true,
+			// No account; no depth knob.
+			ExactAccountAffirm: false, ExactInstallAffirm: true, ExactDepthAffirm: false,
+			ExactModelAffirm: true, ExactPermissionAffirm: true, ProductionEligible: true,
 			// Gemini currently has no sanctioned credential-blind local status
 			// command here, so LoopCoder checks only whether declared auth
 			// references exist and never reads their values or file contents.
@@ -613,6 +658,9 @@ var staticContract = Contract{
 			Executable:     "agy",
 			VersionArgv:    []string{"--version"},
 			Cancellation:   true,
+			// Runner rejects exact AccountRef.
+			ExactAccountAffirm: false, ExactInstallAffirm: true, ExactDepthAffirm: true,
+			ExactModelAffirm: true, ExactPermissionAffirm: true, ProductionEligible: true,
 			// `agy models` is the narrow provider surface available for
 			// auth/model reachability, but it may contact the network; runtime
 			// policy therefore records it and skips it by default.
@@ -653,6 +701,9 @@ var staticContract = Contract{
 			JSONOutput:          true,
 			Cancellation:        true,
 			TokenUsageReporting: true,
+			// grokauth + pinst + stream/accepted_invocation for model/effort/permission.
+			ExactAccountAffirm: true, ExactInstallAffirm: true, ExactDepthAffirm: true,
+			ExactModelAffirm: true, ExactPermissionAffirm: true, ProductionEligible: true,
 			// `grok models` is the documented read-only inventory surface for
 			// Grok Build. It may require account/network reachability, but it
 			// does not launch an agent session, open login, install updates, or
