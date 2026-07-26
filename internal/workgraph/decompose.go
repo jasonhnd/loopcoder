@@ -75,8 +75,9 @@ func DecomposeGoal(opts DecomposeOptions) (Graph, error) {
 		},
 		{
 			Schema: SchemaItem, ID: "wi_tests", Status: ItemRequired,
-			Intent: "tests: add/adjust focused tests proving the change",
-			Owner:  owner, Ownership: OwnLoopCoderWorkItem, IntegrationOrder: 3,
+			Intent: "tests: add/adjust focused tests proving the change for: " + truncate(goal, 2048) +
+				"; run the repository's relevant test commands and retain generated dependency lock evidence",
+			Owner: owner, Ownership: OwnLoopCoderWorkItem, IntegrationOrder: 3,
 			OutputContract: "test_pass", RouteRequirement: "class=tera,depth=medium,permission=bounded_write",
 		},
 		{

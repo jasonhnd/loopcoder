@@ -256,6 +256,14 @@ type ChildOutcome struct {
 	// ArgvDigest is redacted exact launched argv fingerprint when known.
 	ArgvDigest   string   `json:"argv_digest,omitempty"`
 	FilesTouched []string `json:"files_touched,omitempty"`
+	// Production-owned test-contract evidence. A Go-module tests child may not
+	// succeed without an exact passed receipt from direct `go mod tidy` and
+	// `go test ./...`.
+	TestValidationStatus        string `json:"test_validation_status,omitempty"`
+	TestValidationEvidence      string `json:"test_validation_evidence,omitempty"`
+	TestValidationCommandDigest string `json:"test_validation_command_digest,omitempty"`
+	TestValidationHeadSHA       string `json:"test_validation_head_sha,omitempty"`
+	TestValidationReceiptPath   string `json:"test_validation_receipt_path,omitempty"`
 	// Exact structured verifier receipt fields. These are required for
 	// wi_verify success reuse and goal-PR binding; prose/exit-zero is never a
 	// substitute.
@@ -1396,11 +1404,16 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 					Permission: childOut.ActualSources.Permission, Account: childOut.ActualSources.Account,
 					Install: childOut.ActualSources.Install,
 				},
-				ArgvDigest:              childOut.ArgvDigest,
-				FilesTouched:            childOut.FilesTouched,
-				VerifierDecision:        childOut.VerifierDecision,
-				VerifierVerdictDigest:   childOut.VerifierVerdictDigest,
-				VerifierReviewedHeadSHA: childOut.VerifierReviewedHeadSHA,
+				ArgvDigest:                  childOut.ArgvDigest,
+				FilesTouched:                childOut.FilesTouched,
+				TestValidationStatus:        childOut.TestValidationStatus,
+				TestValidationEvidence:      childOut.TestValidationEvidence,
+				TestValidationCommandDigest: childOut.TestValidationCommandDigest,
+				TestValidationHeadSHA:       childOut.TestValidationHeadSHA,
+				TestValidationReceiptPath:   childOut.TestValidationReceiptPath,
+				VerifierDecision:            childOut.VerifierDecision,
+				VerifierVerdictDigest:       childOut.VerifierVerdictDigest,
+				VerifierReviewedHeadSHA:     childOut.VerifierReviewedHeadSHA,
 			}
 
 			term := childOut.Terminal
@@ -1551,6 +1564,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 					"generation":      fmt.Sprintf("%d", genn),
 				}
 				payload = mergePayloadStringMap(payload, childRoutePayloadFields(route))
+				payload = mergePayloadStringMap(payload, testValidationPayloadFields(outc))
 				payload = mergePayloadStringMap(payload, verifierVerdictPayloadFields(outc))
 				// Matching typed pair for Service forced cancel (not hard_kill_recovery).
 				// forced_interrupt/service_forced_interrupt is legal ONLY with the durable
@@ -1630,6 +1644,7 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 					"output_evidence": evid,
 				}
 				payload = mergePayloadStringMap(payload, childRoutePayloadFields(route))
+				payload = mergePayloadStringMap(payload, testValidationPayloadFields(outc))
 				payload = mergePayloadStringMap(payload, verifierVerdictPayloadFields(outc))
 				if supersedes != "" {
 					payload["supersedes_attempt_id"] = supersedes
@@ -2129,12 +2144,17 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 								Permission: childOut2.ActualSources.Permission, Account: childOut2.ActualSources.Account,
 								Install: childOut2.ActualSources.Install,
 							},
-							ArgvDigest:              childOut2.ArgvDigest,
-							FilesTouched:            childOut2.FilesTouched,
-							VerifierDecision:        childOut2.VerifierDecision,
-							VerifierVerdictDigest:   childOut2.VerifierVerdictDigest,
-							VerifierReviewedHeadSHA: childOut2.VerifierReviewedHeadSHA,
-							SupersedesAttemptID:     failedAttemptID, RerouteEventRef: rerouteRef,
+							ArgvDigest:                  childOut2.ArgvDigest,
+							FilesTouched:                childOut2.FilesTouched,
+							TestValidationStatus:        childOut2.TestValidationStatus,
+							TestValidationEvidence:      childOut2.TestValidationEvidence,
+							TestValidationCommandDigest: childOut2.TestValidationCommandDigest,
+							TestValidationHeadSHA:       childOut2.TestValidationHeadSHA,
+							TestValidationReceiptPath:   childOut2.TestValidationReceiptPath,
+							VerifierDecision:            childOut2.VerifierDecision,
+							VerifierVerdictDigest:       childOut2.VerifierVerdictDigest,
+							VerifierReviewedHeadSHA:     childOut2.VerifierReviewedHeadSHA,
+							SupersedesAttemptID:         failedAttemptID, RerouteEventRef: rerouteRef,
 						}
 						term2 := childOut2.Terminal
 						if term2 == workgraph.TermNone {
@@ -2248,10 +2268,30 @@ func (s Service) Execute(ctx context.Context, req Request) (Result, error) {
 
 			// --- Success path: accept + integrate BEFORE Close(succeeded)/terminal ---
 			if closeTerm == workgraph.TermSucceeded {
-				if aerr := AcceptSucceededChild(id, it.Intent, it.Owner, effectiveOut.FilesTouched, effectiveOut.WorktreePath, closeEvidence); aerr != nil {
-					outcome.FailureClass = "acceptance_failed"
+				acceptFailureClass := "acceptance_failed"
+				var aerr error
+				if ClassifyTaskRole(id, it.Intent, it.Owner) == RoleTests {
+					aerr = validatePassedGoTestReceipt(
+						ctx,
+						s.HomeDir,
+						projectID,
+						runID,
+						id,
+						outcome.AttemptID,
+						effectiveOut.WorktreePath,
+						effectiveOut,
+					)
+					if aerr != nil {
+						acceptFailureClass = "test_validation_evidence"
+					}
+				}
+				if aerr == nil {
+					aerr = AcceptSucceededChild(id, it.Intent, it.Owner, effectiveOut.FilesTouched, effectiveOut.WorktreePath, closeEvidence)
+				}
+				if aerr != nil {
+					outcome.FailureClass = acceptFailureClass
 					outcome.Message = aerr.Error()
-					closeEvidence = "failed:acceptance_failed:" + id
+					closeEvidence = "failed:" + acceptFailureClass + ":" + id
 					supersedes := ""
 					if isAlternate {
 						supersedes = failedAttemptIDForAlt
@@ -2950,6 +2990,17 @@ func reconstructOutcomeFromDurable(c *workclaim.Claim, elog *EventLog, projectID
 		TaskClass: c.TaskClass, ExecutionPlanDigest: c.PlanDigest,
 		ChildContractDigest: c.ChildContractDigest, Generation: int(c.Generation),
 		Terminal: string(c.Terminal), OutputEvidence: firstNonEmpty(c.OutputEvidence, termEv.Evidence),
+	}
+	if len(termEv.Payload) > 0 {
+		var m map[string]string
+		if err := json.Unmarshal(termEv.Payload, &m); err != nil {
+			return ChildOutcome{}, fmt.Errorf("terminal payload malformed")
+		}
+		out.TestValidationStatus = m["test_validation_status"]
+		out.TestValidationEvidence = m["test_validation_evidence"]
+		out.TestValidationCommandDigest = m["test_validation_command_digest"]
+		out.TestValidationHeadSHA = m["test_validation_head_sha"]
+		out.TestValidationReceiptPath = m["test_validation_receipt_path"]
 	}
 	if launchEv != nil {
 		if len(launchEv.Payload) == 0 {
