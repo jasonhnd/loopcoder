@@ -2,6 +2,8 @@ package artifactqual
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -61,13 +63,22 @@ func MeasureLatenciesFromBinary(bin, workDir string, envBase []string) (LatencyM
 	env := append([]string{}, envBase...)
 	env = append(env, "LOOPCODER_HOME="+home, "HOME="+home)
 
+	repo, err := initProbeRepo(workDir, "latency-repo")
+	if err != nil {
+		return out, fmt.Errorf("artifactqual: init isolated latency repo: %w", err)
+	}
+	challengeBytes := make([]byte, 24)
+	if _, err := rand.Read(challengeBytes); err != nil {
+		return out, fmt.Errorf("artifactqual: latency challenge: %w", err)
+	}
+	challenge := hex.EncodeToString(challengeBytes)
+	env = append(env, "LOOPCODER_QUALIFY_UI_PROBE_CHALLENGE="+challenge)
+
 	t0 := time.Now().UTC()
-	cmd := exec.Command(bin, "run",
-		"--repo", "acme/qual-latency",
-		"--issue", "42",
-		"--provider", "fixture",
-		"--model", "m",
-		"--format", "jsonl",
+	cmd := exec.Command(bin, "_qualify-ui-probe",
+		"--repo", repo,
+		"--project-id", "acme-qual-latency",
+		"--challenge", challenge,
 	)
 	cmd.Env = append(os.Environ(), env...)
 	stderr, err := cmd.StderrPipe()
@@ -142,9 +153,12 @@ func MeasureLatenciesFromBinary(bin, workDir string, envBase []string) (LatencyM
 	if err := sc.Err(); err != nil && streamErr == nil {
 		streamErr = err
 	}
-	_ = cmd.Wait()
+	waitErr := cmd.Wait()
 	if streamErr != nil {
 		return out, streamErr
+	}
+	if waitErr != nil {
+		return out, errors.New("artifactqual: exact-binary UI probe failed")
 	}
 	if !gotStart {
 		return out, errors.New("artifactqual: start report never observed on built-binary stream")
@@ -218,6 +232,44 @@ func MeasureLatenciesFromBinary(bin, workDir string, envBase []string) (LatencyM
 			Reasons: []string{fmt.Sprintf("ms=%d", freshMs)}},
 	}
 	return out, nil
+}
+
+func initProbeRepo(workDir, name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" || filepath.Base(name) != name {
+		return "", errors.New("artifactqual: invalid isolated probe repo name")
+	}
+	repo := filepath.Join(workDir, name)
+	if err := os.MkdirAll(repo, 0o700); err != nil {
+		return "", err
+	}
+	runGit := func(args ...string) error {
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=LoopCoder Qualifier",
+			"GIT_AUTHOR_EMAIL=qualifier@loopcoder.local",
+			"GIT_COMMITTER_NAME=LoopCoder Qualifier",
+			"GIT_COMMITTER_EMAIL=qualifier@loopcoder.local",
+		)
+		if raw, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(raw)))
+		}
+		return nil
+	}
+	if err := runGit("init", "-b", "pre-prod"); err != nil {
+		return "", err
+	}
+	readme := filepath.Join(repo, "README.md")
+	if err := os.WriteFile(readme, []byte("# Isolated LoopCoder qualification probe\n"), 0o600); err != nil {
+		return "", err
+	}
+	if err := runGit("add", "README.md"); err != nil {
+		return "", err
+	}
+	if err := runGit("commit", "-m", "qualification probe baseline"); err != nil {
+		return "", err
+	}
+	return repo, nil
 }
 
 func waitDurableReport(home, projectID, eventID, contentDigest string, timeout time.Duration) error {
