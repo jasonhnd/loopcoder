@@ -21,6 +21,9 @@ func main() {
 	canaryOK := flag.String("base-canary-ok", "false", "base SHA passed integration-canary")
 	prNumber := flag.Int("pr-number", 0, "pull request number")
 	headBranch := flag.String("head-branch", "", "PR head branch")
+	headSHA := flag.String("head-sha", "", "exact PR head SHA")
+	promotionAnchorSHA := flag.String("promotion-anchor-sha", "", "frozen promotion merge anchor")
+	promotionAnchorOK := flag.String("promotion-anchor-ok", "false", "promotion anchor is live head ancestor")
 	baseBranch := flag.String("base-branch", "", "PR base branch")
 	flag.Parse()
 
@@ -60,11 +63,14 @@ func main() {
 			issueN = closing[0].Number
 		}
 		boot := evidence.BootstrapContext{
-			PRNumber:    *prNumber,
-			HeadBranch:  *headBranch,
-			BaseBranch:  *baseBranch,
-			BaseSHA:     *baseSHA,
-			IssueNumber: issueN,
+			PRNumber:           *prNumber,
+			HeadBranch:         *headBranch,
+			HeadSHA:            *headSHA,
+			BaseBranch:         *baseBranch,
+			BaseSHA:            *baseSHA,
+			IssueNumber:        issueN,
+			PromotionAnchorSHA: *promotionAnchorSHA,
+			PromotionAnchorOK:  parseBool(*promotionAnchorOK),
 		}
 		g := evidence.EvaluateBaseSHAGate(*baseSHA, parseBool(*verifyOK), parseBool(*canaryOK), boot)
 		fmt.Printf("base_sha_allowed=%v\n", g.Allowed)

@@ -39,6 +39,16 @@ const (
 	BootstrapBaseSHA    = "1a6fd6bd6a87232b23db2f6fa06de299604cf57e"
 	BootstrapIssue      = 1092
 
+	// SuspendedPromotion* freezes the owner-authorized, one-time promotion of
+	// the stopped v0.9 snapshot. The immutable merge anchor and exact PR/base
+	// identity prevent this exception from authorizing a different promotion.
+	SuspendedPromotionPRNumber   = 1453
+	SuspendedPromotionHeadBranch = "release/v090-suspended-main-promotion"
+	SuspendedPromotionAnchorSHA  = "ae884dea062a812e5067d891391d578c1648dc29"
+	SuspendedPromotionBaseBranch = "main"
+	SuspendedPromotionBaseSHA    = "9646de33ed38189c74a13e8609d5811d83b58bad"
+	SuspendedPromotionIssue      = 1452
+
 	// CanaryRemediationBaseSHA is the #1218 merge tip whose integration-canary
 	// failed because the canary job lacked GH_TOKEN for doctor's hard gh-auth
 	// check. Exactly this base may skip canary green for one remediation PR so
@@ -269,9 +279,14 @@ func EvaluateImplementationAuthorization(paths []string, closing []ClosingIssue)
 type BootstrapContext struct {
 	PRNumber    int
 	HeadBranch  string
+	HeadSHA     string
 	BaseBranch  string
 	BaseSHA     string
 	IssueNumber int
+	// PromotionAnchorOK is set only after live GitHub comparison proves that
+	// PromotionAnchorSHA is equal to or an ancestor of HeadSHA.
+	PromotionAnchorSHA string
+	PromotionAnchorOK  bool
 }
 
 // EvaluateBootstrapException is true only when every field matches the frozen
@@ -282,6 +297,19 @@ func EvaluateBootstrapException(ctx BootstrapContext) bool {
 		ctx.BaseBranch == BootstrapBaseBranch &&
 		strings.EqualFold(strings.TrimSpace(ctx.BaseSHA), BootstrapBaseSHA) &&
 		ctx.IssueNumber == BootstrapIssue
+}
+
+// EvaluateSuspendedPromotionException matches only the frozen v0.9 archival
+// promotion. It does not authorize a tag, release, later head, or another PR.
+func EvaluateSuspendedPromotionException(ctx BootstrapContext) bool {
+	return ctx.PRNumber == SuspendedPromotionPRNumber &&
+		ctx.HeadBranch == SuspendedPromotionHeadBranch &&
+		strings.TrimSpace(ctx.HeadSHA) != "" &&
+		ctx.BaseBranch == SuspendedPromotionBaseBranch &&
+		strings.EqualFold(strings.TrimSpace(ctx.BaseSHA), SuspendedPromotionBaseSHA) &&
+		ctx.IssueNumber == SuspendedPromotionIssue &&
+		strings.EqualFold(strings.TrimSpace(ctx.PromotionAnchorSHA), SuspendedPromotionAnchorSHA) &&
+		ctx.PromotionAnchorOK
 }
 
 // BaseSHAIntegrationGate describes whether a PR base pre-prod SHA is allowed.
@@ -303,6 +331,10 @@ func EvaluateBaseSHAGate(baseSHA string, integrationVerifyOK, integrationCanaryO
 	if EvaluateBootstrapException(bootstrap) {
 		// Still require base SHA field on bootstrap context match includes SHA.
 		g.Reasons = append(g.Reasons, "bootstrap_exception_pr_1218")
+		return g
+	}
+	if EvaluateSuspendedPromotionException(bootstrap) {
+		g.Reasons = append(g.Reasons, "suspended_promotion_exception_pr_1453")
 		return g
 	}
 	// One-time canary remediation against the known #1218 merge tip.

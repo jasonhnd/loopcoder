@@ -156,6 +156,40 @@ func TestBootstrapExceptionRequiresAllFields(t *testing.T) {
 	}
 }
 
+func TestSuspendedPromotionExceptionRequiresExactIdentity(t *testing.T) {
+	good := BootstrapContext{
+		PRNumber: SuspendedPromotionPRNumber, HeadBranch: SuspendedPromotionHeadBranch,
+		HeadSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", BaseBranch: SuspendedPromotionBaseBranch,
+		BaseSHA: SuspendedPromotionBaseSHA, IssueNumber: SuspendedPromotionIssue,
+		PromotionAnchorSHA: SuspendedPromotionAnchorSHA, PromotionAnchorOK: true,
+	}
+	if !EvaluateSuspendedPromotionException(good) {
+		t.Fatal("expected exact promotion identity to match")
+	}
+	negatives := []BootstrapContext{
+		{PRNumber: 9999, HeadBranch: good.HeadBranch, HeadSHA: good.HeadSHA, BaseBranch: good.BaseBranch, BaseSHA: good.BaseSHA, IssueNumber: good.IssueNumber, PromotionAnchorSHA: good.PromotionAnchorSHA, PromotionAnchorOK: true},
+		{PRNumber: good.PRNumber, HeadBranch: "release/other", HeadSHA: good.HeadSHA, BaseBranch: good.BaseBranch, BaseSHA: good.BaseSHA, IssueNumber: good.IssueNumber, PromotionAnchorSHA: good.PromotionAnchorSHA, PromotionAnchorOK: true},
+		{PRNumber: good.PRNumber, HeadBranch: good.HeadBranch, HeadSHA: "", BaseBranch: good.BaseBranch, BaseSHA: good.BaseSHA, IssueNumber: good.IssueNumber, PromotionAnchorSHA: good.PromotionAnchorSHA, PromotionAnchorOK: true},
+		{PRNumber: good.PRNumber, HeadBranch: good.HeadBranch, HeadSHA: good.HeadSHA, BaseBranch: "pre-prod", BaseSHA: good.BaseSHA, IssueNumber: good.IssueNumber, PromotionAnchorSHA: good.PromotionAnchorSHA, PromotionAnchorOK: true},
+		{PRNumber: good.PRNumber, HeadBranch: good.HeadBranch, HeadSHA: good.HeadSHA, BaseBranch: good.BaseBranch, BaseSHA: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", IssueNumber: good.IssueNumber, PromotionAnchorSHA: good.PromotionAnchorSHA, PromotionAnchorOK: true},
+		{PRNumber: good.PRNumber, HeadBranch: good.HeadBranch, HeadSHA: good.HeadSHA, BaseBranch: good.BaseBranch, BaseSHA: good.BaseSHA, IssueNumber: 1092, PromotionAnchorSHA: good.PromotionAnchorSHA, PromotionAnchorOK: true},
+		{PRNumber: good.PRNumber, HeadBranch: good.HeadBranch, HeadSHA: good.HeadSHA, BaseBranch: good.BaseBranch, BaseSHA: good.BaseSHA, IssueNumber: good.IssueNumber, PromotionAnchorSHA: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", PromotionAnchorOK: true},
+		{PRNumber: good.PRNumber, HeadBranch: good.HeadBranch, HeadSHA: good.HeadSHA, BaseBranch: good.BaseBranch, BaseSHA: good.BaseSHA, IssueNumber: good.IssueNumber, PromotionAnchorSHA: good.PromotionAnchorSHA, PromotionAnchorOK: false},
+	}
+	for i, n := range negatives {
+		if EvaluateSuspendedPromotionException(n) {
+			t.Fatalf("negative %d should fail: %#v", i, n)
+		}
+		if EvaluateBaseSHAGate(n.BaseSHA, false, false, n).Allowed {
+			t.Fatalf("base gate should reject mismatched promotion %d", i)
+		}
+	}
+	g := EvaluateBaseSHAGate(SuspendedPromotionBaseSHA, false, false, good)
+	if !g.Allowed || !hasReasonStr(g.Reasons, "suspended_promotion_exception_pr_1453") {
+		t.Fatalf("%#v", g)
+	}
+}
+
 func TestBaseSHARequiresBothIntegrationChecks(t *testing.T) {
 	empty := BootstrapContext{}
 	if EvaluateBaseSHAGate("abc", true, false, empty).Allowed {

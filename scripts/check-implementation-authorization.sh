@@ -40,7 +40,7 @@ trap 'rm -rf "${TMP}"' EXIT
 export REPO OWNER_LOGIN PR_NUMBER TMPDIR_AUTH="${TMP}"
 export NO_COLOR=1 CLICOLOR=0 GH_FORCE_TTY=0
 
-gh pr view "${PR_NUMBER}" --repo "${REPO}" --json files,labels,headRefName,baseRefName,baseRefOid \
+gh pr view "${PR_NUMBER}" --repo "${REPO}" --json files,labels,headRefName,headRefOid,baseRefName,baseRefOid \
   >"${TMP}/pr_view.json" || fail "gh pr view failed"
 
 python3 -c '
@@ -50,12 +50,14 @@ t=os.environ["TMPDIR_AUTH"]
 open(t+"/files.txt","w").write("\n".join(f.get("path","") for f in (pr.get("files") or []) if f.get("path"))+"\n")
 open(t+"/pr_labels.txt","w").write("\n".join(l.get("name","") for l in (pr.get("labels") or []) if l.get("name"))+"\n")
 open(t+"/head_branch.txt","w").write(pr.get("headRefName") or "")
+open(t+"/head_sha.txt","w").write(pr.get("headRefOid") or "")
 open(t+"/base_branch.txt","w").write(pr.get("baseRefName") or "")
 open(t+"/base_sha.txt","w").write(pr.get("baseRefOid") or "")
-print("files=%d head=%s base=%s sha=%s"%(len(pr.get("files") or []), pr.get("headRefName"), pr.get("baseRefName"), (pr.get("baseRefOid") or "")[:12]))
+print("files=%d head=%s head_sha=%s base=%s base_sha=%s"%(len(pr.get("files") or []), pr.get("headRefName"), (pr.get("headRefOid") or "")[:12], pr.get("baseRefName"), (pr.get("baseRefOid") or "")[:12]))
 '
 
 [[ -s "${TMP}/base_sha.txt" ]] || fail "missing base SHA"
+[[ -s "${TMP}/head_sha.txt" ]] || fail "missing head SHA"
 
 OWNER="${REPO%%/*}"
 NAME="${REPO#*/}"
@@ -67,6 +69,7 @@ query($owner:String!, $name:String!, $number:Int!) {
       baseRefName
       baseRefOid
       headRefName
+      headRefOid
       closingIssuesReferences(first: 20) {
         nodes { number }
       }
@@ -176,9 +179,12 @@ pr = repo["pullRequest"]
 default_branch = (repo.get("defaultBranchRef") or {}).get("name") or "main"
 base_name = pr.get("baseRefName") or open(os.path.join(tmp, "base_branch.txt")).read().strip()
 head_name = pr.get("headRefName") or open(os.path.join(tmp, "head_branch.txt")).read().strip()
+head_sha = pr.get("headRefOid") or open(os.path.join(tmp, "head_sha.txt")).read().strip()
 base_sha = pr.get("baseRefOid") or open(os.path.join(tmp, "base_sha.txt")).read().strip()
 if not base_sha:
     raise SystemExit("missing base SHA")
+if not head_sha:
+    raise SystemExit("missing head SHA")
 
 nodes = (pr.get("closingIssuesReferences") or {}).get("nodes") or []
 out = []
@@ -216,6 +222,7 @@ if not out and base_name and base_name != default_branch:
 json.dump(out, open(os.path.join(tmp, "closing.json"), "w"))
 open(os.path.join(tmp, "base_sha.txt"), "w").write(base_sha)
 open(os.path.join(tmp, "head_branch.txt"), "w").write(head_name)
+open(os.path.join(tmp, "head_sha.txt"), "w").write(head_sha)
 open(os.path.join(tmp, "base_branch.txt"), "w").write(base_name)
 print("closing_source=%s" % source)
 print("closing_issue_count=%d" % len(out))
@@ -231,11 +238,27 @@ PY
 
 BASE_SHA="$(cat "${TMP}/base_sha.txt")"
 HEAD_BRANCH="$(cat "${TMP}/head_branch.txt")"
+HEAD_SHA="$(cat "${TMP}/head_sha.txt")"
 BASE_BRANCH="$(cat "${TMP}/base_branch.txt")"
 [[ -n "${BASE_SHA}" ]] || fail "empty base SHA"
+[[ -n "${HEAD_SHA}" ]] || fail "empty head SHA"
 echo "base_sha=${BASE_SHA}"
 echo "head_branch=${HEAD_BRANCH}"
+echo "head_sha=${HEAD_SHA}"
 echo "base_branch=${BASE_BRANCH}"
+
+PROMOTION_ANCHOR_SHA="ae884dea062a812e5067d891391d578c1648dc29"
+PROMOTION_ANCHOR_OK=false
+PROMOTION_COMPARE_STATUS="$(
+  gh api "repos/${REPO}/compare/${PROMOTION_ANCHOR_SHA}...${HEAD_SHA}" \
+    --jq '.status' 2>/dev/null || true
+)"
+if [[ "${PROMOTION_COMPARE_STATUS}" == "ahead" || "${PROMOTION_COMPARE_STATUS}" == "identical" ]]; then
+  PROMOTION_ANCHOR_OK=true
+fi
+echo "promotion_anchor_sha=${PROMOTION_ANCHOR_SHA}"
+echo "promotion_anchor_compare_status=${PROMOTION_COMPARE_STATUS:-unavailable}"
+echo "promotion_anchor_ok=${PROMOTION_ANCHOR_OK}"
 
 VERIFY_OK=false
 CANARY_OK=false
@@ -258,6 +281,9 @@ go run ./scripts/cmd/checkimplauth/ \
   -base-canary-ok="${CANARY_OK}" \
   -pr-number="${PR_NUMBER}" \
   -head-branch="${HEAD_BRANCH}" \
+  -head-sha="${HEAD_SHA}" \
+  -promotion-anchor-sha="${PROMOTION_ANCHOR_SHA}" \
+  -promotion-anchor-ok="${PROMOTION_ANCHOR_OK}" \
   -base-branch="${BASE_BRANCH}"
 
 echo "implementation-authorization: ok pr=${PR_NUMBER}"
