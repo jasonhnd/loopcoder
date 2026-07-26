@@ -149,6 +149,13 @@ type ChildExecResult struct {
 	Depth    string
 	// FilesTouched are relative paths written under the child worktree.
 	FilesTouched []string
+	// Production-owned tests validation proof. For a tests child rooted at a Go
+	// module, success requires status=passed and exact receipt/evidence bindings.
+	TestValidationStatus        string
+	TestValidationEvidence      string
+	TestValidationCommandDigest string
+	TestValidationHeadSHA       string
+	TestValidationReceiptPath   string
 }
 
 // ChildExecutor runs one claimed WorkItem as a LoopCoder-owned transparent child.
@@ -401,6 +408,9 @@ type ProductionChildExecutor struct {
 	Now    func() time.Time
 	// HardCap bounds each child provider call (default 10m).
 	HardCap time.Duration
+	// TestValidationHardCap bounds the production-owned direct `go mod tidy`
+	// then `go test ./...` gate after a tests provider succeeds (default 10m).
+	TestValidationHardCap time.Duration
 	// AllowFixture enables fixture_local evidence without a live process.
 	// Production must leave this false.
 	AllowFixture bool
@@ -1010,7 +1020,7 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 	invoked := observedInvokedRoute(
 		in.Route, actualProv, actualModel, actualDepth, actualPerm, actualAcct, actualInstall,
 	)
-	if role == RoleVerify {
+	if role == RoleVerify || role == RoleTests {
 		if routeErr := exactRouteMatch(in.Route, invoked); routeErr != nil {
 			out := ChildExecResult{
 				Terminal: workgraph.TermFailed, OutputEvidence: digest, WorktreePath: wt,
@@ -1045,6 +1055,68 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 		bindSpawn(&out)
 		return out, err
 	}
+	var testValidation testValidationResult
+	if role == RoleTests {
+		testValidation, err = runGoModuleTestValidation(
+			ctx,
+			in,
+			wt,
+			logPath,
+			digest,
+			p.TestValidationHardCap,
+			now,
+		)
+		if testValidation.Applicable {
+			bindTestValidation := func(out *ChildExecResult) {
+				out.TestValidationStatus = testValidation.Receipt.Status
+				out.TestValidationEvidence = testValidation.Receipt.ContentDigest
+				out.TestValidationCommandDigest = testValidation.Receipt.CommandDigest
+				out.TestValidationHeadSHA = testValidation.Receipt.HeadSHA
+				out.TestValidationReceiptPath = testValidation.ReceiptPath
+			}
+			if err != nil {
+				digestAfter, filesAfter, digestAfterErr := productOutputDigest(wt)
+				if digestAfterErr == nil && digestAfter != "" {
+					digest = digestAfter
+					files = mergeUniquePaths(files, filesAfter)
+				}
+				failureClass := firstNonEmpty(testValidation.Receipt.FailureClass, "test_validation_evidence")
+				out := ChildExecResult{
+					Terminal: workgraph.TermFailed, OutputEvidence: digest, WorktreePath: wt,
+					ExitCode: testValidation.Receipt.ExitCode, FailureClass: failureClass,
+					Message:  err.Error(),
+					Provider: invoked.Provider, Model: invoked.Model, Depth: invoked.Depth,
+					FilesTouched: files, InvokedRoute: invoked,
+				}
+				bindTestValidation(&out)
+				bindSources(&out)
+				bindSpawn(&out)
+				out = attachUsage(out, res)
+				return out, err
+			}
+			if testValidation.Receipt.Status != testValidationStatusPassed ||
+				!isExactSHA256Digest(testValidation.Receipt.ContentDigest) ||
+				!isExactSHA256Digest(testValidation.Receipt.CommandDigest) ||
+				testValidation.Receipt.ExitCode != 0 {
+				out := ChildExecResult{
+					Terminal: workgraph.TermFailed, OutputEvidence: digest, WorktreePath: wt,
+					ExitCode: 1, FailureClass: "test_validation_evidence",
+					Message:  "production Go test validation receipt is incomplete",
+					Provider: invoked.Provider, Model: invoked.Model, Depth: invoked.Depth,
+					FilesTouched: files, InvokedRoute: invoked,
+				}
+				bindTestValidation(&out)
+				bindSources(&out)
+				bindSpawn(&out)
+				out = attachUsage(out, res)
+				return out, fmt.Errorf("workflowrun: production Go test validation receipt incomplete")
+			}
+			digest, files, digErr = productOutputDigest(wt)
+			if digErr != nil {
+				return failProductDigest(digErr)
+			}
+		}
+	}
 	// A negative verifier verdict is authoritative only after the exact invoked
 	// route and supervised process identity have passed the same checks required
 	// for a positive verdict. A mismatched route must never mint durable
@@ -1077,6 +1149,13 @@ func (p ProductionChildExecutor) Execute(ctx context.Context, in ChildExecInput)
 		VerifierDecision:        verifierVerdict.Decision,
 		VerifierVerdictDigest:   verifierVerdictDigest,
 		VerifierReviewedHeadSHA: verifierVerdict.ReviewedHeadSHA,
+	}
+	if testValidation.Applicable {
+		out.TestValidationStatus = testValidation.Receipt.Status
+		out.TestValidationEvidence = testValidation.Receipt.ContentDigest
+		out.TestValidationCommandDigest = testValidation.Receipt.CommandDigest
+		out.TestValidationHeadSHA = testValidation.Receipt.HeadSHA
+		out.TestValidationReceiptPath = testValidation.ReceiptPath
 	}
 	bindSources(&out)
 	bindSpawn(&out)

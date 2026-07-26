@@ -185,8 +185,14 @@ type ChildReport struct {
 	AttemptID      string                         `json:"attempt_id,omitempty"`
 	OutputEvidence string                         `json:"output_evidence,omitempty"`
 	FilesTouched   []string                       `json:"files_touched,omitempty"`
-	WorktreePath   string                         `json:"worktree_path,omitempty"`
-	Terminal       string                         `json:"terminal,omitempty"`
+	// Production-owned Go tests validation binding (present only when applicable).
+	TestValidationStatus        string `json:"test_validation_status,omitempty"`
+	TestValidationEvidence      string `json:"test_validation_evidence,omitempty"`
+	TestValidationCommandDigest string `json:"test_validation_command_digest,omitempty"`
+	TestValidationHeadSHA       string `json:"test_validation_head_sha,omitempty"`
+	TestValidationReceiptPath   string `json:"test_validation_receipt_path,omitempty"`
+	WorktreePath                string `json:"worktree_path,omitempty"`
+	Terminal                    string `json:"terminal,omitempty"`
 	// FailureClass is the structured failure class (e.g. model_unavailable) when
 	// Terminal is non-success. Retained on universal reports for MU failed routes.
 	FailureClass string `json:"failure_class,omitempty"`
@@ -2086,6 +2092,11 @@ func applyOutcomeRouteFields(cr *ChildReport, co workflowrun.ChildOutcome) {
 	cr.ActualSource = co.ActualSource
 	cr.ActualSources = co.ActualSources
 	cr.ArgvDigest = co.ArgvDigest
+	cr.TestValidationStatus = co.TestValidationStatus
+	cr.TestValidationEvidence = co.TestValidationEvidence
+	cr.TestValidationCommandDigest = co.TestValidationCommandDigest
+	cr.TestValidationHeadSHA = co.TestValidationHeadSHA
+	cr.TestValidationReceiptPath = co.TestValidationReceiptPath
 	if co.InstallRef != "" {
 		cr.InstallRef = co.InstallRef
 	}
@@ -2569,8 +2580,13 @@ func childReportFromOutcome(co workflowrun.ChildOutcome) ChildReport {
 		ReservationID: co.ReservationID, RouteReason: co.RouteReason,
 		Terminal: co.Terminal, FailureClass: co.FailureClass,
 		OutputEvidence: co.OutputEvidence, FilesTouched: workflowrun.ProductFilesOnly(co.FilesTouched),
-		WorktreePath: co.WorktreePath,
-		Stage:        stage, NextAction: next,
+		TestValidationStatus:        co.TestValidationStatus,
+		TestValidationEvidence:      co.TestValidationEvidence,
+		TestValidationCommandDigest: co.TestValidationCommandDigest,
+		TestValidationHeadSHA:       co.TestValidationHeadSHA,
+		TestValidationReceiptPath:   co.TestValidationReceiptPath,
+		WorktreePath:                co.WorktreePath,
+		Stage:                       stage, NextAction: next,
 		// Never integrate historical non-success projection.
 		IntegrateCommitSHA: "",
 	}
@@ -3085,6 +3101,21 @@ func outcomeEventIdentityMatch(co workflowrun.ChildOutcome, cr ChildReport, id l
 	}
 	if co.AttemptID != att || cr.AttemptID != att {
 		return fmt.Errorf("goalrun: attempt %s AttemptID mismatch outcome/report", att)
+	}
+	for _, f := range []struct {
+		name       string
+		outcomeVal string
+		reportVal  string
+	}{
+		{"test_validation_status", co.TestValidationStatus, cr.TestValidationStatus},
+		{"test_validation_evidence", co.TestValidationEvidence, cr.TestValidationEvidence},
+		{"test_validation_command_digest", co.TestValidationCommandDigest, cr.TestValidationCommandDigest},
+		{"test_validation_head_sha", co.TestValidationHeadSHA, cr.TestValidationHeadSHA},
+		{"test_validation_receipt_path", co.TestValidationReceiptPath, cr.TestValidationReceiptPath},
+	} {
+		if f.outcomeVal != f.reportVal {
+			return fmt.Errorf("goalrun: attempt %s %s conflict outcome=%q report=%q", att, f.name, f.outcomeVal, f.reportVal)
+		}
 	}
 	return nil
 }
