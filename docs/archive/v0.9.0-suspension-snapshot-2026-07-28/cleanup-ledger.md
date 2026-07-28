@@ -4,8 +4,8 @@
 **Operation:** v0.9 project suspension archive and local deletion
 **Initial local scope:** 2,035,732,480 bytes
 **Safety model:** Preserve, upload, download-verify, then delete
-**Current phase:** Primary transaction complete; residual sweep preserved,
-deletion pending
+**Current phase:** Primary and second-sweep transactions complete; third-sweep
+evidence preserved, deletion pending
 
 This ledger is intentionally committed in two phases.
 
@@ -315,7 +315,7 @@ The merge commit cannot be written into the commit that creates it without an
 infinite self-reference. GitHub PR #1454 is therefore the authoritative merge
 record, and the draft's `target_commitish` is the durable merge-SHA binding.
 
-## 11. Residual Sweep Pre-Deletion Record
+## 11. Residual Sweep Result
 
 A broader scan after the primary transaction found another 252,332 KiB outside
 the original scope:
@@ -342,5 +342,59 @@ Their sizes, hashes, provenance, and safety scan are in
 classification is in
 [`residual-local-state-inventory.md`](residual-local-state-inventory.md).
 
-Deletion of the residual scope remains blocked until this material is committed
-to a remote branch and the remote bytes are independently read back.
+The preservation commit
+`6610b91a3b2cf71c54003c7a806166c27082b597` was pushed to
+`docs/v090-residual-cleanup-20260728`. Each of the five retained historical
+files was then read back through the GitHub API and matched against its local
+SHA-256 value before deletion.
+
+The second-sweep deletion removed:
+
+- the three selected historical checkout and work-area paths;
+- the three standalone Markdown source files after remote preservation;
+- all six hidden LoopCoder runtime homes;
+- the two selected Go module-cache paths;
+- the LoopCoder crash-reporter plist.
+
+The linked documentation and release-control worktrees were removed through
+`git worktree remove --force` before their controller metadata was pruned.
+All selected second-sweep paths were absent in the post-deletion scan. No
+unrelated repository was modified.
+
+## 12. Third Sweep Pre-Deletion Record
+
+A final full-name scan found 1,200,932 KiB of additional project-specific
+state, including one 4 KiB automation definition:
+
+| Class | KiB | Preservation boundary |
+| --- | ---: | --- |
+| Grok session and terminal history | 1,001,828 | Counts, formats, logical bytes, and time range only |
+| Claude project histories | 34,428 | Directory count, file count, logical bytes, and time range only |
+| Gemini project records | 16 | File count, logical bytes, and time range only |
+| Paseo agent records | 36 | Nine agents verified closed and archived |
+| Claude project caches | 520 | Reproducible cache; no preservation |
+| Local LoopCoder binaries and symlink | 83,920 | Reproducible or superseded; no binary upload |
+| Local LoopCoder installation tree | 80,144 | Public v0.8.1 remains remote; no duplicate upload |
+| Installed Claude LoopCoder skill | 36 | One stale text delta retained; duplicate file omitted |
+| Empty Claude temporary project directories | 0 | No information content |
+| Deleted Codex heartbeat definition | 4 | Name, 15-minute cadence, and deletion result recorded |
+
+The recurring Codex heartbeat was deleted through the Codex automation API
+before local file removal. This prevents a later scheduled wake from
+contradicting the owner's project-stop decision.
+
+The installed skill's unique, path-sanitized delta is retained as
+[`historical/local-tooling/claude-skill-stale-dispatch.diff`](historical/local-tooling/claude-skill-stale-dispatch.diff).
+Its remote readback must match SHA-256
+`d13577605e2acb0f5c6b209275ee157e3c5c59286ea4a7fe651291d77e5761fd`
+before the third-sweep deletion begins.
+
+Raw Claude, Gemini, Grok, and Paseo state is excluded from GitHub because it
+contains or may contain private prompts, terminal output, account-bound
+metadata, host paths, and provider-controlled credential formats. The
+repository retains a bounded inventory, not those raw transcripts.
+
+The final cleanup clone at `${TMPDIR}/lc-v090-residual-finalize` is retained
+until this ledger is merged, exact-merge CI passes, and the unpublished draft
+target is rebound to the new merge commit. It measured 30,028 KiB before the
+third-sweep deletion.

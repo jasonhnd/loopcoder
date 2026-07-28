@@ -1,11 +1,11 @@
 # Residual Local State Inventory
 
 **Audit date:** 2026-07-28
-**Trigger:** Broad post-cleanup home-directory scan
+**Trigger:** Broad post-cleanup home-directory scans
 **Disposition:** Preserve bounded public-safe summaries and unique source;
 delete raw local state
 
-## 1. Why A Second Sweep Was Required
+## 1. Why Additional Sweeps Were Required
 
 The primary cleanup was deliberately scoped to the active development estate
 under `${HOME}/AgenticCoder/loopcoder*` and `${TMPDIR}/loopcoder*`. After that
@@ -17,8 +17,8 @@ three other classes:
 3. Go module cache and macOS crash-report metadata.
 
 These paths were not part of the original 2,035,732,480-byte audit boundary.
-The second sweep accounts for them explicitly instead of silently expanding
-the first inventory after deletion.
+The second and third sweeps account for them explicitly instead of silently
+expanding the first inventory after deletion.
 
 ## 2. Size Boundary
 
@@ -127,7 +127,83 @@ Deletion of the second-sweep paths is allowed only after:
 The final cleanup result is recorded in
 [`cleanup-ledger.md`](cleanup-ledger.md).
 
-## 5. Recovery Boundary
+## 5. Third Sweep: Provider Histories And Installed Copies
+
+A final full-name scan found another 1,200,928 KiB of measured
+project-specific paths. One 4 KiB Codex heartbeat definition had already been
+removed through the Codex automation API, so the complete third-sweep boundary
+was 1,200,932 KiB, approximately 1.15 GiB.
+
+This was not another source checkout. Most of it was provider transcript and
+terminal history.
+
+### 5.1 Provider And Orchestrator State
+
+| Sanitized class | KiB | Entries | Observed file-time range | Disposition |
+| --- | ---: | ---: | --- | --- |
+| Grok session and terminal history | 1,001,828 | 6,251 files | 2026-07-12 through 2026-07-28 | Summarize; delete raw |
+| Claude project histories | 34,428 | 195 project directories, 223 files | 2026-07-03 through 2026-07-23 | Summarize; delete raw |
+| Gemini history and temporary records | 16 | 4 files | 2026-07-10 through 2026-07-22 | Summarize; delete raw |
+| Paseo agent index for this repository | 36 | 9 agent records | 2026-07-04 through 2026-07-28 | Verify closed and archived; hard-delete |
+| Claude project caches | 520 | 4 directories | Host-specific | Delete |
+| Claude temporary project placeholders | 0 | 7 empty directories | Host-specific | Delete |
+
+The Grok tree contained 5,903 `.log`, 174 `.json`, 66 `.jsonl`, 51 `.md`,
+34 `.lock`, and 23 `.txt` files. Its logical file size was 1,009,206,975
+bytes. The Claude project histories had a logical file size of 34,417,626
+bytes. These format counts were collected without copying transcript content
+into the repository.
+
+All nine Paseo agents were inspected through the Paseo CLI before deletion.
+Every record reported `status=closed` and `archived=true`; the provider split
+was four Grok, three Codex, and two Claude agents. This included the final
+`0900` Codex agent and the earlier closed Grok agent. No agent was resumed or
+woken during inspection.
+
+The recurring Codex heartbeat named `Keep LoopCoder v0.9 core routing moving`
+ran every 15 minutes. It was deleted through the Codex automation API before
+the filesystem cleanup so it could not reopen or continue the stopped
+development effort.
+
+Raw provider and orchestrator state was not uploaded because it can contain
+prompts, terminal output, account-bound metadata, local paths, private
+repository context, and provider-controlled credential shapes. A compressed
+raw upload would be unsafe in a public repository and would not be reliable
+product evidence.
+
+### 5.2 Installed And Reproducible Copies
+
+| Sanitized class | KiB | Contents | Disposition |
+| --- | ---: | --- | --- |
+| `${HOME}/.local/bin/loopcoder*` | 83,920 | Four binaries plus one symlink; 85,927,560 logical bytes | Delete |
+| `${HOME}/.local/opt/loopcoder` | 80,144 | Six v0.8.1 archive, checksum, signature, and test-binary files | Delete |
+| Global Claude `loopcoder` skill | 36 | `SKILL.md` and `AGENTS.md` | Preserve one bounded diff; delete installed copy |
+
+The public v0.8.1 archive and release metadata remain on GitHub. The other
+installed binaries were local test, hotfix, backup, or RC copies and were
+reproducible or superseded by retained source and draft assets. They were not
+uploaded again.
+
+The installed skill's `AGENTS.md` was byte-identical to the tracked repository
+file. Its `SKILL.md` differed from the tracked file by 15 changed lines around
+foreground and detached dispatch behavior. That stale local delta is retained
+as a path-sanitized text diff under
+[`historical/local-tooling`](historical/local-tooling); the installed skill is
+not an authoritative runtime or resume instruction.
+
+### 5.3 Unrelated Repository State Left Intact
+
+The broad scan also matched `.loopcoder` directories and `refs/loopcoder`
+namespaces inside other active repositories. Those paths belong to those
+repositories, not to the deleted LoopCoder source-development estate. They
+were deliberately left intact to avoid corrupting unrelated run history or
+Git state.
+
+Codex task history, Codex memory, and provider memory belonging to other
+repositories were also left intact. A name match alone is not sufficient
+authority to delete another project's state.
+
+## 6. Recovery Boundary
 
 The deleted runtime homes are intentionally not recoverable byte-for-byte.
 Future work can recover:
@@ -140,6 +216,7 @@ Future work can recover:
 Future work cannot recover:
 
 - the deleted provider sessions;
+- the deleted Claude, Gemini, Grok, and Paseo project histories;
 - mutable SQLite runtime state;
 - old temporary worktrees;
 - cache contents;
@@ -147,4 +224,3 @@ Future work cannot recover:
 
 That loss is intentional. None of those classes is accepted product evidence
 or safe routing authority.
-

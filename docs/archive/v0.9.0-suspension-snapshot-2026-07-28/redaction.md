@@ -195,26 +195,35 @@ The following were not sanitized and uploaded; they were excluded:
 Exclusion is safer than attempting to enumerate and transform every possible
 secret field in mutable provider state.
 
-### 8.1 Broad residual sweep
+### 8.1 Broad residual sweeps
 
 The final broad scan found six additional hidden runtime homes containing
 SQLite databases, provider execution logs, isolated provider homes, session
 histories, and temporary worktrees. These inputs were classified under the
 same exclusion rule and were not copied into the repository or draft assets.
 
-Five bounded historical files were retained separately under
+Six bounded historical files were retained separately under
 [`historical/`](historical/):
 
 - three Markdown source notes copied byte-for-byte;
 - two local-only commit diffs exported without author or commit headers.
+- one stale installed-skill diff exported with local path components removed.
 
-Those five files were scanned after export for workstation paths, email
+Those six files were scanned after export for workstation paths, email
 addresses, private repository names, recognized credential shapes, bearer
 values, and credential assignments. No actual local identity or recognized
 credential value was found. The machine-readable
 [`redaction-report.json`](redaction-report.json) continues to describe only the
 61-file compressed evidence asset; its counters were not altered to conflate
 the later tracked-file scan with the earlier asset transformation.
+
+The final full-name sweep also found raw Grok terminal/session history, Claude
+project histories, Gemini project records, and Paseo agent metadata. These
+were excluded rather than transformed. Their format counts, sizes, date
+ranges, and deletion disposition are recorded in
+[`residual-local-state-inventory.md`](residual-local-state-inventory.md).
+Transcript text, prompts, terminal output, and raw provider metadata were not
+copied into the public repository.
 
 ## 9. Integrity After Redaction
 

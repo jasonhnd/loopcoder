@@ -46,9 +46,25 @@ automatically. At minimum, recovery requires a fresh design decision, review
 against the then-current tree, `git apply --check`, focused tests, full CI, and
 ordinary PR review.
 
+## Local Tooling Delta
+
+The global Claude `loopcoder` skill contained two files. Its `AGENTS.md` was
+byte-identical to the tracked repository file and was not duplicated. Its
+`SKILL.md` was a stale local copy with a small foreground-versus-detached
+dispatch difference. The installed file was not authoritative, but its unique
+text delta is retained so the deletion is auditable.
+
+| File | Bytes | SHA-256 | Interpretation |
+| --- | ---: | --- | --- |
+| [`local-tooling/claude-skill-stale-dispatch.diff`](local-tooling/claude-skill-stale-dispatch.diff) | 3,369 | `d13577605e2acb0f5c6b209275ee157e3c5c59286ea4a7fe651291d77e5761fd` | Path-sanitized diff from the current tracked `SKILL.md` to the stale installed copy |
+
+This diff is historical evidence, not installation guidance. Current tracked
+documentation controls. A future operator must not use the diff to downgrade
+the repository's dispatch behavior.
+
 ## Public-Safety Check
 
-All five files were scanned after copying or export for:
+All six files were scanned after copying or export for:
 
 - workstation home and temporary paths;
 - email addresses;

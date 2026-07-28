@@ -47,6 +47,10 @@ After the primary cleanup, a broader home-directory scan found another
 252,332 KiB of historical checkouts, hidden runtime homes, caches, and host
 metadata outside the initial scope. That second sweep is documented in
 [`residual-local-state-inventory.md`](residual-local-state-inventory.md).
+A final full-name scan then found another 1,200,932 KiB, dominated by raw Grok
+session and terminal history, plus Claude/Gemini histories, local binary
+installations, caches, closed Paseo records, and one recurring automation.
+That third sweep is documented in the same inventory.
 
 The snapshot therefore follows a strict rule:
 
@@ -195,6 +199,13 @@ worktrees were excluded for privacy and trust reasons. Their bounded
 statistics, Git disposition, and deletion rationale are retained in
 [`residual-local-state-inventory.md`](residual-local-state-inventory.md).
 
+The final scan found 1,001,828 KiB of Grok session and terminal history, 195
+Claude project-history directories, four small Gemini records, nine closed and
+archived Paseo agent records, local LoopCoder binaries and install copies, and
+the installed Claude LoopCoder skill. Raw histories and binaries were excluded.
+One 3,369-byte path-sanitized skill diff was the only unique text delta and is
+retained under [`historical/local-tooling`](historical/local-tooling).
+
 ## 5. What Was Deliberately Excluded
 
 The following content was reviewed and deliberately excluded:
@@ -209,6 +220,8 @@ The following content was reviewed and deliberately excluded:
 | Audit and smoke-test binaries | Reproducible build products, not source or release evidence |
 | Runtime SQLite databases | Machine-local mutable state with privacy and consistency risk |
 | Provider homes and sessions | Account-bound, perishable, and not safe public evidence |
+| Claude, Gemini, and Grok transcript histories | May contain prompts, terminal output, account context, local paths, and provider-controlled secrets |
+| Closed Paseo agent index | Host-local orchestration metadata; all nine records were verified closed and archived before deletion |
 | Dependency and tool caches | Reproducible and stale by definition |
 | Temporary Git repositories | Fixtures or disposable consumer repositories |
 | Zero-byte placeholders | No information content |
@@ -244,6 +257,18 @@ The later broad sweep added approximately 246.4 MiB. Its largest classes were
 hidden bootstrap/runtime homes and two old checkouts, not additional release
 artifacts. The three unique Markdown notes and two local-only code diffs were
 less than 173 KB in total and are now tracked under `historical/`.
+
+The final full-name sweep added approximately 1.15 GiB. About 978 MiB of that
+was Grok session and terminal history; approximately 164 MiB was installed
+LoopCoder binaries and v0.8.1/test copies; about 34 MiB was Claude project
+history. These were accumulated operational copies, not unique source. The
+only additional unique public-safe text was the small installed-skill diff.
+
+Across the original estate, cleanup transaction paths, second sweep, and third
+sweep, the accounted local boundary is 3,650,220,032 bytes. The final
+30,028-KiB residual cleanup clone is removed only after its documentation PR is
+merged and exact-merge verification succeeds; it is cleanup transaction
+overhead, not retained project state.
 
 ## 7. Redaction and Safety Boundary
 
