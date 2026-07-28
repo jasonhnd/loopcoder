@@ -1,3 +1,4 @@
+```diff
 diff --git a/SKILL.md b/local-claude-skill/SKILL.md
 index 780bdc0..b516287 100644
 --- a/SKILL.md
@@ -39,3 +40,4 @@ index 780bdc0..b516287 100644
     ```
  
  5. Verify each resulting PR.
+```

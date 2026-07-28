@@ -33,9 +33,13 @@ Two clean local branches contained commits that were neither reachable nor
 patch-equivalent to `origin/main`. GitHub had no copy of the first commit and
 no associated pull request for either commit. Their code changes are preserved
 as plain binary-capable Git diffs without author name, author email, commit
-message headers, or local path metadata.
+message headers, or local path metadata. Each raw diff payload is enclosed by
+one Markdown `diff` fence so repository link checks do not interpret historical
+patch text as live documentation. The byte count and SHA-256 below apply to the
+unchanged payload between the opening and closing fence, not to the Markdown
+container.
 
-| File | Local commit | Parent | Bytes | SHA-256 |
+| File | Local commit | Parent | Payload bytes | Payload SHA-256 |
 | --- | --- | --- | ---: | --- |
 | [`unmerged-diffs/issue-708-d73b797.diff.md`](unmerged-diffs/issue-708-d73b797.diff.md) | `d73b797800ee2bc04152fbef9f99a0bb1cd61395` | `cd83d73e9b6b144095f9259a19ee2872a15e00a2` | 50,406 | `264adb9151cdc2e53e91b7709ffe78b2a05c1afa63d1b5527abd637a9eb4035c` |
 | [`unmerged-diffs/issue-711-69dc517.diff.md`](unmerged-diffs/issue-711-69dc517.diff.md) | `69dc51719875aa3c07b993bd5851ba6a2be01427` | `cd83d73e9b6b144095f9259a19ee2872a15e00a2` | 51,663 | `31b5586ac2f1bc5b957f15a1e33471792cb82ff2ec25bf31049c17732abe9199` |
@@ -55,7 +59,10 @@ byte-identical to the tracked repository file and was not duplicated. Its
 dispatch difference. The installed file was not authoritative, but its unique
 text delta is retained so the deletion is auditable.
 
-| File | Bytes | SHA-256 | Interpretation |
+As above, the raw diff payload is enclosed by one Markdown `diff` fence. The
+byte count and SHA-256 below apply to the unchanged payload between the fences.
+
+| File | Payload bytes | Payload SHA-256 | Interpretation |
 | --- | ---: | --- | --- |
 | [`local-tooling/claude-skill-stale-dispatch.diff.md`](local-tooling/claude-skill-stale-dispatch.diff.md) | 3,369 | `d13577605e2acb0f5c6b209275ee157e3c5c59286ea4a7fe651291d77e5761fd` | Path-sanitized diff from the current tracked `SKILL.md` to the stale installed copy |
 
