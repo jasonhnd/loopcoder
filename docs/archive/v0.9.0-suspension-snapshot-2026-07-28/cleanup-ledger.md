@@ -384,7 +384,7 @@ before local file removal. This prevents a later scheduled wake from
 contradicting the owner's project-stop decision.
 
 The installed skill's unique, path-sanitized delta is retained as
-[`historical/local-tooling/claude-skill-stale-dispatch.diff`](historical/local-tooling/claude-skill-stale-dispatch.diff).
+[`historical/local-tooling/claude-skill-stale-dispatch.diff.md`](historical/local-tooling/claude-skill-stale-dispatch.diff.md).
 Its remote readback must match SHA-256
 `d13577605e2acb0f5c6b209275ee157e3c5c59286ea4a7fe651291d77e5761fd`
 before the third-sweep deletion begins.
