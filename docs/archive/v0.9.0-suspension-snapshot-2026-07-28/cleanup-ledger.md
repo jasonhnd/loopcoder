@@ -398,3 +398,38 @@ The final cleanup clone at `${TMPDIR}/lc-v090-residual-finalize` is retained
 until this ledger is merged, exact-merge CI passes, and the unpublished draft
 target is rebound to the new merge commit. It measured 30,028 KiB before the
 third-sweep deletion.
+
+## 13. Verification-Residue Pre-Deletion Record
+
+The full local test and pre-push verification runs recreated host-local state
+after the earlier cleanup. A targeted scan of the macOS per-user temporary
+root and selected caches found another 4,573,620 KiB:
+
+| Class | KiB | Count |
+| --- | ---: | ---: |
+| Go `Test...` temporary directories containing LoopCoder state | 4,353,260 | 2,774 |
+| `loopcoder-*` temporary audit/build/qualification directories | 95,664 | 42 |
+| Generic temporary directory containing a LoopCoder build | 32,340 | 1 |
+| Go build-cache entries containing `loopcoder` executables | 90,944 | 4 |
+| Recreated `${HOME}/.loopcoder` runtime | 1,364 | 1 database |
+| Python cache mirrors of deleted temporary paths | 44 | 3 |
+| Go module download cache | 4 | 1 path |
+| **Total** | **4,573,620** | |
+
+The 2,817 system temporary directories ranged from 2026-07-25 through
+2026-07-28. The recreated runtime database passed `PRAGMA integrity_check`.
+Process and open-file scans found no active test, LoopCoder process, or open
+file in the selected paths.
+
+This finding increases the accounted local boundary, excluding the final
+cleanup clone, to 8,333,606,912 bytes. It also explains why the user's disk
+observation exceeded the original 1.90-GiB targeted scope: the first audit did
+not include the macOS per-user system temporary root, and verification could
+repopulate runtime state after deletion.
+
+The statistics in this section must be pushed and read back remotely before
+these paths are deleted. The documentation-only push may bypass the local
+pre-push hook because that hook has already passed twice in this transaction
+and rerunning it would recreate the exact residue this section is meant to
+remove. GitHub CI remains the authoritative verification for the resulting
+pull request.

@@ -225,6 +225,10 @@ ranges, and deletion disposition are recorded in
 Transcript text, prompts, terminal output, and raw provider metadata were not
 copied into the public repository.
 
+The later verification-residue sweep likewise retained only aggregate counts,
+sizes, date ranges, integrity status, and deletion disposition. Raw temporary
+test databases, logs, worktrees, binaries, and cache files were not copied.
+
 ## 9. Integrity After Redaction
 
 Redacted evidence is not byte-equivalent to its raw local source. Its purpose

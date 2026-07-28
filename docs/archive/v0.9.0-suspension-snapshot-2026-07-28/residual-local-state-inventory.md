@@ -203,6 +203,41 @@ Codex task history, Codex memory, and provider memory belonging to other
 repositories were also left intact. A name match alone is not sufficient
 authority to delete another project's state.
 
+### 5.4 Verification-Generated Runtime And System Temporary Residue
+
+The local full test and pre-push verification runs exposed another cleanup
+problem: verification itself recreated `${HOME}/.loopcoder` and left thousands
+of Go test directories in the macOS per-user system temporary root.
+
+The additional measured boundary was 4,573,620 KiB:
+
+| Sanitized class | KiB | Entries | Observed time range | Disposition |
+| --- | ---: | ---: | --- | --- |
+| System temporary top-level directories containing LoopCoder state | 4,481,264 | 2,817 directories | 2026-07-25 through 2026-07-28 | Delete |
+| Go build-cache directories containing a `loopcoder` executable | 90,944 | 4 files | Reproducible | Delete selected cache directories |
+| Recreated `${HOME}/.loopcoder` runtime | 1,364 | 1 SQLite database | 2026-07-28 | Integrity-check; delete |
+| Python cache mirrors of deleted LoopCoder temporary paths | 44 | 3 entries | Reproducible | Delete |
+| Go module download cache for `jasonhnd/loopcoder` | 4 | 1 path | Reproducible | Delete |
+
+The 2,817 temporary directories consisted of:
+
+- 2,774 Go `Test...` directories using 4,353,260 KiB;
+- 42 `loopcoder-*` audit, qualification, provider, or build directories using
+  95,664 KiB;
+- one generic `tmp.*` directory containing a LoopCoder build, using 32,340
+  KiB.
+
+The recreated runtime database contained 1,396,736 logical bytes and returned
+`ok` from `PRAGMA integrity_check`. No Go test, LoopCoder process, or open file
+remained in the selected temporary paths before deletion.
+
+These directories were not uploaded. They are repeated test databases,
+fixtures, logs, worktrees, and binaries. Their value is the measured finding
+that the verification path can leave substantial host residue, not their raw
+bytes. Future work must isolate `LOOPCODER_HOME` and system temporary roots
+during tests and prove teardown rather than assuming Go test cleanup removed
+detached-process fixtures.
+
 ## 6. Recovery Boundary
 
 The deleted runtime homes are intentionally not recoverable byte-for-byte.

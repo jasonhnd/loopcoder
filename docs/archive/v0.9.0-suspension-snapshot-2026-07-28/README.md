@@ -52,6 +52,12 @@ session and terminal history, plus Claude/Gemini histories, local binary
 installations, caches, closed Paseo records, and one recurring automation.
 That third sweep is documented in the same inventory.
 
+Local verification then exposed 4,573,620 KiB more in the macOS per-user
+system temporary root and selected caches: 2,817 leaked LoopCoder-bearing test
+and audit directories, four Go build-cache executables, and a recreated local
+runtime database. This final targeted sweep is also documented in the residual
+inventory.
+
 The snapshot therefore follows a strict rule:
 
 1. preserve unique source differences;
@@ -264,8 +270,9 @@ LoopCoder binaries and v0.8.1/test copies; about 34 MiB was Claude project
 history. These were accumulated operational copies, not unique source. The
 only additional unique public-safe text was the small installed-skill diff.
 
-Across the original estate, cleanup transaction paths, second sweep, and third
-sweep, the accounted local boundary is 3,650,220,032 bytes. The final
+Across the original estate, cleanup transaction paths, provider-history sweep,
+and verification-residue sweep, the accounted local boundary is
+8,333,606,912 bytes. The final
 30,028-KiB residual cleanup clone is removed only after its documentation PR is
 merged and exact-merge verification succeeds; it is cleanup transaction
 overhead, not retained project state.
