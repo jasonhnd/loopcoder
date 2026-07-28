@@ -1,10 +1,10 @@
 # Local Cleanup Ledger
 
-**Ledger opened:** 2026-07-28  
-**Operation:** v0.9 project suspension archive and local deletion  
-**Initial local scope:** 2,035,732,480 bytes  
-**Safety model:** Preserve, upload, download-verify, then delete  
-**Current phase:** Preservation prepared; deletion not yet started  
+**Ledger opened:** 2026-07-28
+**Operation:** v0.9 project suspension archive and local deletion
+**Initial local scope:** 2,035,732,480 bytes
+**Safety model:** Preserve, upload, download-verify, then delete
+**Current phase:** Preservation prepared; deletion not yet started
 
 This ledger is intentionally committed in two phases.
 

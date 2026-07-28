@@ -1,12 +1,12 @@
 # LoopCoder v0.9.0 Suspension Snapshot
 
-**Snapshot date:** 2026-07-28  
-**Repository:** `jasonhnd/loopcoder`  
-**Development state:** Suspended  
-**Product decision:** `NO_GO` / `NOT_RELEASED`  
-**Latest public release:** `v0.8.1`  
-**Publication authority:** None  
-**Snapshot form:** Unpublished GitHub draft with authenticated assets  
+**Snapshot date:** 2026-07-28
+**Repository:** `jasonhnd/loopcoder`
+**Development state:** Suspended
+**Product decision:** `NO_GO` / `NOT_RELEASED`
+**Latest public release:** `v0.8.1`
+**Publication authority:** None
+**Snapshot form:** Unpublished GitHub draft with authenticated assets
 
 > This snapshot is a preservation and cleanup record. It is not a v0.9.0
 > release, release candidate approval, installation recommendation, or
