@@ -384,9 +384,8 @@ before local file removal. This prevents a later scheduled wake from
 contradicting the owner's project-stop decision.
 
 The installed skill's unique, path-sanitized delta is retained as
-[`historical/local-tooling/claude-skill-stale-dispatch.diff.md`](historical/local-tooling/claude-skill-stale-dispatch.diff.md).
-The raw payload between that Markdown file's opening and closing `diff` fence
-must match SHA-256
+[`historical/local-tooling/claude-skill-stale-dispatch.diff.json`](historical/local-tooling/claude-skill-stale-dispatch.diff.json).
+The Base64-decoded payload in that JSON archive envelope must match SHA-256
 `d13577605e2acb0f5c6b209275ee157e3c5c59286ea4a7fe651291d77e5761fd`
 before the third-sweep deletion begins.
 
