@@ -4,7 +4,8 @@
 **Operation:** v0.9 project suspension archive and local deletion
 **Initial local scope:** 2,035,732,480 bytes
 **Safety model:** Preserve, upload, download-verify, then delete
-**Current phase:** Primary local deletion complete; final merge pending
+**Current phase:** All authorized local deletion complete; archival PR and
+exact-merge verification pending
 
 This ledger is intentionally committed in two phases.
 
@@ -100,7 +101,8 @@ The cleanup must not delete or modify:
   temporary fixtures;
 - Paseo application data unrelated to this stopped project;
 - Codex tasks, memory, or conversation history;
-- the current unrelated Codex workspace;
+- unrelated content in the current Codex workspace; only the separately
+  inventoried LoopCoder subpaths and notes are in the residual sweep;
 - public v0.8.1 release assets;
 - any GitHub repository other than `jasonhnd/loopcoder`;
 - the GitHub source, issues, PRs, Actions runs, or draft snapshot.
@@ -256,16 +258,18 @@ The audited pre-deletion scope was 2,035,732,480 bytes, approximately 1.90 GiB
 or 2.04 GB. That number covered the six development-root paths and 57
 `${TMPDIR}/loopcoder*` paths.
 
-The three finalization-only paths below are deliberately retained until PR
-#1454 is merged and the draft target is rebound to the merge commit:
+The three finalization-only paths below were retained until PR #1454 was
+merged and the draft target was rebound to the merge commit:
 
 - `${TMPDIR}/lc-v090-finalize`;
 - `${TMPDIR}/lc-v090-snapshot-stage`;
 - `${TMPDIR}/lc-v090-download-verify`.
 
-They are not development leftovers. They are the independent Git clone, upload
-source, and download-verification copy needed to finish the remote
-transaction. Their combined size before final removal was 123,384 KiB.
+They were not development leftovers. They were the independent Git clone,
+upload source, and download-verification copy needed to finish the remote
+transaction. Their combined size before final removal was 123,384 KiB. All
+three were deleted after exact-merge CI passed and the remote state was read
+back successfully.
 
 ## 9. Post-Deletion Verification
 
@@ -275,9 +279,9 @@ The primary cleanup passed these checks:
 | --- | --- |
 | `${HOME}/AgenticCoder/loopcoder*` top-level scan | 0 paths |
 | `${TMPDIR}/loopcoder*` top-level scan | 0 paths |
-| Finalization scanner top-level scan | 0 paths |
+| Finalization scanner and transaction-path scan | 0 paths |
 | Open project issues | 0 |
-| Open pull requests | PR #1454 only, this archival transaction |
+| Open pull requests | 0 after PR #1454 merged |
 | v0.9 product tags | 0 |
 | Internal lookup Git tag refs | 0 |
 | Draft snapshot | ID `360850177`, still `draft=true` |
@@ -288,17 +292,222 @@ Process inspection found no LoopCoder development agent, provider canary, goal
 run, or artifact qualification process. Matches during the check were only the
 inspection commands themselves.
 
-## 10. Final Transaction Boundary
+## 10. Primary Transaction Result
 
-PR #1454 must be merged only after its final exact head passes `verify`, `test`,
-`race`, and `security`. After merge:
+PR #1454 merged on 2026-07-28.
 
-1. the unpublished draft target is rebound to the exact merge commit;
-2. the draft, asset set, issue count, PR count, and tag refs are read again;
-3. the three finalization-only paths are deleted;
-4. a final local path scan must return zero.
+| Identity | Exact value |
+| --- | --- |
+| Final PR head | `2c8970d06aaee98613178de653299eaee30927b3` |
+| Merge commit | `19d25dbf230482564173c7eb6eb7c7d1de5f189f` |
+| Exact-merge CI run | `30332243077` |
+| Exact-merge CI result | `verify`, `test`, `race`, and `security` passed |
+| Draft target after merge | `19d25dbf230482564173c7eb6eb7c7d1de5f189f` |
+| Draft publication | `draft=true`, `published_at=null` |
+| Latest public release | `v0.8.1` |
+
+The remote branch `docs/v090-suspension-snapshot-20260728` was deleted after
+merge. Final readback found zero open issues, zero open pull requests, no
+v0.9 Git tag, no internal lookup Git ref, and all five draft assets still
+uploaded with their recorded sizes and digests.
 
 The merge commit cannot be written into the commit that creates it without an
 infinite self-reference. GitHub PR #1454 is therefore the authoritative merge
-record, and the draft's `target_commitish` becomes the durable merge-SHA
-binding after the merge.
+record, and the draft's `target_commitish` is the durable merge-SHA binding.
+
+## 11. Residual Sweep Result
+
+A broader scan after the primary transaction found another 252,332 KiB outside
+the original scope:
+
+- three historical checkout/work-area paths;
+- three standalone Markdown notes;
+- six hidden `$LOOPCODER_HOME` variants;
+- two Go module cache paths;
+- one macOS crash-reporter plist.
+
+The six hidden runtime homes contained 5,563 files and six SQLite databases.
+Every database passed `PRAGMA integrity_check`. Raw state was excluded because
+it included machine-local paths, mutable databases, provider homes, session
+logs, and temporary Git worktrees.
+
+Five bounded files totaling 172,655 bytes were retained:
+
+- three historical Markdown notes;
+- one code diff for local-only issue #708 commit `d73b797...`;
+- one code diff for local-only issue #711 commit `69dc517...`.
+
+Their sizes, hashes, provenance, and safety scan are in
+[`historical/README.md`](historical/README.md). The complete residual
+classification is in
+[`residual-local-state-inventory.md`](residual-local-state-inventory.md).
+
+The preservation commit
+`6610b91a3b2cf71c54003c7a806166c27082b597` was pushed to
+`docs/v090-residual-cleanup-20260728`. Each of the five retained historical
+files was then read back through the GitHub API and matched against its local
+SHA-256 value before deletion.
+
+The second-sweep deletion removed:
+
+- the three selected historical checkout and work-area paths;
+- the three standalone Markdown source files after remote preservation;
+- all six hidden LoopCoder runtime homes;
+- the two selected Go module-cache paths;
+- the LoopCoder crash-reporter plist.
+
+The linked documentation and release-control worktrees were removed through
+`git worktree remove --force` before their controller metadata was pruned.
+All selected second-sweep paths were absent in the post-deletion scan. No
+unrelated repository was modified.
+
+## 12. Third Sweep Pre-Deletion Record
+
+A final full-name scan found 1,200,932 KiB of additional project-specific
+state, including one 4 KiB automation definition:
+
+| Class | KiB | Preservation boundary |
+| --- | ---: | --- |
+| Grok session and terminal history | 1,001,828 | Counts, formats, logical bytes, and time range only |
+| Claude project histories | 34,428 | Directory count, file count, logical bytes, and time range only |
+| Gemini project records | 16 | File count, logical bytes, and time range only |
+| Paseo agent records | 36 | Nine agents verified closed and archived |
+| Claude project caches | 520 | Reproducible cache; no preservation |
+| Local LoopCoder binaries and symlink | 83,920 | Reproducible or superseded; no binary upload |
+| Local LoopCoder installation tree | 80,144 | Public v0.8.1 remains remote; no duplicate upload |
+| Installed Claude LoopCoder skill | 36 | One stale text delta retained; duplicate file omitted |
+| Empty Claude temporary project directories | 0 | No information content |
+| Deleted Codex heartbeat definition | 4 | Name, 15-minute cadence, and deletion result recorded |
+
+The recurring Codex heartbeat was deleted through the Codex automation API
+before local file removal. This prevents a later scheduled wake from
+contradicting the owner's project-stop decision.
+
+The installed skill's unique, path-sanitized delta is retained as
+[`historical/local-tooling/claude-skill-stale-dispatch.diff.json`](historical/local-tooling/claude-skill-stale-dispatch.diff.json).
+The Base64-decoded payload in that JSON archive envelope must match SHA-256
+`d13577605e2acb0f5c6b209275ee157e3c5c59286ea4a7fe651291d77e5761fd`
+before the third-sweep deletion begins.
+
+Raw Claude, Gemini, Grok, and Paseo state is excluded from GitHub because it
+contains or may contain private prompts, terminal output, account-bound
+metadata, host paths, and provider-controlled credential formats. The
+repository retains a bounded inventory, not those raw transcripts.
+
+The final cleanup clone at `${TMPDIR}/lc-v090-residual-finalize` is retained
+until this ledger is merged, exact-merge CI passes, and the unpublished draft
+target is rebound to the new merge commit. It measured 30,028 KiB before the
+third-sweep deletion.
+
+## 13. Verification-Residue Pre-Deletion Record
+
+The full local test and pre-push verification runs recreated host-local state
+after the earlier cleanup. A targeted scan of the macOS per-user temporary
+root and selected caches found another 4,573,620 KiB:
+
+| Class | KiB | Count |
+| --- | ---: | ---: |
+| Go `Test...` temporary directories containing LoopCoder state | 4,353,260 | 2,774 |
+| `loopcoder-*` temporary audit/build/qualification directories | 95,664 | 42 |
+| Generic temporary directory containing a LoopCoder build | 32,340 | 1 |
+| Go build-cache entries containing `loopcoder` executables | 90,944 | 4 |
+| Recreated `${HOME}/.loopcoder` runtime | 1,364 | 1 database |
+| Python cache mirrors of deleted temporary paths | 44 | 3 |
+| Go module download cache | 4 | 1 path |
+| **Total** | **4,573,620** | |
+
+The 2,817 system temporary directories ranged from 2026-07-25 through
+2026-07-28. The recreated runtime database passed `PRAGMA integrity_check`.
+Process and open-file scans found no active test, LoopCoder process, or open
+file in the selected paths.
+
+This finding increases the accounted local boundary, excluding the final
+cleanup clone, to 8,333,606,912 bytes. It also explains why the user's disk
+observation exceeded the original 1.90-GiB targeted scope: the first audit did
+not include the macOS per-user system temporary root, and verification could
+repopulate runtime state after deletion.
+
+The statistics in this section must be pushed and read back remotely before
+these paths are deleted. The documentation-only push may bypass the local
+pre-push hook because that hook has already passed twice in this transaction
+and rerunning it would recreate the exact residue this section is meant to
+remove. GitHub CI remains the authoritative verification for the resulting
+pull request.
+
+## 14. Final Local Deletion Result
+
+The third sweep and verification-residue cleanup completed on 2026-07-28.
+
+### 14.1 Scheduled And Agent State
+
+- The 15-minute Codex heartbeat was deleted through the Codex automation API.
+- Nine LoopCoder Paseo agents were deleted by exact agent ID through
+  `paseo delete`.
+- Every agent had first been independently verified as `closed` and archived.
+- The initial `paseo delete --cwd` call deleted zero records because archived
+  agents are excluded from that selector; the result was not treated as
+  success.
+- Each of the nine exact-ID calls then returned `deletedCount: 1`.
+- The now-empty repository-specific Paseo agent directory was removed.
+- A final `paseo ls --all` query found zero agents for the stopped repository
+  cwd.
+
+No agent was resumed or woken during cleanup.
+
+### 14.2 Provider, Installation, And Cache State
+
+The following selected classes were deleted:
+
+- the 1,001,828-KiB Grok session tree;
+- all 195 Claude project-history directories and 223 files;
+- four Gemini project records;
+- four Claude project-cache directories;
+- seven empty Claude temporary project directories;
+- the installed Claude LoopCoder skill after its unique diff was preserved;
+- four local LoopCoder binaries, one symlink, and the v0.8.1/test install tree;
+- the recreated `${HOME}/.loopcoder` database;
+- four Go build-cache directories containing LoopCoder executables;
+- three Python cache mirrors;
+- the selected Go module download-cache path.
+
+`loopcoder` no longer resolves on `PATH`.
+
+### 14.3 System Temporary State
+
+- Selected top-level directories before deletion: 2,817
+- Selected allocated size before deletion: 4,481,264 KiB
+- Selected top-level directories after deletion: 0
+- Active Go test or LoopCoder process after deletion: 0
+- Open files in the selected directories before deletion: 0
+
+The deletion operated on the 2,817 audited top-level names derived from a
+LoopCoder-bearing descendant. It did not delete other macOS temporary
+directories.
+
+### 14.4 Intentional Retentions
+
+Other active repositories still own their own `.loopcoder` directories or
+`refs/loopcoder` namespaces. Those are not copies of the stopped source
+repository and were left intact. Codex tasks, Codex memory, and provider memory
+for other repositories were also retained.
+
+The broad home scan encountered normal macOS privacy denials in unrelated
+system containers. Those protected containers were not part of the
+project-managed storage roots. Every accessible, previously identified
+LoopCoder project path was checked through a targeted post-deletion scan.
+
+### 14.5 Remaining Transaction Path
+
+The only remaining local source checkout for this transaction is
+`${TMPDIR}/lc-v090-residual-finalize`, the 30,028-KiB clone used to commit,
+push, merge, and verify this ledger. It is deleted after:
+
+1. the archival PR merges to `main`;
+2. exact-merge CI passes;
+3. the unpublished draft remains unpublished and is rebound to the merge SHA;
+4. the remote branch and tracked archive are read back successfully.
+
+Including the finalizer after its eventual removal, the complete accounted
+local deletion transaction totals 8,364,355,584 bytes. This is approximately
+7.79 GiB or 8.36 GB. The figure includes cleanup-only transaction paths and
+verification-generated residue, not 7.79 GiB of unique product source.

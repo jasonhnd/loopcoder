@@ -300,15 +300,48 @@ Both binaries are Darwin arm64 Mach-O executables built with:
 The extracted binaries were not retained separately because they are exactly
 recoverable from the retained archives.
 
-## 11. Final Disposition
+## 11. Broad Residual Inventory
+
+The primary inventory was intentionally bounded to the active development root
+and temporary estate. A subsequent broad home-directory scan found 252,332 KiB
+outside that boundary:
+
+| Class | KiB | Durable result |
+| --- | ---: | --- |
+| Historical checkouts and linked worktree | 47,132 | Clean or remote-represented; two local-only commit diffs retained |
+| Three standalone product/roadmap/postmortem notes | 76 | Exact files retained under `historical/source-notes/` |
+| Six hidden runtime homes | 204,996 | Counts and integrity results retained; raw state excluded |
+| Go module caches and crash metadata | 128 | Reproducible or host-specific; no raw retention |
+
+The two local-only commit diffs are:
+
+| Local branch | Commit | Diff bytes | SHA-256 |
+| --- | --- | ---: | --- |
+| `loop/issue-708` | `d73b797800ee2bc04152fbef9f99a0bb1cd61395` | 50,406 | `264adb9151cdc2e53e91b7709ffe78b2a05c1afa63d1b5527abd637a9eb4035c` |
+| `loop/issue-711` | `69dc51719875aa3c07b993bd5851ba6a2be01427` | 51,663 | `31b5586ac2f1bc5b957f15a1e33471792cb82ff2ec25bf31049c17732abe9199` |
+
+Neither exact commit was reachable or patch-equivalent to current `main`.
+Neither had an associated GitHub pull request. The preserved form deliberately
+omits author identity and commit headers.
+
+See
+[`residual-local-state-inventory.md`](residual-local-state-inventory.md) and
+[`historical/README.md`](historical/README.md) for the complete classification.
+
+## 12. Final Disposition
 
 The retention result is intentionally small:
 
 - approximately 18.7 MB of RC archives;
 - approximately 188 KB of compressed decision evidence;
 - tracked Markdown, JSON manifests, and redaction records, plus the draft
-  `SHA256SUMS` asset.
+  `SHA256SUMS` asset;
+- 172,655 bytes of historical notes and local-only code diffs discovered in
+  the broad residual sweep.
 
-The deleted local estate was approximately 2.04 GB. The difference is the
-space occupied by repetition, mutable runtime state, stale process evidence,
-and checkout mechanics rather than unique durable engineering knowledge.
+The primary deleted local estate was approximately 2.04 GB. The broad sweep
+identified another 252,332 KiB, and the primary transaction used and then
+deleted 123,384 KiB of finalization-only storage. The difference between that
+local footprint and the retained material is the space occupied by repetition,
+mutable runtime state, stale process evidence, caches, and checkout mechanics
+rather than unique durable engineering knowledge.

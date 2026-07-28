@@ -25,7 +25,7 @@ This directory answers a different operational question:
 > What must be retained on GitHub so the local v0.9 development estate can be
 > removed without losing useful, unique, or decision-relevant evidence?
 
-The local estate had grown to 2,035,732,480 bytes across:
+The initial targeted local estate had grown to 2,035,732,480 bytes across:
 
 - one central Git controller;
 - 22 registered development worktrees;
@@ -42,6 +42,21 @@ cycles. Keeping all of it would make future recovery less trustworthy, not
 more trustworthy: a future operator would have to distinguish dozens of stale
 and partially overlapping local states before reaching the few records that
 actually explain the stop.
+
+After the primary cleanup, a broader home-directory scan found another
+252,332 KiB of historical checkouts, hidden runtime homes, caches, and host
+metadata outside the initial scope. That second sweep is documented in
+[`residual-local-state-inventory.md`](residual-local-state-inventory.md).
+A final full-name scan then found another 1,200,932 KiB, dominated by raw Grok
+session and terminal history, plus Claude/Gemini histories, local binary
+installations, caches, closed Paseo records, and one recurring automation.
+That third sweep is documented in the same inventory.
+
+Local verification then exposed 4,573,620 KiB more in the macOS per-user
+system temporary root and selected caches: 2,817 leaked LoopCoder-bearing test
+and audit directories, four Go build-cache executables, and a recreated local
+runtime database. This final targeted sweep is also documented in the residual
+inventory.
 
 The snapshot therefore follows a strict rule:
 
@@ -71,13 +86,15 @@ definition head is not a substitute for the candidate source identity.
 ## 3. Durable Draft Assets
 
 The assets are attached to the unpublished draft named
-`Internal suspension snapshot 2026-07-28 (not a release)` with the internal
-lookup label `internal-snapshot-v090-20260728`.
+`Internal suspension snapshot 2026-07-28 (not a release)`, database ID
+`360850177`. After the draft target was rebound to the archival merge commit,
+GitHub represented its draft-only tag label as
+`untagged-c2dee6e6a6773d7d9781`.
 
-The lookup label is not a product version and must not be converted into a Git
-tag. The draft must remain unpublished unless the owner separately authorizes
-a different archival action. In particular, it must never be published as a
-v0.9 release.
+That opaque label is not a Git ref or product version and must not be converted
+into a Git tag. The draft must remain unpublished unless the owner separately
+authorizes a different archival action. In particular, it must never be
+published as a v0.9 release.
 
 | Asset | Bytes | SHA-256 | Why retained |
 | --- | ---: | --- | --- |
@@ -176,6 +193,25 @@ The archive also contains sanitized inventories for:
 
 These inventories replace local absolute paths with `${HOME}` and `${TMPDIR}`.
 
+### 4.6 Broad residual sweep
+
+The final broad scan found three historical product notes and two code commits
+that existed only in an older local checkout. They are retained in
+[`historical/`](historical/), with exact sizes and SHA-256 values.
+
+The same scan found six hidden runtime homes containing 5,563 files and six
+valid SQLite databases. Raw databases, provider sessions, logs, and temporary
+worktrees were excluded for privacy and trust reasons. Their bounded
+statistics, Git disposition, and deletion rationale are retained in
+[`residual-local-state-inventory.md`](residual-local-state-inventory.md).
+
+The final scan found 1,001,828 KiB of Grok session and terminal history, 195
+Claude project-history directories, four small Gemini records, nine closed and
+archived Paseo agent records, local LoopCoder binaries and install copies, and
+the installed Claude LoopCoder skill. Raw histories and binaries were excluded.
+One 3,369-byte path-sanitized skill diff was the only unique text delta and is
+retained under [`historical/local-tooling`](historical/local-tooling).
+
 ## 5. What Was Deliberately Excluded
 
 The following content was reviewed and deliberately excluded:
@@ -190,11 +226,14 @@ The following content was reviewed and deliberately excluded:
 | Audit and smoke-test binaries | Reproducible build products, not source or release evidence |
 | Runtime SQLite databases | Machine-local mutable state with privacy and consistency risk |
 | Provider homes and sessions | Account-bound, perishable, and not safe public evidence |
+| Claude, Gemini, and Grok transcript histories | May contain prompts, terminal output, account context, local paths, and provider-controlled secrets |
+| Closed Paseo agent index | Host-local orchestration metadata; all nine records were verified closed and archived before deletion |
 | Dependency and tool caches | Reproducible and stale by definition |
 | Temporary Git repositories | Fixtures or disposable consumer repositories |
 | Zero-byte placeholders | No information content |
 | Private repository names and URLs | Removed by the public-safety policy |
 | Provider credentials, OAuth data, emails, machine IDs | Removed or pseudonymized; never stored as raw durable evidence |
+| Hidden `$LOOPCODER_HOME` variants | Summarized by count, size, date range, and integrity result; raw cross-project and provider-session state excluded |
 
 This is a semantic retention decision, not a byte-for-byte backup. The project
 can be audited and selectively resumed from GitHub, but the deleted local
@@ -219,6 +258,24 @@ This explains why exact-byte deduplication alone would not have solved the
 problem. Many binaries differed because each RC was built from a different
 commit. They were different bytes but served the same obsolete debugging role.
 The correct cleanup unit was semantic usefulness, not hash equality.
+
+The later broad sweep added approximately 246.4 MiB. Its largest classes were
+hidden bootstrap/runtime homes and two old checkouts, not additional release
+artifacts. The three unique Markdown notes and two local-only code diffs were
+less than 173 KB in total and are now tracked under `historical/`.
+
+The final full-name sweep added approximately 1.15 GiB. About 978 MiB of that
+was Grok session and terminal history; approximately 164 MiB was installed
+LoopCoder binaries and v0.8.1/test copies; about 34 MiB was Claude project
+history. These were accumulated operational copies, not unique source. The
+only additional unique public-safe text was the small installed-skill diff.
+
+Across the original estate, cleanup transaction paths, provider-history sweep,
+and verification-residue sweep, the accounted local boundary is
+8,333,606,912 bytes. The final
+30,028-KiB residual cleanup clone is removed only after its documentation PR is
+merged and exact-merge verification succeeds; it is cleanup transaction
+overhead, not retained project state.
 
 ## 7. Redaction and Safety Boundary
 
@@ -257,6 +314,11 @@ At the snapshot audit:
 - no v0.9 public release existed;
 - `v0.8.1` remained the latest public release.
 
+The archival PR #1454 subsequently merged to
+`19d25dbf230482564173c7eb6eb7c7d1de5f189f`. Exact-SHA `main` CI run
+`30332243077` passed `verify`, `test`, `race`, and `security`. The unpublished
+draft target was rebound to that merge commit.
+
 Closing an issue as part of project suspension does not prove its acceptance
 criteria were met. The historical issue state and the product verdict must be
 read separately.
@@ -279,6 +341,10 @@ The cleanup was designed to fail safely:
     [`cleanup-ledger.md`](cleanup-ledger.md);
 11. merge the documentation PR to `main`;
 12. delete the temporary finalization clone and staging directory.
+13. run a broader home-directory scan;
+14. preserve newly discovered unique notes and source diffs;
+15. delete the newly inventoried hidden runtime, checkout, cache, and
+    host-metadata residuals.
 
 Local deletion must not begin before step 8 succeeds.
 
@@ -314,6 +380,7 @@ After this snapshot, the durable v0.9 record lives in
 - merged suspension report;
 - this archival index;
 - tracked manifests and the draft checksum asset;
+- historical source notes and local-only code diffs found by the final sweep;
 - an unpublished, authenticated draft containing the bounded binary and
   evidence assets.
 
