@@ -4,7 +4,7 @@
 **Operation:** v0.9 project suspension archive and local deletion
 **Initial local scope:** 2,035,732,480 bytes
 **Safety model:** Preserve, upload, download-verify, then delete
-**Current phase:** Remote preservation verified; local deletion authorized
+**Current phase:** Primary local deletion complete; final merge pending
 
 This ledger is intentionally committed in two phases.
 
@@ -193,3 +193,112 @@ as JSON.
 
 All section 2 gates have passed. The useful recovery material no longer
 depends on the local development estate, so local deletion may proceed.
+
+## 8. Deletion Result
+
+The authorized primary cleanup completed on 2026-07-28.
+
+### 8.1 Linked Worktrees
+
+- Registered linked worktrees before removal: 22
+- Nontrivial uncommitted state found in the final status pass: 0
+- Removal method: `git worktree remove --force`
+- Worktree administration cleanup: `git worktree prune`
+- Registered linked worktrees after removal: 0
+
+The `--force` flag was needed only because 19 worktrees contained an untracked
+`.DS_Store`. The final status pass found no unpreserved source or evidence
+change.
+
+### 8.2 Development Root
+
+Six top-level paths were deleted:
+
+| Deleted path class | Count |
+| --- | ---: |
+| Central bare controller | 1 |
+| Linked-worktree parent | 1 |
+| Clean independent clones | 2 |
+| Dirty independent clones preserved as binary patches | 2 |
+| **Total** | **6** |
+
+The controller was deleted last because it owned the linked worktree
+administration records.
+
+### 8.3 Temporary Estate
+
+- Audited `${TMPDIR}/loopcoder*` top-level paths: 57
+- Deleted `${TMPDIR}/loopcoder*` top-level paths: 57
+- Remaining `${TMPDIR}/loopcoder*` top-level paths: 0
+- Finalization scanner paths deleted: 3
+
+One old canary cache contained read-only Go module files. After the first
+deletion pass stopped at that boundary, write permission was restored only for
+that selected canary directory. The directory and the remaining nine
+top-level paths were then deleted successfully.
+
+The removed temporary material included:
+
+- repeated extracted RC binaries;
+- draft-RC build and qualification directories;
+- consumer-canary clones and homes;
+- provider smoke-test homes;
+- Go build and module caches;
+- runtime databases and lock files;
+- duplicate logs, JSON observations, and PR-body scratch files.
+
+Their useful decision and recovery content had already been retained in the
+download-verified GitHub assets.
+
+### 8.4 Space Boundary
+
+The audited pre-deletion scope was 2,035,732,480 bytes, approximately 1.90 GiB
+or 2.04 GB. That number covered the six development-root paths and 57
+`${TMPDIR}/loopcoder*` paths.
+
+The three finalization-only paths below are deliberately retained until PR
+#1454 is merged and the draft target is rebound to the merge commit:
+
+- `${TMPDIR}/lc-v090-finalize`;
+- `${TMPDIR}/lc-v090-snapshot-stage`;
+- `${TMPDIR}/lc-v090-download-verify`.
+
+They are not development leftovers. They are the independent Git clone, upload
+source, and download-verification copy needed to finish the remote
+transaction. Their combined size before final removal was 123,384 KiB.
+
+## 9. Post-Deletion Verification
+
+The primary cleanup passed these checks:
+
+| Check | Result |
+| --- | --- |
+| `${HOME}/AgenticCoder/loopcoder*` top-level scan | 0 paths |
+| `${TMPDIR}/loopcoder*` top-level scan | 0 paths |
+| Finalization scanner top-level scan | 0 paths |
+| Open project issues | 0 |
+| Open pull requests | PR #1454 only, this archival transaction |
+| v0.9 product tags | 0 |
+| Internal lookup Git tag refs | 0 |
+| Draft snapshot | ID `360850177`, still `draft=true` |
+| Draft publication | `published_at=null` |
+| Draft asset count | 5 |
+
+Process inspection found no LoopCoder development agent, provider canary, goal
+run, or artifact qualification process. Matches during the check were only the
+inspection commands themselves.
+
+## 10. Final Transaction Boundary
+
+PR #1454 must be merged only after its final exact head passes `verify`, `test`,
+`race`, and `security`. After merge:
+
+1. the unpublished draft target is rebound to the exact merge commit;
+2. the draft, asset set, issue count, PR count, and tag refs are read again;
+3. the three finalization-only paths are deleted;
+4. a final local path scan must return zero.
+
+The merge commit cannot be written into the commit that creates it without an
+infinite self-reference. GitHub PR #1454 is therefore the authoritative merge
+record, and the draft's `target_commitish` becomes the durable merge-SHA
+binding after the merge.
