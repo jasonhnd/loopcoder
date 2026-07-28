@@ -1,0 +1,20 @@
+{
+  "schema_version": "loopcoder.suspension-redaction.v1",
+  "generated_at": "2026-07-28T04:57:01.887Z",
+  "policy": {
+    "secret_values": "removed",
+    "account_and_machine_identifiers": "stable_sha256_pseudonym",
+    "email_addresses": "removed",
+    "local_home_paths": "replaced_with_HOME",
+    "local_temporary_paths": "replaced_with_TMPDIR",
+    "private_disposable_repository_names": "removed"
+  },
+  "stats": {
+    "files_read": 61,
+    "files_written": 61,
+    "json_values_redacted": 4,
+    "identifiers_pseudonymized": 452,
+    "text_replacements": 260,
+    "parse_fallbacks": 0
+  }
+}

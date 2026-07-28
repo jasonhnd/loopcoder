@@ -20,6 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   root-cause and accountability analysis, exact snapshot, lessons, and future
   resume conditions are recorded in the
   [`v0.9.0 development suspension report`](docs/v0.9.0-development-suspension-report-2026-07-26.md).
+- **Suspension evidence archived and local development estate retired** -
+  retained the exact RC60 `NO_GO` archive, final unaccepted RC61 archive,
+  sanitized acceptance evidence, seven non-equivalent local commit patches,
+  two dirty-clone patches, exact checksums, redaction record, restore guide,
+  and cleanup ledger in the
+  [`v0.9.0 suspension snapshot`](docs/archive/v0.9.0-suspension-snapshot-2026-07-28/README.md).
+  Binary and evidence assets remain in an unpublished authenticated GitHub
+  draft; this adds no v0.9 tag or public release. Redundant worktrees, clones,
+  build outputs, runtime databases, caches, and temporary evidence were
+  removed only after remote upload and independent checksum verification.
 
 ### Changed
 

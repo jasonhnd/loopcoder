@@ -32,6 +32,14 @@ future resume. The v0.9 quickstart and capability matrix remain in the
 repository as stopped-SHA implementation records; they are not current release
 instructions.
 
+A bounded, public-safe
+[`v0.9.0 suspension snapshot`](docs/archive/v0.9.0-suspension-snapshot-2026-07-28/README.md)
+preserves RC60, RC61, failed acceptance evidence, unique local source patches,
+exact digests, redaction policy, and the local cleanup ledger in this
+repository. Its binary and evidence assets are held in an unpublished,
+authenticated GitHub draft. The draft is an archive, not a product release,
+and creates no v0.9 Git tag.
+
 For documentation inventory only, the stopped snapshot registered
 `loopcoder capabilities`, `loopcoder diagnose`, and `loopcoder qualify`.
 Their names are retained here so source and command documentation remain

@@ -1,0 +1,69 @@
+{
+  "schema": "loopcoder.v090.suspension_snapshot.v1",
+  "created_at": "2026-07-28T04:57:20Z",
+  "repository": "jasonhnd/loopcoder",
+  "purpose": "Durable internal suspension snapshot; not a product release",
+  "release_state": {
+    "decision": "NO_GO",
+    "development": "suspended",
+    "latest_public_release": "v0.8.1",
+    "v0_9_tag_exists": false,
+    "v0_9_public_release_exists": false,
+    "publication_authorized": false
+  },
+  "source_bindings": {
+    "snapshot_documentation_main_sha": "40bc76eaa13d7cdc113c0f17950239819141e411",
+    "stopped_product_pre_prod_sha": "30cabdaf77d749c8305349f7f6a87189014b8af8",
+    "current_documentation_pre_prod_sha": "017e450e3a503ab55c5bd3d6b21268d167368e51"
+  },
+  "assets": [
+    {
+      "name": "loopcoder_0.9.0-rc.60_darwin_arm64.tar.gz",
+      "bytes": 9264799,
+      "sha256": "270870d7ae0b1712d6eb3cbf67d948fdc680b0da4aceaf5344a08c03b70e7aae",
+      "candidate_sha": "4361b7bad4cbba897cd3069a81692aec6bad5f0c",
+      "workflow_run": 30190284334,
+      "actions_artifact_id": 8628327068,
+      "acceptance": "NO_GO",
+      "reason": "Nearest completed live acceptance attempt; qualifier failed with six required metrics not_run"
+    },
+    {
+      "name": "loopcoder_0.9.0-rc.61_darwin_arm64.tar.gz",
+      "bytes": 9271775,
+      "sha256": "bea1a17c1e1ef500569ce2283128646c8337a2191c9639921580fbc9d7ac8db1",
+      "candidate_sha": "30cabdaf77d749c8305349f7f6a87189014b8af8",
+      "workflow_definition_head_sha": "9646de33ed38189c74a13e8609d5811d83b58bad",
+      "workflow_run": 30193014249,
+      "actions_artifact_id": 8629212456,
+      "acceptance": "NOT_RUN",
+      "reason": "Final built candidate; live consumer canary and exact-artifact qualifier never began"
+    },
+    {
+      "name": "v0.9.0-suspension-evidence-2026-07-28.tar.zst",
+      "bytes": 187791,
+      "sha256": "ea0bd8ca4654c1e5f04b6d2067a61bc6d62dc8c2d825d7d09d47628082c1c52d",
+      "uncompressed_bytes": 5263360,
+      "sanitized_text_files": 61,
+      "non_equivalent_local_commit_patches": 7,
+      "dirty_clone_patches": 2
+    }
+  ],
+  "redaction": {
+    "secret_values_removed": 4,
+    "account_and_machine_identifiers_pseudonymized": 452,
+    "text_replacements": 260,
+    "parse_fallbacks": 0,
+    "raw_private_evidence_included": false
+  },
+  "cleanup_scope_before": {
+    "bytes": 2035732480,
+    "agenticcoder_top_level_paths": 6,
+    "temporary_top_level_paths": 57,
+    "registered_worktrees_including_controller": 23,
+    "local_branches": 148,
+    "unreachable_commits_discarded": 510,
+    "unreachable_blobs_discarded": 409,
+    "unreachable_trees_discarded": 1206,
+    "unreachable_tags_discarded": 4
+  }
+}

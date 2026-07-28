@@ -29,6 +29,7 @@ Every document is exactly one of these types:
 - [`self-hosting-playbook.md`](self-hosting-playbook.md): mandatory scope, resource, progress, retry, verification, and cleanup controls for LoopCoder developing itself.
 - [`v0.8.0-retrospective.md`](v0.8.0-retrospective.md): sanitized engineering retrospective and corrective-action record for the v0.8.0 cycle.
 - [`v0.9.0-development-suspension-report-2026-07-26.md`](v0.9.0-development-suspension-report-2026-07-26.md): authoritative v0.9 project-stop record, including objective, chronology, quantitative scope, RC evidence, failure analysis, exact snapshot, lessons, and resume conditions.
+- [`archive/v0.9.0-suspension-snapshot-2026-07-28/`](archive/v0.9.0-suspension-snapshot-2026-07-28/README.md): durable preservation and cleanup record for RC60, RC61, sanitized evidence, unique local patches, checksums, redaction, restore, and local deletion.
 - [`reference/audit.md`](reference/audit.md): read-only security audit command.
 - [`reference/architecture.md`](reference/architecture.md): current system map.
 - [`reference/development-release-checklist.md`](reference/development-release-checklist.md): reusable intake-to-publication evidence checklist and GO/NO-GO matrix.
