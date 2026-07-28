@@ -4,8 +4,8 @@
 **Operation:** v0.9 project suspension archive and local deletion
 **Initial local scope:** 2,035,732,480 bytes
 **Safety model:** Preserve, upload, download-verify, then delete
-**Current phase:** Primary and second-sweep transactions complete; third-sweep
-evidence preserved, deletion pending
+**Current phase:** All authorized local deletion complete; archival PR and
+exact-merge verification pending
 
 This ledger is intentionally committed in two phases.
 
@@ -433,3 +433,81 @@ pre-push hook because that hook has already passed twice in this transaction
 and rerunning it would recreate the exact residue this section is meant to
 remove. GitHub CI remains the authoritative verification for the resulting
 pull request.
+
+## 14. Final Local Deletion Result
+
+The third sweep and verification-residue cleanup completed on 2026-07-28.
+
+### 14.1 Scheduled And Agent State
+
+- The 15-minute Codex heartbeat was deleted through the Codex automation API.
+- Nine LoopCoder Paseo agents were deleted by exact agent ID through
+  `paseo delete`.
+- Every agent had first been independently verified as `closed` and archived.
+- The initial `paseo delete --cwd` call deleted zero records because archived
+  agents are excluded from that selector; the result was not treated as
+  success.
+- Each of the nine exact-ID calls then returned `deletedCount: 1`.
+- The now-empty repository-specific Paseo agent directory was removed.
+- A final `paseo ls --all` query found zero agents for the stopped repository
+  cwd.
+
+No agent was resumed or woken during cleanup.
+
+### 14.2 Provider, Installation, And Cache State
+
+The following selected classes were deleted:
+
+- the 1,001,828-KiB Grok session tree;
+- all 195 Claude project-history directories and 223 files;
+- four Gemini project records;
+- four Claude project-cache directories;
+- seven empty Claude temporary project directories;
+- the installed Claude LoopCoder skill after its unique diff was preserved;
+- four local LoopCoder binaries, one symlink, and the v0.8.1/test install tree;
+- the recreated `${HOME}/.loopcoder` database;
+- four Go build-cache directories containing LoopCoder executables;
+- three Python cache mirrors;
+- the selected Go module download-cache path.
+
+`loopcoder` no longer resolves on `PATH`.
+
+### 14.3 System Temporary State
+
+- Selected top-level directories before deletion: 2,817
+- Selected allocated size before deletion: 4,481,264 KiB
+- Selected top-level directories after deletion: 0
+- Active Go test or LoopCoder process after deletion: 0
+- Open files in the selected directories before deletion: 0
+
+The deletion operated on the 2,817 audited top-level names derived from a
+LoopCoder-bearing descendant. It did not delete other macOS temporary
+directories.
+
+### 14.4 Intentional Retentions
+
+Other active repositories still own their own `.loopcoder` directories or
+`refs/loopcoder` namespaces. Those are not copies of the stopped source
+repository and were left intact. Codex tasks, Codex memory, and provider memory
+for other repositories were also retained.
+
+The broad home scan encountered normal macOS privacy denials in unrelated
+system containers. Those protected containers were not part of the
+project-managed storage roots. Every accessible, previously identified
+LoopCoder project path was checked through a targeted post-deletion scan.
+
+### 14.5 Remaining Transaction Path
+
+The only remaining local source checkout for this transaction is
+`${TMPDIR}/lc-v090-residual-finalize`, the 30,028-KiB clone used to commit,
+push, merge, and verify this ledger. It is deleted after:
+
+1. the archival PR merges to `main`;
+2. exact-merge CI passes;
+3. the unpublished draft remains unpublished and is rebound to the merge SHA;
+4. the remote branch and tracked archive are read back successfully.
+
+Including the finalizer after its eventual removal, the complete accounted
+local deletion transaction totals 8,364,355,584 bytes. This is approximately
+7.79 GiB or 8.36 GB. The figure includes cleanup-only transaction paths and
+verification-generated residue, not 7.79 GiB of unique product source.
