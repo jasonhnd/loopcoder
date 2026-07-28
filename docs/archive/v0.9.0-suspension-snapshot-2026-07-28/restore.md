@@ -43,23 +43,25 @@ release behavior remained unchanged.
 
 ## 3. Locate The Unpublished Draft
 
-The snapshot uses the internal lookup label
-`internal-snapshot-v090-20260728`. It is an unpublished draft, not a Git tag.
-Authenticated repository administration access may be required to see it.
+The snapshot is GitHub release database ID `360850177`. It is an unpublished
+draft, not a Git tag. Authenticated repository administration access may be
+required to see it. After its target was rebound to the archival merge commit,
+GitHub represented the draft-only tag label as
+`untagged-c2dee6e6a6773d7d9781`; use the immutable release database ID and
+asset IDs as the lookup boundary rather than depending on that opaque label.
 
 ```bash
-gh api repos/jasonhnd/loopcoder/releases \
-  --jq '.[] |
-    select(.tag_name == "internal-snapshot-v090-20260728") |
-    {
-      id,
-      name,
-      tag_name,
-      draft,
-      prerelease,
-      published_at,
-      assets: [.assets[] | {id,name,size,digest}]
-    }'
+gh api repos/jasonhnd/loopcoder/releases/360850177 \
+  --jq '{
+    id,
+    name,
+    tag_name,
+    target_commitish,
+    draft,
+    prerelease,
+    published_at,
+    assets: [.assets[] | {id,name,size,digest}]
+  }'
 ```
 
 Expected safety state:
@@ -67,7 +69,8 @@ Expected safety state:
 - `draft: true`;
 - `prerelease: true`;
 - `published_at: null`;
-- no corresponding `refs/tags/internal-snapshot-v090-20260728`;
+- `target_commitish: 19d25dbf230482564173c7eb6eb7c7d1de5f189f`;
+- no corresponding `refs/tags/untagged-c2dee6e6a6773d7d9781`;
 - no v0.9 product tag;
 - no v0.9 public release.
 
@@ -83,10 +86,8 @@ authenticated, scriptable boundary:
 mkdir -p snapshot-download
 
 release_id="$(
-  gh api repos/jasonhnd/loopcoder/releases \
-    --jq '.[] |
-      select(.tag_name == "internal-snapshot-v090-20260728") |
-      .id'
+  gh api repos/jasonhnd/loopcoder/releases/360850177 \
+    --jq '.id'
 )"
 
 gh api "repos/jasonhnd/loopcoder/releases/${release_id}" \
@@ -241,6 +242,12 @@ git am --3way issue-1337-89d15db.patch
 
 The dirty-clone patches do not carry approved commit history. Treat them as
 forensic diffs.
+
+The later broad residual sweep added two plain code diffs under
+[`historical/unmerged-diffs/`](historical/unmerged-diffs/). They preserve
+local-only issue #708 and #711 commits without author or commit headers. Use
+`git apply --check` for inspection; they are not mail patches and must not be
+passed to `git am`.
 
 ## 10. Data That Cannot Be Restored
 

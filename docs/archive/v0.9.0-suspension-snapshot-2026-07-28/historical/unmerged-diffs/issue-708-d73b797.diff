@@ -1,0 +1,1249 @@
+diff --git a/internal/cli/cli_test.go b/internal/cli/cli_test.go
+index 86393d3..3a7c23b 100644
+--- a/internal/cli/cli_test.go
++++ b/internal/cli/cli_test.go
+@@ -4204,9 +4204,9 @@ func TestNestedRunDispatchesThreeChildrenConcurrentlyAndHonorsDependencies(t *te
+ 		t.Fatalf("write delivery config: %v", err)
+ 	}
+ 	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
+-		nestedPlanItem("alpha", 701, nil, true, "write", nil),
+-		nestedPlanItem("beta", 702, nil, true, "write", nil),
+-		nestedPlanItem("gamma", 703, []string{"alpha"}, true, "write", nil),
++		nestedPlanItem("alpha", 701, nil, true, "read-only", nil),
++		nestedPlanItem("beta", 702, nil, true, "read-only", nil),
++		nestedPlanItem("gamma", 703, []string{"alpha"}, true, "read-only", nil),
+ 	}, 2)
+ 
+ 	startedAlpha := make(chan struct{})
+@@ -4324,7 +4324,7 @@ func TestNestedRunUsesConfiguredCodexProvider(t *testing.T) {
+ 		t.Fatalf("write delivery config: %v", err)
+ 	}
+ 	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
+-		nestedPlanItem("alpha", 701, nil, true, "write", nil),
++		nestedPlanItem("alpha", 701, nil, true, "read-only", nil),
+ 	}, 1)
+ 
+ 	var got worker.Options
+@@ -4389,6 +4389,119 @@ func TestNestedRunRejectsPermissionEscalationBeforeDispatch(t *testing.T) {
+ 	}
+ }
+ 
++func TestEnforceNestedPlanScopeRejectsPhysicalPathEscapes(t *testing.T) {
++	repo := t.TempDir()
++	outside := t.TempDir()
++	if err := os.MkdirAll(filepath.Join(repo, "internal"), 0o755); err != nil {
++		t.Fatalf("mkdir internal: %v", err)
++	}
++	tests := []struct {
++		name string
++		repo string
++		path string
++		want string
++	}{
++		{name: "traversal", repo: ".", path: "../outside", want: "path traversal"},
++		{name: "absolute outside", repo: ".", path: filepath.Join(outside, "file.txt"), want: "escapes parent repo"},
++		{name: "windows volume", repo: ".", path: `C:\outside`, want: "Windows volume"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			plan := nestedScopePlan(tt.repo, tt.path)
++			err := enforceNestedPlanScope(repo, string(reporter.PermissionOrchestrate), &plan)
++			if err == nil || !strings.Contains(err.Error(), tt.want) {
++				t.Fatalf("enforceNestedPlanScope error = %v, want containing %q", err, tt.want)
++			}
++		})
++	}
++}
++
++func TestEnforceNestedPlanScopeUsesPhysicalPathIdentity(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("symlink creation is not reliable in unprivileged Windows test runs")
++	}
++	root := t.TempDir()
++	repo := filepath.Join(root, "repo")
++	if err := os.MkdirAll(filepath.Join(repo, "real"), 0o755); err != nil {
++		t.Fatalf("mkdir repo: %v", err)
++	}
++	outside := filepath.Join(root, "outside")
++	if err := os.MkdirAll(outside, 0o755); err != nil {
++		t.Fatalf("mkdir outside: %v", err)
++	}
++	if err := os.Symlink(outside, filepath.Join(repo, "link-out")); err != nil {
++		t.Skipf("symlink unavailable: %v", err)
++	}
++	if err := os.Symlink(filepath.Join(repo, "real"), filepath.Join(repo, "link-in")); err != nil {
++		t.Skipf("symlink unavailable: %v", err)
++	}
++
++	escaped := nestedScopePlan(".", "link-out/file.txt")
++	if err := enforceNestedPlanScope(repo, string(reporter.PermissionOrchestrate), &escaped); err == nil || !strings.Contains(err.Error(), "escapes parent repo") {
++		t.Fatalf("symlink escape error = %v, want parent escape", err)
++	}
++
++	alias := nestedScopePlan(".", "link-in/file.txt")
++	if err := enforceNestedPlanScope(repo, string(reporter.PermissionOrchestrate), &alias); err != nil {
++		t.Fatalf("valid physical in-repo alias rejected: %v", err)
++	}
++}
++
++func nestedScopePlan(repo, path string) orchestration.ChildPlan {
++	return orchestration.ChildPlan{
++		SchemaVersion:  orchestration.ChildPlanSchemaVersionV1,
++		PlanID:         "plan-run-20260102T030405Z-wave",
++		ParentRunID:    state.RunIDForWave(fixedCLINow()),
++		RootRunID:      state.RunIDForWave(fixedCLINow()),
++		ParentDepth:    0,
++		MaxDepth:       2,
++		MaxConcurrency: 1,
++		CreatedAt:      state.FormatTimestamp(fixedCLINow()),
++		Items: []orchestration.ChildRunPlan{{
++			ChildKey:   "alpha",
++			Title:      "alpha",
++			Role:       string(reporter.RoleWorker),
++			Scope:      orchestration.ChildScope{Repo: repo, Paths: []string{path}, Issues: []int{701}},
++			Permission: string(reporter.PermissionReadOnly),
++			Aggregation: orchestration.ChildAggregation{
++				Mode:          orchestration.ChildAggregationCollect,
++				Required:      true,
++				IncludeReport: true,
++			},
++		}},
++	}
++}
++
++func TestNestedRunRejectsWriteWorkerScopeBeforeDispatch(t *testing.T) {
++	t.Setenv("LOOPCODER_HOME", t.TempDir())
++	var stdout, stderr bytes.Buffer
++	repo := t.TempDir()
++	if err := os.WriteFile(filepath.Join(repo, ".delivery.yml"), []byte("version: 1\nadapters:\n  worker: codex\n"), 0o644); err != nil {
++		t.Fatalf("write delivery config: %v", err)
++	}
++	planPath := writeNestedPlanFixture(t, repo, []orchestration.ChildRunPlan{
++		nestedPlanItem("alpha", 701, nil, true, "write", nil),
++	}, 1)
++	called := false
++
++	exitCode := RunWithDeps([]string{"nested", "run", "--repo", repo, "--plan", planPath}, &stdout, &stderr, Deps{
++		Now: fixedCLINow,
++		Dispatch: func(context.Context, worker.Options) (worker.Result, error) {
++			called = true
++			return worker.Result{}, nil
++		},
++	})
++	if exitCode != 2 {
++		t.Fatalf("RunWithDeps returned exit code %d, want 2; stderr=%q stdout=%q", exitCode, stderr.String(), stdout.String())
++	}
++	if called {
++		t.Fatal("dispatch was called despite unsupported write scope")
++	}
++	if !strings.Contains(stderr.String(), "requires an enforceable filesystem scope") {
++		t.Fatalf("stderr missing scope contract diagnostic: %q", stderr.String())
++	}
++}
++
+ func TestNestedRunTestSubprocessExecutesRealChildProcesses(t *testing.T) {
+ 	t.Setenv("LOOPCODER_HOME", t.TempDir())
+ 	var stdout, stderr bytes.Buffer
+diff --git a/internal/cli/nested.go b/internal/cli/nested.go
+index bb42c50..d338ab2 100644
+--- a/internal/cli/nested.go
++++ b/internal/cli/nested.go
+@@ -17,6 +17,7 @@ import (
+ 	lcdefaults "github.com/jasonhnd/loopcoder/internal/defaults"
+ 	"github.com/jasonhnd/loopcoder/internal/home"
+ 	"github.com/jasonhnd/loopcoder/internal/orchestration"
++	"github.com/jasonhnd/loopcoder/internal/pathid"
+ 	"github.com/jasonhnd/loopcoder/internal/reporter"
+ 	"github.com/jasonhnd/loopcoder/internal/state"
+ 	"github.com/jasonhnd/loopcoder/internal/storage"
+@@ -248,6 +249,10 @@ func runNestedRun(args []string, stdout, stderr io.Writer, deps Deps) int {
+ 		opts.Model = firstNonEmptyNested(opts.Model, "deterministic-subprocess")
+ 		opts.Effort = firstNonEmptyNested(opts.Effort, "none")
+ 	}
++	if err := enforceNestedWorkerScopeContract(opts.Provider, &plan); err != nil {
++		fmt.Fprintf(stderr, "nested run: %v\n", err)
++		return 2
++	}
+ 
+ 	layout, err := home.Resolve(home.DefaultDeps())
+ 	if err != nil {
+@@ -308,9 +313,6 @@ func nestedDispatchExecutor(opts nestedRunOptions, deps Deps, stderr io.Writer)
+ 		} else if ok {
+ 			return existing, nil
+ 		}
+-		if child.Permission == string(reporter.PermissionReadOnly) {
+-			return orchestration.ChildRunResult{}, fmt.Errorf("provider dispatch executor cannot run read-only child %q through write-capable worker dispatch", child.ChildKey)
+-		}
+ 		if child.Issue <= 0 {
+ 			return orchestration.ChildRunResult{}, fmt.Errorf("child %q requires a positive issue or scope issue for worker dispatch", child.ChildKey)
+ 		}
+@@ -497,6 +499,10 @@ func completedNestedAttempt(repoPath string, child orchestration.ChildRunPlan) (
+ }
+ 
+ func enforceNestedPlanScope(repoPath, parentPermission string, plan *orchestration.ChildPlan) error {
++	parentCanonical, err := pathid.Canonicalize(repoPath)
++	if err != nil {
++		return fmt.Errorf("resolve parent repo physical path: %w", err)
++	}
+ 	for i := range plan.Items {
+ 		child := &plan.Items[i]
+ 		if !permissionWithin(parentPermission, child.Permission) {
+@@ -506,9 +512,40 @@ func enforceNestedPlanScope(repoPath, parentPermission string, plan *orchestrati
+ 		if err != nil {
+ 			return fmt.Errorf("child %q scope.repo: %w", child.ChildKey, err)
+ 		}
+-		if !pathWithin(repoPath, childRepo) {
++		childCanonical, err := pathid.Canonicalize(childRepo)
++		if err != nil {
++			return fmt.Errorf("child %q scope.repo: resolve physical path: %w", child.ChildKey, err)
++		}
++		if !physicalPathWithin(parentCanonical.Identity, childCanonical.Identity) {
+ 			return fmt.Errorf("child %q scope.repo %q escapes parent repo %s", child.ChildKey, child.Scope.Repo, repoPath)
+ 		}
++		for _, scopePath := range child.Scope.Paths {
++			resolved, err := resolveNestedScopePath(childRepo, scopePath)
++			if err != nil {
++				return fmt.Errorf("child %q scope.paths %q: %w", child.ChildKey, scopePath, err)
++			}
++			scopeCanonical, err := pathid.Canonicalize(resolved)
++			if err != nil {
++				return fmt.Errorf("child %q scope.paths %q: resolve physical path: %w", child.ChildKey, scopePath, err)
++			}
++			if !physicalPathWithin(parentCanonical.Identity, scopeCanonical.Identity) {
++				return fmt.Errorf("child %q scope.paths %q escapes parent repo %s", child.ChildKey, scopePath, repoPath)
++			}
++			if !physicalPathWithin(childCanonical.Identity, scopeCanonical.Identity) {
++				return fmt.Errorf("child %q scope.paths %q escapes child repo %s", child.ChildKey, scopePath, childRepo)
++			}
++		}
++	}
++	return nil
++}
++
++func enforceNestedWorkerScopeContract(provider string, plan *orchestration.ChildPlan) error {
++	for i := range plan.Items {
++		child := &plan.Items[i]
++		switch reporter.Permission(child.Permission) {
++		case reporter.PermissionWrite, reporter.PermissionOrchestrate:
++			return fmt.Errorf("child %q permission %q requires an enforceable filesystem scope, but provider %q does not expose one", child.ChildKey, child.Permission, provider)
++		}
+ 	}
+ 	return nil
+ }
+@@ -757,6 +794,23 @@ func resolveNestedChildRepo(repoPath, childRepo string) (string, error) {
+ 	return filepath.Abs(filepath.Join(repoPath, childRepo))
+ }
+ 
++func resolveNestedScopePath(childRepo, scopePath string) (string, error) {
++	scopePath = strings.TrimSpace(scopePath)
++	if scopePath == "" {
++		return "", fmt.Errorf("empty path")
++	}
++	if hasNestedParentPathSegment(scopePath) {
++		return "", fmt.Errorf("path traversal is not allowed")
++	}
++	if hasNestedWindowsVolumeEscape(scopePath) {
++		return "", fmt.Errorf("Windows volume or UNC paths are not allowed")
++	}
++	if filepath.IsAbs(scopePath) {
++		return filepath.Abs(scopePath)
++	}
++	return filepath.Abs(filepath.Join(childRepo, scopePath))
++}
++
+ func pathWithin(parent, child string) bool {
+ 	parent = filepath.Clean(parent)
+ 	child = filepath.Clean(child)
+@@ -770,6 +824,42 @@ func pathWithin(parent, child string) bool {
+ 	return strings.HasPrefix(child, parent+string(filepath.Separator))
+ }
+ 
++func physicalPathWithin(parent, child string) bool {
++	parent = filepath.Clean(parent)
++	child = filepath.Clean(child)
++	if runtime.GOOS == "windows" {
++		parent = strings.ToLower(parent)
++		child = strings.ToLower(child)
++	}
++	if parent == child {
++		return true
++	}
++	return strings.HasPrefix(child, parent+string(filepath.Separator))
++}
++
++func hasNestedParentPathSegment(path string) bool {
++	for _, part := range strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' }) {
++		if part == ".." {
++			return true
++		}
++	}
++	return false
++}
++
++func hasNestedWindowsVolumeEscape(path string) bool {
++	path = strings.TrimSpace(path)
++	if strings.HasPrefix(path, `\\`) || strings.HasPrefix(path, `//`) {
++		return true
++	}
++	if len(path) >= 3 {
++		letter := path[0]
++		if ((letter >= 'A' && letter <= 'Z') || (letter >= 'a' && letter <= 'z')) && path[1] == ':' && (path[2] == '\\' || path[2] == '/') {
++			return true
++		}
++	}
++	return false
++}
++
+ func shellCommand(ctx context.Context, command string) *exec.Cmd {
+ 	if runtime.GOOS == "windows" {
+ 		return exec.CommandContext(ctx, "powershell", "-NoProfile", "-Command", command)
+diff --git a/internal/orchestration/child_plan.go b/internal/orchestration/child_plan.go
+index 81c79da..d6826e3 100644
+--- a/internal/orchestration/child_plan.go
++++ b/internal/orchestration/child_plan.go
+@@ -182,6 +182,12 @@ func normalizeAndValidateChildItems(plan *ChildPlan) error {
+ 		if strings.TrimSpace(item.RunID) != "" && !state.IsRunID(item.RunID) {
+ 			return fmt.Errorf("child %q run id %q is invalid", item.ChildKey, item.RunID)
+ 		}
++		if strings.TrimSpace(item.RunID) == plan.ParentRunID {
++			return fmt.Errorf("child %q run id %q cannot equal parent_run_id", item.ChildKey, item.RunID)
++		}
++		if strings.TrimSpace(item.RunID) == plan.RootRunID {
++			return fmt.Errorf("child %q run id %q cannot equal root_run_id", item.ChildKey, item.RunID)
++		}
+ 	}
+ 	for _, item := range plan.Items {
+ 		for _, dep := range item.DependsOn {
+@@ -321,15 +327,45 @@ func validateChildScope(childKey, permission string, scope ChildScope) error {
+ 			return fmt.Errorf("child %q write-capable permission requires bounded mutable scope", childKey)
+ 		}
+ 		for _, path := range scope.Paths {
+-			switch strings.TrimSpace(path) {
++			trimmed := strings.TrimSpace(path)
++			switch trimmed {
+ 			case "", ".", "./", "**", "**/*", "/*", "/":
+ 				return fmt.Errorf("child %q write-capable permission rejects unbounded path scope %q", childKey, path)
+ 			}
++			if hasParentPathSegment(trimmed) {
++				return fmt.Errorf("child %q write-capable permission rejects traversal path scope %q", childKey, path)
++			}
++			if hasWindowsVolumeEscape(trimmed) {
++				return fmt.Errorf("child %q write-capable permission rejects Windows volume path scope %q", childKey, path)
++			}
+ 		}
+ 	}
+ 	return nil
+ }
+ 
++func hasParentPathSegment(path string) bool {
++	for _, part := range strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' }) {
++		if part == ".." {
++			return true
++		}
++	}
++	return false
++}
++
++func hasWindowsVolumeEscape(path string) bool {
++	path = strings.TrimSpace(path)
++	if strings.HasPrefix(path, `\\`) || strings.HasPrefix(path, `//`) {
++		return true
++	}
++	if len(path) >= 3 {
++		letter := path[0]
++		if ((letter >= 'A' && letter <= 'Z') || (letter >= 'a' && letter <= 'z')) && path[1] == ':' && (path[2] == '\\' || path[2] == '/') {
++			return true
++		}
++	}
++	return false
++}
++
+ func normalizeStringList(values []string) []string {
+ 	seen := map[string]bool{}
+ 	out := make([]string, 0, len(values))
+diff --git a/internal/orchestration/nested_scheduler.go b/internal/orchestration/nested_scheduler.go
+index 93c0052..9a627af 100644
+--- a/internal/orchestration/nested_scheduler.go
++++ b/internal/orchestration/nested_scheduler.go
+@@ -427,6 +427,12 @@ func normalizeChildRunPlans(children []ChildRunPlan, opts NestedScheduleOptions,
+ 		if !state.IsRunID(child.RunID) {
+ 			return nil, fmt.Errorf("child %q run id %q is invalid", child.ChildKey, child.RunID)
+ 		}
++		if child.RunID == opts.ParentRunID {
++			return nil, fmt.Errorf("child %q run id %q cannot equal parent_run_id", child.ChildKey, child.RunID)
++		}
++		if child.RunID == opts.RootRunID {
++			return nil, fmt.Errorf("child %q run id %q cannot equal root_run_id", child.ChildKey, child.RunID)
++		}
+ 		if seenRunIDs[child.RunID] {
+ 			return nil, fmt.Errorf("duplicate child run id %q", child.RunID)
+ 		}
+diff --git a/internal/orchestration/nested_scheduler_test.go b/internal/orchestration/nested_scheduler_test.go
+index 68456c3..528c65f 100644
+--- a/internal/orchestration/nested_scheduler_test.go
++++ b/internal/orchestration/nested_scheduler_test.go
+@@ -584,6 +584,14 @@ func TestValidateChildPlanRejectsInvalidBoundedFields(t *testing.T) {
+ 		}, want: "cycle"},
+ 		{name: "hard depth cap", edit: func(p *ChildPlan) { p.MaxDepth = NestedHardMaxDepth + 1 }, want: "hard maximum"},
+ 		{name: "unbounded write scope", edit: func(p *ChildPlan) { p.Items[0].Scope = ChildScope{Repo: ".", Paths: []string{"**"}} }, want: "unbounded path scope"},
++		{name: "traversal write scope", edit: func(p *ChildPlan) { p.Items[0].Scope = ChildScope{Repo: ".", Paths: []string{"../outside"}} }, want: "traversal path scope"},
++		{name: "windows volume write scope", edit: func(p *ChildPlan) { p.Items[0].Scope = ChildScope{Repo: ".", Paths: []string{`C:\outside`}} }, want: "Windows volume path scope"},
++		{name: "child reuses parent run id", edit: func(p *ChildPlan) { p.Items[0].RunID = p.ParentRunID }, want: "cannot equal parent_run_id"},
++		{name: "child reuses root run id", edit: func(p *ChildPlan) {
++			p.ParentRunID = "run-20260709T000001Z-child-parent-0"
++			p.ParentDepth = 1
++			p.Items[0].RunID = p.RootRunID
++		}, want: "cannot equal root_run_id"},
+ 	}
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+@@ -747,6 +755,37 @@ func TestScheduleNestedRunsPersistsDurablePlanBeforeLaunchAndReplaysIdempotently
+ 	}
+ }
+ 
++func TestScheduleNestedRunsRejectsParentRunIDReuseBeforeLaunch(t *testing.T) {
++	now := nestedTestNow()
++	parentRunID := "run-20260709T000000Z-wave"
++	called := false
++	_, err := ScheduleNestedRuns(context.Background(), NestedScheduleOptions{
++		RepoPath:    t.TempDir(),
++		ParentRunID: parentRunID,
++		RootRunID:   parentRunID,
++		MaxChildren: 1,
++		Now:         now,
++		Clock:       func() time.Time { return now },
++		Children: []ChildRunPlan{{
++			ID:         "self",
++			RunID:      parentRunID,
++			Issue:      1,
++			Permission: "write",
++			Required:   true,
++		}},
++		Execute: func(context.Context, ChildRunPlan) (ChildRunResult, error) {
++			called = true
++			return ChildRunResult{Status: NestedStatusSucceeded}, nil
++		},
++	})
++	if err == nil || !strings.Contains(err.Error(), "cannot equal parent_run_id") {
++		t.Fatalf("ScheduleNestedRuns error = %v, want parent run id reuse rejection", err)
++	}
++	if called {
++		t.Fatal("Execute was called for invalid self-cycle child")
++	}
++}
++
+ func nestedTestNow() time.Time {
+ 	return time.Date(2026, 7, 9, 0, 0, 0, 0, time.UTC)
+ }
+diff --git a/internal/runstatus/runstatus_test.go b/internal/runstatus/runstatus_test.go
+index fb9fca6..50d9222 100644
+--- a/internal/runstatus/runstatus_test.go
++++ b/internal/runstatus/runstatus_test.go
+@@ -84,6 +84,38 @@ func TestRenderLifecycleRecordWithParentAndChild(t *testing.T) {
+ 	}
+ }
+ 
++func TestRenderSurfacesCorruptSelfReferenceWithoutRecursing(t *testing.T) {
++	repo := t.TempDir()
++	runID := "run-corrupt"
++	if err := state.AppendLifecycleTransition(repo, state.LifecycleTransition{
++		Timestamp:   "2026-07-09T00:00:00Z",
++		RunID:       runID,
++		ParentRunID: runID,
++		State:       state.StatePlanned,
++		ChildRunID:  runID,
++	}); err != nil {
++		t.Fatalf("append corrupt lifecycle: %v", err)
++	}
++
++	report, err := Load(Options{RepoPath: repo, RunID: runID})
++	if err != nil {
++		t.Fatalf("Load returned error: %v", err)
++	}
++	if len(report.RunTree.Nodes) != 1 {
++		t.Fatalf("run tree nodes = %d, want bounded self-reference traversal to one node: %#v", len(report.RunTree.Nodes), report.RunTree.Nodes)
++	}
++	got := Render(report)
++	for _, want := range []string{
++		"ParentRunId: run-corrupt",
++		"ChildRunIds: run-corrupt",
++		"last_error: run references itself as parent; run references itself as child",
++	} {
++		if !strings.Contains(got, want) {
++			t.Fatalf("rendered corrupt status missing %q:\n%s", want, got)
++		}
++	}
++}
++
+ func TestMarshalJSONIncludesRunTreeContract(t *testing.T) {
+ 	repo := t.TempDir()
+ 	parent := "run-parent"
+diff --git a/internal/runstatus/tree.go b/internal/runstatus/tree.go
+index 363dd87..78c5972 100644
+--- a/internal/runstatus/tree.go
++++ b/internal/runstatus/tree.go
+@@ -70,15 +70,31 @@ func collectRunTreeNode(repoPath, runID, parentRunID, projectID string, depth in
+ 		parentRunID = firstNonEmpty(lifecycle.ParentRunID, eventParent)
+ 	}
+ 	children := map[string]bool{}
++	var problems []string
++	if strings.TrimSpace(parentRunID) == runID {
++		problems = append(problems, "run references itself as parent")
++	}
+ 	for _, child := range lifecycle.ChildRunIDs {
+-		if strings.TrimSpace(child) != "" && child != runID {
+-			children[child] = true
++		child = strings.TrimSpace(child)
++		if child == "" {
++			continue
++		}
++		if child == runID {
++			problems = append(problems, "run references itself as child")
++			continue
+ 		}
++		children[child] = true
+ 	}
+ 	for _, child := range eventChildren {
+-		if strings.TrimSpace(child) != "" && child != runID {
+-			children[child] = true
++		child = strings.TrimSpace(child)
++		if child == "" {
++			continue
++		}
++		if child == runID {
++			problems = append(problems, "run events reference itself as child")
++			continue
+ 		}
++		children[child] = true
+ 	}
+ 
+ 	node := RunTreeNode{
+@@ -102,6 +118,9 @@ func collectRunTreeNode(repoPath, runID, parentRunID, projectID string, depth in
+ 	}
+ 	applyLifecycleTimestamps(&node, lifecycle.History)
+ 	applyRunNodeDetails(repoPath, runID, now, &node)
++	if len(problems) > 0 {
++		node.LastError = appendRunTreeError(node.LastError, strings.Join(problems, "; "))
++	}
+ 	nodes[runID] = &node
+ 
+ 	for _, child := range node.ChildRunIDs {
+@@ -109,6 +128,18 @@ func collectRunTreeNode(repoPath, runID, parentRunID, projectID string, depth in
+ 	}
+ }
+ 
++func appendRunTreeError(existing, problem string) string {
++	existing = strings.TrimSpace(existing)
++	problem = strings.TrimSpace(problem)
++	if existing == "" {
++		return problem
++	}
++	if problem == "" || strings.Contains(existing, problem) {
++		return existing
++	}
++	return existing + "; " + problem
++}
++
+ func runParent(repoPath, runID string) string {
+ 	lifecycle, err := state.LoadLifecycle(repoPath, runID)
+ 	if err == nil && strings.TrimSpace(lifecycle.ParentRunID) != "" {
+diff --git a/internal/storage/nested_graph.go b/internal/storage/nested_graph.go
+index 1136062..ff29b89 100644
+--- a/internal/storage/nested_graph.go
++++ b/internal/storage/nested_graph.go
+@@ -2,6 +2,7 @@ package storage
+ 
+ import (
+ 	"context"
++	"database/sql"
+ 	"encoding/json"
+ 	"fmt"
+ 	"strings"
+@@ -64,6 +65,9 @@ func PersistChildPlanGraph(ctx context.Context, store Store, parent RunNode, chi
+ 		return fmt.Errorf("persist child plan graph: child/edge count mismatch")
+ 	}
+ 	return store.WithTx(ctx, func(tx Tx) error {
++		if err := validateChildPlanGraph(ctx, tx, parent, children, plan, edges); err != nil {
++			return err
++		}
+ 		if err := upsertRunNode(ctx, tx, parent); err != nil {
+ 			return err
+ 		}
+@@ -152,7 +156,16 @@ func upsertRunNode(ctx context.Context, tx Tx, run RunNode) error {
+ }
+ 
+ func upsertRunEdge(ctx context.Context, tx Tx, edge RunEdgeRecord) error {
+-	if strings.TrimSpace(edge.ParentRunID) == "" || strings.TrimSpace(edge.ChildRunID) == "" {
++	edge.ParentRunID = strings.TrimSpace(edge.ParentRunID)
++	edge.ChildRunID = strings.TrimSpace(edge.ChildRunID)
++	edge.RootRunID = strings.TrimSpace(edge.RootRunID)
++	edge.PlanID = strings.TrimSpace(edge.PlanID)
++	edge.ChildKey = strings.TrimSpace(edge.ChildKey)
++	edge.Permission = strings.TrimSpace(edge.Permission)
++	edge.Status = strings.TrimSpace(edge.Status)
++	edge.CreatedAt = strings.TrimSpace(edge.CreatedAt)
++	edge.UpdatedAt = strings.TrimSpace(edge.UpdatedAt)
++	if edge.ParentRunID == "" || edge.ChildRunID == "" {
+ 		return fmt.Errorf("persist run edge: parent_run_id and child_run_id are required")
+ 	}
+ 	if strings.TrimSpace(edge.ScopeJSON) == "" {
+@@ -186,3 +199,237 @@ func upsertRunEdge(ctx context.Context, tx Tx, edge RunEdgeRecord) error {
+ 	}
+ 	return nil
+ }
++
++func validateChildPlanGraph(ctx context.Context, tx Tx, parent RunNode, children []RunNode, plan ChildPlanRecord, edges []RunEdgeRecord) error {
++	parent.RunID = strings.TrimSpace(parent.RunID)
++	parent.RootRunID = firstNonEmptyStorage(parent.RootRunID, parent.RunID)
++	plan.ParentRunID = strings.TrimSpace(plan.ParentRunID)
++	plan.RootRunID = strings.TrimSpace(plan.RootRunID)
++	if parent.RunID == "" || plan.ParentRunID == "" || plan.RootRunID == "" {
++		return fmt.Errorf("persist child plan graph: parent_run_id and root_run_id are required")
++	}
++	if plan.ParentRunID != parent.RunID {
++		return fmt.Errorf("persist child plan graph: plan parent_run_id %q does not match parent run %q", plan.ParentRunID, parent.RunID)
++	}
++	if parent.RootRunID != plan.RootRunID {
++		return fmt.Errorf("persist child plan graph: parent root_run_id %q does not match plan root_run_id %q", parent.RootRunID, plan.RootRunID)
++	}
++	if parent.Depth < 0 {
++		return fmt.Errorf("persist child plan graph: parent depth must be non-negative")
++	}
++	if parent.Depth == 0 && parent.RootRunID != parent.RunID {
++		return fmt.Errorf("persist child plan graph: root parent %q must use itself as root_run_id, got %q", parent.RunID, parent.RootRunID)
++	}
++
++	existingParent, parentExists, err := loadStoredRun(ctx, tx, parent.RunID)
++	if err != nil {
++		return err
++	}
++	if parent.Depth > 0 && !parentExists {
++		return fmt.Errorf("persist child plan graph: parent run %q at depth %d is missing from durable graph", parent.RunID, parent.Depth)
++	}
++	if parentExists {
++		if err := validateCompatibleExistingRun("parent", existingParent, parent.RunID, "", parent.RootRunID, parent.Depth); err != nil {
++			return err
++		}
++		if existingParent.ParentRunID == parent.RunID {
++			return fmt.Errorf("persist child plan graph: parent run %q references itself as parent", parent.RunID)
++		}
++	}
++
++	ancestors, err := loadAncestorSet(ctx, tx, parent.RunID)
++	if err != nil {
++		return err
++	}
++	if parent.RootRunID != parent.RunID && !ancestors[parent.RootRunID] {
++		return fmt.Errorf("persist child plan graph: root_run_id %q is not an ancestor of parent %q", parent.RootRunID, parent.RunID)
++	}
++	graph, err := loadRunEdgeGraph(ctx, tx)
++	if err != nil {
++		return err
++	}
++
++	seenRunIDs := map[string]bool{}
++	seenOrdinals := map[int]bool{}
++	for i := range children {
++		child := children[i]
++		edge := edges[i]
++		child.RunID = strings.TrimSpace(child.RunID)
++		child.ParentRunID = strings.TrimSpace(child.ParentRunID)
++		child.RootRunID = firstNonEmptyStorage(child.RootRunID, parent.RootRunID)
++		edge.ParentRunID = strings.TrimSpace(edge.ParentRunID)
++		edge.ChildRunID = strings.TrimSpace(edge.ChildRunID)
++		edge.RootRunID = strings.TrimSpace(edge.RootRunID)
++		edge.PlanID = strings.TrimSpace(edge.PlanID)
++		edge.ChildKey = strings.TrimSpace(edge.ChildKey)
++
++		if child.RunID == "" || edge.ChildRunID == "" {
++			return fmt.Errorf("persist child plan graph: child[%d] run_id is required", i)
++		}
++		if edge.ParentRunID != parent.RunID || edge.ChildRunID != child.RunID {
++			return fmt.Errorf("persist child plan graph: child[%d] edge %q/%q does not match parent %q child %q", i, edge.ParentRunID, edge.ChildRunID, parent.RunID, child.RunID)
++		}
++		if child.ParentRunID != parent.RunID {
++			return fmt.Errorf("persist child plan graph: child %q parent_run_id %q does not match %q", child.RunID, child.ParentRunID, parent.RunID)
++		}
++		if child.RootRunID != parent.RootRunID || edge.RootRunID != parent.RootRunID {
++			return fmt.Errorf("persist child plan graph: child %q root_run_id mismatch", child.RunID)
++		}
++		if child.Depth != parent.Depth+1 || edge.Depth != child.Depth {
++			return fmt.Errorf("persist child plan graph: child %q depth mismatch: parent=%d child=%d edge=%d", child.RunID, parent.Depth, child.Depth, edge.Depth)
++		}
++		if edge.Ordinal < 0 {
++			return fmt.Errorf("persist child plan graph: child %q ordinal must be non-negative", child.RunID)
++		}
++		if seenOrdinals[edge.Ordinal] {
++			return fmt.Errorf("persist child plan graph: duplicate child ordinal %d", edge.Ordinal)
++		}
++		seenOrdinals[edge.Ordinal] = true
++		if edge.ChildKey == "" || edge.PlanID == "" {
++			return fmt.Errorf("persist child plan graph: child %q plan_id and child_key are required", child.RunID)
++		}
++		if child.RunID == parent.RunID {
++			return fmt.Errorf("persist child plan graph: child %q cannot reuse parent_run_id", child.RunID)
++		}
++		if child.RunID == parent.RootRunID {
++			return fmt.Errorf("persist child plan graph: child %q cannot reuse root_run_id", child.RunID)
++		}
++		if ancestors[child.RunID] {
++			return fmt.Errorf("persist child plan graph: child %q cannot reuse an ancestor run_id", child.RunID)
++		}
++		if seenRunIDs[child.RunID] {
++			return fmt.Errorf("persist child plan graph: duplicate child run_id %q", child.RunID)
++		}
++		seenRunIDs[child.RunID] = true
++
++		existingChild, childExists, err := loadStoredRun(ctx, tx, child.RunID)
++		if err != nil {
++			return err
++		}
++		if childExists {
++			if err := validateCompatibleExistingRun("child", existingChild, child.RunID, parent.RunID, parent.RootRunID, child.Depth); err != nil {
++				return err
++			}
++		}
++		if reachesRun(graph, child.RunID, parent.RunID) {
++			return fmt.Errorf("persist child plan graph: edge %s -> %s would create a cycle", parent.RunID, child.RunID)
++		}
++	}
++	return nil
++}
++
++func validateCompatibleExistingRun(label string, existing RunNode, runID, parentRunID, rootRunID string, depth int) error {
++	if existing.RunID != runID {
++		return fmt.Errorf("persist child plan graph: %s run lookup returned %q for %q", label, existing.RunID, runID)
++	}
++	if parentRunID != "" && strings.TrimSpace(existing.ParentRunID) != "" && strings.TrimSpace(existing.ParentRunID) != parentRunID {
++		return fmt.Errorf("persist child plan graph: %s run %q already belongs to parent %q, not %q", label, runID, existing.ParentRunID, parentRunID)
++	}
++	if strings.TrimSpace(existing.RootRunID) != "" && strings.TrimSpace(existing.RootRunID) != rootRunID {
++		return fmt.Errorf("persist child plan graph: %s run %q has root_run_id %q, not %q", label, runID, existing.RootRunID, rootRunID)
++	}
++	if existing.Depth != depth {
++		return fmt.Errorf("persist child plan graph: %s run %q has depth %d, not %d", label, runID, existing.Depth, depth)
++	}
++	return nil
++}
++
++func loadStoredRun(ctx context.Context, tx Tx, runID string) (RunNode, bool, error) {
++	runID = strings.TrimSpace(runID)
++	if runID == "" {
++		return RunNode{}, false, nil
++	}
++	var run RunNode
++	var parent, root, project sql.NullString
++	err := tx.QueryRow(ctx, `SELECT id, project_id, parent_run_id, root_run_id, depth, origin, status, COALESCE(created_at, ''), COALESCE(updated_at, '') FROM runs WHERE id = ?`, runID).
++		Scan(&run.RunID, &project, &parent, &root, &run.Depth, &run.Origin, &run.Status, &run.CreatedAt, &run.UpdatedAt)
++	if err != nil {
++		if err == sql.ErrNoRows {
++			return RunNode{}, false, nil
++		}
++		return RunNode{}, false, fmt.Errorf("persist child plan graph: load run %q: %w", runID, err)
++	}
++	run.ProjectID = project.String
++	run.ParentRunID = parent.String
++	run.RootRunID = root.String
++	return run, true, nil
++}
++
++func loadAncestorSet(ctx context.Context, tx Tx, runID string) (map[string]bool, error) {
++	ancestors := map[string]bool{}
++	seen := map[string]bool{}
++	current := strings.TrimSpace(runID)
++	for current != "" {
++		if seen[current] {
++			return nil, fmt.Errorf("persist child plan graph: existing parent chain contains a cycle at %q", current)
++		}
++		seen[current] = true
++		run, ok, err := loadStoredRun(ctx, tx, current)
++		if err != nil {
++			return nil, err
++		}
++		if !ok || strings.TrimSpace(run.ParentRunID) == "" {
++			return ancestors, nil
++		}
++		parent := strings.TrimSpace(run.ParentRunID)
++		ancestors[parent] = true
++		current = parent
++	}
++	return ancestors, nil
++}
++
++func loadRunEdgeGraph(ctx context.Context, tx Tx) (map[string][]string, error) {
++	rows, err := tx.Query(ctx, `SELECT parent_run_id, child_run_id FROM run_edges`)
++	if err != nil {
++		return nil, fmt.Errorf("persist child plan graph: load run edges: %w", err)
++	}
++	defer rows.Close()
++	graph := map[string][]string{}
++	for rows.Next() {
++		var parent, child string
++		if err := rows.Scan(&parent, &child); err != nil {
++			return nil, fmt.Errorf("persist child plan graph: scan run edge: %w", err)
++		}
++		parent = strings.TrimSpace(parent)
++		child = strings.TrimSpace(child)
++		if parent != "" && child != "" {
++			graph[parent] = append(graph[parent], child)
++		}
++	}
++	if err := rows.Err(); err != nil {
++		return nil, fmt.Errorf("persist child plan graph: scan run edges: %w", err)
++	}
++	return graph, nil
++}
++
++func reachesRun(graph map[string][]string, start, target string) bool {
++	start = strings.TrimSpace(start)
++	target = strings.TrimSpace(target)
++	if start == "" || target == "" {
++		return false
++	}
++	seen := map[string]bool{}
++	stack := []string{start}
++	for len(stack) > 0 {
++		current := stack[len(stack)-1]
++		stack = stack[:len(stack)-1]
++		if current == target {
++			return true
++		}
++		if seen[current] {
++			continue
++		}
++		seen[current] = true
++		stack = append(stack, graph[current]...)
++	}
++	return false
++}
++
++func firstNonEmptyStorage(values ...string) string {
++	for _, value := range values {
++		if strings.TrimSpace(value) != "" {
++			return strings.TrimSpace(value)
++		}
++	}
++	return ""
++}
+diff --git a/internal/storage/nested_graph_test.go b/internal/storage/nested_graph_test.go
+new file mode 100644
+index 0000000..82aa945
+--- /dev/null
++++ b/internal/storage/nested_graph_test.go
+@@ -0,0 +1,261 @@
++package storage
++
++import (
++	"context"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestPersistChildPlanGraphRejectsSelfAndCycle(t *testing.T) {
++	ctx := context.Background()
++	store := openNestedGraphTestStore(t)
++	defer store.Close()
++
++	parent := nestedGraphRun("run-20260710T120000Z-wave", "", "run-20260710T120000Z-wave", 0)
++	child := nestedGraphRun(parent.RunID, parent.RunID, parent.RootRunID, 1)
++	err := PersistChildPlanGraph(ctx, store, parent, []RunNode{child}, nestedGraphPlan(parent), []RunEdgeRecord{nestedGraphEdge(parent, child, 0)})
++	if err == nil || !strings.Contains(err.Error(), "cannot reuse parent_run_id") {
++		t.Fatalf("self-cycle error = %v, want parent reuse rejection", err)
++	}
++	assertNestedGraphCounts(t, store, 0, 0, 0)
++
++	if err := PersistChildPlanGraph(ctx, store, parent,
++		[]RunNode{nestedGraphRun("run-20260710T120001Z-child-alpha-0", parent.RunID, parent.RootRunID, 1)},
++		nestedGraphPlan(parent),
++		[]RunEdgeRecord{nestedGraphEdge(parent, nestedGraphRun("run-20260710T120001Z-child-alpha-0", parent.RunID, parent.RootRunID, 1), 0)},
++	); err != nil {
++		t.Fatalf("persist valid parent/child: %v", err)
++	}
++	grandchild := nestedGraphRun("run-20260710T120002Z-child-beta-0", "run-20260710T120001Z-child-alpha-0", parent.RootRunID, 2)
++	if err := store.WithTx(ctx, func(tx Tx) error {
++		if _, err := tx.Exec(ctx, `INSERT INTO runs(id, parent_run_id, root_run_id, depth, status, updated_at, created_at) VALUES (?, ?, ?, ?, 'queued', '2026-07-10T12:00:02Z', '2026-07-10T12:00:02Z')`, grandchild.RunID, grandchild.ParentRunID, grandchild.RootRunID, grandchild.Depth); err != nil {
++			return err
++		}
++		_, err := tx.Exec(ctx, `INSERT INTO run_edges(parent_run_id, child_run_id, edge_type, created_at, root_run_id, plan_id, child_key, depth, ordinal, scope_json, permission, aggregation_json, status, updated_at) VALUES (?, ?, 'child', '2026-07-10T12:00:02Z', ?, 'plan-existing', 'beta', 2, 0, '{}', 'write', '{}', 'queued', '2026-07-10T12:00:02Z')`, grandchild.ParentRunID, grandchild.RunID, grandchild.RootRunID)
++		return err
++	}); err != nil {
++		t.Fatalf("seed grandchild: %v", err)
++	}
++
++	cycleParent := nestedGraphRun(grandchild.RunID, grandchild.ParentRunID, parent.RootRunID, 2)
++	cycleChild := nestedGraphRun(parent.RunID, grandchild.RunID, parent.RootRunID, 3)
++	err = PersistChildPlanGraph(ctx, store, cycleParent, []RunNode{cycleChild}, nestedGraphPlan(cycleParent), []RunEdgeRecord{nestedGraphEdge(cycleParent, cycleChild, 0)})
++	if err == nil || !strings.Contains(err.Error(), "cannot reuse root_run_id") {
++		t.Fatalf("cycle/ancestor error = %v, want root reuse rejection", err)
++	}
++}
++
++func TestPersistChildPlanGraphRejectsMultiLevelCycle(t *testing.T) {
++	ctx := context.Background()
++	store := openNestedGraphTestStore(t)
++	defer store.Close()
++	parent := nestedGraphRun("run-20260710T120000Z-wave", "", "run-20260710T120000Z-wave", 0)
++	child := nestedGraphRun("run-20260710T120001Z-child-alpha-0", parent.RunID, parent.RootRunID, 1)
++	if err := store.WithTx(ctx, func(tx Tx) error {
++		if _, err := tx.Exec(ctx, `INSERT INTO runs(id, root_run_id, depth, status, updated_at, created_at) VALUES (?, ?, 0, 'running', '2026-07-10T12:00:00Z', '2026-07-10T12:00:00Z')`, parent.RunID, parent.RootRunID); err != nil {
++			return err
++		}
++		if _, err := tx.Exec(ctx, `INSERT INTO runs(id, root_run_id, depth, status, updated_at, created_at) VALUES (?, ?, 1, 'queued', '2026-07-10T12:00:01Z', '2026-07-10T12:00:01Z')`, child.RunID, child.RootRunID); err != nil {
++			return err
++		}
++		_, err := tx.Exec(ctx, `INSERT INTO run_edges(parent_run_id, child_run_id, edge_type, created_at) VALUES (?, ?, 'child', '2026-07-10T12:00:01Z')`, child.RunID, parent.RunID)
++		return err
++	}); err != nil {
++		t.Fatalf("seed reverse edge: %v", err)
++	}
++	err := PersistChildPlanGraph(ctx, store, parent, []RunNode{child}, nestedGraphPlan(parent), []RunEdgeRecord{nestedGraphEdge(parent, child, 0)})
++	if err == nil || !strings.Contains(err.Error(), "would create a cycle") {
++		t.Fatalf("cycle error = %v, want reachability cycle rejection", err)
++	}
++}
++
++func TestPersistChildPlanGraphRejectsRootDepthOrdinalAndExistingIDMismatches(t *testing.T) {
++	tests := []struct {
++		name string
++		edit func(context.Context, Store, *RunNode, *RunNode, *ChildPlanRecord, *RunEdgeRecord) error
++		want string
++	}{
++		{
++			name: "root mismatch",
++			edit: func(_ context.Context, _ Store, _ *RunNode, child *RunNode, _ *ChildPlanRecord, edge *RunEdgeRecord) error {
++				child.RootRunID = "run-20260710T125959Z-wave"
++				edge.RootRunID = child.RootRunID
++				return nil
++			},
++			want: "root_run_id mismatch",
++		},
++		{
++			name: "depth mismatch",
++			edit: func(_ context.Context, _ Store, _ *RunNode, child *RunNode, _ *ChildPlanRecord, edge *RunEdgeRecord) error {
++				child.Depth = 3
++				edge.Depth = 3
++				return nil
++			},
++			want: "depth mismatch",
++		},
++		{
++			name: "ordinal mismatch",
++			edit: func(_ context.Context, _ Store, _ *RunNode, _ *RunNode, _ *ChildPlanRecord, edge *RunEdgeRecord) error {
++				edge.Ordinal = -1
++				return nil
++			},
++			want: "ordinal must be non-negative",
++		},
++		{
++			name: "existing child belongs to another parent",
++			edit: func(ctx context.Context, store Store, _ *RunNode, child *RunNode, _ *ChildPlanRecord, _ *RunEdgeRecord) error {
++				otherParent := nestedGraphRun("run-20260710T115959Z-wave", "", "run-20260710T115959Z-wave", 0)
++				return store.WithTx(ctx, func(tx Tx) error {
++					if _, err := tx.Exec(ctx, `INSERT INTO runs(id, root_run_id, depth, status, updated_at, created_at) VALUES (?, ?, 0, 'running', '2026-07-10T11:59:59Z', '2026-07-10T11:59:59Z')`, otherParent.RunID, otherParent.RootRunID); err != nil {
++						return err
++					}
++					_, err := tx.Exec(ctx, `INSERT INTO runs(id, parent_run_id, root_run_id, depth, status, updated_at, created_at) VALUES (?, ?, ?, 1, 'queued', '2026-07-10T12:00:00Z', '2026-07-10T12:00:00Z')`, child.RunID, otherParent.RunID, otherParent.RootRunID)
++					return err
++				})
++			},
++			want: "already belongs to parent",
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			ctx := context.Background()
++			store := openNestedGraphTestStore(t)
++			defer store.Close()
++			parent := nestedGraphRun("run-20260710T120000Z-wave", "", "run-20260710T120000Z-wave", 0)
++			child := nestedGraphRun("run-20260710T120001Z-child-alpha-0", parent.RunID, parent.RootRunID, 1)
++			plan := nestedGraphPlan(parent)
++			edge := nestedGraphEdge(parent, child, 0)
++			if err := tt.edit(ctx, store, &parent, &child, &plan, &edge); err != nil {
++				t.Fatalf("seed mismatch fixture: %v", err)
++			}
++			err := PersistChildPlanGraph(ctx, store, parent, []RunNode{child}, plan, []RunEdgeRecord{edge})
++			if err == nil || !strings.Contains(err.Error(), tt.want) {
++				t.Fatalf("PersistChildPlanGraph error = %v, want containing %q", err, tt.want)
++			}
++		})
++	}
++}
++
++func TestStorageHealthSurfacesDurableGraphCorruption(t *testing.T) {
++	ctx := context.Background()
++	store := openNestedGraphTestStore(t)
++	defer store.Close()
++	if err := store.WithTx(ctx, func(tx Tx) error {
++		if _, err := tx.Exec(ctx, `INSERT INTO runs(id, root_run_id, depth, status, updated_at, created_at) VALUES ('run-20260710T120000Z-wave', 'run-20260710T120000Z-wave', 0, 'running', '2026-07-10T12:00:00Z', '2026-07-10T12:00:00Z')`); err != nil {
++			return err
++		}
++		_, err := tx.Exec(ctx, `INSERT INTO run_edges(parent_run_id, child_run_id, edge_type, created_at, root_run_id, plan_id, child_key, depth, ordinal, scope_json, permission, aggregation_json, status, updated_at) VALUES ('run-20260710T120000Z-wave', 'run-20260710T120000Z-wave', 'child', '2026-07-10T12:00:00Z', 'run-20260710T120000Z-wave', 'plan-corrupt', 'self', 1, 0, '{}', 'write', '{}', 'queued', '2026-07-10T12:00:00Z')`)
++		return err
++	}); err != nil {
++		t.Fatalf("seed corrupt graph: %v", err)
++	}
++	health, err := store.Health(ctx)
++	if err == nil || !strings.Contains(err.Error(), "durable run graph") || !strings.Contains(err.Error(), "self edge") {
++		t.Fatalf("Health = %#v err=%v, want durable graph self-edge error", health, err)
++	}
++	if health.OK {
++		t.Fatalf("health.OK = true for corrupt graph: %#v", health)
++	}
++}
++
++func TestStorageHealthDoesNotTreatLegacyOrdinalOnlyEdgeAsEnriched(t *testing.T) {
++	ctx := context.Background()
++	store := openNestedGraphTestStore(t)
++	defer store.Close()
++	if err := store.WithTx(ctx, func(tx Tx) error {
++		if _, err := tx.Exec(ctx, `INSERT INTO runs(id, root_run_id, depth, status, updated_at, created_at) VALUES ('run-20260710T120000Z-wave', 'run-20260710T120000Z-wave', 0, 'running', '2026-07-10T12:00:00Z', '2026-07-10T12:00:00Z')`); err != nil {
++			return err
++		}
++		if _, err := tx.Exec(ctx, `INSERT INTO runs(id, root_run_id, depth, status, updated_at, created_at) VALUES ('run-20260710T120001Z-child-alpha-0', '', 0, 'queued', '2026-07-10T12:00:01Z', '2026-07-10T12:00:01Z')`); err != nil {
++			return err
++		}
++		_, err := tx.Exec(ctx, `INSERT INTO run_edges(parent_run_id, child_run_id, edge_type, created_at, ordinal) VALUES ('run-20260710T120000Z-wave', 'run-20260710T120001Z-child-alpha-0', 'child', '2026-07-10T12:00:01Z', 0)`)
++		return err
++	}); err != nil {
++		t.Fatalf("seed legacy graph: %v", err)
++	}
++	health, err := store.Health(ctx)
++	if err != nil {
++		t.Fatalf("Health returned error for legacy ordinal-only edge: %#v err=%v", health, err)
++	}
++	if !health.OK {
++		t.Fatalf("health.OK = false for legacy ordinal-only edge: %#v", health)
++	}
++}
++
++func openNestedGraphTestStore(t *testing.T) Store {
++	t.Helper()
++	store, err := Open(context.Background(), Options{
++		Path: filepath.Join(t.TempDir(), "loopcoder.db"),
++		Now: func() time.Time { return time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC) },
++	})
++	if err != nil {
++		t.Fatalf("Open: %v", err)
++	}
++	return store
++}
++
++func nestedGraphRun(runID, parentRunID, rootRunID string, depth int) RunNode {
++	return RunNode{
++		RunID:       runID,
++		ParentRunID: parentRunID,
++		RootRunID:   rootRunID,
++		Depth:       depth,
++		Origin:      "nested_test",
++		Status:      "queued",
++		CreatedAt:   "2026-07-10T12:00:00Z",
++		UpdatedAt:   "2026-07-10T12:00:00Z",
++	}
++}
++
++func nestedGraphPlan(parent RunNode) ChildPlanRecord {
++	return ChildPlanRecord{
++		PlanID:         "plan-" + parent.RunID,
++		ParentRunID:    parent.RunID,
++		RootRunID:      parent.RootRunID,
++		SchemaVersion:  "loopcoder.child_plan.v1",
++		MaxDepth:       4,
++		MaxConcurrency: 1,
++		PlanJSON:       "{}",
++		CreatedAt:      "2026-07-10T12:00:00Z",
++	}
++}
++
++func nestedGraphEdge(parent, child RunNode, ordinal int) RunEdgeRecord {
++	return RunEdgeRecord{
++		ParentRunID:     parent.RunID,
++		ChildRunID:      child.RunID,
++		RootRunID:       parent.RootRunID,
++		PlanID:          "plan-" + parent.RunID,
++		ChildKey:        "alpha",
++		Depth:           child.Depth,
++		Ordinal:         ordinal,
++		ScopeJSON:       `{"repo":".","paths":["internal/storage"]}`,
++		Permission:      "write",
++		AggregationJSON: `{"mode":"collect","required":true,"include_report":true}`,
++		Status:          "queued",
++		CreatedAt:       "2026-07-10T12:00:00Z",
++		UpdatedAt:       "2026-07-10T12:00:00Z",
++	}
++}
++
++func assertNestedGraphCounts(t *testing.T, store Store, wantPlans, wantRuns, wantEdges int) {
++	t.Helper()
++	var plans, runs, edges int
++	if err := store.WithTx(context.Background(), func(tx Tx) error {
++		if err := tx.QueryRow(context.Background(), `SELECT COUNT(*) FROM child_plans`).Scan(&plans); err != nil {
++			return err
++		}
++		if err := tx.QueryRow(context.Background(), `SELECT COUNT(*) FROM runs`).Scan(&runs); err != nil {
++			return err
++		}
++		return tx.QueryRow(context.Background(), `SELECT COUNT(*) FROM run_edges`).Scan(&edges)
++	}); err != nil {
++		t.Fatalf("query graph counts: %v", err)
++	}
++	if plans != wantPlans || runs != wantRuns || edges != wantEdges {
++		t.Fatalf("graph counts plans/runs/edges = %d/%d/%d, want %d/%d/%d", plans, runs, edges, wantPlans, wantRuns, wantEdges)
++	}
++}
+diff --git a/internal/storage/storage.go b/internal/storage/storage.go
+index fe94425..1b83281 100644
+--- a/internal/storage/storage.go
++++ b/internal/storage/storage.go
+@@ -62,6 +62,27 @@ type sqliteStore struct {
+ 	now  func() time.Time
+ }
+ 
++type durableGraphRun struct {
++	id     string
++	parent string
++	root   string
++	depth  int
++}
++
++type durableGraphEdge struct {
++	parent      string
++	child       string
++	root        string
++	planID      string
++	childKey    string
++	depth       int
++	ordinal     int
++	scope       string
++	permission  string
++	aggregation string
++	status      string
++}
++
+ type sqlTx struct {
+ 	tx *sql.Tx
+ }
+@@ -348,6 +369,9 @@ func CheckHealth(ctx context.Context, path string) (Health, error) {
+ 	if err := integrityCheck(ctx, db); err != nil {
+ 		return health, fmt.Errorf("storage health: %w", err)
+ 	}
++	if err := durableGraphConsistencyCheck(ctx, db); err != nil {
++		return health, fmt.Errorf("storage health: %w", err)
++	}
+ 	health.OK = true
+ 	health.Message = "storage database is healthy"
+ 	return health, nil
+@@ -745,6 +769,112 @@ func integrityCheck(ctx context.Context, db *sql.DB) error {
+ 	return nil
+ }
+ 
++func durableGraphConsistencyCheck(ctx context.Context, db *sql.DB) error {
++	runRows, err := db.QueryContext(ctx, `SELECT id, COALESCE(parent_run_id, ''), COALESCE(root_run_id, ''), depth FROM runs`)
++	if err != nil {
++		return fmt.Errorf("durable run graph: load runs: %w", err)
++	}
++	runs := map[string]durableGraphRun{}
++	for runRows.Next() {
++		var run durableGraphRun
++		if err := runRows.Scan(&run.id, &run.parent, &run.root, &run.depth); err != nil {
++			runRows.Close()
++			return fmt.Errorf("durable run graph: scan runs: %w", err)
++		}
++		runs[run.id] = run
++	}
++	if err := runRows.Close(); err != nil {
++		return fmt.Errorf("durable run graph: scan runs: %w", err)
++	}
++
++	edgeRows, err := db.QueryContext(ctx, `SELECT parent_run_id, child_run_id, root_run_id, plan_id, child_key, depth, ordinal, scope_json, permission, aggregation_json, status FROM run_edges`)
++	if err != nil {
++		return fmt.Errorf("durable run graph: load edges: %w", err)
++	}
++	var edges []durableGraphEdge
++	graph := map[string][]string{}
++	var problems []string
++	for edgeRows.Next() {
++		var edge durableGraphEdge
++		if err := edgeRows.Scan(&edge.parent, &edge.child, &edge.root, &edge.planID, &edge.childKey, &edge.depth, &edge.ordinal, &edge.scope, &edge.permission, &edge.aggregation, &edge.status); err != nil {
++			edgeRows.Close()
++			return fmt.Errorf("durable run graph: scan edges: %w", err)
++		}
++		edges = append(edges, edge)
++		graph[edge.parent] = append(graph[edge.parent], edge.child)
++		if edge.parent == edge.child {
++			problems = append(problems, fmt.Sprintf("self edge %s -> %s", edge.parent, edge.child))
++		}
++	}
++	if err := edgeRows.Close(); err != nil {
++		return fmt.Errorf("durable run graph: scan edges: %w", err)
++	}
++
++	for _, edge := range edges {
++		if edge.parent != edge.child && durableReachesRun(graph, edge.child, edge.parent) {
++			problems = append(problems, fmt.Sprintf("cycle involving %s -> %s", edge.parent, edge.child))
++			break
++		}
++		if !durableEdgeIsEnriched(edge) {
++			continue
++		}
++		parent, parentOK := runs[edge.parent]
++		child, childOK := runs[edge.child]
++		if !parentOK || !childOK {
++			continue
++		}
++		if strings.TrimSpace(child.parent) != "" && child.parent != edge.parent {
++			problems = append(problems, fmt.Sprintf("edge %s -> %s disagrees with child parent_run_id %s", edge.parent, edge.child, child.parent))
++		}
++		if strings.TrimSpace(edge.root) == "" || strings.TrimSpace(child.root) == "" || edge.root != child.root {
++			problems = append(problems, fmt.Sprintf("edge %s -> %s has inconsistent root_run_id", edge.parent, edge.child))
++		}
++		if strings.TrimSpace(parent.root) != "" && strings.TrimSpace(edge.root) != "" && parent.root != edge.root {
++			problems = append(problems, fmt.Sprintf("edge %s -> %s root_run_id does not match parent", edge.parent, edge.child))
++		}
++		if edge.depth != child.depth {
++			problems = append(problems, fmt.Sprintf("edge %s -> %s depth %d disagrees with child depth %d", edge.parent, edge.child, edge.depth, child.depth))
++		}
++	}
++	if len(problems) > 0 {
++		sort.Strings(problems)
++		detail := strings.Join(problems, "; ")
++		if len(problems) > 3 {
++			detail = strings.Join(problems[:3], "; ") + fmt.Sprintf("; plus %d more", len(problems)-3)
++		}
++		return fmt.Errorf("durable run graph has %d problem(s): %s", len(problems), detail)
++	}
++	return nil
++}
++
++func durableEdgeIsEnriched(edge durableGraphEdge) bool {
++	return strings.TrimSpace(edge.root) != "" ||
++		strings.TrimSpace(edge.planID) != "" ||
++		strings.TrimSpace(edge.childKey) != "" ||
++		strings.TrimSpace(edge.scope) != "" && strings.TrimSpace(edge.scope) != "{}" ||
++		strings.TrimSpace(edge.permission) != "" ||
++		strings.TrimSpace(edge.aggregation) != "" && strings.TrimSpace(edge.aggregation) != "{}" ||
++		strings.TrimSpace(edge.status) != ""
++}
++
++func durableReachesRun(graph map[string][]string, start, target string) bool {
++	seen := map[string]bool{}
++	stack := []string{start}
++	for len(stack) > 0 {
++		current := stack[len(stack)-1]
++		stack = stack[:len(stack)-1]
++		if current == target {
++			return true
++		}
++		if seen[current] {
++			continue
++		}
++		seen[current] = true
++		stack = append(stack, graph[current]...)
++	}
++	return false
++}
++
+ func unsupportedVersionError(version int) error {
+ 	return fmt.Errorf("unsupported storage schema version %d; selected loopcoder supports schema version %d", version, CurrentSchemaVersion)
+ }

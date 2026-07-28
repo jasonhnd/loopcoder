@@ -4,7 +4,8 @@
 **Operation:** v0.9 project suspension archive and local deletion
 **Initial local scope:** 2,035,732,480 bytes
 **Safety model:** Preserve, upload, download-verify, then delete
-**Current phase:** Primary local deletion complete; final merge pending
+**Current phase:** Primary transaction complete; residual sweep preserved,
+deletion pending
 
 This ledger is intentionally committed in two phases.
 
@@ -100,7 +101,8 @@ The cleanup must not delete or modify:
   temporary fixtures;
 - Paseo application data unrelated to this stopped project;
 - Codex tasks, memory, or conversation history;
-- the current unrelated Codex workspace;
+- unrelated content in the current Codex workspace; only the separately
+  inventoried LoopCoder subpaths and notes are in the residual sweep;
 - public v0.8.1 release assets;
 - any GitHub repository other than `jasonhnd/loopcoder`;
 - the GitHub source, issues, PRs, Actions runs, or draft snapshot.
@@ -256,16 +258,18 @@ The audited pre-deletion scope was 2,035,732,480 bytes, approximately 1.90 GiB
 or 2.04 GB. That number covered the six development-root paths and 57
 `${TMPDIR}/loopcoder*` paths.
 
-The three finalization-only paths below are deliberately retained until PR
-#1454 is merged and the draft target is rebound to the merge commit:
+The three finalization-only paths below were retained until PR #1454 was
+merged and the draft target was rebound to the merge commit:
 
 - `${TMPDIR}/lc-v090-finalize`;
 - `${TMPDIR}/lc-v090-snapshot-stage`;
 - `${TMPDIR}/lc-v090-download-verify`.
 
-They are not development leftovers. They are the independent Git clone, upload
-source, and download-verification copy needed to finish the remote
-transaction. Their combined size before final removal was 123,384 KiB.
+They were not development leftovers. They were the independent Git clone,
+upload source, and download-verification copy needed to finish the remote
+transaction. Their combined size before final removal was 123,384 KiB. All
+three were deleted after exact-merge CI passed and the remote state was read
+back successfully.
 
 ## 9. Post-Deletion Verification
 
@@ -275,9 +279,9 @@ The primary cleanup passed these checks:
 | --- | --- |
 | `${HOME}/AgenticCoder/loopcoder*` top-level scan | 0 paths |
 | `${TMPDIR}/loopcoder*` top-level scan | 0 paths |
-| Finalization scanner top-level scan | 0 paths |
+| Finalization scanner and transaction-path scan | 0 paths |
 | Open project issues | 0 |
-| Open pull requests | PR #1454 only, this archival transaction |
+| Open pull requests | 0 after PR #1454 merged |
 | v0.9 product tags | 0 |
 | Internal lookup Git tag refs | 0 |
 | Draft snapshot | ID `360850177`, still `draft=true` |
@@ -288,17 +292,55 @@ Process inspection found no LoopCoder development agent, provider canary, goal
 run, or artifact qualification process. Matches during the check were only the
 inspection commands themselves.
 
-## 10. Final Transaction Boundary
+## 10. Primary Transaction Result
 
-PR #1454 must be merged only after its final exact head passes `verify`, `test`,
-`race`, and `security`. After merge:
+PR #1454 merged on 2026-07-28.
 
-1. the unpublished draft target is rebound to the exact merge commit;
-2. the draft, asset set, issue count, PR count, and tag refs are read again;
-3. the three finalization-only paths are deleted;
-4. a final local path scan must return zero.
+| Identity | Exact value |
+| --- | --- |
+| Final PR head | `2c8970d06aaee98613178de653299eaee30927b3` |
+| Merge commit | `19d25dbf230482564173c7eb6eb7c7d1de5f189f` |
+| Exact-merge CI run | `30332243077` |
+| Exact-merge CI result | `verify`, `test`, `race`, and `security` passed |
+| Draft target after merge | `19d25dbf230482564173c7eb6eb7c7d1de5f189f` |
+| Draft publication | `draft=true`, `published_at=null` |
+| Latest public release | `v0.8.1` |
+
+The remote branch `docs/v090-suspension-snapshot-20260728` was deleted after
+merge. Final readback found zero open issues, zero open pull requests, no
+v0.9 Git tag, no internal lookup Git ref, and all five draft assets still
+uploaded with their recorded sizes and digests.
 
 The merge commit cannot be written into the commit that creates it without an
 infinite self-reference. GitHub PR #1454 is therefore the authoritative merge
-record, and the draft's `target_commitish` becomes the durable merge-SHA
-binding after the merge.
+record, and the draft's `target_commitish` is the durable merge-SHA binding.
+
+## 11. Residual Sweep Pre-Deletion Record
+
+A broader scan after the primary transaction found another 252,332 KiB outside
+the original scope:
+
+- three historical checkout/work-area paths;
+- three standalone Markdown notes;
+- six hidden `$LOOPCODER_HOME` variants;
+- two Go module cache paths;
+- one macOS crash-reporter plist.
+
+The six hidden runtime homes contained 5,563 files and six SQLite databases.
+Every database passed `PRAGMA integrity_check`. Raw state was excluded because
+it included machine-local paths, mutable databases, provider homes, session
+logs, and temporary Git worktrees.
+
+Five bounded files totaling 172,655 bytes were retained:
+
+- three historical Markdown notes;
+- one code diff for local-only issue #708 commit `d73b797...`;
+- one code diff for local-only issue #711 commit `69dc517...`.
+
+Their sizes, hashes, provenance, and safety scan are in
+[`historical/README.md`](historical/README.md). The complete residual
+classification is in
+[`residual-local-state-inventory.md`](residual-local-state-inventory.md).
+
+Deletion of the residual scope remains blocked until this material is committed
+to a remote branch and the remote bytes are independently read back.
