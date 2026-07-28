@@ -106,16 +106,18 @@ Do not use signed browser URLs as durable evidence. They expire.
 
 ## 5. Verify Downloaded Bytes
 
-Use the tracked checksum record, not a checksum copied from a chat or old
-terminal:
+Use the downloaded draft checksum asset, not a checksum copied from a chat or
+old terminal. First confirm that its GitHub asset digest is
+`sha256:b29001e0e3e62ccb9936aac2fc563d58e83f1832c0806eec6530a48a70770a85`,
+then run:
 
 ```bash
-cp docs/archive/v0.9.0-suspension-snapshot-2026-07-28/SHA256SUMS \
-  snapshot-download/
-
 cd snapshot-download
 shasum -a 256 -c SHA256SUMS
 ```
+
+The tracked [`asset-manifest.json`](asset-manifest.json) provides an
+independent repository copy of the expected asset names, sizes, and digests.
 
 Expected digests:
 

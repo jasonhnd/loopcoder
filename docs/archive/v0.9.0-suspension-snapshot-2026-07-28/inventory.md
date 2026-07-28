@@ -306,7 +306,8 @@ The retention result is intentionally small:
 
 - approximately 18.7 MB of RC archives;
 - approximately 188 KB of compressed decision evidence;
-- tracked Markdown, JSON manifests, checksums, and redaction records.
+- tracked Markdown, JSON manifests, and redaction records, plus the draft
+  `SHA256SUMS` asset.
 
 The deleted local estate was approximately 2.04 GB. The difference is the
 space occupied by repetition, mutable runtime state, stale process evidence,

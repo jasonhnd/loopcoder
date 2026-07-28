@@ -84,12 +84,12 @@ v0.9 release.
 | `loopcoder_0.9.0-rc.60_darwin_arm64.tar.gz` | 9,264,799 | `270870d7ae0b1712d6eb3cbf67d948fdc680b0da4aceaf5344a08c03b70e7aae` | Exact archive used by the nearest completed live acceptance attempt |
 | `loopcoder_0.9.0-rc.61_darwin_arm64.tar.gz` | 9,271,775 | `bea1a17c1e1ef500569ce2283128646c8337a2191c9639921580fbc9d7ac8db1` | Final built archive; canary and qualifier were never run |
 | `v0.9.0-suspension-evidence-2026-07-28.tar.zst` | 187,791 | `ea0bd8ca4654c1e5f04b6d2067a61bc6d62dc8c2d825d7d09d47628082c1c52d` | Sanitized acceptance, source-delta, inventory, and cleanup evidence |
-| `snapshot-manifest.json` | See draft asset | Bound by `SHA256SUMS` | Machine-readable source, artifact, redaction, and cleanup scope |
+| `snapshot-manifest.json` | See draft asset | Bound by the draft `SHA256SUMS` asset | Machine-readable source, artifact, redaction, and cleanup scope |
 | `SHA256SUMS` | See draft asset | Self-excluded checksum list | Offline verification for the other four assets |
 
-The tracked copies of [`asset-manifest.json`](asset-manifest.json) and
-[`SHA256SUMS`](SHA256SUMS) make the identity record durable even if GitHub's
-draft-asset behavior changes later.
+The tracked [`asset-manifest.json`](asset-manifest.json) records the same
+artifact names, sizes, and digests. The exact `SHA256SUMS` file remains a draft
+asset and is independently bound by GitHub's asset digest.
 
 ## 4. Evidence Archive Contents
 
@@ -313,7 +313,7 @@ After this snapshot, the durable v0.9 record lives in
 - source history;
 - merged suspension report;
 - this archival index;
-- tracked manifests and checksums;
+- tracked manifests and the draft checksum asset;
 - an unpublished, authenticated draft containing the bounded binary and
   evidence assets.
 
