@@ -105,7 +105,7 @@ jobs:
           printf 'archive_digest_sha256=%s\n' "${archive_digest}"
           printf 'archive_name=%s\n' "${archive}"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-darwin-arm64
           path: dist/loopcoder_*_darwin_arm64.tar.gz
@@ -184,7 +184,7 @@ jobs:
 
       - name: Retain Apple trust evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: macos-codesign-evidence-${{ github.ref_name }}
           path: ${{ runner.temp }}/apple-sign-evidence/macos-codesign-evidence.json
@@ -227,7 +227,7 @@ jobs:
           cd ..
           bash scripts/stage-draft-release.sh validate-candidate
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-candidate-${{ github.ref_name }}
           path: |
@@ -339,7 +339,7 @@ jobs:
             --max-duration-seconds 300
 
       - name: Retain packaged nested permission matrix evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: nested-permission-matrix-evidence-${{ github.run_id }}
           path: ${{ runner.temp }}/nested-permission-evidence/permission-matrix-evidence.json
@@ -356,7 +356,7 @@ jobs:
 
       - name: Retain sanitized permission-matrix diagnostics
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: nested-permission-matrix-diagnostics-${{ github.run_id }}
           path: ${{ runner.temp }}/loopcoder-permission-matrix-diagnostics
