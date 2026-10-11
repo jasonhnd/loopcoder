@@ -124,7 +124,7 @@ jobs:
 
       - name: Upload sanitized evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: canary-fixture-${{ matrix.provider }}-${{ matrix.scenario }}-${{ github.run_id }}
           path: ${{ runner.temp }}/canary-evidence/release-provider-canary-*.json
@@ -188,7 +188,7 @@ jobs:
           fi
           tar -C "${RUNNER_TEMP}/package" -czf "${RUNNER_TEMP}/loopcoder_canary_darwin_arm64.tar.gz" loopcoder
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: canary-candidate-${{ github.run_id }}
           path: ${{ runner.temp }}/loopcoder_canary_darwin_arm64.tar.gz
@@ -231,7 +231,7 @@ jobs:
 
       - name: Upload sanitized codex evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: canary-live-codex-${{ github.run_id }}
           path: ${{ runner.temp }}/canary-evidence/release-provider-canary-codex.json
@@ -274,7 +274,7 @@ jobs:
 
       - name: Upload sanitized claude evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: canary-live-claude-${{ github.run_id }}
           path: ${{ runner.temp }}/canary-evidence/release-provider-canary-claude.json
@@ -316,7 +316,7 @@ jobs:
             --expected-digest "${EXPECTED_DIGEST}"
       - name: Upload sanitized grok evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: canary-live-grok-${{ github.run_id }}
           path: ${{ runner.temp }}/canary-evidence/release-provider-canary-grok.json
@@ -357,7 +357,7 @@ jobs:
             --expected-digest "${EXPECTED_DIGEST}"
       - name: Upload sanitized antigravity evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: canary-live-antigravity-${{ github.run_id }}
           path: ${{ runner.temp }}/canary-evidence/release-provider-canary-antigravity.json
